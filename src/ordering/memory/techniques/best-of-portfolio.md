@@ -67,7 +67,28 @@ ceiling of *this family of methods*; the next real gain probably needs a
 qualitatively different candidate, not another partitioner setting. See
 [open-questions.md](../open-questions.md).
 
+## The prediction above was right, and here is what "qualitatively different" meant
+The 122 ties are not evidence that the matrices are hard — they are evidence that
+**AMD is the winner there**, and that every candidate added so far was drawn from
+families that lose to AMD on that set. The fix was not a better competitor to AMD
+but *another AMD*: because AMD's tie-breaking reads the vertex numbering,
+`AMD(Q A Qᵀ)` composed back through `Q` is a different minimum-degree ordering
+for the cost of one AMD pass. That single change improved **41 of 300** matrices,
+worth −0.0070 — more than the entire partitioner sweep — and most of the wins are
+former exact ties. See
+[experiments/0003](../experiments/0003-relabelled-amd-multistart.md).
+
+The transferable lesson: when a large set is tied at the anchor, look for
+variation *within* the anchor's own family before adding another family.
+
+It also changed the shape of a gate. Every other candidate here uses a hard
+`(n, nnz)` envelope; the multi-start instead takes a per-matrix **time budget**
+(`restarts = budget / nnz`), which bounds its cost everywhere at once and makes
+the budget its own gate. That pattern is reusable for any candidate whose cost
+scales with nnz and whose quality improves with repetition.
+
 ## Links
 - [amd.md](amd.md) — the anchor, and why it is hard to beat here.
 - [nested-dissection.md](nested-dissection.md) — the separator family in the portfolio.
 - [experiments/0002](../experiments/0002-measured-gates-metis-kahip.md) — the measurements above.
+- [experiments/0003](../experiments/0003-relabelled-amd-multistart.md) — the relabelled-AMD multi-start and the budget-as-gate pattern.

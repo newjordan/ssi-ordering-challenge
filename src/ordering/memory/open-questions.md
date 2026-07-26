@@ -7,14 +7,21 @@ it, rather than deleting it — a resolved question is a useful signpost.
 
 ## Active
 
-- [ ] **Relabelled-AMD multi-start (top lead, probe already written).** AMD's
-      tie-breaking depends on the vertex NUMBERING, so `AMD(P A Pᵀ)` composed
-      back through `P` is a different minimum-degree ordering for the cost of one
-      AMD pass. 122 of 300 matrices tie AMD at exactly 1.000 — on those, *AMD is
-      the winner*, and a different AMD is the one candidate family never tried.
-      `probe_relabel_amd` in [`probe.rs`](../probe.rs) reports the score at
-      4/8/16/24 restarts plus per-matrix cost; it compiles but has not been run
-      to completion. **Run it first next session.**
+- [ ] **Structured relabelings, not random ones (top lead).** The shipped
+      multi-start uses uniform-random `Q` (Fisher-Yates), which is the dumbest
+      possible choice — it works only because AMD's tie-breaking is numbering-
+      sensitive. A *structured* `Q` should do better at identical cost: seed the
+      relabeling from RCM, from a partitioner's block order, or from a previous
+      restart's winning permutation (a hill-climb rather than i.i.d. sampling).
+      The budget machinery in [0003](experiments/0003-relabelled-amd-multistart.md)
+      already prices candidates, so this is cheap to test — reuse
+      `probe_relabel_budget` and swap `relabel`.
+- [ ] **Does the budget want to be non-uniform across buckets?** The shipped
+      `RELABEL_BUDGET` spends the same ~0.3 s everywhere, but `gt_10k` carries
+      weight 0.40 over only 45 matrices (~4.4× the per-matrix leverage of
+      `lt_1k`). A bucket-weighted budget — more restarts where a win is worth
+      more — was never tested. Note `n` is known inside `order()`, so this stays
+      a pure function of `(n, nnz)`.
 - [ ] **The big tied matrices are gated out of everything.** `faclay75`
       (n=272878), `acopf_case9241pegase_qcqp` (n=313068), `gabriel10` (n=244056),
       `unitcommit_200_100_1_mod_8` (n=146830) all tie at 1.000 and receive only
@@ -23,10 +30,13 @@ it, rather than deleting it — a resolved question is a useful signpost.
       `acopf_case9241pegase_qcqp` gets literally nothing but the baseline. These
       are the highest-leverage matrices on the corpus (gt_10k weight 0.40 over
       only 45 matrices). `probe_large` is written to measure exactly this.
-- [ ] **Is the 1.019 s worst case safe?** That is a ~2× margin on the enforced
-      2 s SIGKILL, and one breach FAILs the entire run. Worth deciding whether to
-      spend some score buying margin back on `crudeoil_lee4_10` / `ringpack_30_2`
-      (both n≈18k, nnz≈121k — the AMF passes are the likely cost).
+- [ ] **How fast is the grader, really?** Partly answered and partly reopened by
+      [0003](experiments/0003-relabelled-amd-multistart.md): the header's "3-5×
+      slower than local" claim is false (a 1.019 s local revision passed), and
+      repeat local runs vary ~1.6×, so we are tuning against a number we know to
+      one significant figure. Nothing in the harness output exposes grader
+      timing. Until it does, the only defensible rule is comparative — stay at or
+      below the worst case of a revision known to have passed.
 - [ ] Do any ML/RL-guided ordering ideas fit a stdlib-only, deterministic,
       2 s/matrix `order()`? Survey the literature before assuming yes/no.
 - [ ] The hand-rolled `nd_order` / `ndfm_order` use a plain **degree sort** at

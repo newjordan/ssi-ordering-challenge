@@ -185,28 +185,9 @@ fn probe_ties() {
     }
 }
 
-/// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
-/// a fixed seed, so every run produces the identical sequence.
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// A relabeling of `0..n` from a fixed seed (Fisher–Yates over SplitMix64).
-fn relabel(n: usize, seed: u64) -> Vec<usize> {
-    let mut q: Vec<usize> = (0..n).collect();
-    let mut s = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(0x1234_5678_9ABC_DEF0);
-    for i in (1..n).rev() {
-        let j = (splitmix64(&mut s) % (i as u64 + 1)) as usize;
-        q.swap(i, j);
-    }
-    q
-}
+// `splitmix64`, `relabel` and `relabel_restarts` now live in the shipped module
+// (`super`) and reach this file through `use super::*` — the probe must exercise
+// the exact same functions `order()` uses, or its predictions stop being valid.
 
 /// RANDOMIZED-RESTART minimum degree, for free, using the library AMD.
 ///
@@ -683,4 +664,138 @@ fn probe_multiseed() {
     println!("SCORE cur = {:.6}", aggregate(&cur.0, &cur.1));
     println!("SCORE new = {:.6}", aggregate(&new.0, &new.1));
     println!("worst EXTRA sweep time = {:.3} s on {}", rows[0].0, rows[0].1);
+}
+
+/// Score the BUDGETED relabelled-AMD multi-start and measure its true combined
+/// cost.
+///
+/// [`probe_relabel_amd`] established the family works — 41 of 300 matrices
+/// improved, 0.883906 -> 0.874024 at a flat 24 restarts. But a flat count is
+/// unshippable: 24 restarts costs 1.444 s on `nuclear10a` and 0.658 s on
+/// `crudeoil_lee4_10`, on top of each matrix's own `order()` time, which would
+/// put the heavy tier near or past the 2 s SIGKILL.
+///
+/// This probe evaluates the fix — spend a fixed budget per matrix instead of a
+/// fixed count (see [`relabel_restarts`]) — across several `(budget, cap)`
+/// settings. It runs enough restarts per matrix to satisfy every policy, records
+/// the running-best flops and cumulative cost after each restart, then reads off
+/// each policy from that one sweep. `worst_s` is the real number that decides
+/// shippability: measured `order()` time PLUS measured restart time, per matrix.
+#[test]
+#[ignore]
+fn probe_relabel_budget() {
+    const POLICIES: [(usize, usize); 8] = [
+        (150_000, 24),
+        (300_000, 24),
+        (300_000, 48),
+        (450_000, 24),
+        (450_000, 48),
+        (600_000, 48),
+        (600_000, 96),
+        (900_000, 96),
+    ];
+
+    let corpus = crate::corpus::corpus();
+    let np = POLICIES.len();
+    let mut cur = ([0.0f64; 3], [0usize; 3]);
+    let mut pol: Vec<([f64; 3], [usize; 3])> = vec![([0.0; 3], [0; 3]); np];
+    let mut worst: Vec<(f64, String)> = vec![(0.0, String::new()); np];
+    let mut improved = vec![0usize; np];
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        let t_ord = Instant::now();
+        let cur_flops = flops_of(&sp, &order(pat)) as f64;
+        let ord_secs = t_ord.elapsed().as_secs_f64();
+
+        let rmax = POLICIES
+            .iter()
+            .map(|&(b, c)| relabel_restarts(b, c, nnz))
+            .max()
+            .unwrap_or(0);
+
+        // best_after[r] / cum[r]: best flops and seconds spent after r restarts.
+        let mut best_after = vec![cur_flops; rmax + 1];
+        let mut cum = vec![0.0f64; rmax + 1];
+        let mut best = cur_flops;
+        let t0 = Instant::now();
+        for r in 0..rmax {
+            let q = relabel(n, r as u64 + 1);
+            let b = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                if let Ok(pb) = feral_amd::amd_order(&bcore) {
+                    let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                    if is_bijection(&perm, n) {
+                        best = best.min(flops_of(&sp, &perm) as f64);
+                    }
+                }
+            }
+            best_after[r + 1] = best;
+            cum[r + 1] = t0.elapsed().as_secs_f64();
+        }
+
+        let bkt = bucket(n);
+        cur.0[bkt] += (cur_flops / base).ln();
+        cur.1[bkt] += 1;
+        for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
+            let r = relabel_restarts(bd, cap, nnz);
+            let f = best_after[r];
+            pol[pi].0[bkt] += (f / base).ln();
+            pol[pi].1[bkt] += 1;
+            if f < cur_flops - 1e-9 {
+                improved[pi] += 1;
+            }
+            let combined = ord_secs + cum[r];
+            if combined > worst[pi].0 {
+                worst[pi] = (combined, name.clone());
+            }
+        }
+    }
+
+    println!("\nSCORE cur = {:.6}", aggregate(&cur.0, &cur.1));
+    println!(
+        "\n{:>9} {:>4} {:>10} {:>9} {:>9}  {}",
+        "budget", "cap", "score", "worst_s", "improved", "worst matrix"
+    );
+    for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
+        println!(
+            "{bd:>9} {cap:>4} {:>10.6} {:>9.3} {:>9}  {}",
+            aggregate(&pol[pi].0, &pol[pi].1),
+            worst[pi].0,
+            improved[pi],
+            worst[pi].1
+        );
+    }
+    println!("\nper-bucket for each policy:");
+    for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
+        print!("{bd:>9} {cap:>4} ");
+        for b in 0..3 {
+            if pol[pi].1[b] > 0 {
+                print!(
+                    " {}={:.4}",
+                    BUCKET_NAMES[b],
+                    (pol[pi].0[b] / pol[pi].1[b] as f64).exp()
+                );
+            }
+        }
+        println!();
+    }
 }
