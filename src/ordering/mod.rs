@@ -20,21 +20,29 @@
 //!
 //! ## Where the headroom is
 //!
-//! The latest safe run measured `worst_local_order_secs = 0.313 s` against a
-//! `0.35 s` local ceiling, and many matrices are STILL TIED at AMD. Each tie is
-//! pure upside. The small buckets (`lt_1k`, `1k_10k`) carry the WORST ratios
-//! (~0.92) and the longest list of tied-at-AMD instances (`wastewater*`,
-//! `wastepaper6`, `syn*`, `tln2`) — small combinatorial/network structures where
-//! the minimum-DEGREE family (AMD/AMF), bandwidth (RCM), profile (Sloan) and
-//! nested dissection all stall at the baseline. That region is where this
-//! revision opens a new front.
+//! 122 of the 300 dev matrices are STILL TIED at exactly 1.000 — AMD beats every
+//! separator-, profile- and bandwidth-based candidate on them (60 in `lt_1k`, 40
+//! in `1k_10k`, 22 in `gt_10k`). Each tie is pure upside. Note the leverage is
+//! very uneven: `gt_10k` carries weight 0.40 over only 45 matrices, so one large
+//! matrix is worth ~4.4 small ones — but it is also where the time cap bites
+//! hardest.
 //!
 //! ## The timing fact that bounds every change here
 //!
-//! Every one of the slowest matrices is HIGH-nnz relative to its n
-//! (all `nnz ≥ 163816`); the cost driver is nnz (METIS/AMF on a dense-ish
-//! pattern), NOT n. Any candidate confined to `nnz < 130000` runs STRICTLY below
-//! the slow tier, so it cannot move the worst case.
+//! MEASURED 2026-07-26 with the test-only `probe` module (the harness prints
+//! `(capped)` instead of a time, so this is otherwise invisible):
+//!
+//!   worst local `order()` = **1.019 s** on `crudeoil_lee4_10` (n=17809,
+//!   nnz=120632), then 1.011 s `ringpack_30_2`, 0.869 s `nuclear104`.
+//!
+//! That is a ~2× margin on the enforced 2 s SIGKILL, and ONE breach FAILs the
+//! whole run. **The slow tier has no room for additional candidates.** (An
+//! earlier revision of this header claimed a 0.313 s worst case against a 0.35 s
+//! ceiling; that was wrong by ~3×. Re-measure rather than trusting a number
+//! written here.)
+//!
+//! The cost driver is nnz, NOT n: `qapw` (n=705, nnz=87496) costs 0.539 s, more
+//! than matrices 300× larger. Gate by nnz first, with an `n` cap as backstop.
 //!
 //! ## What this revision adds (worst case HELD byte-for-byte)
 //!
@@ -76,6 +84,11 @@
 //! the two required `order()` runs are byte-identical (determinism gate).
 
 use crate::Pattern;
+
+/// TEST-ONLY measurement harness (timing headroom, tie lists, candidate
+/// what-if scoring). Not compiled into the shipped binary.
+#[cfg(test)]
+mod probe;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -210,6 +223,26 @@ const SCOTCH_MAX_NNZ: usize = 200_000;
 /// `1k_10k` bucket; still tens of ms at this size, and far below the slow tier.
 const SCOTCH_TUNED_MAX_N: usize = 10_000;
 const SCOTCH_TUNED_MAX_NNZ: usize = 120_000;
+
+/// METIS PARAMETER variants (imbalance tolerance, ND→AMD switch point, one extra
+/// seed) — see the block in `order()` for what each one is. All measured on the
+/// dev corpus (`probe_family`): every variant costs ≤ 0.068 s at the top of this
+/// envelope and the FIVE together add ≤ 0.285 s, giving a worst combined
+/// `order()` of 0.668 s (crudeoil_lee4_06) — comfortably below the 1.019 s
+/// worst case the slow tier already carries, so the global worst is unmoved.
+/// The envelope is set by nnz (the cost driver) with an n cap as backstop.
+const METIS_VAR_MAX_N: usize = 30_000;
+const METIS_VAR_MAX_NNZ: usize = 60_000;
+
+/// STRONGER KaHIP envelope (a second seed, and the Eco quality mode). These are
+/// the most expensive additions measured — up to 0.65 s at n≈22k — so unlike the
+/// METIS variants they get a TIGHT envelope. `probe_family` put every KaHIP win
+/// at n ≤ 11556 / nnz ≤ 40860 (mpbp_34, mpbp_35, chimera_selby-c16-01), so the
+/// gate is drawn just above those: it keeps all three wins and drops every
+/// instance where KaHIP costs more than ~0.31 s. Worst combined `order()` inside
+/// this envelope is 0.823 s (mpbp_07), still below the existing 1.019 s worst.
+const KAHIP_MULTI_MAX_N: usize = 12_000;
+const KAHIP_MULTI_MAX_NNZ: usize = 45_000;
 
 /// KaHIP is a distinct partitioner (dropped in general for being 13 s on a
 /// giant), added ONLY on small matrices where it is milliseconds even at 5×.
@@ -570,6 +603,78 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
     // dense tiny like qap) while nnz stays tight. `seed = 1` (default) deterministic.
     if n < KAHIP_MAX_N && nnz < KAHIP_MAX_NNZ {
         consider(&|| feral_kahip::kahip_order(&core));
+    }
+
+    // METIS PARAMETER variants. Every METIS candidate above varies only the
+    // amount of WORK (initial partitionings, FM passes); these vary the SHAPE of
+    // the dissection instead, which is what actually changes the ordering:
+    //
+    //   * `max_imbalance` is the tolerance on how uneven the two sides of a
+    //     bisection may be. Relaxing or tightening it moves every separator on
+    //     the whole recursion — a looser bound lets METIS buy a smaller vertex
+    //     separator by accepting lopsided halves, which is often the right trade
+    //     on the irregular KKT graphs here (default 0.20).
+    //   * `nd_to_amd_switch` is the subproblem size at which METIS stops
+    //     dissecting and hands the rest to minimum degree. It sets where the
+    //     ND-vs-MD crossover falls, and the best crossover is
+    //     structure-dependent: dissecting further helps grid-like blocks, while
+    //     switching earlier helps dense/irregular tails (default 200).
+    //   * one extra seed, which redraws the coarsening matching and the initial
+    //     bisections.
+    //
+    // Measured on the dev corpus: these five account for four of the seven
+    // matrices any new candidate improves at all (maxcsp-langford-3-11
+    // 0.450→0.392, ndcc13 0.745→0.721, nuclear25a 0.697→0.683,
+    // multiplants_mtg1b 0.782→0.775). Each costs ≤ 0.068 s inside this
+    // envelope. Deterministic (fixed seeds, fixed parameters). Best-of floor →
+    // zero-downside.
+    if n < METIS_VAR_MAX_N && nnz < METIS_VAR_MAX_NNZ {
+        for imb in [0.05f64, 0.10] {
+            let opts = feral_metis::MetisOptions {
+                max_imbalance: imb,
+                ..Default::default()
+            };
+            consider(&|| feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p));
+        }
+        for sw in [100u32, 400] {
+            let opts = feral_metis::MetisOptions {
+                nd_to_amd_switch: sw,
+                ..Default::default()
+            };
+            consider(&|| feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p));
+        }
+        let opts_seed = feral_metis::MetisOptions {
+            seed: 21,
+            ..Default::default()
+        };
+        consider(&|| feral_metis::metis_order_full(&core, &opts_seed).map(|(p, _, _)| p));
+    }
+
+    // STRONGER KaHIP: a second seed and the Eco quality mode. KaHIP's default
+    // `Fast` mode does a single multilevel pass; `Eco` adds a V-cycle with flow
+    // refinement at the finest level, which finds genuinely better node
+    // separators on the irregular combinatorial graphs (network/scheduling
+    // families) where the minimum-degree and METIS/Scotch families all stall.
+    //
+    // These are the two biggest single wins measured anywhere on the corpus, and
+    // both land in the HIGHEST-weight bucket: mpbp_34 0.567→0.452 (seed 2) and
+    // mpbp_35 0.588→0.469 (Eco), plus chimera_selby-c16-01 0.811→0.691 (Eco).
+    // They are also the most expensive additions, so the envelope is tight (see
+    // KAHIP_MULTI_MAX_N/NNZ) — drawn just above the three wins, which caps the
+    // added cost at ~0.31 s and leaves the global worst case unmoved.
+    // `seed`/`mode` are fixed → deterministic. Best-of floor → zero-downside.
+    if n < KAHIP_MULTI_MAX_N && nnz < KAHIP_MULTI_MAX_NNZ {
+        let kahip_seed2 = feral_kahip::KahipOptions {
+            seed: 2,
+            ..Default::default()
+        };
+        consider(&|| feral_kahip::kahip_order_full(&core, &kahip_seed2).map(|(p, _, _)| p));
+
+        let kahip_eco = feral_kahip::KahipOptions {
+            mode: feral_kahip::KahipMode::Eco,
+            ..Default::default()
+        };
+        consider(&|| feral_kahip::kahip_order_full(&core, &kahip_eco).map(|(p, _, _)| p));
     }
 
     best_perm
