@@ -40,11 +40,15 @@ The cost driver is **nnz, not n** — `qapw` (n=705, nnz=87496) takes 0.539 s wh
 much larger sparse matrices take less. Gate by nnz first, n as a backstop.
 
 ## Where the remaining headroom is
-122 of 300 matrices are tied at *exactly* 1.000 — AMD beats every separator-,
-profile- and bandwidth-based candidate on them (60 in lt_1k, 40 in 1k_10k, 22 in
-gt_10k). Pushing every tie to 0.95 would take the score from 0.888 to ≈0.869, so
-that set bounds what this architecture can still deliver by adding more of the
-same kind of candidate.
+**99** of 300 matrices are tied at *exactly* 1.000 (58 lt_1k, 24 1k_10k, 17
+gt_10k). Re-measure with `probe_ties` rather than trusting this figure — it read
+122 before the relabelled-AMD multi-start and was left stale in five files.
+
+The bucket split is the interesting part. `lt_1k` barely moved (60 → 58) *even
+though those matrices already get the maximum 24 relabel restarts*, while
+`1k_10k` fell 40 → 24. Small tied matrices are therefore structurally
+AMD-optimal, not under-searched: more search there is not the answer, and at
+0.0002 of score per matrix it would take ~15 flips to matter at all.
 
 Per-matrix leverage is very uneven, and this decides where to spend effort:
 

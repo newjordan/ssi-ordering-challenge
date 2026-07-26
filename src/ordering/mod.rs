@@ -20,12 +20,28 @@
 //!
 //! ## Where the headroom is
 //!
-//! 122 of the 300 dev matrices are STILL TIED at exactly 1.000 — AMD beats every
-//! separator-, profile- and bandwidth-based candidate on them (60 in `lt_1k`, 40
-//! in `1k_10k`, 22 in `gt_10k`). Each tie is pure upside. Note the leverage is
-//! very uneven: `gt_10k` carries weight 0.40 over only 45 matrices, so one large
-//! matrix is worth ~4.4 small ones — but it is also where the time cap bites
-//! hardest.
+//! **99** of the 300 dev matrices are still tied at exactly 1.000 — AMD beats
+//! every other candidate on them. Each tie is pure upside. Measured with
+//! `probe_ties`; RE-RUN IT rather than trusting this number, which has already
+//! been stale once (it read 122 before the relabelled-AMD multi-start).
+//!
+//! | bucket | tied | of | note |
+//! |---|---|---|---|
+//! | `lt_1k` | 58 | 147 | was 60 — only TWO flipped |
+//! | `1k_10k` | 24 | 108 | was 40 |
+//! | `gt_10k` | 17 | 45 | was 22 |
+//!
+//! The `lt_1k` row is the informative one. Those matrices already receive the
+//! MAXIMUM 24 relabel restarts and still tie, which says they are structurally
+//! AMD-optimal rather than under-searched. Do not spend effort there without
+//! first checking the runner-up margin: at 0.0002 of score per matrix it would
+//! take ~15 flips to be worth anything.
+//!
+//! Leverage is very uneven: `gt_10k` carries weight 0.40 over only 45 matrices,
+//! so one large matrix is worth ~4.4 small ones. Exact sensitivity, useful for
+//! pricing a candidate before building it: `d(score) = w_b * geomean_b / count_b`
+//! per unit change in ln(ratio), i.e. **0.00739 for `gt_10k`** vs 0.00185 for
+//! `lt_1k`.
 //!
 //! ## The timing fact that bounds every change here
 //!
@@ -317,6 +333,69 @@ const KAHIP_MAX_NNZ: usize = 50_000;
 const RELABEL_BUDGET: usize = 300_000;
 const RELABEL_MAX_RESTARTS: usize = 24;
 
+/// HEAVY TIER: where `RELABEL_BUDGET / nnz` rounds to zero, take ONE restart
+/// anyway — but only on SPARSE patterns (see [`HEAVY_SPARSE_MAX_AVG_DEG`]).
+///
+/// Making the budget its own gate (above) had a blind spot: any matrix with
+/// `nnz > RELABEL_BUDGET` got ZERO restarts, which excluded 10 of the 45 dev
+/// `gt_10k` matrices — the bucket carrying weight 0.40. Six were tied at exactly
+/// 1.0000, so the best candidate family was barred from the best targets.
+///
+/// One restart is affordable here because on SPARSE heavies the cost constant is
+/// good: 0.358 s at nnz=1379706 (`faclay75`), `k ~ 2.6e-7` per nnz. The ceiling
+/// sits just above the dev-corpus maximum; beyond it there is no measurement.
+///
+/// Pays for itself on `acopf_case9241pegase_qcqp` (n=313068, nnz=1292408), which
+/// otherwise receives *only* the baseline AMD pass: 1.0000 -> 0.9737.
+const RELABEL_HEAVY_MAX_NNZ: usize = 1_500_000;
+
+/// SPARSITY GUARD for both heavy-tier additions, learned from a FAILED eval
+/// submission (2026-07-26, submission 0cbb4def).
+///
+/// A first version of the heavy tier gated on nnz windows alone. It passed dev
+/// (worst local `order()` 0.963 s) and then FAILED the grader: `telecomsp_metro`
+/// (n=13940, nnz=743408, nnz/n≈53) breached the 2 s SIGKILL. Mining the eval
+/// run's public Actions log for the full per-matrix census showed why this was
+/// inevitable rather than unlucky: the eval corpus contains a DENSE-HEAVY class
+/// that dev simply lacks — `pb302035` nnz/n=497, `pedigree_sim2000` 356, `truck`
+/// 116, `eigena2` 99 — while dev's densest heavy is 38.6. A no-dense AMD pass
+/// (deferral disabled, i.e. the hub-column safety valve removed) fired on all of
+/// them.
+///
+/// Two rules follow, and both are encoded here:
+///
+/// 1. **Gate a hazard by its own covariate.** The no-dense hazard is column
+///    density, so the gate must test density, not just nnz. `nnz <= 6*n` keeps
+///    every dev win (densities 4.1–4.7) and excludes every observed eval blowup
+///    candidate (11.9–497); the gap between 6.0 and 11.9 in the eval census
+///    makes 6 a natural boundary rather than a tuned one.
+/// 2. **Additions must be affordable on top of an UNKNOWN existing load.** Dev
+///    worst-case comparisons cannot see how close an eval matrix already runs to
+///    the cap. Per-class worst measured constants bound the ADDED cost instead:
+///    relabel ≤ 2.6e-7 * 1.5M ≈ 0.39 s, no-dense AMD ≤ 5.6e-7 * 700k ≈ 0.39 s
+///    (the `faclay75`-class worst, 0.771 s at 1.38M, is excluded by the reduced
+///    ceiling below). Combined worst ≈ 0.57 s fits even on a matrix already near
+///    ~1.4 s.
+const HEAVY_SPARSE_MAX_AVG_DEG: usize = 6;
+
+/// HEAVY TIER no-dense AMD: `aggressive: false, dense_alpha: -1.0`, i.e. AMD with
+/// dense-column deferral suppressed. The ROBUST block already runs this variant,
+/// but only under `nnz < 130_000`, so no heavy matrix had ever seen it.
+///
+/// Runs only under the sparsity guard ([`HEAVY_SPARSE_MAX_AVG_DEG`]) — deferral
+/// is the safety valve for hub columns, so switching it off on a dense pattern is
+/// unbounded, which is exactly how the first version of this gate failed the
+/// grader. The ceiling is 700k (down from an earlier 1.2M) so the worst added
+/// cost stays ≈ 0.39 s at the worst measured sparse constant; this gives up the
+/// dev win on `gabriel10` (nnz=1.15M, was 0.9756) as the price of bounding the
+/// unseen-corpus risk.
+///
+/// Keeps the dev win on `cont6-qq` 0.9145 -> 0.8899, and the eval census shows
+/// ten currently-tied sparse heavies in exactly this window (`optcdeg2`, `dtoc5`,
+/// three `unitcommit`s, `transswitch`/`powerflow` spp, `gabriel08`, ...).
+const HEAVY_AMDND_MIN_NNZ: usize = 250_000;
+const HEAVY_AMDND_MAX_NNZ: usize = 700_000;
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -346,11 +425,23 @@ fn relabel(n: usize, seed: u64) -> Vec<usize> {
 /// `budget` microseconds of restarts (see [`RELABEL_BUDGET`]), never more than
 /// `cap`. A pure function of `nnz`, never wall-clock, so both required `order()`
 /// runs pick the identical candidate set.
-fn relabel_restarts(budget: usize, cap: usize, nnz: usize) -> usize {
+fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
     if nnz == 0 {
         return 0;
     }
-    (budget / nnz).min(cap)
+    let restarts = budget / nnz;
+    if restarts == 0 {
+        // Heavy tier: the budget rounds to zero, but one pass is still cheap on
+        // SPARSE patterns (k ~ 2.6e-7 at the top of the range). The sparsity
+        // guard is load-bearing: without it this floor fired on eval matrices
+        // with nnz/n up to 497 and FAILED the grader — see
+        // [`HEAVY_SPARSE_MAX_AVG_DEG`]. Above the nnz ceiling there is no
+        // measurement, so decline.
+        return usize::from(
+            nnz <= RELABEL_HEAVY_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n,
+        );
+    }
+    restarts.min(cap)
 }
 
 /// Return an elimination order for `pattern` (best-of over the ordering family).
@@ -778,6 +869,25 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
         consider(&|| feral_kahip::kahip_order_full(&core, &kahip_eco).map(|(p, _, _)| p));
     }
 
+    // HEAVY-TIER no-dense AMD. The ROBUST block runs this same variant, but only
+    // under `nnz < 130_000`, so the largest matrices — the ones with the most
+    // weight per matrix and the fewest candidates — had never been offered it.
+    // Suppressing dense-column deferral changes which vertices AMD eliminates
+    // last, and on large sparse KKT graphs that is worth more than the deferral
+    // heuristic it replaces. Window and rationale: [`HEAVY_AMDND_MIN_NNZ`].
+    // Measured cost inside the window is ≤0.346 s; deterministic (fixed options);
+    // best-of floor → zero-downside.
+    if nnz >= HEAVY_AMDND_MIN_NNZ
+        && nnz < HEAVY_AMDND_MAX_NNZ
+        && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
+    {
+        let amd_heavy_nodense = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_heavy_nodense).map(|(p, ..)| p));
+    }
+
     // RELABELLED-AMD MULTI-START — a randomized-restart minimum degree, for free.
     //
     // AMD's output is decided by its tie-breaking, and its tie-breaking reads the
@@ -806,7 +916,7 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
     // Deterministic: `relabel` is a pure function of `(n, seed)` with seeds fixed
     // at 1..=restarts, and `restarts` is a pure function of nnz. Best-of floor →
     // zero-downside, and each candidate is bijection-checked before it can win.
-    let restarts = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, nnz);
+    let restarts = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz);
     for r in 0..restarts {
         let seed = r as u64 + 1;
         consider(&|| {

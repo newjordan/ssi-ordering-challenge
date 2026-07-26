@@ -444,23 +444,48 @@ fn family_perm(idx: usize, core: &feral_ordering_core::CscPattern<'_>) -> Option
     }
 }
 
-/// The LARGE end of the corpus is where the `n` caps in `order()` shut every
-/// candidate off — `acopf_case9241pegase_qcqp` (n=313k) gets nothing but the AMD
-/// baseline. But the cost driver is nnz, not n, so some of those matrices may
-/// have budget going unused. This probe reports, for every large matrix, how
-/// long `order()` actually takes today and what a single extra AMF / METIS pass
-/// would cost and buy.
+/// The HEAVY end of the corpus: what the matrices that `order()` barely touches
+/// would gain from one more pass.
+///
+/// SELECTION IS BY nnz, NOT n. An earlier revision of this probe skipped
+/// `n < 100_000`, which made it blind to most of what it was written to study:
+/// of the ten `gt_10k` matrices that the shipped `RELABEL_BUDGET` gives ZERO
+/// relabel restarts, five have n between 14k and 70k (`pooling_sppc1pq`
+/// n=14100/nnz=477680, `pooling_sppb5pq` n=18529/nnz=674470, `kissing2`
+/// n=20772/nnz=401024, `pooling_sppc3pq` n=23173/nnz=893724,
+/// `transswitch2736spr` n=69651/nnz=331010). Cost tracks nnz, and so does the
+/// budget that excluded them, so the selection must too.
+///
+/// Why this matters: `restarts = RELABEL_BUDGET / nnz` yields 0 whenever
+/// `nnz > 300_000`, so the relabelled-AMD multi-start — the highest-value
+/// candidate family found so far — never runs on the highest-leverage bucket
+/// (gt_10k carries weight 0.40 over only 45 matrices). SIX of those ten are
+/// still tied at exactly 1.0000.
+///
+/// Columns: current `order()` cost/ratio, then per candidate a (seconds, ratio)
+/// pair. `rl1`/`rl2` are one and two relabelled-AMD restarts — the thing the
+/// budget currently forbids here. `amdnd` is AMD with dense-column deferral
+/// disabled and aggressive absorption off, which the ROBUST block notes runs at
+/// baseline-AMD speed at ANY n but is gated to `nnz < 130_000` today. METIS is
+/// measured only below `METIS_PROBE_MAX_NNZ`; it was already clocked at ~6.2 s
+/// near nnz≈1.4M, which is unaffordable regardless of what it buys.
 #[test]
 #[ignore]
 fn probe_large() {
+    const HEAVY_MIN_NNZ: usize = 250_000;
+    const METIS_PROBE_MAX_NNZ: usize = 500_000;
+
     let corpus = crate::corpus::corpus();
-    println!("\nmatrix\tn\tnnz\tcur_s\tcur_ratio\tamf5_s\tamf5_r\tamfnd_s\tamfnd_r\tmetis_s\tmetis_r");
+    println!(
+        "\nmatrix\tn\tnnz\tcur_s\tcur_r\trl1_s\trl1_r\trl2_s\trl2_r\tamdnd_s\tamdnd_r\tamf5_s\tamf5_r\tamfnd_s\tamfnd_r\tmetis_s\tmetis_r"
+    );
     for (name, pat) in &corpus {
         let n = pat.n;
-        if n < 100_000 {
+        let nnz_sel = pat.nnz();
+        if nnz_sel < HEAVY_MIN_NNZ {
             continue;
         }
-        let nnz = pat.nnz();
+        let nnz = nnz_sel;
         let sp = scoring_pattern(pat);
         let (cp, ri) = core_of(pat);
         let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
@@ -477,6 +502,41 @@ fn probe_large() {
         let cur = flops_of(&sp, &order(pat)) as f64 / base;
         let cur_s = t0.elapsed().as_secs_f64();
 
+        // RELABELLED-AMD restarts — cumulative best after 1 and after 2, timed
+        // cumulatively, exactly as `order()` would accrue them.
+        let mut rl = Vec::new();
+        {
+            let mut best = f64::INFINITY;
+            let t = Instant::now();
+            for r in 0..2u64 {
+                let q = relabel(n, r + 1);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                    if let Ok(pb) = feral_amd::amd_order(&bcore) {
+                        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                        if is_bijection(&perm, n) {
+                            best = best.min(flops_of(&sp, &perm) as f64 / base);
+                        }
+                    }
+                }
+                rl.push((t.elapsed().as_secs_f64(), best));
+            }
+        }
+
+        // AMD with dense deferral disabled and aggressive absorption off.
+        let amd_nd = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let t = Instant::now();
+        let ar = match feral_amd::amd_order_opts(&core, &amd_nd) {
+            Ok((p, ..)) => {
+                let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
+            }
+            Err(_) => f64::NAN,
+        };
+        let as_ = t.elapsed().as_secs_f64();
+
         // One AMF pass at dense_alpha 5, and one with dense detection disabled.
         let mut out = Vec::new();
         for da in [5.0f64, -1.0] {
@@ -491,20 +551,25 @@ fn probe_large() {
             };
             out.push((t.elapsed().as_secs_f64(), r));
         }
-        // One default METIS pass.
-        let t = Instant::now();
-        let mr = match feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default()) {
-            Ok((p, _, _)) => {
-                let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
-            }
-            Err(_) => f64::NAN,
+        // One default METIS pass, only where it is cheap enough to be worth timing.
+        let (ms, mr) = if nnz < METIS_PROBE_MAX_NNZ {
+            let t = Instant::now();
+            let r = match feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default())
+            {
+                Ok((p, _, _)) => {
+                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
+                }
+                Err(_) => f64::NAN,
+            };
+            (t.elapsed().as_secs_f64(), r)
+        } else {
+            (f64::NAN, f64::NAN)
         };
-        let ms = t.elapsed().as_secs_f64();
 
         println!(
-            "{name}\t{n}\t{nnz}\t{cur_s:.3}\t{cur:.4}\t{:.3}\t{:.4}\t{:.3}\t{:.4}\t{ms:.3}\t{mr:.4}",
-            out[0].0, out[0].1, out[1].0, out[1].1
+            "{name}\t{n}\t{nnz}\t{cur_s:.3}\t{cur:.4}\t{:.3}\t{:.4}\t{:.3}\t{:.4}\t{as_:.3}\t{ar:.4}\t{:.3}\t{:.4}\t{:.3}\t{:.4}\t{ms:.3}\t{mr:.4}",
+            rl[0].0, rl[0].1, rl[1].0, rl[1].1, out[0].0, out[0].1, out[1].0, out[1].1
         );
     }
 }
@@ -726,7 +791,7 @@ fn probe_relabel_budget() {
 
         let rmax = POLICIES
             .iter()
-            .map(|&(b, c)| relabel_restarts(b, c, nnz))
+            .map(|&(b, c)| relabel_restarts(b, c, n, nnz))
             .max()
             .unwrap_or(0);
 
@@ -756,7 +821,7 @@ fn probe_relabel_budget() {
         cur.0[bkt] += (cur_flops / base).ln();
         cur.1[bkt] += 1;
         for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
-            let r = relabel_restarts(bd, cap, nnz);
+            let r = relabel_restarts(bd, cap, n, nnz);
             let f = best_after[r];
             pol[pi].0[bkt] += (f / base).ln();
             pol[pi].1[bkt] += 1;
@@ -797,5 +862,112 @@ fn probe_relabel_budget() {
             }
         }
         println!();
+    }
+}
+
+/// ISOLATED cost measurement for the heavy tier.
+///
+/// [`probe_large`] measures cost and benefit in one pass, and its BENEFIT column
+/// (a flop ratio) is exact — flops are deterministic. Its COST column is not:
+/// running AMF and METIS passes over 250k-1.4M-nnz patterns for every matrix in
+/// sequence inflates the `order()` timings measured alongside them by up to 7x.
+/// Measured directly, same code, same inputs, minutes apart:
+///
+/// | matrix | `probe_timing_and_score` | `probe_large` |
+/// |---|---|---|
+/// | `kissing2` | 0.222 s | 1.623 s |
+/// | `unitcommit_200_100_1_mod_8` | 0.296 s | 2.003 s |
+/// | `nuclear104` | 0.839 s | 2.380 s |
+///
+/// That is far outside the ~1.6x run-to-run variance seen elsewhere, and it is
+/// self-inflicted — most likely thermal throttling or allocator pressure from the
+/// probe's own sustained work. It does NOT indicate the shipped `order()` runs
+/// near the cap; the clean probe still reports a 0.896 s worst case.
+///
+/// So: never size a gate from [`probe_large`]'s seconds. This probe exists to
+/// produce the numbers that decision actually needs. It measures ONLY the two
+/// candidates that [`probe_large`] showed can win on this tier, runs no AMF or
+/// METIS, and reports the MINIMUM over `REPS` repetitions — min is the robust
+/// estimator here because contention and throttling can only ever make a sample
+/// slower than the true uncontended cost.
+#[test]
+#[ignore]
+fn probe_heavy_cost() {
+    const HEAVY_MIN_NNZ: usize = 250_000;
+    const REPS: usize = 3;
+
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\torder_s\trl1_s\tamdnd_s\tcur_r\trl1_r\tamdnd_r\tworst_if_both");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 || nnz < HEAVY_MIN_NNZ {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        // order(): min-of-REPS.
+        let mut order_s = f64::INFINITY;
+        let mut cur_r = f64::NAN;
+        for _ in 0..REPS {
+            let t = Instant::now();
+            let p = order(pat);
+            order_s = order_s.min(t.elapsed().as_secs_f64());
+            cur_r = flops_of(&sp, &p) as f64 / base;
+        }
+
+        // One relabelled-AMD restart: min-of-REPS.
+        let mut rl1_s = f64::INFINITY;
+        let mut rl1_r = f64::NAN;
+        for _ in 0..REPS {
+            let t = Instant::now();
+            let q = relabel(n, 1);
+            let b = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let mut r = f64::NAN;
+            if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                if let Ok(pb) = feral_amd::amd_order(&bcore) {
+                    let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                    if is_bijection(&perm, n) {
+                        r = flops_of(&sp, &perm) as f64 / base;
+                    }
+                }
+            }
+            rl1_s = rl1_s.min(t.elapsed().as_secs_f64());
+            rl1_r = r;
+        }
+
+        // AMD, dense deferral off + aggressive absorption off: min-of-REPS.
+        let amd_nd = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let mut amdnd_s = f64::INFINITY;
+        let mut amdnd_r = f64::NAN;
+        for _ in 0..REPS {
+            let t = Instant::now();
+            let r = match feral_amd::amd_order_opts(&core, &amd_nd) {
+                Ok((p, ..)) => {
+                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
+                }
+                Err(_) => f64::NAN,
+            };
+            amdnd_s = amdnd_s.min(t.elapsed().as_secs_f64());
+            amdnd_r = r;
+        }
+
+        let worst = order_s + rl1_s + amdnd_s;
+        println!(
+            "{name}\t{n}\t{nnz}\t{order_s:.3}\t{rl1_s:.3}\t{amdnd_s:.3}\t{cur_r:.4}\t{rl1_r:.4}\t{amdnd_r:.4}\t{worst:.3}"
+        );
     }
 }

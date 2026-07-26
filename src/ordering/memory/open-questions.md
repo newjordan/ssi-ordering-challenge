@@ -22,7 +22,24 @@ it, rather than deleting it — a resolved question is a useful signpost.
       `lt_1k`). A bucket-weighted budget — more restarts where a win is worth
       more — was never tested. Note `n` is known inside `order()`, so this stays
       a pure function of `(n, nnz)`.
-- [ ] **The big tied matrices are gated out of everything.** `faclay75`
+- [ ] **Price ideas by RUNNER-UP MARGIN, not tie count.** [0004](experiments/0004-heavy-tier-gates.md)
+      over-estimated its own value ~5x by assuming heavy ties would fall as deeply
+      as mid-size ones did in [0003](experiments/0003-relabelled-amd-multistart.md);
+      round-3 wins landed at 0.83–0.92, heavy-tier wins at 0.89–0.98. A tie is not
+      a uniform unit of opportunity. For each remaining tie, record the best
+      *non-AMD* candidate's ratio: margins of 1.01–1.1 are flippable, 2–10x are
+      structurally AMD-optimal and should be abandoned. This is the missing input
+      to every EV estimate. Cheap — one probe over the existing `consider` set.
+- [ ] **`lt_1k` looks structurally done.** 58 of 147 still tie *while already
+      receiving the maximum 24 relabel restarts* (vs `1k_10k` falling 40→24 on the
+      same change). More search there is answering a question that is not being
+      asked. At 0.00185 of score per matrix per unit ln(ratio) it needs ~15 deep
+      flips to be worth anything — do not build randomized MinFill or annealing on
+      spec.
+- [ ] **The big tied matrices are gated out of everything.** RESOLVED IN PART by
+      [0004](experiments/0004-heavy-tier-gates.md) — `acopf_case9241pegase_qcqp`
+      now gets a relabel restart (1.0000→0.9737) and `gabriel10` a no-dense AMD
+      pass (1.0000→0.9756). Still open for the rest: `faclay75`
       (n=272878), `acopf_case9241pegase_qcqp` (n=313068), `gabriel10` (n=244056),
       `unitcommit_200_100_1_mod_8` (n=146830) all tie at 1.000 and receive only
       AMD plus at most one AMF pass, because the candidate gates are capped on
