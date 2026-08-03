@@ -1,6 +1,6 @@
 //! Local purity & license gate — a thin delegator to the shared `ssi-purity`
 //! crate (Phase 4a). The scan logic lives in ONE place, and the grader runs
-//! THIS SAME harness binary (Yukon dispatches `cargo run --release`), so the
+//! THIS SAME harness binary (Hilbert dispatches `cargo run --release`), so the
 //! gate cannot drift between local and graded runs — they are byte-identical.
 //!
 //! Mode is `RequireDeny`: `cargo-deny` MUST be installed and pass — a missing

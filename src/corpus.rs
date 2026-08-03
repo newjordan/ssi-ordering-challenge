@@ -27,7 +27,7 @@ pub const DEV_CORPUS_FILE: &str = "corpus/dev/patterns.jsonl";
 /// run, so local behavior is unchanged: the harness grades the public dev corpus
 /// (`DEV_CORPUS_FILE`). The grading workflow sets this to the downloaded EVAL
 /// corpus at a temp path *outside* the repo tree, so the eval bytes are never in
-/// a tracked file and can never be committed (publish-to-Yukon plan §1). This is
+/// a tracked file and can never be committed (publish-to-Hilbert plan §1). This is
 /// the corpus-path seam: additive and default-preserving — it does not touch the
 /// contract (signature/score/gates/output formats are unchanged).
 pub const CORPUS_FILE_ENV: &str = "SSI_CORPUS_FILE";
