@@ -1,20 +1,20 @@
 name: benchmark
 
-# Yukon GitHub Actions execution provider: this workflow IS the grader.
-# Yukon builds a candidate ref (validated baseline + the submission's
+# Hilbert GitHub Actions execution provider: this workflow IS the grader.
+# Hilbert builds a candidate ref (validated baseline + the submission's
 # src/ordering/ only) and dispatches THIS workflow on it; the score artifact is
-# the machine-readable channel it reads back. See docs/PUBLISH-TO-YUKON-PLAN.md.
+# the machine-readable channel it reads back. See docs/PUBLISH-TO-HILBERT-PLAN.md.
 #
-# Dispatch-only by design: no `pull_request` trigger. Yukon (or an explicit
+# Dispatch-only by design: no `pull_request` trigger. Hilbert (or an explicit
 # maintainer click) is the only thing that may start paid runner minutes, and
 # head-SHA correlation works regardless of what triggered the run. Adding a
 # `pull_request` trigger would let fork/maintainer PRs start runs and would
-# double-run every Yukon submission.
+# double-run every Hilbert submission.
 on:
   workflow_dispatch:
 
-# The workflow needs no Yukon credentials: the dispatched ref already IS the
-# payload, and Yukon posts the score table on the PR itself. Read-only repo
+# The workflow needs no Hilbert credentials: the dispatched ref already IS the
+# payload, and Hilbert posts the score table on the PR itself. Read-only repo
 # access is all the grading run requires.
 permissions:
   contents: read
@@ -130,10 +130,10 @@ jobs:
               exec cargo run --release --offline --locked
             '
 
-      # The score artifact is the channel Yukon reads. Upload even on failure so
+      # The score artifact is the channel Hilbert reads. Upload even on failure so
       # a partial/zero score is visible rather than silently lost; the run still
       # concludes `failure` (the harness exits non-zero on any gate failure),
-      # which is what Yukon keys its accept/reject decision on.
+      # which is what Hilbert keys its accept/reject decision on.
       - name: Upload score
         if: always()
         uses: actions/upload-artifact@v4

@@ -36,10 +36,10 @@ symbolic analysis, via the `ssi-scoring` crate that the grader also uses.
 ssi-ordering-challenge/            (THE PUBLIC REPO / contestant template)
 ├── Cargo.toml            workspace root; harness package + members          [frozen]
 ├── deny.toml             shared license policy (cargo-deny)                  [frozen]
-├── benchmark.json        Yukon import manifest (runner, editablePaths, score)[frozen]
+├── benchmark.json        Hilbert import manifest (runner, editablePaths, score)[frozen]
 ├── .github/
 │   ├── workflows/
-│   │   └── benchmark.yml self-grading workflow (Yukon dispatches it)         [frozen]
+│   │   └── benchmark.yml self-grading workflow (Hilbert dispatches it)         [frozen]
 │   └── scripts/
 │       └── fetch-eval-corpus.sh  pulls the hidden eval corpus at run time    [frozen]
 ├── src/
@@ -181,7 +181,7 @@ recomputed score, and determinism re-runs.
 Nothing about the contract, the metric, the baseline, or the scoring path
 changes — those are shared via `ssi-scoring`, and **the grader is this same
 harness binary**. Grading runs in the repo's own GitHub Actions
-(`.github/workflows/benchmark.yml`), which the Yukon platform dispatches against
+(`.github/workflows/benchmark.yml`), which the Hilbert platform dispatches against
 a candidate built from the validated baseline + the submission's `src/ordering/`
 only. The workflow installs `cargo-deny`, runs `prepare-build.sh` (validate
 `deps.toml` → vendor → scan tree), builds `--offline --locked`, and runs the
@@ -198,7 +198,7 @@ separate scoring code to drift from what you run locally. Grading adds:
    (no build-time network); the scored run executes in a fresh network namespace
    (`unshare -n`, loopback only) so `order()` has no runtime egress, under the
    2–4 GB memory cap (which doubles as the anti-lookup-table cap).
-3. **The platform wiring**: Yukon opens a PR per submission, dispatches the
+3. **The platform wiring**: Hilbert opens a PR per submission, dispatches the
    workflow on its head commit, reads the uploaded `score.json`, posts the
    score + metrics, and merges (accept) or closes (reject). AMD = 1.00 is the
    anchor; METIS-style nested dissection and MUMPS fill are reference lines.

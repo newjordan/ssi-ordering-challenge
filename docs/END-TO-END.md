@@ -205,7 +205,7 @@ contract details and a suggested approach.
 ## 7. From local harness to the production grader
 
 **The grader is this same harness binary**, run in the repo's own GitHub Actions
-(`.github/workflows/benchmark.yml`) rather than a separate program. The Yukon
+(`.github/workflows/benchmark.yml`) rather than a separate program. The Hilbert
 platform builds a candidate from the validated baseline + **only** the
 submission's `src/ordering/` (including its `deps.toml`), dispatches the workflow
 on it, and reads the uploaded `score.json`. The workflow: installs `cargo-deny`,

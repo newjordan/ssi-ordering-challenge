@@ -238,7 +238,7 @@ recorded there; keep the reasoning behind each step in `src/ordering/memory/`.
 ## 6. How this maps to the production grader
 
 **The grader is this same harness binary**, run in the repo's own GitHub Actions
-(`.github/workflows/benchmark.yml`) and dispatched by the Yukon platform. It
+(`.github/workflows/benchmark.yml`) and dispatched by the Hilbert platform. It
 builds a candidate from the validated baseline + **only** the submission's
 `src/ordering/`, runs the workflow, and reads the uploaded `score.json`. The
 workflow grades a **hidden** eval corpus — disjoint from the dev corpus,
