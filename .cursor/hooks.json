@@ -1,74 +1,38 @@
 {
   "version": 1,
   "hooks": {
-    "beforeSubmitPrompt": [
+    "sessionStart": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "afterAgentResponse": [
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor session"
+      },
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "afterAgentThought": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
       }
     ],
     "beforeShellExecution": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor session",
+        "matcher": "hilbert"
       }
     ],
-    "afterShellExecution": [
+    "beforeSubmitPrompt": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "afterFileEdit": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "postToolUse": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "postToolUseFailure": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "afterMCPExecution": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "subagentStart": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "subagentStop": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "sessionStart": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
-      }
-    ],
-    "sessionEnd": [
-      {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
       }
     ],
     "stop": [
       {
-        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor"
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
       }
     ]
   }
