@@ -1,5 +1,6 @@
 name: benchmark
 
+# (Touch to register this workflow_dispatch workflow with GitHub Actions.)
 # Hilbert GitHub Actions execution provider: this workflow IS the grader.
 # Hilbert builds a candidate ref (validated baseline + the submission's
 # src/ordering/ only) and dispatches THIS workflow on it; the score artifact is
