@@ -54,6 +54,14 @@ pub fn run_capped(cmd: &mut Command, cfg: &CapConfig) -> WorkerOutcome {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // Reap detached children on EVERY return, not just timeout: a
+                // fast, successful order() must not leave a background process
+                // behind (F1/F3). Best-effort: a setsid'd daemon escapes the
+                // process group — which is why the scored step additionally
+                // runs in a PID namespace (benchmark.yml), where escape is
+                // impossible. This layer catches the common case even if the
+                // namespace is ever lost, for one syscall.
+                kill_group(&mut child);
                 return if status.success() {
                     WorkerOutcome::Ok
                 } else {
