@@ -177,6 +177,17 @@ fn main() -> ExitCode {
                 // particular SSI_CORPUS_FILE must not reach order() (F2).
                 .env_clear()
                 .current_dir(&worker_cwd);
+            // Re-forward ONLY the harness's own time-cap test hook. env_clear()
+            // above also strips this, which would silently defeat the
+            // time_cap::slow_ordering_is_killed_and_fails_promptly regression
+            // test (the pre-existing slow matrix masks it in debug, but a
+            // release run exposes it). It is inert in normal/graded runs — the
+            // grader never sets it — so re-adding just this one named var keeps
+            // the F2 mitigation (SSI_CORPUS_FILE and everything else stay
+            // stripped) while keeping the cap enforcement testable.
+            if let Ok(sleep_ms) = std::env::var("SSI_TEST_SLEEP_MS") {
+                cmd.env("SSI_TEST_SLEEP_MS", sleep_ms);
+            }
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
