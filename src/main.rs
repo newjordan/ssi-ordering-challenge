@@ -102,6 +102,13 @@ fn main() -> ExitCode {
 
     let corpus_file = corpus::corpus_path();
     let corpus = corpus::corpus();
+    // The corpus is fully resident in memory now and no worker has run yet.
+    // If this is a grader-supplied hidden eval corpus, unlink it so worker
+    // children cannot read the eval set from disk (F2). The default dev
+    // corpus lives in the repo tree, is public, and is left alone.
+    if corpus_file != Path::new(corpus::DEV_CORPUS_FILE) {
+        let _ = std::fs::remove_file(&corpus_file);
+    }
     if corpus.is_empty() {
         let reason = format!(
             "no patterns found at {}. Run from the repo root.",
