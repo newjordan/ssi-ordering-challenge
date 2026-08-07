@@ -102,6 +102,13 @@ fn main() -> ExitCode {
 
     let corpus_file = corpus::corpus_path();
     let corpus = corpus::corpus();
+    // The corpus is fully resident in memory now and no worker has run yet.
+    // If this is a grader-supplied hidden eval corpus, unlink it so worker
+    // children cannot read the eval set from disk (F2). The default dev
+    // corpus lives in the repo tree, is public, and is left alone.
+    if corpus_file != Path::new(corpus::DEV_CORPUS_FILE) {
+        let _ = std::fs::remove_file(&corpus_file);
+    }
     if corpus.is_empty() {
         let reason = format!(
             "no patterns found at {}. Run from the repo root.",
@@ -158,8 +165,29 @@ fn main() -> ExitCode {
         let run_once = |tag: &str| -> Result<Vec<usize>, String> {
             let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
             let _ = std::fs::remove_file(&out_perm);
+            // Per-worker empty CWD. The pattern and output paths are absolute,
+            // so the worker needs no working-directory view of anything: no repo
+            // tree, no score.json, no results.tsv (F4).
+            let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
+            std::fs::create_dir_all(&worker_cwd)
+                .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--worker").arg(&pat_file).arg(&out_perm);
+            cmd.arg("--worker").arg(&pat_file).arg(&out_perm)
+                // The worker runs contestant code; hand it NOTHING. In
+                // particular SSI_CORPUS_FILE must not reach order() (F2).
+                .env_clear()
+                .current_dir(&worker_cwd);
+            // Re-forward ONLY the harness's own time-cap test hook. env_clear()
+            // above also strips this, which would silently defeat the
+            // time_cap::slow_ordering_is_killed_and_fails_promptly regression
+            // test (the pre-existing slow matrix masks it in debug, but a
+            // release run exposes it). It is inert in normal/graded runs — the
+            // grader never sets it — so re-adding just this one named var keeps
+            // the F2 mitigation (SSI_CORPUS_FILE and everything else stay
+            // stripped) while keeping the cap enforcement testable.
+            if let Ok(sleep_ms) = std::env::var("SSI_TEST_SLEEP_MS") {
+                cmd.env("SSI_TEST_SLEEP_MS", sleep_ms);
+            }
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
