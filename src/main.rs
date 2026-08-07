@@ -158,8 +158,18 @@ fn main() -> ExitCode {
         let run_once = |tag: &str| -> Result<Vec<usize>, String> {
             let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
             let _ = std::fs::remove_file(&out_perm);
+            // Per-worker empty CWD. The pattern and output paths are absolute,
+            // so the worker needs no working-directory view of anything: no repo
+            // tree, no score.json, no results.tsv (F4).
+            let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
+            std::fs::create_dir_all(&worker_cwd)
+                .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--worker").arg(&pat_file).arg(&out_perm);
+            cmd.arg("--worker").arg(&pat_file).arg(&out_perm)
+                // The worker runs contestant code; hand it NOTHING. In
+                // particular SSI_CORPUS_FILE must not reach order() (F2).
+                .env_clear()
+                .current_dir(&worker_cwd);
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
