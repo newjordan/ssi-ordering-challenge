@@ -3339,3 +3339,183 @@ fn probe_orbit() {
         worst_order.1
     );
 }
+
+/// STACK RECON PROBE (Noether/Pharmakos composition, priming-round5): runs
+/// the FULL `order()` portfolio — now including BOTH Component B (ORBIT) and
+/// the PHARMAKOS phase, ported into this build from `sbx-pharmakos` — over
+/// the reconstructed 427-matrix eval corpus and reports:
+///
+///   1. The harness's exact bucketed weighted-geomean recon score for the
+///      combined build.
+///   2. Per-phase attribution via `order_with_options(pat, MAX, orbit_on,
+///      pharmakos_on)`: for each matrix, compare the FULL result against the
+///      same result with just ORBIT disabled and just PHARMAKOS disabled, to
+///      identify which matrices each phase is responsible for IN THE
+///      COMBINED BUILD (accounts for any best-of threshold interaction
+///      between the two phases, not just each phase's own internal
+///      "did I accept a round" bookkeeping) — and confirms the two phases'
+///      win sets are DISJOINT (no matrix where both fire).
+///   3. Zero-regression checks: full pipeline vs AMD (must never regress),
+///      and full vs the both-disabled pre-phase incumbent (must never
+///      regress — both phases are strictly-better-only).
+///   4. CAP-SAFETY BY IDENTITY: on every matrix with `n > ORBIT_MAX_N` OR
+///      `nnz >= PHARMAKOS_MAX_NNZ` (a "giant" — cap-critical under either
+///      gate), BOTH phases are structurally gated off regardless of the
+///      enabled flags, so `order()` must be byte-identical to
+///      `order_with_options(pat, MAX, false, false)` — this is the
+///      identity-based cap certification (see the `ORBIT_*`/`PHARMAKOS_*`
+///      constants' doc comments): no absolute timing claim needed, just that
+///      the giants' code path provably does not touch either phase's logic.
+///
+/// Env: SSI_CORPUS_FILE=<path> overrides the default reconstructed-eval-
+/// corpus path below.
+///
+/// `cargo test --release -- --ignored --nocapture probe_stack`
+#[test]
+#[ignore]
+fn probe_stack() {
+    let default_path =
+        "/Users/philrio/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl";
+    let path_string = std::env::var("SSI_CORPUS_FILE").unwrap_or_else(|_| default_path.to_string());
+    let path = std::path::Path::new(&path_string);
+    let corpus = match ssi_scoring::load_corpus_jsonl(path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_stack: failed to load {}: {e}", path.display());
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path.display());
+
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+
+    let mut orbit_fired = 0usize;
+    let mut pharmakos_fired = 0usize;
+    let mut both_fired = 0usize; // should be exactly 0 (disjoint claim)
+    let mut improved_vs_amd = 0usize;
+    let mut regressed_vs_amd = 0usize; // must be 0 (anchored best-of)
+    let mut regressed_vs_neither = 0usize; // must be 0 (both phases strictly-better-only)
+
+    let mut orbit_rows: Vec<(String, usize, usize, f64, f64)> = Vec::new();
+    let mut pharmakos_rows: Vec<(String, usize, usize, f64, f64)> = Vec::new();
+    let mut giants: Vec<(String, usize, usize)> = Vec::new();
+    let mut giant_mismatches: Vec<String> = Vec::new();
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd_perm) as f64;
+
+        let full = order(pat);
+        let f_full = flops_of(&sp, &full) as f64;
+
+        let no_orbit = order_with_options(pat, usize::MAX, false, true);
+        let f_no_orbit = flops_of(&sp, &no_orbit) as f64;
+
+        let no_pharmakos = order_with_options(pat, usize::MAX, true, false);
+        let f_no_pharmakos = flops_of(&sp, &no_pharmakos) as f64;
+
+        let neither = order_with_options(pat, usize::MAX, false, false);
+        let f_neither = flops_of(&sp, &neither) as f64;
+
+        let this_orbit_fired = f_full < f_no_orbit - 0.5;
+        let this_pharmakos_fired = f_full < f_no_pharmakos - 0.5;
+        if this_orbit_fired {
+            orbit_fired += 1;
+            orbit_rows.push((name.clone(), n, nnz, f_no_orbit / base, f_full / base));
+        }
+        if this_pharmakos_fired {
+            pharmakos_fired += 1;
+            pharmakos_rows.push((name.clone(), n, nnz, f_no_pharmakos / base, f_full / base));
+        }
+        if this_orbit_fired && this_pharmakos_fired {
+            both_fired += 1;
+        }
+
+        let ratio = f_full / base;
+        if ratio < 1.0 - 1e-9 {
+            improved_vs_amd += 1;
+        } else if ratio > 1.0 + 1e-9 {
+            regressed_vs_amd += 1;
+        }
+        if f_full > f_neither + 0.5 {
+            regressed_vs_neither += 1;
+        }
+
+        // Cap-safety-by-identity: giants (either gate's threshold breached)
+        // must see BOTH phases structurally inert, so order() must equal
+        // the both-disabled path exactly.
+        if n > ORBIT_MAX_N || nnz >= PHARMAKOS_MAX_NNZ {
+            giants.push((name.clone(), n, nnz));
+            if full != neither {
+                giant_mismatches.push(name.clone());
+            }
+        }
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+    }
+
+    println!("\n--- ORBIT fired-on matrices (no_orbit ratio -> full ratio) ---");
+    println!("matrix\tn\tnnz\tno_orbit_ratio\tfull_ratio");
+    for (name, n, nnz, a, b) in &orbit_rows {
+        println!("{name}\t{n}\t{nnz}\t{a:.6}\t{b:.6}");
+    }
+
+    println!("\n--- PHARMAKOS fired-on matrices (no_pharmakos ratio -> full ratio) ---");
+    println!("matrix\tn\tnnz\tno_pharmakos_ratio\tfull_ratio");
+    for (name, n, nnz, a, b) in &pharmakos_rows {
+        println!("{name}\t{n}\t{nnz}\t{a:.6}\t{b:.6}");
+    }
+
+    println!("\n--- per-bucket ---");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<8} count={:<5} geomean={:.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    let score = aggregate(&log_sums, &counts);
+    let total: usize = counts.iter().sum();
+    println!("\nRECON SCORE = {score:.6}");
+    println!("baseline to beat = 0.834343  (delta = {:+.6})", score - 0.834343);
+    println!("orbit-regate alone = 0.834286  (delta = {:+.6})", score - 0.834286);
+    println!("pharmakos alone    = 0.834320  (delta = {:+.6})", score - 0.834320);
+    println!("ORBIT fired on {orbit_fired}/{total} matrices");
+    println!("PHARMAKOS fired on {pharmakos_fired}/{total} matrices");
+    println!("BOTH fired on the same matrix (should be 0, disjoint claim): {both_fired}");
+    println!("full pipeline strictly improved vs AMD: {improved_vs_amd}/{total}");
+    println!("full pipeline regressed vs AMD (must be 0): {regressed_vs_amd}");
+    println!(
+        "full pipeline regressed vs both-phases-disabled incumbent (must be 0): {regressed_vs_neither}"
+    );
+    println!(
+        "\n--- CAP-SAFETY BY IDENTITY: giants (n > ORBIT_MAX_N={ORBIT_MAX_N} OR nnz >= PHARMAKOS_MAX_NNZ={PHARMAKOS_MAX_NNZ}) ---"
+    );
+    println!("giant count = {}", giants.len());
+    for (name, n, nnz) in &giants {
+        println!("GIANT\t{name}\tn={n}\tnnz={nnz}");
+    }
+    println!(
+        "byte-identical to both-phases-disabled on ALL giants: {} (mismatches: {:?})",
+        giant_mismatches.is_empty(),
+        giant_mismatches
+    );
+}
