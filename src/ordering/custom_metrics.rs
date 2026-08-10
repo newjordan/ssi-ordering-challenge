@@ -75,58 +75,20 @@ use feral_ordering_core::{CscPattern, OrderingError};
 
 /// Which score formula `finalize_step_variant` computes at re-insertion. See
 /// the module doc for what each one estimates and why it was kept.
-///
-/// The seven `Deg*`/`*Wf*`/`*Degme*` variants below (win **F**) are the top 7
-/// of a 39-point sweep over powers/roots of loose-degree, mixtures with the
-/// AMF fill accumulator `wf`, and a front-size (`degme`) cross term —
-/// `metric_sweep.rs`'s `MetricSpec` grid, research sandbox `sbx-metrics2`.
-/// Greedy forward-selection against the REAL `order()` portfolio (not AMD
-/// alone) found these 7 the best COMBINED addition set at count 7
-/// (0.854109 -> 0.840926 on the 427-matrix reconstructed-graded corpus,
-/// `probe_diversity_marginal_sweep`); each is a pure `raw_deg`-based formula
-/// (no AMF saturated-RMF branch), so all nine `Deg*`/`SqDiv`/`SqPure`
-/// variants share the same write-back discipline. Same trust argument as
-/// `SqDiv`/`SqPure`: identical Pass-1/Pass-2 bookkeeping, only the
-/// re-insertion score differs.
-///   - `DegSqrt` = `deg^0.5`
-///   - `DegP075` = `deg^0.75`
-///   - `DegP125` = `deg^1.25`
-///   - `DegDivNvSqrtWf` = `deg/(nv+1) + 0.5 * sign(wf)*|wf|^0.5`
-///   - `DegDivNvWfP15` = `deg/(nv+1) + 0.1 * sign(wf)*|wf|^1.5`
-///   - `DegPlusDegme` = `deg + 1.0 * degme/(nv+1)`
-///   - `DegDivNvDegme` = `deg/(nv+1) + 0.5 * degme/(nv+1)`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreVariant {
     SqDiv,
     SqPure,
     Ammf,
     AmindNorm,
-    DegSqrt,
-    DegP075,
-    DegP125,
-    DegDivNvSqrtWf,
-    DegDivNvWfP15,
-    DegPlusDegme,
-    DegDivNvDegme,
 }
 
-/// `SqDiv`/`SqPure`/the seven win-F variants need an extra write-back of
-/// `ws.degree[i]` after scoring (the AMF-style variants, `Ammf`/`AmindNorm`,
-/// already write it inside their saturated/regular branch below) —
-/// `ws.degree` must always hold the true AMD-style loose-degree estimate for
-/// later steps' monotone-cap logic, regardless of which formula ranks
-/// candidates for selection.
-const DEGREE_FAMILY: &[ScoreVariant] = &[
-    ScoreVariant::SqDiv,
-    ScoreVariant::SqPure,
-    ScoreVariant::DegSqrt,
-    ScoreVariant::DegP075,
-    ScoreVariant::DegP125,
-    ScoreVariant::DegDivNvSqrtWf,
-    ScoreVariant::DegDivNvWfP15,
-    ScoreVariant::DegPlusDegme,
-    ScoreVariant::DegDivNvDegme,
-];
+/// `SqDiv`/`SqPure` need an extra write-back of `ws.degree[i]` after scoring
+/// (the AMF-style variants, `Ammf`/`AmindNorm`, already write it inside their
+/// saturated/regular branch below) — `ws.degree` must always hold the true
+/// AMD-style loose-degree estimate for later steps' monotone-cap logic,
+/// regardless of which formula ranks candidates for selection.
+const DEGREE_FAMILY: &[ScoreVariant] = &[ScoreVariant::SqDiv, ScoreVariant::SqPure];
 
 /// Saturation cap mirroring `algo::AMF_DUMMY_I32` (private to the vendor
 /// crate and not re-exported, so this is an independent copy of the same
@@ -429,23 +391,6 @@ fn finalize_step_variant(
                         _ => unreachable!(),
                     }
                 }
-                ScoreVariant::DegSqrt => raw_deg.sqrt(),
-                ScoreVariant::DegP075 => raw_deg.powf(0.75),
-                ScoreVariant::DegP125 => raw_deg.powf(1.25),
-                ScoreVariant::DegDivNvSqrtWf => {
-                    let a = wf_f.abs().sqrt();
-                    let wf_signed = if wf_f < 0.0 { -a } else { a };
-                    raw_deg / (nvi_i as f64 + 1.0) + 0.5 * wf_signed
-                }
-                ScoreVariant::DegDivNvWfP15 => {
-                    let a = wf_f.abs().powf(1.5);
-                    let wf_signed = if wf_f < 0.0 { -a } else { a };
-                    raw_deg / (nvi_i as f64 + 1.0) + 0.1 * wf_signed
-                }
-                ScoreVariant::DegPlusDegme => raw_deg + (degme_i as f64) / (nvi_i as f64 + 1.0),
-                ScoreVariant::DegDivNvDegme => {
-                    raw_deg / (nvi_i as f64 + 1.0) + 0.5 * (degme_i as f64) / (nvi_i as f64 + 1.0)
-                }
             };
 
             // SqDiv/SqPure still need the AMD-style degree write-back (the
@@ -591,13 +536,6 @@ mod tests {
             ScoreVariant::SqPure,
             ScoreVariant::Ammf,
             ScoreVariant::AmindNorm,
-            ScoreVariant::DegSqrt,
-            ScoreVariant::DegP075,
-            ScoreVariant::DegP125,
-            ScoreVariant::DegDivNvSqrtWf,
-            ScoreVariant::DegDivNvWfP15,
-            ScoreVariant::DegPlusDegme,
-            ScoreVariant::DegDivNvDegme,
         ] {
             let perm = order_variant(&core, 10.0, true, variant)
                 .unwrap_or_else(|e| panic!("{variant:?} failed: {e:?}"));
@@ -622,13 +560,6 @@ mod tests {
             ScoreVariant::SqPure,
             ScoreVariant::Ammf,
             ScoreVariant::AmindNorm,
-            ScoreVariant::DegSqrt,
-            ScoreVariant::DegP075,
-            ScoreVariant::DegP125,
-            ScoreVariant::DegDivNvSqrtWf,
-            ScoreVariant::DegDivNvWfP15,
-            ScoreVariant::DegPlusDegme,
-            ScoreVariant::DegDivNvDegme,
         ] {
             let a = order_variant(&core, 10.0, true, variant).unwrap();
             let b = order_variant(&core, 10.0, true, variant).unwrap();
