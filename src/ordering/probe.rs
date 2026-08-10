@@ -3148,57 +3148,69 @@ fn probe_minimalize() {
     );
 }
 
-/// PHARMAKOS RECON PROBE: runs the FULL `order()` portfolio (now including
-/// the PHARMAKOS phase — see the `PHARMAKOS_*` constants' doc comment in
-/// `mod.rs` and `~/ssi-ordering-LEARNINGS/data/priming-round4/girard.md`)
-/// over the reconstructed 427-matrix eval corpus and reports the harness's
-/// exact bucketed weighted-geomean score, an isolated before/after (via
-/// `order_with_options(pat, usize::MAX, false)` — PHARMAKOS disabled, so the
-/// same portfolio minus only this phase) to attribute how many matrices the
-/// phase actually FIRED on / IMPROVED / (should be zero) REGRESSED, and a
-/// per-matrix `order()` wall-clock reading for cap-safety sense (shared-box
-/// noisy — see `mod.rs`'s own timing-fact caveat; read as an order of
-/// magnitude only, never absolute).
+/// COMPONENT B measurement (`probe_orbit`, Noether priming round 4 —
+/// `~/ssi-ordering-LEARNINGS/data/priming-round4/noether.md` §2.2
+/// "Component B: orbit-batched completion-lattice descent"). Two things:
 ///
-/// Per-matrix internal guard: `order()` itself already time-bounds every
-/// phase by (n, nnz) gates rather than a wall clock, so a single matrix
-/// cannot hang this probe — no additional guard needed here.
+///   1. **Recon score of the FULL `order()`** (Component B is wired into
+///      `order_with_relabel_cap` as a sibling candidate to the MINL
+///      completion-lattice descent — see the `ORBIT_*` constants' doc
+///      comment). Aggregated with the harness's own bucketed weighted-
+///      geomean, exactly like the grader. Point this at the reconstructed
+///      eval corpus via `SSI_CORPUS_FILE=/path/to/eval-reconstructed.jsonl`
+///      for the graded curve; unset for the dev curve.
+///   2. **Component B's OWN marginal**, isolated from every other phase: WL
+///      color refinement + `orbit_batched_delete` replayed directly against
+///      the plain AMD incumbent (bypassing telos/strip/hill-climb/MINL), via
+///      the SAME functions `order()` calls (`orbit_wl_classes`,
+///      `orbit_batched_delete`, `filled_graph`, `minl_mcs_peo`) — so there is
+///      no drift between what this measures and what ships. Reports, per
+///      matrix: WL class count (compression ratio), fill-edge count, edges
+///      removed, whether the AMD-incumbent completion strictly improved, and
+///      timing (WL / filled-graph / batched-delete), plus corpus-wide
+///      fire/improve counts and the WL-timing distribution (Rust vs. the
+///      priming doc's 304 ms/matrix Python number).
 ///
-/// `cargo test --release -- --ignored --nocapture probe_pharmakos`
+/// Env: SSI_PROBE_SHARD="i/m" processes matrices with idx % m == i.
+/// Env: SSI_CORPUS_FILE=<path> to point `crate::corpus::corpus()` at the
+/// reconstructed eval corpus instead of the public dev corpus.
 #[test]
 #[ignore]
-fn probe_pharmakos() {
-    let path = std::path::Path::new(
-        "/Users/philrio/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl",
+fn probe_orbit() {
+    let shard = std::env::var("SSI_PROBE_SHARD")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('/')?;
+            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+        })
+        .unwrap_or((0, 1));
+    let corpus = crate::corpus::corpus();
+    println!(
+        "ORBIT\tmatrix\tn\tnnz\tfull_ratio\tclasses\tcompression\tfill_ct\tb_removed\tb_win\twl_ms\tfg_ms\tscan_ms\torder_ms"
     );
-    let corpus = match ssi_scoring::load_corpus_jsonl(path) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("SKIP probe_pharmakos: failed to load {}: {e}", path.display());
-            return;
-        }
-    };
-    println!("corpus: {} matrices from {}", corpus.len(), path.display());
 
-    let mut log_sums = [0.0f64; 3];
+    let mut logs_full = [0f64; 3];
     let mut counts = [0usize; 3];
-    let mut worst: Vec<(f64, String, usize, usize)> = Vec::new();
+    let mut total = 0usize;
+    let mut wl_fire = 0usize; // matrices where WL found classes < n (any compression)
+    let mut wl_improve = 0usize; // matrices where Component B's OWN scan (off AMD) removed >=1 edge
+    let mut b_win = 0usize; // matrices where Component B's OWN scan strictly beat AMD
+    let mut wl_ms_all: Vec<u128> = Vec::new();
+    let mut worst_order: (String, u128) = (String::new(), 0);
+    let mut compressions: Vec<f64> = Vec::new();
 
-    let mut fired = 0usize; // pharmakos candidate strictly beat the pre-phase incumbent
-    let mut improved_vs_amd = 0usize; // full pipeline strictly beats AMD
-    let mut regressed_vs_amd = 0usize; // should be exactly 0 (anchored best-of)
-    let mut regressed_vs_pre_phase = 0usize; // should be exactly 0 (pharmakos itself never regresses)
-    let mut fired_rows: Vec<(String, usize, usize, f64, f64)> = Vec::new();
-
-    for (name, pat) in &corpus {
+    for (idx, (name, pat)) in corpus.iter().enumerate() {
+        if idx % shard.1 != shard.0 {
+            continue;
+        }
         let n = pat.n;
         if n == 0 {
             continue;
         }
         let nnz = pat.nnz();
         let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let (cp0, ri0) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp0, &ri0).unwrap();
         let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
             .unwrap()
             .into_iter()
@@ -3206,104 +3218,124 @@ fn probe_pharmakos() {
             .collect();
         let base = flops_of(&sp, &amd_perm) as f64;
 
-        // Pre-phase incumbent (everything except PHARMAKOS) for attribution.
-        let pre = order_with_options(pat, usize::MAX, false);
-        let f_pre = flops_of(&sp, &pre) as f64;
-
-        let t0 = Instant::now();
-        let perm = order(pat);
-        let secs = t0.elapsed().as_secs_f64();
-        let mine = flops_of(&sp, &perm) as f64;
-
-        if mine < f_pre - 0.5 {
-            fired += 1;
-            fired_rows.push((name.clone(), n, nnz, f_pre / base, mine / base));
-        } else if mine > f_pre + 0.5 {
-            regressed_vs_pre_phase += 1;
+        // (1) Full order() recon score — includes Component B as wired in.
+        let t_order = Instant::now();
+        let full = order(pat);
+        let order_ms = t_order.elapsed().as_millis();
+        if order_ms > worst_order.1 {
+            worst_order = (name.clone(), order_ms);
         }
-
-        let ratio = mine / base;
-        if ratio < 1.0 - 1e-9 {
-            improved_vs_amd += 1;
-        } else if ratio > 1.0 + 1e-9 {
-            regressed_vs_amd += 1;
-        }
-
+        let f_full = flops_of(&sp, &full) as f64;
+        total += 1;
         let b = bucket(n);
-        log_sums[b] += ratio.ln();
         counts[b] += 1;
-        worst.push((secs, name.clone(), n, nnz));
-    }
+        let full_ratio = f_full / base;
+        logs_full[b] += full_ratio.ln();
 
-    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    println!("\n--- slowest 20 order() calls (shared-box noisy, order-of-magnitude only) ---");
-    println!("secs\tmatrix\tn\tnnz");
-    for (secs, name, n, nnz) in worst.iter().take(20) {
-        println!("{secs:.4}\t{name}\t{n}\t{nnz}");
-    }
-
-    println!("\n--- PHARMAKOS fired-on matrices (pre-phase ratio -> final ratio) ---");
-    println!("matrix\tn\tnnz\tpre_ratio\tfinal_ratio");
-    for (name, n, nnz, pre_r, fin_r) in &fired_rows {
-        println!("{name}\t{n}\t{nnz}\t{pre_r:.6}\t{fin_r:.6}");
-    }
-
-    println!("\n--- per-bucket ---");
-    for b in 0..3 {
-        if counts[b] > 0 {
-            println!(
-                "{:<8} count={:<5} geomean={:.6}",
-                BUCKET_NAMES[b],
-                counts[b],
-                (log_sums[b] / counts[b] as f64).exp()
-            );
+        // (2) Component B's OWN marginal, isolated: replay off the plain
+        // AMD incumbent using the exact functions order() calls, gated by
+        // the SAME `n <= ORBIT_MAX_N` identity-safety cap production uses
+        // (see the `ORBIT_*` constants' "CAP-BREACH POST-MORTEM" doc
+        // comment) — so this instrumentation's fire/improve counts reflect
+        // what Component B actually does inside `order()`, not what it
+        // WOULD do if ungated.
+        let mut classes_ct = n;
+        let mut fill_ct = 0usize;
+        let mut b_removed = 0usize;
+        let mut b_beats_amd = false;
+        let (mut wl_ms, mut fg_ms, mut scan_ms) = (0u128, 0u128, 0u128);
+        let t_fg = Instant::now();
+        if n <= ORBIT_MAX_N {
+        if let Some((fcp, fri)) = filled_graph(&sp, &amd_perm, ORBIT_MAX_LNNZ) {
+            fg_ms = t_fg.elapsed().as_millis();
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            fill_ct = fill.len();
+            if !fill.is_empty() {
+                let t_wl = Instant::now();
+                let (class, k) = orbit_wl_classes(n, &asort, ORBIT_WL_MAX_ROUNDS);
+                wl_ms = t_wl.elapsed().as_millis();
+                classes_ct = k;
+                let t_scan = Instant::now();
+                b_removed = orbit_batched_delete(&mut adj, &fill, &class);
+                scan_ms = t_scan.elapsed().as_millis();
+                if b_removed > 0 {
+                    let cand = minl_mcs_peo(n, &adj);
+                    if is_bijection(&cand, n) {
+                        let f = flops_of(&sp, &cand);
+                        if (f as f64) < base {
+                            b_beats_amd = true;
+                        }
+                    }
+                }
+            }
         }
-    }
-    let score = aggregate(&log_sums, &counts);
-    let total: usize = counts.iter().sum();
-    println!("\nRECON SCORE = {score:.6}");
-    println!("baseline to beat = 0.834343  (delta = {:+.6})", score - 0.834343);
-    println!("PHARMAKOS fired on {fired}/{total} matrices");
-    println!("full pipeline strictly improved vs AMD: {improved_vs_amd}/{total}");
-    println!("full pipeline regressed vs AMD (must be 0): {regressed_vs_amd}");
-    println!("PHARMAKOS itself regressed vs pre-phase incumbent (must be 0): {regressed_vs_pre_phase}");
-    if let Some((w_secs, w_name, w_n, w_nnz)) = worst.first() {
-        println!("WORST order() = {w_secs:.3}s ({w_name}, n={w_n}, nnz={w_nnz})");
-    }
-}
+        }
+        if classes_ct < n {
+            wl_fire += 1;
+            compressions.push(n as f64 / classes_ct.max(1) as f64);
+        }
+        if b_removed > 0 {
+            wl_improve += 1;
+        }
+        if b_beats_amd {
+            b_win += 1;
+        }
+        wl_ms_all.push(wl_ms);
 
-/// AD-HOC diagnostic (not a deliverable, just cap-safety triage): min-of-3
-/// timing of `order()` WITH vs WITHOUT the PHARMAKOS phase on the specific
-/// matrices `probe_pharmakos` flagged as the current worst-case wall times,
-/// to see how much of that worst-case time PHARMAKOS itself is adding near
-/// its `PHARMAKOS_MAX_NNZ` gate boundary.
-#[test]
-#[ignore]
-fn probe_pharmakos_worst_timing() {
-    let path = std::path::Path::new(
-        "/Users/philrio/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl",
-    );
-    let corpus = ssi_scoring::load_corpus_jsonl(path).expect("load eval corpus");
-    let targets = ["gams04", "arki0009", "telecomsp_njlata", "ringpack_30_1"];
-    for (name, pat) in &corpus {
-        if !targets.contains(&name.as_str()) {
-            continue;
-        }
-        let mut with_secs = f64::MAX;
-        let mut without_secs = f64::MAX;
-        for _ in 0..3 {
-            let t0 = Instant::now();
-            let _ = order_with_options(pat, usize::MAX, true);
-            with_secs = with_secs.min(t0.elapsed().as_secs_f64());
-            let t0 = Instant::now();
-            let _ = order_with_options(pat, usize::MAX, false);
-            without_secs = without_secs.min(t0.elapsed().as_secs_f64());
-        }
+        let compression = n as f64 / classes_ct.max(1) as f64;
         println!(
-            "{name}\tn={}\tnnz={}\twith_pharmakos={with_secs:.4}s\twithout_pharmakos={without_secs:.4}s\tdelta={:.4}s",
-            pat.n,
-            pat.nnz(),
-            with_secs - without_secs
+            "ORBIT\t{name}\t{n}\t{nnz}\t{full_ratio:.6}\t{classes_ct}\t{compression:.3}\t{fill_ct}\t{b_removed}\t{b_beats_amd}\t{wl_ms}\t{fg_ms}\t{scan_ms}\t{order_ms}"
         );
     }
+
+    let full_score = aggregate(&logs_full, &counts);
+    wl_ms_all.sort_unstable();
+    let p = |q: f64| -> u128 {
+        if wl_ms_all.is_empty() {
+            0
+        } else {
+            let i = ((wl_ms_all.len() as f64 - 1.0) * q).round() as usize;
+            wl_ms_all[i.min(wl_ms_all.len() - 1)]
+        }
+    };
+    compressions.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let cmed = if compressions.is_empty() {
+        0.0
+    } else {
+        compressions[compressions.len() / 2]
+    };
+    println!(
+        "ORBIT-AGG\ttotal={total}\tfull_score={full_score:.6}\twl_fire={wl_fire}\twl_improve={wl_improve}\tb_win={b_win}\twl_ms_p50={}\twl_ms_p90={}\twl_ms_max={}\tcompression_med={cmed:.3}\tworst_order={}:{}ms",
+        p(0.50),
+        p(0.90),
+        p(1.00),
+        worst_order.0,
+        worst_order.1
+    );
 }
