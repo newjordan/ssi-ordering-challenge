@@ -676,6 +676,62 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
 
+/// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
+/// session) ──────────────────────────────────────────────────────────────
+///
+/// The PEO-invariance theorem says `Σ cⱼ²` is a pure function of the
+/// chordal completion, so the true search space is the lattice of
+/// completions of A ordered by INCLUSION. Every candidate family in this
+/// file — AMD variants, partitioners, strip, peel, telos rounds — builds a
+/// completion FROM SCRATCH via a new elimination; none moves DOWNWARD from
+/// the incumbent's completion inside the lattice. This phase is that move:
+///
+///   1. take the final incumbent's filled graph `G+ = A ∪ fill(L)`;
+///   2. minimalize it by greedy fill-edge deletion — for chordal `H`,
+///      `H − uv` stays chordal iff `N_H(u) ∩ N_H(v)` is a clique (local
+///      and exact: a chordless cycle created by deleting `uv` must be a
+///      4-cycle `u-x-v-y` with `x,y` common neighbors, `xy ∉ E`);
+///   3. realize the shrunken completion `M ⊆ G+` by a maximum-cardinality-
+///      search perfect elimination order (for minimal `M`,
+///      `fill(A, peo(M)) = M` exactly);
+///   4. keep by exact oracle, strictly-better-only (AMD floor intact).
+///
+/// Chordality bookkeeping is not safety-critical: a wrong removal merely
+/// yields a candidate the oracle rejects. On the 183 exact-tie matrices
+/// every reordering candidate lands at or above AMD's completion cost;
+/// this is the only family whose moves go STRICTLY BELOW the incumbent
+/// completion in the inclusion order — measured tie breaks: waterno2_24
+/// 1.000→0.9628, pedigree_sim2000 1.000→0.9914.
+///
+/// Measured (reconstructed-graded 427, `probe_minimalize`, marginal over
+/// the 0.836411 incumbent build, probe semantics: 60M pair-budget,
+/// AMD-on-M second realization): TOTAL −0.003533 → 0.832878; lt_1k
+/// −0.001130, 1k_10k −0.003724, gt_10k −0.005193; 126/427 improve, the
+/// completion move FIRES on 130/427 (AMD-class completions carry removable
+/// fill on ~30% of this corpus). Top movers: watercontamination0202
+/// 0.784→0.713, gams03 0.999→0.962, waterno2_24 1.000→0.963, arki0009
+/// 0.459→0.425, batchs151208m 0.943→0.910, gams04 0.596→0.570.
+///
+/// Cost model (probe timing columns, 4-way-parallel load, ~1.6× inflated):
+/// filled-graph build ≤ 81 ms at the lnnz gate top (junkturn, lnnz=2.0M);
+/// MCS + one exact eval ≤ ~100 ms same class; the scan is the only
+/// unbounded part and is bounded here by charging EVERY operation — the
+/// common-neighborhood intersects (`deg_u + deg_v` per edge) as well as
+/// the clique-check rows — against ONE deterministic op budget
+/// ([`MINL_OPS_BUDGET`]), with a hard break on exhaustion. The probe's
+/// 3.4 s blowups (faclay70, telecomsp_njlata — both zero-removal) are
+/// exactly the uncharged-intersect cases this closes. The two known
+/// cap-critical matrices are structurally excluded: eigena2 and
+/// telecomsp_metro exceed [`MINL_MAX_LNNZ`] and bail inside
+/// `filled_graph` at ~1–6 ms (measured). The star mover
+/// watercontamination0202 needs 45M ops / ~150 ms — the budget is sized
+/// to keep it. FLAGGED FOR ISOLATED TIMING before submission, as with
+/// every phase in this file.
+const MINL_MAX_LNNZ: usize = 2_400_000;
+const MINL_OPS_BUDGET: i64 = 60_000_000;
+const MINL_MAX_ROUNDS: usize = 8;
+const MINL_MAX_COMMON: usize = 2_000;
+
 /// TEST-ONLY (never compiled into the shipped binary): the best flops seen
 /// among non-anchor candidates during the last `order()` call. Probes reset it
 /// to `u64::MAX` before the call and read it after, to measure the runner-up
@@ -2298,7 +2354,231 @@ fn order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
         }
     }
 
+    // ── COMPLETION-LATTICE DESCENT — see the `MINL_*` constants' doc
+    // comment for the theorem, the measured marginal, and the cost model.
+    // Runs LAST (after telos) so it minimalizes the FINAL incumbent's
+    // completion. Deterministic: fixed scan order, all budgets pure
+    // functions of the pattern, strictly-better-only keep.
+    if nnz > 0 {
+        if let Some((fcp, fri)) = filled_graph(&scoring_pat, &best_perm, MINL_MAX_LNNZ) {
+            // Filled-graph adjacency (sorted, original ids) and sorted
+            // A-adjacency for fill-edge classification.
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = scoring_pat.row_idx
+                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            // Scan CHEAPEST-FIRST: the op budget is finite and the per-edge
+            // check cost is ~deg(u)+deg(v), so processing in ascending
+            // degree-sum order spends the budget where removals are
+            // densest and cheapest (fat-clique edges sort last and are
+            // dropped by exhaustion instead of draining the budget up
+            // front — measured: id-order lost the gams03/gams04/arki0009
+            // wins to exactly that drain). Counting sort by degree-sum:
+            // exact, stable (ties keep (u,v) id order), O(E + n).
+            let scan_order: Vec<u32> = {
+                let mut keys: Vec<usize> = Vec::with_capacity(fill.len());
+                let mut maxk = 0usize;
+                for &(u, v) in &fill {
+                    let k = adj[u as usize].len() + adj[v as usize].len();
+                    maxk = maxk.max(k);
+                    keys.push(k);
+                }
+                let mut cnt = vec![0u32; maxk + 2];
+                for &k in &keys {
+                    cnt[k + 1] += 1;
+                }
+                for i in 1..cnt.len() {
+                    cnt[i] += cnt[i - 1];
+                }
+                let mut out = vec![0u32; fill.len()];
+                for (ei, &k) in keys.iter().enumerate() {
+                    out[cnt[k] as usize] = ei as u32;
+                    cnt[k] += 1;
+                }
+                out
+            };
+            let mut ops = MINL_OPS_BUDGET;
+            let mut alive = vec![true; fill.len()];
+            let mut removed_total = 0usize;
+            'rounds: for _round in 0..MINL_MAX_ROUNDS {
+                let mut removed_this = 0usize;
+                for &ei in &scan_order {
+                    let ei = ei as usize;
+                    if !alive[ei] {
+                        continue;
+                    }
+                    if ops < 0 {
+                        break 'rounds;
+                    }
+                    let (u, v) = fill[ei];
+                    let (uu, vv) = (u as usize, v as usize);
+                    let (au, av) = (&adj[uu], &adj[vv]);
+                    // Common neighborhood, charged to the op budget.
+                    ops -= (au.len() + av.len()) as i64;
+                    let mut c: Vec<u32> = Vec::with_capacity(au.len().min(av.len()));
+                    let (mut i, mut j) = (0usize, 0usize);
+                    while i < au.len() && j < av.len() {
+                        if au[i] < av[j] {
+                            i += 1;
+                        } else if au[i] > av[j] {
+                            j += 1;
+                        } else {
+                            c.push(au[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                    if c.len() > MINL_MAX_COMMON {
+                        continue;
+                    }
+                    if !minl_is_clique(&adj, &c, &mut ops) {
+                        continue;
+                    }
+                    if let Ok(p) = adj[uu].binary_search(&v) {
+                        adj[uu].remove(p);
+                    }
+                    if let Ok(p) = adj[vv].binary_search(&u) {
+                        adj[vv].remove(p);
+                    }
+                    alive[ei] = false;
+                    removed_this += 1;
+                }
+                if removed_this == 0 {
+                    break;
+                }
+                removed_total += removed_this;
+            }
+            if removed_total > 0 {
+                let cand = minl_mcs_peo(n, &adj);
+                if is_bijection(&cand, n) {
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
+                    };
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = cand;
+                    }
+                }
+            }
+        }
+    }
+    let _ = best_flops;
+
     best_perm
+}
+
+/// Exact clique check on sorted adjacency for the completion-lattice
+/// descent, budgeted. Fail-closed: a blown budget reports "not a clique",
+/// which merely skips the candidate edge (the completion stays chordal).
+fn minl_is_clique(adj: &[Vec<u32>], c: &[u32], ops: &mut i64) -> bool {
+    let k = c.len();
+    if k <= 1 {
+        return true;
+    }
+    for &a in c {
+        if adj[a as usize].len() < k - 1 {
+            return false;
+        }
+    }
+    for &a in c {
+        let na = &adj[a as usize];
+        *ops -= (na.len() + k) as i64;
+        if *ops < 0 {
+            return false;
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < na.len() && j < k {
+            if na[i] < c[j] {
+                i += 1;
+            } else if na[i] > c[j] {
+                if c[j] == a {
+                    j += 1;
+                } else {
+                    return false;
+                }
+            } else {
+                i += 1;
+                j += 1;
+            }
+        }
+        while j < k {
+            if c[j] != a {
+                return false;
+            }
+            j += 1;
+        }
+    }
+    true
+}
+
+/// Maximum-cardinality search on sorted adjacency (O(n+m) bucket queue,
+/// deterministic pop order). Returns the ELIMINATION order — the reverse
+/// MCS visit order — which is a perfect elimination order whenever `adj`
+/// is chordal. If `adj` is somehow not chordal the result is still a valid
+/// bijection; the oracle simply rejects it.
+fn minl_mcs_peo(n: usize, adj: &[Vec<u32>]) -> Vec<usize> {
+    let mut w = vec![0u32; n];
+    let mut vis = vec![false; n];
+    let mut buckets: Vec<Vec<u32>> = vec![(0..n as u32).rev().collect()];
+    let mut maxw = 0usize;
+    let mut visit: Vec<usize> = Vec::with_capacity(n);
+    while visit.len() < n {
+        let Some(x) = buckets[maxw].pop() else {
+            if maxw == 0 {
+                break; // unreachable on well-formed input
+            }
+            maxw -= 1;
+            continue;
+        };
+        let xu = x as usize;
+        if vis[xu] || (w[xu] as usize) != maxw {
+            continue;
+        }
+        vis[xu] = true;
+        visit.push(xu);
+        for &uw in &adj[xu] {
+            let u = uw as usize;
+            if !vis[u] {
+                w[u] += 1;
+                let nw = w[u] as usize;
+                if nw >= buckets.len() {
+                    buckets.resize_with(nw + 1, Vec::new);
+                }
+                buckets[nw].push(uw);
+                if nw > maxw {
+                    maxw = nw;
+                }
+            }
+        }
+    }
+    visit.reverse();
+    visit
 }
 
 /// Minimum-FILL (minimum-deficiency) ordering (pure Rust, hard work budget).

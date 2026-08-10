@@ -1,3 +1,2 @@
-CURRENT #1 (2026-08-08 23:10): submission cb310b1e, graded 0.841472, recon 0.8364.
-Telos-gradient-descent build (from PEO-invariance theorem). TELOS_MAX_NNZ=150k (conservative).
-Worst order() ~0.821s (well under 0.985s pass line). Frontier: 0.886->0.863->0.847->0.845->0.844->0.841472.
+recon-graded 0.854109 | worst ~0.55s (vs frontier 0.91s) | tests green
+src: sbx-timing-rca | 2026-08-06 | drop AmindNorm + D density-window gate (20<nnz/n<50, nnz<1M) on 4 gt_10k matrices

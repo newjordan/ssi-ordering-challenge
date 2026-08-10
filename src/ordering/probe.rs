@@ -2852,3 +2852,298 @@ fn probe_score() {
         println!("SCORE\t{name}\t{n}\t{}\t{r:.6}", pat.nnz());
     }
 }
+
+/// COMPLETION-LATTICE DESCENT (`probe_minimalize`): the PEO-invariance
+/// theorem says Σcⱼ² is a pure function of the chordal completion, so the
+/// true search space is the lattice of completions of A ordered by
+/// INCLUSION. Every existing candidate family (AMD variants, strip, peel,
+/// telos rounds) builds a completion FROM SCRATCH via a new elimination;
+/// none moves DOWNWARD from the incumbent's completion inside the lattice.
+/// This probe measures exactly that move:
+///
+///   1. take the incumbent best-of completion G+ = A ∪ fill(L);
+///   2. minimalize it by greedy fill-edge deletion — for chordal H, H−uv
+///      stays chordal iff N_H(u) ∩ N_H(v) is a clique (local, exact:
+///      any chordless cycle created by deleting uv must be a 4-cycle
+///      u-x-v-y with x,y common neighbors and xy ∉ E);
+///   3. realize the shrunken completion M ⊆ G+ by an MCS perfect-elimination
+///      order (for minimal M, fill(A, peo(M)) = M exactly), plus one AMD
+///      pass on M as a second realization;
+///   4. keep by exact oracle. Chordality bookkeeping is therefore not
+///      safety-critical: a wrong removal merely wastes the candidate.
+///
+/// On the 183 exact-tie matrices every reordering candidate lands at or
+/// above AMD's completion cost; this is the only family whose moves go
+/// STRICTLY BELOW the incumbent completion in the inclusion order.
+///
+/// Env: SSI_PROBE_SHARD="i/m" processes matrices with idx % m == i.
+#[test]
+#[ignore]
+fn probe_minimalize() {
+    let shard = std::env::var("SSI_PROBE_SHARD")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('/')?;
+            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+        })
+        .unwrap_or((0, 1));
+    let corpus = crate::corpus::corpus();
+    println!("MINL\tmatrix\tn\tnnz\tlnnz\tfill\tremoved\trounds\tinc_r\tnew_r\twin");
+
+    // Exact clique check on sorted adjacency, budgeted (fail-closed: a
+    // blown budget reports "not a clique", which merely skips the edge).
+    fn is_clique(adj: &[Vec<u32>], c: &[u32], budget: &mut i64) -> bool {
+        let k = c.len();
+        if k <= 1 {
+            return true;
+        }
+        for &a in c {
+            if adj[a as usize].len() < k - 1 {
+                return false;
+            }
+        }
+        for &a in c {
+            let na = &adj[a as usize];
+            *budget -= (na.len() + k) as i64;
+            if *budget < 0 {
+                return false;
+            }
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < na.len() && j < k {
+                if na[i] < c[j] {
+                    i += 1;
+                } else if na[i] > c[j] {
+                    if c[j] == a {
+                        j += 1;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    i += 1;
+                    j += 1;
+                }
+            }
+            while j < k {
+                if c[j] != a {
+                    return false;
+                }
+                j += 1;
+            }
+        }
+        true
+    }
+
+    // Maximum-cardinality search on sorted adjacency, O(n+m) bucket queue,
+    // deterministic. Returns the ELIMINATION order (reverse MCS visit
+    // order), a PEO when `adj` is chordal.
+    fn mcs_peo(n: usize, adj: &[Vec<u32>]) -> Vec<usize> {
+        let mut w = vec![0u32; n];
+        let mut vis = vec![false; n];
+        let mut buckets: Vec<Vec<u32>> = vec![(0..n as u32).rev().collect()];
+        let mut maxw = 0usize;
+        let mut visit: Vec<usize> = Vec::with_capacity(n);
+        while visit.len() < n {
+            let Some(x) = buckets[maxw].pop() else {
+                if maxw == 0 {
+                    break; // unreachable on well-formed input
+                }
+                maxw -= 1;
+                continue;
+            };
+            let xu = x as usize;
+            if vis[xu] || (w[xu] as usize) != maxw {
+                continue;
+            }
+            vis[xu] = true;
+            visit.push(xu);
+            for &uw in &adj[xu] {
+                let u = uw as usize;
+                if !vis[u] {
+                    w[u] += 1;
+                    let nw = w[u] as usize;
+                    if nw >= buckets.len() {
+                        buckets.resize_with(nw + 1, Vec::new);
+                    }
+                    buckets[nw].push(uw);
+                    if nw > maxw {
+                        maxw = nw;
+                    }
+                }
+            }
+        }
+        visit.reverse();
+        visit
+    }
+
+    let mut logs_inc = [0f64; 3];
+    let mut logs_new = [0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut improved = 0usize;
+    let mut total = 0usize;
+    for (idx, (name, pat)) in corpus.iter().enumerate() {
+        if idx % shard.1 != shard.0 {
+            continue;
+        }
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp0, ri0) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp0, &ri0).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let inc = order(pat);
+        let f_inc = flops_of(&sp, &inc);
+        total += 1;
+        let b = bucket(n);
+        counts[b] += 1;
+        let inc_r = f_inc as f64 / base;
+        logs_inc[b] += inc_r.ln();
+
+        let mut f_new = f_inc;
+        let mut removed_total = 0usize;
+        let mut rounds_used = 0usize;
+        let mut lnnz_out = 0usize;
+        let mut fill_ct = 0usize;
+        let mut win = "-";
+        let mut pairs_used: i64 = 0;
+        let (mut fg_ms, mut scan_ms, mut real_ms) = (0u128, 0u128, 0u128);
+        let t_fg = Instant::now();
+        let fg = filled_graph(&sp, &inc, 3_000_000);
+        fg_ms = t_fg.elapsed().as_millis();
+        if let Some((fcp, fri)) = fg {
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            lnnz_out = fri.len() / 2;
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    let wu = wv as usize;
+                    if wu > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            fill_ct = fill.len();
+            let t_scan = Instant::now();
+            let mut pair_budget: i64 = 60_000_000;
+            let mut alive = vec![true; fill.len()];
+            for _round in 0..8 {
+                let mut removed_this = 0usize;
+                for ei in 0..fill.len() {
+                    if !alive[ei] || pair_budget < 0 {
+                        continue;
+                    }
+                    let (u, v) = fill[ei];
+                    let (uu, vv) = (u as usize, v as usize);
+                    let (au, av) = (&adj[uu], &adj[vv]);
+                    let mut c: Vec<u32> = Vec::with_capacity(au.len().min(av.len()));
+                    let (mut i, mut j) = (0usize, 0usize);
+                    while i < au.len() && j < av.len() {
+                        if au[i] < av[j] {
+                            i += 1;
+                        } else if au[i] > av[j] {
+                            j += 1;
+                        } else {
+                            c.push(au[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                    if c.len() > 2000 {
+                        continue;
+                    }
+                    if !is_clique(&adj, &c, &mut pair_budget) {
+                        continue;
+                    }
+                    if let Ok(p) = adj[uu].binary_search(&v) {
+                        adj[uu].remove(p);
+                    }
+                    if let Ok(p) = adj[vv].binary_search(&u) {
+                        adj[vv].remove(p);
+                    }
+                    alive[ei] = false;
+                    removed_this += 1;
+                }
+                if removed_this == 0 {
+                    break;
+                }
+                rounds_used += 1;
+                removed_total += removed_this;
+            }
+            pairs_used = 60_000_000 - pair_budget;
+            scan_ms = t_scan.elapsed().as_millis();
+            let t_real = Instant::now();
+            if removed_total > 0 {
+                let peo = mcs_peo(n, &adj);
+                if is_bijection(&peo, n) {
+                    let f = flops_of(&sp, &peo);
+                    if f < f_new {
+                        f_new = f;
+                        win = "mcs";
+                    }
+                }
+                let mut mcp: Vec<i32> = Vec::with_capacity(n + 1);
+                mcp.push(0);
+                let mut mri: Vec<i32> = Vec::with_capacity(fri.len());
+                for v in 0..n {
+                    for &wv in &adj[v] {
+                        mri.push(wv as i32);
+                    }
+                    mcp.push(mri.len() as i32);
+                }
+                if let Some(p) = feral_ordering_core::CscPattern::new(n, &mcp, &mri)
+                    .and_then(|c| feral_amd::amd_order(&c).ok())
+                {
+                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&p, n) {
+                        let f = flops_of(&sp, &p);
+                        if f < f_new {
+                            f_new = f;
+                            win = "amd";
+                        }
+                    }
+                }
+            }
+            real_ms = t_real.elapsed().as_millis();
+        }
+        let new_r = f_new as f64 / base;
+        logs_new[b] += new_r.ln();
+        if f_new < f_inc {
+            improved += 1;
+        }
+        println!(
+            "MINL\t{name}\t{n}\t{nnz}\t{lnnz_out}\t{fill_ct}\t{removed_total}\t{rounds_used}\t{inc_r:.6}\t{new_r:.6}\t{win}\t{fg_ms}\t{scan_ms}\t{real_ms}\t{pairs_used}"
+        );
+    }
+    println!(
+        "MINL-AGG\ttotal={total}\timproved={improved}\tinc={:.6}\tnew={:.6}",
+        aggregate(&logs_inc, &counts),
+        aggregate(&logs_new, &counts)
+    );
+}
