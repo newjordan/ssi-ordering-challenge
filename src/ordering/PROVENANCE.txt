@@ -1,2 +1,3 @@
-recon-graded 0.854109 | worst ~0.55s (vs frontier 0.91s) | tests green
-src: sbx-timing-rca | 2026-08-06 | drop AmindNorm + D density-window gate (20<nnz/n<50, nnz<1M) on 4 gt_10k matrices
+CURRENT #1 (2026-08-08): submission 86f02d9a, graded 0.844292, recon 0.8389.
+Shot 3 = metrics(7) + peel + count-relabel + filled-graph-reorder + strip-v2 (cap-fixed, mutual-excl dense strips).
+Worst order() ~0.985s (PASSED grader). Frontier march: 0.886->0.863->0.847->0.845->0.844292.
