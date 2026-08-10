@@ -3147,3 +3147,163 @@ fn probe_minimalize() {
         aggregate(&logs_new, &counts)
     );
 }
+
+/// PHARMAKOS RECON PROBE: runs the FULL `order()` portfolio (now including
+/// the PHARMAKOS phase — see the `PHARMAKOS_*` constants' doc comment in
+/// `mod.rs` and `~/ssi-ordering-LEARNINGS/data/priming-round4/girard.md`)
+/// over the reconstructed 427-matrix eval corpus and reports the harness's
+/// exact bucketed weighted-geomean score, an isolated before/after (via
+/// `order_with_options(pat, usize::MAX, false)` — PHARMAKOS disabled, so the
+/// same portfolio minus only this phase) to attribute how many matrices the
+/// phase actually FIRED on / IMPROVED / (should be zero) REGRESSED, and a
+/// per-matrix `order()` wall-clock reading for cap-safety sense (shared-box
+/// noisy — see `mod.rs`'s own timing-fact caveat; read as an order of
+/// magnitude only, never absolute).
+///
+/// Per-matrix internal guard: `order()` itself already time-bounds every
+/// phase by (n, nnz) gates rather than a wall clock, so a single matrix
+/// cannot hang this probe — no additional guard needed here.
+///
+/// `cargo test --release -- --ignored --nocapture probe_pharmakos`
+#[test]
+#[ignore]
+fn probe_pharmakos() {
+    let path = std::path::Path::new(
+        "/Users/philrio/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl",
+    );
+    let corpus = match ssi_scoring::load_corpus_jsonl(path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_pharmakos: failed to load {}: {e}", path.display());
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path.display());
+
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut worst: Vec<(f64, String, usize, usize)> = Vec::new();
+
+    let mut fired = 0usize; // pharmakos candidate strictly beat the pre-phase incumbent
+    let mut improved_vs_amd = 0usize; // full pipeline strictly beats AMD
+    let mut regressed_vs_amd = 0usize; // should be exactly 0 (anchored best-of)
+    let mut regressed_vs_pre_phase = 0usize; // should be exactly 0 (pharmakos itself never regresses)
+    let mut fired_rows: Vec<(String, usize, usize, f64, f64)> = Vec::new();
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd_perm) as f64;
+
+        // Pre-phase incumbent (everything except PHARMAKOS) for attribution.
+        let pre = order_with_options(pat, usize::MAX, false);
+        let f_pre = flops_of(&sp, &pre) as f64;
+
+        let t0 = Instant::now();
+        let perm = order(pat);
+        let secs = t0.elapsed().as_secs_f64();
+        let mine = flops_of(&sp, &perm) as f64;
+
+        if mine < f_pre - 0.5 {
+            fired += 1;
+            fired_rows.push((name.clone(), n, nnz, f_pre / base, mine / base));
+        } else if mine > f_pre + 0.5 {
+            regressed_vs_pre_phase += 1;
+        }
+
+        let ratio = mine / base;
+        if ratio < 1.0 - 1e-9 {
+            improved_vs_amd += 1;
+        } else if ratio > 1.0 + 1e-9 {
+            regressed_vs_amd += 1;
+        }
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        worst.push((secs, name.clone(), n, nnz));
+    }
+
+    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("\n--- slowest 20 order() calls (shared-box noisy, order-of-magnitude only) ---");
+    println!("secs\tmatrix\tn\tnnz");
+    for (secs, name, n, nnz) in worst.iter().take(20) {
+        println!("{secs:.4}\t{name}\t{n}\t{nnz}");
+    }
+
+    println!("\n--- PHARMAKOS fired-on matrices (pre-phase ratio -> final ratio) ---");
+    println!("matrix\tn\tnnz\tpre_ratio\tfinal_ratio");
+    for (name, n, nnz, pre_r, fin_r) in &fired_rows {
+        println!("{name}\t{n}\t{nnz}\t{pre_r:.6}\t{fin_r:.6}");
+    }
+
+    println!("\n--- per-bucket ---");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<8} count={:<5} geomean={:.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    let score = aggregate(&log_sums, &counts);
+    let total: usize = counts.iter().sum();
+    println!("\nRECON SCORE = {score:.6}");
+    println!("baseline to beat = 0.834343  (delta = {:+.6})", score - 0.834343);
+    println!("PHARMAKOS fired on {fired}/{total} matrices");
+    println!("full pipeline strictly improved vs AMD: {improved_vs_amd}/{total}");
+    println!("full pipeline regressed vs AMD (must be 0): {regressed_vs_amd}");
+    println!("PHARMAKOS itself regressed vs pre-phase incumbent (must be 0): {regressed_vs_pre_phase}");
+    if let Some((w_secs, w_name, w_n, w_nnz)) = worst.first() {
+        println!("WORST order() = {w_secs:.3}s ({w_name}, n={w_n}, nnz={w_nnz})");
+    }
+}
+
+/// AD-HOC diagnostic (not a deliverable, just cap-safety triage): min-of-3
+/// timing of `order()` WITH vs WITHOUT the PHARMAKOS phase on the specific
+/// matrices `probe_pharmakos` flagged as the current worst-case wall times,
+/// to see how much of that worst-case time PHARMAKOS itself is adding near
+/// its `PHARMAKOS_MAX_NNZ` gate boundary.
+#[test]
+#[ignore]
+fn probe_pharmakos_worst_timing() {
+    let path = std::path::Path::new(
+        "/Users/philrio/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl",
+    );
+    let corpus = ssi_scoring::load_corpus_jsonl(path).expect("load eval corpus");
+    let targets = ["gams04", "arki0009", "telecomsp_njlata", "ringpack_30_1"];
+    for (name, pat) in &corpus {
+        if !targets.contains(&name.as_str()) {
+            continue;
+        }
+        let mut with_secs = f64::MAX;
+        let mut without_secs = f64::MAX;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let _ = order_with_options(pat, usize::MAX, true);
+            with_secs = with_secs.min(t0.elapsed().as_secs_f64());
+            let t0 = Instant::now();
+            let _ = order_with_options(pat, usize::MAX, false);
+            without_secs = without_secs.min(t0.elapsed().as_secs_f64());
+        }
+        println!(
+            "{name}\tn={}\tnnz={}\twith_pharmakos={with_secs:.4}s\twithout_pharmakos={without_secs:.4}s\tdelta={:.4}s",
+            pat.n,
+            pat.nnz(),
+            with_secs - without_secs
+        );
+    }
+}

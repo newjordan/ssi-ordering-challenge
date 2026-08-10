@@ -732,6 +732,66 @@ const MINL_OPS_BUDGET: i64 = 60_000_000;
 const MINL_MAX_ROUNDS: usize = 8;
 const MINL_MAX_COMMON: usize = 2_000;
 
+/// ── PHARMAKOS ORDERING — Girardian scapegoat/expulsion phase (see
+/// `~/ssi-ordering-LEARNINGS/data/priming-round4/girard.md`, "Phase 2"). A
+/// vertex's `blame` is the a-posteriori attribution `Σ_{K ∋ v} (|K|-1)²` over
+/// the maximal cliques of the CURRENT incumbent's chordal completion (exact,
+/// via the fundamental-supernode test on the elimination tree + GNP column
+/// counts, combined with the already-existing `filled_graph` adjacency — no
+/// standalone clique-tree struct exists in this crate, so this IS the
+/// "clique tree" reuse: same inputs the MINL phase already builds). The
+/// highest-blame vertex(es) are expelled to a terminal block S (ordered LAST
+/// by ascending original index — no CAMD entry point exists in `feral_amd`,
+/// so "AMD on G∖S, append S" is the documented stand-in per the spec), the
+/// arena is re-solved from scratch by AMD, and the round is kept only if it
+/// strictly lowers Σc² (anchored best-of — a failed sacrifice reverts and
+/// blacklists the vertex, never retried). Runs LAST, after MINL, on whatever
+/// incumbent the rest of the pipeline already produced.
+///
+/// `PHARMAKOS_MAX_NNZ`: top-level gate — skip the whole phase above this nnz
+/// (cost driver is nnz per the file's own timing-fact header; multiple
+/// filled-graph rebuilds per matrix here, unlike MINL's single pass, so this
+/// is set well under `MINL_MAX_LNNZ`'s scale to keep the added worst-case
+/// `order()` time small). RETIGHTENED post-measurement: `probe_pharmakos`
+/// over the 427-matrix reconstructed eval corpus fired (found ANY
+/// improvement) on exactly 4/427 matrices, all with nnz <= 49,190; every
+/// gt_10k / large-nnz matrix under the original 300k gate (gams04 nnz≈298k,
+/// arki0009 nnz≈61.5k, ringpack_30_1 nnz≈108.5k) cost real time
+/// (`probe_pharmakos_worst_timing`: +25-87ms per matrix even on a losing
+/// round) for zero wins, pushing the measured worst-case `order()` from
+/// ~0.87-0.93s to ~0.96-1.0s with no score benefit. 60,000 keeps every
+/// observed win with headroom (max winning nnz 49,190) and removes the
+/// costly-but-fruitless large-matrix tail.
+/// `PHARMAKOS_MAX_LNNZ`: per-round fill-size gate on `filled_graph` (same
+/// function/semantics as MINL's use) — a round whose pilot completion's own
+/// fill exceeds this bails out of the ritual loop entirely (gate OUT, fall
+/// through to the incumbent, zero loss, per the spec's "gate out matrices
+/// too large to stay cheap").
+/// `PHARMAKOS_MAX_ROUNDS`: bounded round budget (ritual repetition cap).
+/// `PHARMAKOS_TRIES_PER_ROUND`: how many candidate scapegoats (or batches)
+/// are tried per pilot-completion snapshot before giving up that round
+/// (each failed try is a full CAMD-stand-in + exact eval, so this bounds
+/// per-round cost independent of corpus structure).
+/// `PHARMAKOS_SMAX_MULT`/`_MIN`/`_ABS_CAP`: terminal-set size guard, `s_max
+/// ≈ mult·√n` clamped to `[min, abs_cap]` — "the crown must stay small" /
+/// separator-tax argument from the spec (a terminal block that grows past
+/// this stops paying for itself and risks a monolithic terminal clique).
+/// `PHARMAKOS_BATCH_N_THRESHOLD`/`PHARMAKOS_BATCH_K`: batch variant for
+/// large n — expel the top-k blame vertices per attempt instead of 1, to
+/// cut the number of CAMD-stand-in + exact-count re-runs. SIMPLIFICATION
+/// vs. the full spec: a failed batch is blacklisted whole (no automatic
+/// degrade-to-k=1 sub-batch retry) — documented choice, not implemented,
+/// given time budget.
+const PHARMAKOS_MAX_NNZ: usize = 60_000;
+const PHARMAKOS_MAX_LNNZ: usize = 500_000;
+const PHARMAKOS_MAX_ROUNDS: usize = 5;
+const PHARMAKOS_TRIES_PER_ROUND: usize = 3;
+const PHARMAKOS_SMAX_MULT: f64 = 2.0;
+const PHARMAKOS_SMAX_MIN: usize = 4;
+const PHARMAKOS_SMAX_ABS_CAP: usize = 200;
+const PHARMAKOS_BATCH_N_THRESHOLD: usize = 5_000;
+const PHARMAKOS_BATCH_K: usize = 8;
+
 /// TEST-ONLY (never compiled into the shipped binary): the best flops seen
 /// among non-anchor candidates during the last `order()` call. Probes reset it
 /// to `u64::MAX` before the call and read it after, to measure the runner-up
@@ -1151,7 +1211,19 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
 /// `relabel_cap`. `order()` passes `usize::MAX` (no extra cap, shipped
 /// behavior); probes pass `0` to measure the portfolio-minus-multi-start
 /// baseline so restart schedules can be compared at a true equal budget.
+///
+/// Thin wrapper over [`order_with_options`] (PHARMAKOS enabled) so every
+/// existing call site of this function — `order()` and every probe that
+/// already knew this name — is untouched by the PHARMAKOS phase's addition.
 fn order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
+    order_with_options(pattern, relabel_cap, true)
+}
+
+/// Same portfolio, with the PHARMAKOS phase (see the `PHARMAKOS_*` constants'
+/// doc comment) additionally toggleable — `pharmakos_enabled = false` gives
+/// probes the pre-phase incumbent for an isolated before/after comparison,
+/// mirroring how `relabel_cap` already isolates the relabel multi-start.
+fn order_with_options(pattern: &Pattern, relabel_cap: usize, pharmakos_enabled: bool) -> Vec<usize> {
 
     let n = pattern.n;
     if n == 0 {
@@ -2488,6 +2560,102 @@ fn order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
             }
         }
     }
+
+    // ── PHARMAKOS ORDERING — see the `PHARMAKOS_*` constants' doc comment
+    // for the theorem, the CAMD stand-in, and the batch simplification.
+    // Runs LAST (after MINL) so blame is computed on the pipeline's FINAL
+    // incumbent completion. Deterministic: fixed descending-blame /
+    // ascending-index scan order, no randomness, no time-of-day; every
+    // round is kept only if it is a STRICT improvement over the incumbent
+    // at the start of this phase (AMD floor intact transitively).
+    if pharmakos_enabled && nnz > 0 && nnz < PHARMAKOS_MAX_NNZ {
+        let mut arena_perm = best_perm.clone();
+        let mut arena_flops = best_flops;
+        let mut in_s = vec![false; n];
+        let mut untouchable = vec![false; n];
+        let mut s_count = 0usize;
+        let s_max = (PHARMAKOS_SMAX_MULT * (n as f64).sqrt()).round() as usize;
+        let s_max = s_max.clamp(PHARMAKOS_SMAX_MIN, PHARMAKOS_SMAX_ABS_CAP);
+        let batch_k = if n >= PHARMAKOS_BATCH_N_THRESHOLD { PHARMAKOS_BATCH_K } else { 1 };
+
+        for _round in 0..PHARMAKOS_MAX_ROUNDS {
+            if s_count >= s_max {
+                break;
+            }
+            let Some((fcp, fri)) = filled_graph(&scoring_pat, &arena_perm, PHARMAKOS_MAX_LNNZ)
+            else {
+                break; // pilot completion too large to stay cheap -> gate out, keep incumbent
+            };
+            let adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let permuted = permute_pattern(&scoring_pat, &arena_perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let counts = column_counts_gnp(&permuted, &etree);
+            let blame = pharmakos_blame(n, &arena_perm, &etree, &counts, &adj);
+
+            let mut eligible: Vec<usize> =
+                (0..n).filter(|&v| !in_s[v] && !untouchable[v]).collect();
+            if eligible.is_empty() {
+                break;
+            }
+            eligible.sort_unstable_by(|&a, &b| blame[b].cmp(&blame[a]).then(a.cmp(&b)));
+
+            let mut tries = 0usize;
+            let mut idx = 0usize;
+            let mut accepted_this_round = false;
+            while idx < eligible.len() && tries < PHARMAKOS_TRIES_PER_ROUND {
+                let take = batch_k.min(eligible.len() - idx);
+                let batch = &eligible[idx..idx + take];
+                if blame[batch[0]] == 0 {
+                    // No accusation signal left in this pilot snapshot -- further
+                    // candidates are pure ties, not worth the eval budget.
+                    break;
+                }
+                for &v in batch {
+                    in_s[v] = true;
+                }
+                tries += 1;
+                if let Some(cand) = pharmakos_terminal_reorder(&scoring_pat, &in_s) {
+                    if is_bijection(&cand, n) {
+                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            cached
+                        } else {
+                            ws.flops(&scoring_pat, &cand)
+                        };
+                        if f < arena_flops {
+                            arena_flops = f;
+                            arena_perm = cand;
+                            s_count += take;
+                            accepted_this_round = true;
+                            break; // ritual re-run: rebuild the clique tree next round
+                        }
+                    }
+                }
+                // Failed sacrifice ⇒ revert, mark untouchable, try the next
+                // candidate(s) against the SAME pilot snapshot (no rebuild).
+                for &v in batch {
+                    in_s[v] = false;
+                    untouchable[v] = true;
+                }
+                idx += take;
+            }
+            if !accepted_this_round {
+                break;
+            }
+        }
+
+        if arena_flops < best_flops {
+            best_flops = arena_flops;
+            best_perm = arena_perm;
+        }
+    }
+
     let _ = best_flops;
 
     best_perm
@@ -2579,6 +2747,110 @@ fn minl_mcs_peo(n: usize, adj: &[Vec<u32>]) -> Vec<usize> {
     }
     visit.reverse();
     visit
+}
+
+/// PHARMAKOS blame pass: `blame(v) = Σ_{K ∋ v} (|K|-1)²` over the EXACT
+/// maximal cliques of the chordal completion `perm` induces, computed in one
+/// pass over the elimination tree + filled-graph adjacency (no standalone
+/// clique-tree struct exists in this crate — this recovers the same
+/// information from what's already built: `EliminationTree`/
+/// `column_counts_gnp`, same as every other phase, plus `filled_graph`'s
+/// adjacency, same as MINL).
+///
+/// Maximal-clique recovery is the standard fundamental-supernode test (Liu,
+/// Ng & Peyton 1993): elimination-tree node `p` is ABSORBED into its unique
+/// child `j`'s clique (i.e. `column(p)` is a strict subset of `column(j)`,
+/// not a distinct maximal clique) iff `p` has exactly one child `j` AND
+/// `counts[j] == counts[p] + 1`. Every non-absorbed rank `r` is a
+/// "representative": its maximal clique is `{perm[r]} ∪ {w ∈
+/// adj[perm[r]] : rank[w] > r}`, read directly off the filled-graph
+/// adjacency (cliques are complete subgraphs, so this is EXACT membership,
+/// not inferred). `O(Σ_{representative r} |K_r|) ≤ O(nnz(L))`.
+fn pharmakos_blame(
+    n: usize,
+    perm: &[usize],
+    etree: &EliminationTree,
+    counts: &[usize],
+    adj: &[Vec<u32>],
+) -> Vec<u64> {
+    let mut rank = vec![0usize; n];
+    for (r, &v) in perm.iter().enumerate() {
+        rank[v] = r;
+    }
+    let children = etree.children();
+    let mut absorbed = vec![false; n];
+    for p in 0..n {
+        if children[p].len() == 1 {
+            let j = children[p][0];
+            if counts[j] == counts[p] + 1 {
+                absorbed[p] = true;
+            }
+        }
+    }
+    let mut blame = vec![0u64; n];
+    for r in 0..n {
+        if absorbed[r] {
+            continue;
+        }
+        let v_r = perm[r];
+        let k_extra = adj[v_r].iter().filter(|&&w| rank[w as usize] > r).count();
+        let k_size = k_extra + 1;
+        if k_size <= 1 {
+            continue;
+        }
+        let term = ((k_size - 1) as u64) * ((k_size - 1) as u64);
+        blame[v_r] += term;
+        for &w in &adj[v_r] {
+            if rank[w as usize] > r {
+                blame[w as usize] += term;
+            }
+        }
+    }
+    blame
+}
+
+/// PHARMAKOS's CAMD stand-in (no constrained-AMD entry point exists in
+/// `feral_amd`): order the arena `V ∖ S` by ordinary AMD on the induced
+/// subgraph, then append `S` LAST sorted by ASCENDING ORIGINAL INDEX — the
+/// spec's explicit documented fallback choice ("AMD on G∖S then append S
+/// ordered by ascending original index"), deliberately NOT the
+/// degree-sorted tail STRIP/TELOS use elsewhere in this file, to match the
+/// spec literally. Same induced-subgraph construction as `strip_candidate`.
+/// Deterministic; returns `None` only if the subgraph AMD call fails.
+fn pharmakos_terminal_reorder(sp: &ScoringPattern, in_s: &[bool]) -> Option<Vec<usize>> {
+    let n = sp.n;
+    let mut new_id = vec![usize::MAX; n];
+    let mut old_id: Vec<usize> = Vec::new();
+    for v in 0..n {
+        if !in_s[v] {
+            new_id[v] = old_id.len();
+            old_id.push(v);
+        }
+    }
+    let m = old_id.len();
+    if m == 0 {
+        // Degenerate: the whole graph got expelled. Ascending index is a
+        // valid bijection and keeps the fallback deterministic.
+        return Some((0..n).collect());
+    }
+    let mut scp: Vec<i32> = Vec::with_capacity(m + 1);
+    let mut sri: Vec<i32> = Vec::new();
+    scp.push(0);
+    for &v in &old_id {
+        for kk in sp.col_ptr[v]..sp.col_ptr[v + 1] {
+            let w = sp.row_idx[kk];
+            if !in_s[w] {
+                sri.push(new_id[w] as i32);
+            }
+        }
+        scp.push(sri.len() as i32);
+    }
+    let core = feral_ordering_core::CscPattern::new(m, &scp, &sri)?;
+    let sub_amd = feral_amd::amd_order(&core).ok()?;
+    let mut perm: Vec<usize> = sub_amd.iter().map(|&x| old_id[x as usize]).collect();
+    let tail: Vec<usize> = (0..n).filter(|&v| in_s[v]).collect(); // already ascending
+    perm.extend(tail);
+    Some(perm)
 }
 
 /// Minimum-FILL (minimum-deficiency) ordering (pure Rust, hard work budget).
