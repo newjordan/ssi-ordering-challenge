@@ -4,13 +4,27 @@ The map of the knowledge base. One line per page, grouped by type. Read this
 first; keep it current whenever you add, rename, or retire a page.
 
 ## Current best
-- Best score: dev **0.876511** (density-guarded heavy tier; fill 0.962099),
-  2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
+- Best score: dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
+  see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
+  (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
   (0004) FAILED the grader — see [0005](experiments/0005-eval-fail-density-regate.md).
 - **EVAL CENSUS available**: the grader prints per-matrix results into each
   submission's public Actions log; [0005](experiments/0005-eval-fail-density-regate.md)
   has the mining commands. 500 matrices, ties 111/47/33 per bucket. Target eval,
   not dev extrapolation.
+- ⭐ **THE EVAL CORPUS ITSELF IS RECONSTRUCTED — STOP EXTRAPOLATING FROM DEV.**
+  Dev and eval share **exactly ONE matrix** on `(n, nnz)`. The eval names are
+  MINLPLib instances and `flops(AMD)` is an exact oracle, so **427 of 500 are
+  verified bit-for-bit**. The shipped code that graded 0.8844 scores **0.8831**
+  on them — 0.15% error, all buckets tracking. Measure changes directly:
+  `SSI_CORPUS_FILE=~/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl cargo run --release --offline --locked`
+  See [0010](experiments/0010-parallel-research-session.md). Regenerate for a new
+  round with the scripts in that directory.
+- ⚠️ **THE CAP IS TIGHTER THAN IT LOOKS.** Identical code passed the enforced-cap
+  test twice and FAILED a third run. A green cap test is weak evidence; a red one
+  is strong. No candidate can make the score worse (verified: zero of 500 graded
+  matrices exceed 1.000) but one breach fails the whole run — **the risk is
+  asymmetric, so ship less when in doubt.**
 - Per bucket: lt_1k 0.9073 (147) · 1k_10k 0.9069 (108) · gt_10k 0.8306 (45).
 - **99** matrices still tied at exactly 1.000 (58 lt_1k · 24 1k_10k · 17 gt_10k);
   re-run `probe_ties` rather than trusting that number.
@@ -71,6 +85,17 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
 - [0003-relabelled-amd-multistart.md](experiments/0003-relabelled-amd-multistart.md) — `AMD(Q A Qᵀ)` composed back through `Q` as a randomized-restart minimum degree, on a per-matrix time budget. 0.883906 → **0.876925**. WIN, the largest single gain so far.
 - [0004-heavy-tier-gates.md](experiments/0004-heavy-tier-gates.md) — heavy-tier nnz-window gates. Dev win (0.876329) but **FAILED the grader**; probe-contamination findings remain valid.
 - [0005-eval-fail-density-regate.md](experiments/0005-eval-fail-density-regate.md) — the FAIL autopsy, the **eval census** discovery, and the density re-gate (`nnz<=6n`, amdnd ceiling 700k). Dev 0.876511, predicted exactly.
+- [0006-hillclimb-phase.md](experiments/0006-hillclimb-phase.md) — structured relabelings LOSE at equal budget (top lead resolved, negative), but a bucket-weighted hill-climb phase APPENDED after the random multi-start wins: 0.876511 → **0.875359**. Promoted: eval 0.885313 (`952ef52`).
+- [0007-heavy-multi-restart.md](experiments/0007-heavy-multi-restart.md) — heavy relabel passes are 4-23× cheaper than the old cost model; budget-scaled `clamp(900k/nnz,1,4)` passes on sparse heavy. 0.875359 → **0.875217** dev; real target is the 6-8 sparse-heavy EVAL ties. Promoted: eval 0.885175 (`e53a6f3`).
+- [0008-amdnd-ceiling-restore.md](experiments/0008-amdnd-ceiling-restore.md) — `probe_vheavy` isolated re-measurement: the 700k amdnd ceiling's cost model was 2× pessimistic; restored to 1.5M, gabriel10 0.9756 reclaimed. 0.875217 → **0.875036** dev. Promoted: eval 0.885170 (`37ec258`) — near-zero eval delta, gabriel10 is dev-only.
+- [0009-separator-negative-hc-extend.md](experiments/0009-separator-negative-hc-extend.md) — heavy separators are DEAD (METIS/Scotch 1.4-4.5× worse than AMD on the sparse heavy class, Scotch 9519× on faclay75); hc gate audited 60k→165k, crudeoil_pooling_dt3 0.972→0.954. 0.875036 → **0.874894** dev.
+
+- [0010-parallel-research-session.md](experiments/0010-parallel-research-session.md) — **read this
+  one.** Eval-corpus reconstruction (427/500 exact, calibrated to 0.15%); the **diversity-beats-quality**
+  thesis (four metrics all WORSE than AMD standalone bought −0.0088 together); the **STRIP transform**
+  (−0.0098, largest single win yet); proof the **tie seam is inert** (11 of 12 tied large matrices flat
+  to 200 restarts, while the responders are matrices we already win); the **cap pass/fail flip**; the
+  `select_pivot_amf` **cost cliff**; and 27.4% of scored candidates being exact duplicates.
 
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
