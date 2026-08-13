@@ -224,7 +224,7 @@ const AMF_SWEEP_MAX_N: usize = 300_000;
 /// zero score would be pure added cost on exactly the matrices that can
 /// least afford it, so WIN F's own envelope stops well below the gate wall
 /// rather than reusing the full 130_000 ceiling.
-const WINF_MAX_NNZ: usize = 100_000;
+const WINF_MAX_NNZ: usize = 130_000;
 /// nnz ceiling for the extra sweep-found AMD α1/α16 passes in the MEDIUM block.
 /// Excludes high-nnz dense mediums (nuclear104 nnz=258k) that already load the
 /// candidate stack near the 2 s cap; below it each AMD pass is a few ms.
@@ -644,7 +644,7 @@ const STRIPV2_DENSE_SPLIT_AVG_DEG: f64 = 35.0;
 /// grid — worst-case driver eigena2 (nnz=372,500, Σc²(AMD)=5.2e9,
 /// 1 GNP + 2 passes + 5 evals). Flagged for isolated timing before
 /// submission.
-const TELOS_MAX_NNZ: usize = 150_000;
+const TELOS_MAX_NNZ: usize = 400_000;
 const TELOS_TIER_A_MAX_NNZ: usize = 150_000;
 /// Tier-A sub-orderer pass budget per round: passes = clamp(this/nnz,
 /// TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A). 700k (vs the probe's 1M) leans
@@ -1041,7 +1041,8 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
 /// verified safety; re-widening it needs isolated per-candidate timing on the
 /// heavy tier first, not another analytic guess.
 const STRIP_MAX_AVG_DEG: usize = 24; // nnz/n >= 25 disables strip entirely
-const STRIP_MAX_NNZ: usize = 130_000;
+const STRIP_MAX_NNZ: usize = 400_000;
+const STRIP_MAX_N: usize = 30_000; // strip cost scales with n; cap-safety limit
 
 /// Build one strip candidate: delete the first `k` vertices of `ranked`
 /// (already sorted DESCENDING by the strip criterion, ties broken by ascending
@@ -1975,7 +1976,7 @@ fn order_with_options(
     // for the measurement that set this boundary. Best-of floor →
     // zero-downside; cost envelope is analytic only (see [`STRIP_MAX_NNZ`]),
     // flagged for isolated timing.
-    if n > 0 && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG + 1) * n {
+    if n > 0 && n < STRIP_MAX_N && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG + 1) * n {
         let mut deg_ranked: Vec<usize> = (0..n).collect();
         deg_ranked.sort_unstable_by(|&a, &b| {
             let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
