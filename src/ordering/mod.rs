@@ -1296,6 +1296,39 @@ fn strip_from_induced(
     Some(perm)
 }
 
+/// STRIP-transform variant that orders the induced remainder with AMF
+/// (approximate minimum FILL) instead of AMD (min-degree) — same peel-and-append
+/// structure as [`strip_from_induced`], reusing the identical incrementally-built
+/// `InducedSubgraph` (no rebuild cost). Experiment 0013: STRIP wins on the
+/// low-density hub class because AMD's dense-column deferral never fires there;
+/// running AMF on the remainder is a different objective on exactly that class,
+/// free upside under the best-of floor. `dense_alpha` per caller.
+fn strip_from_induced_amf(
+    sp: &ScoringPattern,
+    sub: &nested_subgraph::InducedSubgraph,
+    removed_prefix: &[usize],
+    dense_alpha: f64,
+) -> Option<Vec<i32>> {
+    let core = feral_ordering_core::CscPattern::new(
+        sub.local_to_global.len(),
+        &sub.col_ptr,
+        &sub.row_idx,
+    )?;
+    let opts = feral_amf::AmfOptions {
+        dense_alpha,
+        ..Default::default()
+    };
+    let (sub_amf, ..) = feral_amf::amf_order_opts(&core, &opts).ok()?;
+    let mut perm: Vec<i32> = sub_amf
+        .iter()
+        .map(|&x| sub.local_to_global[x as usize] as i32)
+        .collect();
+    let mut tail: Vec<usize> = removed_prefix.to_vec();
+    tail.sort_unstable_by_key(|&v| (sp.col_ptr[v + 1] - sp.col_ptr[v], v));
+    perm.extend(tail.into_iter().map(|v| v as i32));
+    Some(perm)
+}
+
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     // TEST-ONLY hook: when SSI_TEST_SLEEP_MS is set, sleep that long before
@@ -2008,6 +2041,16 @@ fn order_with_options(
         // is byte-identical to the old `strip_candidate(&scoring_pat,
         // &deg_ranked, k)` call it replaces for each surviving k — see its
         // doc comment.
+        // AMF-core STRIP (experiment 0013) gate: min-fill on the stripped
+        // remainder is diversity on the low-density hub class, but each pass adds
+        // an AMF call. The STRIP win concentrates on smaller matrices while the
+        // worst `order()` times all sit on STRIP-eligible large matrices
+        // (ringpack/gams05/crudeoil, nnz≈100-250k) that are ALREADY big wins AMF
+        // can't flip — so gate the AMF-core passes at `nnz ≤ 60k`, keeping the
+        // win off the near-cap tier. (Measured: ungated pushed worst 0.935→0.977s
+        // for the same score; gated keeps ~0.935s.)
+        const STRIP_AMF_MAX_NNZ: usize = 60_000;
+        let strip_amf = nnz <= STRIP_AMF_MAX_NNZ;
         let ks: Vec<usize> = [96usize, 64, 48, 24, 6].into_iter().filter(|&k| k < n).collect();
         if let Some((&k0, rest)) = ks.split_first() {
             let (mut deg_builder, deg_sub0) =
@@ -2016,6 +2059,12 @@ fn order_with_options(
                 strip_from_induced(&scoring_pat, &deg_sub0, &deg_ranked[..k0])
                     .ok_or(feral_ordering_core::OrderingError::MalformedInput)
             });
+            if strip_amf {
+                consider(&|| {
+                    strip_from_induced_amf(&scoring_pat, &deg_sub0, &deg_ranked[..k0], 5.0)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                });
+            }
             let mut k_prev = k0;
             for &k in rest {
                 let deg_sub = deg_builder.advance_to(&deg_ranked, k, k_prev);
@@ -2023,6 +2072,12 @@ fn order_with_options(
                     strip_from_induced(&scoring_pat, &deg_sub, &deg_ranked[..k])
                         .ok_or(feral_ordering_core::OrderingError::MalformedInput)
                 });
+                if strip_amf {
+                    consider(&|| {
+                        strip_from_induced_amf(&scoring_pat, &deg_sub, &deg_ranked[..k], 5.0)
+                            .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                    });
+                }
                 k_prev = k;
             }
         }
@@ -2136,27 +2191,48 @@ fn order_with_options(
     // passes). Same `relabel(n, seed)` seeds as the AMD loop by design: AMF on
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
+    // RELABEL-AMF α SWEEP (`sbx-relabel-amf-alpha`, experiment 0011→0012): the
+    // base pass uses AMF's default dense_alpha 5.0; the base (non-relabelled) AMF
+    // α-sweep (win D, mod.rs:1442) found α=2.5 and α=0.5 each win a matrix that
+    // α5 misses, so the objective is α-sensitive. Mirror that here as extra
+    // relabelled-AMF diversity. The α5 pass keeps the full `nnz ≤ 130k` envelope;
+    // the two extra α values are gated TIGHTER at `nnz ≤ 60k` so they never touch
+    // the near-cap matrices (ringpack/crudeoil at nnz≈100-120k set the worst
+    // `order()` time) — added cost lands only on smaller matrices where AMF is
+    // cheap and the timing probe shows large headroom. Cost-additive but bounded.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
-    if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        let amf_opts = feral_amf::AmfOptions {
-            dense_alpha: 5.0,
-            ..Default::default()
-        };
+    const RELABEL_AMF_ALPHA_MAX_NNZ: usize = 60_000;
+    if nnz > 0 && relabel_cap > 0 {
+        // (dense_alpha, nnz gate) for each relabelled-AMF variant.
+        let amf_variants: [(f64, usize); 3] = [
+            (5.0, RELABEL_AMF_MAX_NNZ),
+            (2.5, RELABEL_AMF_ALPHA_MAX_NNZ),
+            (0.5, RELABEL_AMF_ALPHA_MAX_NNZ),
+        ];
         let amf_restarts =
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
-        for r in 0..amf_restarts {
-            let seed = r as u64 + 1;
-            consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-                // Compose back: `q[k]` is the original vertex that B numbers `k`.
-                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
+        for (alpha, max_nnz) in amf_variants {
+            if nnz > max_nnz {
+                continue;
+            }
+            let amf_opts = feral_amf::AmfOptions {
+                dense_alpha: alpha,
+                ..Default::default()
+            };
+            for r in 0..amf_restarts {
+                let seed = r as u64 + 1;
+                consider(&|| {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(&scoring_pat, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
+                    // Compose back: `q[k]` is the original vertex that B numbers `k`.
+                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+                });
+            }
         }
     }
 
