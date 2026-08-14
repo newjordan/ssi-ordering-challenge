@@ -2137,14 +2137,48 @@ fn order_with_options(
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
+    const RELABEL_AMF_ALPHA_MAX_NNZ: usize = 60_000;
     if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        let amf_opts = feral_amf::AmfOptions {
-            dense_alpha: 5.0,
-            ..Default::default()
-        };
-        let amf_restarts =
+        let amf_variants: [(f64, usize); 3] = [
+            (5.0, RELABEL_AMF_MAX_NNZ),
+            (2.5, RELABEL_AMF_ALPHA_MAX_NNZ),
+            (0.5, RELABEL_AMF_ALPHA_MAX_NNZ),
+        ];
+        for (alpha, max_nnz) in amf_variants {
+            if nnz > max_nnz { continue; }
+            let amf_opts = feral_amf::AmfOptions {
+                dense_alpha: alpha,
+                ..Default::default()
+            };
+            let amf_restarts =
+                relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
+            for r in 0..amf_restarts {
+                let seed = r as u64 + 1;
+                consider(&|| {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(&scoring_pat, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
+                    // Compose back: `q[k]` is the original vertex that B numbers `k`.
+                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+                });
+            }
+        }
+    }
+
+    // RELABELLED no-dense AMD — another objective-flavored relabel on small
+    // matrices. Suppressing dense-column deferral changes which vertices AMD
+    // eliminates last, and on the smaller patterns it often finds a different
+    // minimum-degree ordering without touching the n≈18k cap bottleneck. The
+    // n<15_000 gate keeps ringpack_30_2 and the crudeoil_lee4_* class out.
+    const RELABEL_ND_MAX_N: usize = 15_000;
+    if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && n < RELABEL_ND_MAX_N && relabel_cap > 0 {
+        let nd_restarts =
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
-        for r in 0..amf_restarts {
+        for r in 0..nd_restarts {
             let seed = r as u64 + 1;
             consider(&|| {
                 let q = relabel(n, seed);
@@ -2153,8 +2187,8 @@ fn order_with_options(
                 let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
                 let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
                     .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-                // Compose back: `q[k]` is the original vertex that B numbers `k`.
+                let nd_opts = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &nd_opts)?;
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
             });
         }
