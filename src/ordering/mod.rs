@@ -2113,50 +2113,38 @@ fn order_with_options(
         });
     }
 
-    // RELABELLED-AMF MULTISTART (`sbx-relabel-amf`): the relabel trick above
-    // works because AMD's tie-break reads the vertex numbering, so `AMD(QAQᵀ)`
-    // composed back through `Q` is a distinct minimum-DEGREE ordering per seed.
-    // AMF (approximate minimum FILL) is a *different objective* that is already
-    // a strong, distinct family in this portfolio (the α-sweep above), and its
-    // tie-break likewise reads the numbering — so `AMF(QAQᵀ)` composed back is a
-    // randomized-restart minimum-FILL ordering for the cost of one AMF pass.
-    // The knowledge base's own theses motivate this directly: "look for variation
-    // WITHIN a winning family before adding another" (best-of-portfolio.md) and
-    // "diversity beats quality" (experiment 0010) — relabelled-AMF is free
-    // diversity drawn from the fill objective the tied class (where min-degree
-    // AMD already won over every candidate) has never been probed under.
-    //
-    // Cap-safety: AMF per-pass cost scales with nnz (~0.26s on nnz≈1M in the
-    // α-sweep), so this is gated well below that class at `nnz <= 130_000` (the
-    // ND/RCM/Sloan envelope, where isolated cost is small and the timing probe
-    // shows large headroom — most such matrices run <0.1s total), and the
-    // restart count comes from the SAME per-matrix time budget as the AMD
-    // multistart (`RELABEL_BUDGET/nnz`, capped), which bounds added cost at
-    // every point at once (nnz=130k → 2 passes ≈0.08s; tiny nnz → 24 trivial
-    // passes). Same `relabel(n, seed)` seeds as the AMD loop by design: AMF on
-    // the identical relabelled graph is a genuinely different candidate, and
-    // every result is bijection-checked in `consider` before it can win.
+    // RELABELLED-AMF MULTI-START — mirror of the relabelled-AMD multistart
+    // above, but optimizing approximate minimum fill on the shuffled pattern.
+    // A new objective (fill) on the same free-diversity play as 0003; wins
+    // are concentrated in the 1k_10k bucket (per darenspears' 0011 experiment).
+    // Sweep the same dense-alpha family the base AMF sweep uses; restrict the
+    // extra 2.5/0.5 alphas to smaller matrices where the added passes stay cheap
+    // and avoid the n≈18k / nnz≈120k class that is already the cap bottleneck.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
+    const RELABEL_AMF_EXTRA_ALPHA_MAX_N: usize = 15_000;
     if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        let amf_opts = feral_amf::AmfOptions {
-            dense_alpha: 5.0,
-            ..Default::default()
+        let amf_alphas: &[f64] = if n < RELABEL_AMF_EXTRA_ALPHA_MAX_N {
+            &[5.0, 2.5, 0.5]
+        } else {
+            &[5.0]
         };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
-        for r in 0..amf_restarts {
-            let seed = r as u64 + 1;
-            consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-                // Compose back: `q[k]` is the original vertex that B numbers `k`.
-                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
+        for &alpha in amf_alphas {
+            let amf_opts = feral_amf::AmfOptions { dense_alpha: alpha, ..Default::default() };
+            let amf_restarts =
+                relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
+            for r in 0..amf_restarts {
+                let seed = r as u64 + 1;
+                consider(&|| {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(&scoring_pat, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
+                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+                });
+            }
         }
     }
 
