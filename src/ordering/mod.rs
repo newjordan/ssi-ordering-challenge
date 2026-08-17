@@ -293,8 +293,8 @@ const NDFM_MAX_NNZ: usize = 130_000;
 /// worst-scoring small buckets' tied-at-AMD combinatorial/network graphs
 /// (`wastewater*`, `wastepaper6`, `syn*`, `tln2`). Deterministic. Best-of floor
 /// → zero-downside.
-const MINFILL_MAX_N: usize = 3_000;
-const MINFILL_MAX_NNZ: usize = 12_000;
+const MINFILL_MAX_N: usize = 4_000;
+const MINFILL_MAX_NNZ: usize = 16_000;
 
 /// METIS runtime is structure-dependent and can explode on large/dense patterns
 /// (measured: 6.2 s at nnz≈1.38M). Bound it by nnz PRIMARILY (the cost driver),
