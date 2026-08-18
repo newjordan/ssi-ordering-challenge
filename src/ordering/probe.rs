@@ -3519,3 +3519,108 @@ fn probe_stack() {
         giant_mismatches
     );
 }
+
+/// EXACT-DP census: for every corpus matrix small enough to solve exactly,
+/// compare the shipped portfolio against the PROVABLE optimum of `Σ cⱼ²`.
+///
+/// This answers the only question that matters before shipping the DP: on the
+/// tiny-`n` class the portfolio already samples heavily (24 relabel restarts of
+/// AMD, the AMF multistart, and every other candidate), is there any gap left
+/// between "best of many heuristics" and "optimal"? Prints the per-matrix gap,
+/// the exact solve time, and what the dev score would become.
+#[test]
+#[ignore]
+fn probe_exact_dp() {
+    let corpus = crate::corpus::corpus();
+    let max_n: usize = std::env::var("EXACT_MAX_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    println!(
+        "{:<26} {:>4} {:>6} {:>9} {:>9} {:>9} {:>8}",
+        "matrix", "n", "nnz", "amd", "portfolio", "exact", "secs"
+    );
+
+    let mut improved = 0usize;
+    let mut considered = 0usize;
+    let mut worst_secs = 0.0f64;
+    // Σ of ln(ratio) deltas, for pricing the change against the dev score.
+    let mut ln_delta_sum = 0.0f64;
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n > max_n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+        let port = flops_of(&sp, &order(pat));
+
+        let Some(adj) = crate::ordering::exact_dp::adjacency(n, &pat.col_ptr, &pat.row_idx) else {
+            continue;
+        };
+        let t0 = Instant::now();
+        let Some((perm, dp_flops)) = crate::ordering::exact_dp::exact_min_flops_order(n, &adj)
+        else {
+            continue;
+        };
+        let secs = t0.elapsed().as_secs_f64();
+        worst_secs = worst_secs.max(secs);
+
+        // Independently re-score the DP's permutation through the SAME trusted
+        // scoring path the grader uses — never trust the DP's own accumulator.
+        assert!(
+            super::is_bijection(&perm, n),
+            "{name}: exact DP returned a non-bijection"
+        );
+        let exact = flops_of(&sp, &perm);
+        assert_eq!(
+            exact, dp_flops,
+            "{name}: DP objective {dp_flops} disagrees with the trusted scorer {exact}"
+        );
+        assert!(
+            exact <= port,
+            "{name}: exact {exact} is WORSE than the portfolio {port} — DP is wrong"
+        );
+
+        considered += 1;
+        if exact < port {
+            improved += 1;
+            ln_delta_sum += (exact as f64 / port as f64).ln();
+        }
+
+        println!(
+            "{:<26} {:>4} {:>6} {:>9} {:>9} {:>9} {:>8.4}{}",
+            name,
+            n,
+            pat.nnz(),
+            amd,
+            port,
+            exact,
+            secs,
+            if exact < port { "  <-- WIN" } else { "" }
+        );
+    }
+
+    // lt_1k leverage: d(score) per unit ln(ratio) = w * geomean_b / count_b.
+    // Every matrix this small is in lt_1k by construction.
+    const LT1K_LEVERAGE: f64 = 0.30 * 0.899524 / 147.0;
+    println!("\n--- exact-DP census (n <= {max_n}) ---");
+    println!("matrices solved exactly : {considered}");
+    println!("strictly improved       : {improved}");
+    println!("worst exact solve       : {worst_secs:.4} s");
+    println!(
+        "predicted dev gain      : {:.6} of score",
+        -ln_delta_sum * LT1K_LEVERAGE
+    );
+}

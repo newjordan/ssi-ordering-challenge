@@ -4,16 +4,7 @@ The map of the knowledge base. One line per page, grouped by type. Read this
 first; keep it current whenever you add, rename, or retire a page.
 
 ## Current best
-- Best score: dev **0.843417** (relabel α-diversity, [0012](experiments/0012-relabel-alpha-diversity.md);
-  CURRENT-ROUND corpus, 147/108/45). Cost-neutral (zero added generation passes),
-  so cap risk is structurally identical to the frontier. Previous: dev 0.843535
-  (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md)).
-- ⚠️ **DEV CAN NO LONGER RESOLVE OUR WINS.** The last three shipped deltas are
-  −0.0018, −0.0001, −0.0001 while dev and eval share exactly ONE matrix on
-  `(n,nnz)` and recent REJECTIONS sat at +0.0002…+0.0009. Rebuilding the
-  reconstructed eval corpus ([0010](experiments/0010-parallel-research-session.md)a)
-  is now the blocking instrument, not an optimization. It is NOT present in a
-  fresh environment (`~/ssi-ordering-LEARNINGS/` lives outside the repo). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -104,19 +95,33 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   relabelled-**AMF** multistart alongside the relabelled-AMD one (0003): same relabel+compose-back,
   min-fill objective instead of min-degree. Free diversity within a winning family. dev
   0.845333→**0.843535**, all in 1k_10k. Gated nnz≤130k; worst order() 0.945s.
-- [0012-relabel-alpha-diversity.md](experiments/0012-relabel-alpha-diversity.md) — cycle
-  `dense_alpha` across relabel restarts at IDENTICAL pass count: free diversity, zero added
-  cost. dev 0.843535→**0.843417**. Also re-sizes the long-disabled **win C** from measured
-  constants (the "1.5 s" envelope was a unit-convention artifact; nnz cancels, so added cost
-  ≈ `k*budget`) — then DECLINES it anyway at −0.000035, because it was the only change
-  carrying cap risk. Records that **the α axis cannot reach gt_10k by construction** (those
-  matrices afford ~1 restart, so they only ever see grid slot 0).
 - [0010-parallel-research-session.md](experiments/0010-parallel-research-session.md) — **read this
   one.** Eval-corpus reconstruction (427/500 exact, calibrated to 0.15%); the **diversity-beats-quality**
   thesis (four metrics all WORSE than AMD standalone bought −0.0088 together); the **STRIP transform**
   (−0.0098, largest single win yet); proof the **tie seam is inert** (11 of 12 tied large matrices flat
   to 200 restarts, while the responders are matrices we already win); the **cap pass/fail flip**; the
   `select_pivot_amf` **cost cliff**; and 27.4% of scored candidates being exact duplicates.
+
+- [0012-exact-dp-small-n.md](experiments/0012-exact-dp-small-n.md) — **NEGATIVE, conclusive.**
+  Exact subset-DP minimization of `Σ cⱼ²` (the elimination game is order-independent per
+  eliminated SET, so `f(S∪{v}) = min_v f(S)+c(v,S)²` is valid). On all **30** dev matrices with
+  `n ≤ 24` the portfolio is already **provably optimal** — 0 improvements, `exact == portfolio`
+  bit-for-bit. The bottom of `lt_1k` is SOLVED, not under-searched: stop spending effort below
+  `n = 25`. Unshippable regardless (1.51 s at n=24 vs the 2 s cap). Retained as a correctness
+  instrument: `probe_exact_dp` asserts bijection, DP-objective == trusted scorer, and
+  `exact ≤ portfolio`.
+
+- [0013-gate-covariate-audit.md](experiments/0013-gate-covariate-audit.md) — **WIN, dev
+  0.843535→0.843129.** Four pure additions (monotone under the best-of floor, so score risk is
+  structurally zero and only TIME is at stake): AMF `n`-caps 250k/300k→320k (wrong-covariate — AMF
+  cost is nnz-driven but `n` was binding on `acopf_case9241pegase_qcqp`, excluded from ALL THREE AMF
+  regimes); a **D_WIDE SPARSE ARM** re-admitting the α0.5 pass whose documented `cont6-qq` win
+  0.8899→0.8484 had never actually been live; a **relabelled no-dense AMD multistart** (`nnz≤60k`,
+  a different basin from 0003 since dense-column deferral is off); and RCM/Sloan/ND/NDFM 130k→180k.
+  Also a NEGATIVE worth reading: `WINF_MAX_NNZ` is an accidental no-op, and "restoring" its
+  documented intent REGRESSED gt_10k — those 7 variants do win on the gate-wall matrices. And a
+  systemic correction: the "`nnz<130000` is below the slow tier" premise in **eleven** doc comments
+  is refuted — 130k is where cost is MAXIMAL (`ringpack_30_2`, nnz=121458, is the worst matrix).
 
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

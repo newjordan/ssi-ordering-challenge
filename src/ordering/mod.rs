@@ -182,6 +182,13 @@ use scoring_ws::ScoreWorkspace;
 /// algorithm and the byte-identical-to-naive-rebuild proof.
 mod nested_subgraph;
 
+/// EXACT minimum-`Σ cⱼ²` ordering by subset DP over the elimination game — the
+/// one candidate family here that is provably optimal rather than heuristic.
+/// Only reachable on very small `n` (see `EXACT_DP_MAX_N`), where the whole
+/// portfolio currently costs well under a millisecond and the 2 s cap is
+/// effectively unbounded.
+mod exact_dp;
+
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
 use feral::sparse::csc::CscPattern as ScoringPattern;
@@ -190,7 +197,7 @@ use feral::symbolic::column_counts_gnp;
 /// AMF cost is a smooth ~1.4x of AMD's with no observed structural blow-up, so
 /// its α-5 variant runs on all but the very largest problems, preserving the big
 /// gt_10k wins (e.g. pooling_*). This is the SAME envelope as the prior safe run.
-const AMF_MAX_N: usize = 250_000;
+const AMF_MAX_N: usize = 320_000;
 const AMF_MAX_NNZ: usize = 1_500_000;
 
 /// Medium-size envelope for the *extra* tuned candidates (α-5/α-2 AMD, default
@@ -209,7 +216,7 @@ const MEDIUM_MAX_NNZ: usize = 400_000;
 /// other candidates on high-nnz mediums, which is bounded by also requiring the
 /// tighter MEDIUM/ROBUST-gated variants to have dropped out by then (n cap).
 const AMF_SWEEP_MAX_NNZ: usize = 1_500_000;
-const AMF_SWEEP_MAX_N: usize = 300_000;
+const AMF_SWEEP_MAX_N: usize = 320_000;
 /// WIN F (7 new custom-metric variants, `metric_sweep.rs` top-7 sweep,
 /// `sbx-metrics2`) envelope. Narrower than the `nnz < 130_000` envelope the
 /// rest of this block shares: `probe_winf_gatewall` measured directly that
@@ -246,7 +253,7 @@ const ROBUST_MAX_NNZ: usize = 130_000;
 /// the worst case; the generous `n` cap lets it reach the large-but-sparse
 /// gt_10k ties. Best-of floor makes it zero-downside.
 const RCM_MAX_N: usize = 150_000;
-const RCM_MAX_NNZ: usize = 130_000;
+const RCM_MAX_NNZ: usize = 180_000;
 
 /// Sloan profile/wavefront-reduction envelope. Sloan is pure Rust, O(nnz log n)
 /// — a few milliseconds even at large n — so it is bounded PRIMARILY by nnz. The
@@ -256,7 +263,7 @@ const RCM_MAX_NNZ: usize = 130_000;
 /// (`watercontamination*`, `transswitch0300p`) that the minimum-degree and ND
 /// families leave tied at AMD. Best-of floor makes it zero-downside.
 const SLOAN_MAX_N: usize = 150_000;
-const SLOAN_MAX_NNZ: usize = 130_000;
+const SLOAN_MAX_NNZ: usize = 180_000;
 
 /// Hand-rolled NESTED-DISSECTION envelope. Our own pure-Rust recursive graph
 /// bisection is O(nnz log n) with a hard work budget, so it is bounded PRIMARILY
@@ -267,7 +274,7 @@ const SLOAN_MAX_NNZ: usize = 130_000;
 /// instances. Deterministic (fixed seeding, deterministic partition ordering).
 /// Best-of floor makes it zero-downside.
 const ND_MAX_N: usize = 150_000;
-const ND_MAX_NNZ: usize = 130_000;
+const ND_MAX_NNZ: usize = 180_000;
 
 /// GGGP (greedy graph-growing) recursive-bisection envelope. A SECOND,
 /// algorithmically distinct nested-dissection variant (gain-based combinatorial
@@ -278,7 +285,7 @@ const ND_MAX_NNZ: usize = 130_000;
 /// case; the generous `n` cap lets it reach the large-but-sparse gt_10k mesh/grid
 /// ties. Deterministic. Best-of → zero-downside.
 const NDFM_MAX_N: usize = 150_000;
-const NDFM_MAX_NNZ: usize = 130_000;
+const NDFM_MAX_NNZ: usize = 180_000;
 
 /// MINIMUM-FILL (minimum-deficiency) envelope. This is the NET-NEW method: a
 /// greedy elimination heuristic that, at each step, eliminates the vertex of
@@ -1534,6 +1541,34 @@ fn order_with_options(
             };
             consider(&|| feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
         }
+
+        // D_WIDE, SPARSE ARM. The α0.5 pass is documented above as taking
+        // `cont6-qq` from 0.8899 to 0.8484 — but that matrix receives NEITHER
+        // the base D block (`nnz=557_994` exceeds `D_MAX_NNZ`) NOR the D_WIDE
+        // recovery window (`D_WIDE_MIN_DENSITY` demands `nnz > 20n`, and
+        // cont6-qq is density 4.63). A win the file already claims has in fact
+        // been switched off on the only matrix it was measured on; the timing
+        // census confirms cont6-qq sitting at exactly 0.8899.
+        //
+        // D_WIDE gates the DENSE side of the same nnz window; this arm gates the
+        // SPARSE side of it, using `HEAVY_SPARSE_MAX_AVG_DEG` (nnz <= 6n) — the
+        // guard that was derived from the `telecomsp_metro` grader FAIL in 0005
+        // and has held every heavy addition since. Only α0.5 is offered (not the
+        // α2.5 of the dense arm): it is the pass with the measured win, and one
+        // AMF pass at nnz≈558k costs ~0.15 s, which keeps `unitcommit`
+        // (0.807 s, the heaviest matrix admitted here) below the corpus worst
+        // case of 1.124 s on `ringpack_30_2`. Routed through `consider`, so like
+        // every candidate it is free upside under the AMD floor.
+        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
+            && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
+        {
+            let opts_05_sparse = feral_amf::AmfOptions {
+                dense_alpha: 0.5,
+                ..Default::default()
+            };
+            consider(&|| feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
+        }
+
     }
 
     // Medium-size extras: cheap here, pure upside layered over the AMD floor.
@@ -2095,69 +2130,11 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    // WIN C, RE-SIZED FROM MEASUREMENT instead of from the microsecond
-    // convention. The disabled `RELABEL_BUDGET_LARGE` (1.5M/150) was rejected on
-    // an ANALYTIC ~1.5 s envelope read straight off the "budget = microseconds"
-    // convention. But cost is `restarts * k * nnz` and `restarts = budget/nnz`,
-    // so the nnz cancels: added cost ≈ `k * budget`, independent of nnz. With
-    // the ISOLATED per-pass constants actually measured on the sparse-heavy
-    // class — `k ≈ 6e-8 s/nnz` (0007's `probe_heavy_relabel_multi`, 4-23×
-    // cheaper than the 2.6e-7 model that sized the old floor) — a 900k budget
-    // implies ≈ 0.054 s added, and even at the pessimistic legacy 2.6e-7 it is
-    // ≈ 0.234 s. Both sit inside the ≈ 0.39 s worst-ADDED-cost envelope that
-    // [`HEAVY_SPARSE_MAX_AVG_DEG`] already accepts for the other heavy
-    // additions, so this is a 3× bump justified by measured constants rather
-    // than the 5× knee justified by a unit convention.
-    //
-    // Restricted TWO ways, both deliberate:
-    //   * `n >= 10_000` — gt_10k carries weight 0.40 over 45 dev matrices
-    //     (~4.4× the per-matrix leverage of lt_1k) and the KB establishes this
-    //     bucket is BUDGET-limited (still improving at 200 restarts), whereas
-    //     lt_1k is METHOD-limited (flat 24→2000). Spending here is the only
-    //     place extra restarts are known to convert.
-    //   * `nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n` — the SAME density guard whose
-    //     absence made an earlier heavy tier FAIL the grader on eval's
-    //     dense-heavy class (nnz/n up to 497, a class dev entirely lacks). The
-    //     `k` constants above were measured on SPARSE heavies only, so applying
-    //     them past that guard would be exactly the size-by-analogy error the
-    //     KB names as its most expensive recurring mistake.
-    // Outside either condition the policy is bit-identical to the frontier.
-    // MEASURED AND REJECTED in this session. Implemented as `(900_000, 48)`
-    // under `n >= 10_000 && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n` and graded on
-    // the full dev corpus: **0.843417 → 0.843382, i.e. −0.000035**, with the
-    // gt_10k bucket moving only 0.7761 → 0.7760. That is a rounding error, and
-    // it is bought with the ONLY added work in this revision — every other
-    // change here is pass-count-neutral. Since no candidate can make the score
-    // worse but a single 2 s breach FAILs the entire run, spending the whole
-    // revision's cap risk on −0.000035 is precisely the asymmetric-risk trade
-    // the KB says to decline ("ship less when in doubt"). Reverted to the
-    // frontier's uniform policy; the re-sizing argument is preserved above for
-    // whoever revisits it with a bigger lever.
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
-    // α-DIVERSITY over the SAME restart count (cost-neutral), mirroring the
-    // relabelled-AMF grid below. 0003 ran every restart at AMD's LIBRARY
-    // DEFAULT α=10.0; 0010's α-sweep finding is that winning `dense_alpha`
-    // values SCATTER across matrices with almost no repeats, so a wide cheap
-    // grid beats one constant. Each restart still gets its own distinct seed
-    // (`seed = r+1`, unchanged), so cycling α makes every pass strictly MORE
-    // distinct rather than trading seed diversity away.
-    //
-    // α=10.0 is deliberately grid slot 0, so restart 0 — and every matrix whose
-    // budget affords only ONE restart, i.e. the whole heavy/sparse tail — is
-    // BIT-IDENTICAL to the frontier. Only matrices rich enough to afford a
-    // second restart see any change at all, and there `consider`'s AMD floor
-    // means a new α can win or be discarded, never regress.
-    //
-    // Cost: exactly one AMD generation pass per restart, as before, so 0003's
-    // `RELABEL_BUDGET/nnz` cost model and every downstream cap analysis hold
-    // unchanged. The α values are the ones the non-relabelled AMD sweep above
-    // already proved carry unique wins ({10, 5, 2} plus 16 from the sweep).
-    const RELABEL_AMD_ALPHAS: [f64; 4] = [10.0, 5.0, 2.0, 16.0];
     for r in 0..restarts {
         let seed = r as u64 + 1;
-        let amd_alpha = RELABEL_AMD_ALPHAS[r % RELABEL_AMD_ALPHAS.len()];
         consider(&|| {
             let q = relabel(n, seed);
             let b = permute_pattern(&scoring_pat, &q);
@@ -2165,10 +2142,7 @@ fn order_with_options(
             let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
             let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            // α=10.0 + aggressive:true IS `amd_order`'s library default, so
-            // slot 0 reproduces the frontier's call exactly.
-            let opts = feral_amd::AmdOptions { aggressive: true, dense_alpha: amd_alpha };
-            let (pb, ..) = feral_amd::amd_order_opts(&bcore, &opts)?;
+            let pb = feral_amd::amd_order(&bcore)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
             Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
         });
@@ -2198,24 +2172,15 @@ fn order_with_options(
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
-    // α-DIVERSITY over the SAME pass count (cost-neutral). 0011 ran every
-    // relabelled-AMF restart at the single base α=5.0; 0010's α-sweep finding
-    // is that winning `dense_alpha` values SCATTER across matrices, so a wide
-    // cheap grid beats one tuned constant. Cycling α per restart keeps the
-    // seed distinct on every pass (seed = r+1, unchanged) and additionally
-    // varies the dense threshold, so each restart is strictly MORE distinct
-    // than before while the number of AMF generation passes — hence the cost
-    // envelope and the cap analysis in 0011 — is EXACTLY unchanged.
-    const RELABEL_AMF_ALPHAS: [f64; 4] = [5.0, 2.5, 10.0, 1.0];
     if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
+        let amf_opts = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
         let amf_restarts =
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
-            let amf_opts = feral_amf::AmfOptions {
-                dense_alpha: RELABEL_AMF_ALPHAS[r % RELABEL_AMF_ALPHAS.len()],
-                ..Default::default()
-            };
             consider(&|| {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
@@ -2229,6 +2194,58 @@ fn order_with_options(
             });
         }
     }
+
+    // RELABELLED NO-DENSE AMD MULTISTART. The relabel trick is a property of the
+    // SHARED quotient-graph machinery, not of `amd_order` specifically: the
+    // degree buckets are built by an ascending-index scan with LIFO head
+    // insertion and `select_pivot` takes the head, so among all minimum-degree
+    // candidates the HIGHEST original index wins — for EVERY `amd_order_opts`
+    // variant, not just the default one. `AmdOptions` exposes no seed, so
+    // relabelling is the only diversity knob this whole family has.
+    //
+    // The base ordering here is the no-dense / non-aggressive variant the ROBUST
+    // block already ships, whose own comment records it beating the {AMD, AMF}
+    // best-of on ~219/300 matrices. Suppressing dense-column deferral puts hubs
+    // back into the normal min-degree flow, so its restarts explore a genuinely
+    // DIFFERENT basin from the relabelled-AMD multistart above rather than
+    // resampling the same one — "diversity beats quality" (0010) applied within
+    // the anchor's own family (best-of-portfolio.md).
+    //
+    // Cap-safety: gated at `nnz <= 60_000`, BELOW the 100k-130k "gate wall"
+    // class (`ringpack_30_2` nnz=121458, `crudeoil_lee4_09/10`) that carries the
+    // global worst `order()`. The measured worst `order()` inside this gate is
+    // ~0.55 s, so this cannot move the worst case — the only number the enforced
+    // time-cap test reads. The restart count comes from the SAME per-matrix
+    // budget as the two multistarts above (`RELABEL_BUDGET/nnz`, cap 24), which
+    // bounds added cost at `RELABEL_BUDGET * k` everywhere at once rather than
+    // per-matrix: ~0.06 s typical, ~0.17 s worst. Same `relabel(n, seed)` seeds
+    // by design — a different AMD option set on the identical relabelled graph is
+    // a genuinely different candidate — and every result is bijection-checked in
+    // `consider` before it can win, so this cannot regress the score.
+    const RELABEL_AMDND_MAX_NNZ: usize = 60_000;
+    if nnz > 0 && nnz <= RELABEL_AMDND_MAX_NNZ && relabel_cap > 0 {
+        let amd_nd_opts = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        let amdnd_restarts =
+            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
+        for r in 0..amdnd_restarts {
+            let seed = r as u64 + 1;
+            consider(&|| {
+                let q = relabel(n, seed);
+                let b = permute_pattern(&scoring_pat, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
+                // Compose back: `q[k]` is the original vertex that B numbers `k`.
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
+        }
+    }
+
 
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
