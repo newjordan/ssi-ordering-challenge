@@ -3774,3 +3774,328 @@ fn probe_biconn_heavy() {
         println!("WIN\t{name}\t{n}\t{nnz}\t{r:.4}");
     }
 }
+/// DUPLICATE / SCORING-COST CENSUS (test-only, machine-independent).
+///
+/// Runs `order()` on every corpus matrix with the `CENSUS_LOG` instrumentation
+/// active and reports, per scoring site: candidates produced, cache hits,
+/// cache misses (= actual `ws.flops` scoring passes, the expensive unit),
+/// unique permutations, and — the number that justifies cache-insert widening —
+/// how many MISSES were exact duplicates of an earlier candidate (wasted
+/// scoring; only possible at sites that do not insert into `flops_cache`).
+///
+/// Sites: 0=portfolio 1=relabel-AMD 2=relabel-AMF 3=hill-climb 4=peel
+/// 5=count-relabel 6=fillg/strip-v2 7=telos 8=minl 9=orbit 10=pharmakos.
+///
+/// Run: `cargo test --release -- --ignored --nocapture --test-threads=1 probe_dup_census`
+#[test]
+#[ignore]
+fn probe_dup_census() {
+    const SITE_NAMES: [&str; 11] = [
+        "portfolio", "relabel_amd", "relabel_amf", "hillclimb", "peel", "count_relabel",
+        "fillg_stripv2", "telos", "minl", "orbit", "pharmakos",
+    ];
+    let corpus = crate::corpus::corpus();
+
+    let mut site_total = [0usize; 11];
+    let mut site_hit = [0usize; 11];
+    let mut site_miss = [0usize; 11];
+    let mut site_uniq: [std::collections::HashSet<u64>; 11] = Default::default();
+    let mut site_dup_miss = [0usize; 11]; // misses whose hash was seen before (any site)
+
+    let mut grand_total = 0usize;
+    let mut grand_uniq: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut matrices_with_dup_miss: Vec<(usize, String, usize, usize)> = Vec::new();
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        CENSUS_LOG.with(|l| l.borrow_mut().clear());
+        CENSUS_PHASE.with(|c| c.set(0));
+        let _ = order(pat);
+        let rows = CENSUS_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()));
+
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut this_dup_miss = 0usize;
+        for (site, hash, hit) in rows {
+            let s = site as usize;
+            site_total[s] += 1;
+            site_uniq[s].insert(hash);
+            grand_total += 1;
+            grand_uniq.insert(hash);
+            let is_dup = !seen.insert(hash);
+            if hit {
+                site_hit[s] += 1;
+            } else {
+                site_miss[s] += 1;
+                if is_dup {
+                    site_dup_miss[s] += 1;
+                    this_dup_miss += 1;
+                }
+            }
+        }
+        if this_dup_miss > 0 {
+            matrices_with_dup_miss.push((this_dup_miss, name.clone(), n, pat.nnz()));
+        }
+    }
+
+    println!("\n--- per-site candidate census (full dev corpus) ---");
+    println!("site\t\tcandidates\tcache_hits\tmisses(scored)\tunique\twasted_miss_dup");
+    for s in 0..11 {
+        if site_total[s] > 0 {
+            println!(
+                "{:<14}\t{}\t{}\t{}\t{}\t{}",
+                SITE_NAMES[s],
+                site_total[s],
+                site_hit[s],
+                site_miss[s],
+                site_uniq[s].len(),
+                site_dup_miss[s]
+            );
+        }
+    }
+    println!(
+        "\nTOTAL: candidates={} unique={} dup_rate={:.1}%",
+        grand_total,
+        grand_uniq.len(),
+        100.0 * (grand_total - grand_uniq.len()) as f64 / grand_total.max(1) as f64
+    );
+    let wasted: usize = site_dup_miss.iter().sum();
+    let scored: usize = site_miss.iter().sum();
+    println!(
+        "scoring passes (misses)={scored} of which wasted on duplicates={wasted} ({:.1}%)",
+        100.0 * wasted as f64 / scored.max(1) as f64
+    );
+
+    matrices_with_dup_miss.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("\n--- top matrices by wasted duplicate scoring passes ---");
+    for (cnt, name, n, nnz) in matrices_with_dup_miss.iter().take(20) {
+        println!("{cnt}\t{name}\tn={n}\tnnz={nnz}");
+    }
+}
+
+/// PERMUTATION DUMP (test-only) — the output-neutrality proof harness.
+///
+/// Writes one line per corpus matrix: `name  n  nnz  perm_hash  flops`.
+/// Run before and after a candidate output-neutral change and diff the two
+/// files: every row must be identical (the 64-bit FNV fingerprint makes an
+/// undetected permutation change a ~2^-64-per-pair event; the flops column is
+/// the exact scored objective).
+///
+/// `SSI_PERM_DUMP` overrides the output path (default /tmp/perms_dump.txt).
+#[test]
+#[ignore]
+fn probe_dump_perms() {
+    let path = std::env::var("SSI_PERM_DUMP").unwrap_or_else(|_| "/tmp/perms_dump.txt".to_string());
+    let corpus = crate::corpus::corpus();
+    let mut out = String::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let perm = order(pat);
+        let sp = scoring_pattern(pat);
+        let f = flops_of(&sp, &perm);
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{:016x}\t{}\n",
+            name,
+            n,
+            pat.nnz(),
+            census_hash(&perm),
+            f
+        ));
+    }
+    std::fs::write(&path, out).expect("write perm dump");
+    println!("wrote {} matrices to {path}", corpus.len());
+}
+
+/// RE-SPEND SIZING PROBE (test-only): what if the relabelled-AMD multi-start
+/// budget/cap were raised for n >= 10_000 matrices ONLY (the gt_10k bucket,
+/// weight 0.40 — the bucket measured "budget-limited, still falling at 200
+/// restarts" in experiment 0010)?
+///
+/// For every matrix the shipped `order()` result and time are the base. On
+/// n >= 10_000 matrices the probe then runs up to `rmax` relabelled-AMD
+/// restarts (same seeds 1..=r the shipped loop uses), tracking the best flops
+/// after r restarts and the cumulative restart seconds. For a policy
+/// (budget, cap) giving r1 > r0 = shipped restarts on a matrix:
+///   new best flops = best_after[r1]            (exact — seeds 1..=r0 are
+///                                               already inside the shipped
+///                                               result, so only r0+1..=r1
+///                                               are new)
+///   added seconds  = cum[r1] - cum[r0]         (exact — only the NEW
+///                                               restarts' measured time)
+/// Policies with r1 <= r0 are no-ops on that matrix (score and time
+/// unchanged), so the control row reproduces the shipped score exactly.
+///
+/// Run: `cargo test --release -- --ignored --nocapture --test-threads=1 probe_relabel_gt10k`
+#[test]
+#[ignore]
+fn probe_relabel_gt10k() {
+    const POLICIES: [(usize, usize); 7] = [
+        (300_000, 24), // shipped control
+        (600_000, 48),
+        (900_000, 64),
+        (900_000, 96),
+        (1_200_000, 96),
+        (1_500_000, 150), // the disabled "win C" setting
+        (2_000_000, 200),
+    ];
+
+    let corpus = crate::corpus::corpus();
+    let np = POLICIES.len();
+    let mut cur = ([0.0f64; 3], [0usize; 3]);
+    let mut pol: Vec<([f64; 3], [usize; 3])> = vec![([0.0; 3], [0; 3]); np];
+    let mut worst: Vec<(f64, String)> = vec![(0.0, String::new()); np];
+    let mut improved = vec![0usize; np];
+    let mut cur_worst = (0.0f64, String::new());
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        let t_ord = Instant::now();
+        let cur_flops = flops_of(&sp, &order(pat)) as f64;
+        let ord_secs = t_ord.elapsed().as_secs_f64();
+        if ord_secs > cur_worst.0 {
+            cur_worst = (ord_secs, name.clone());
+        }
+
+        let r0 = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz);
+        let rmax = if n >= 10_000 {
+            POLICIES
+                .iter()
+                .map(|&(b, c)| relabel_restarts(b, c, n, nnz))
+                .max()
+                .unwrap_or(0)
+                .max(r0)
+        } else {
+            0
+        };
+
+        let mut best_after = vec![cur_flops; rmax + 1];
+        let mut cum = vec![0.0f64; rmax + 1];
+        let mut best = cur_flops;
+        let t0 = Instant::now();
+        for r in 0..rmax {
+            let q = relabel(n, r as u64 + 1);
+            let b = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                if let Ok(pb) = feral_amd::amd_order(&bcore) {
+                    let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                    if is_bijection(&perm, n) {
+                        best = best.min(flops_of(&sp, &perm) as f64);
+                    }
+                }
+            }
+            best_after[r + 1] = best;
+            cum[r + 1] = t0.elapsed().as_secs_f64();
+        }
+
+        let bkt = bucket(n);
+        cur.0[bkt] += (cur_flops / base).ln();
+        cur.1[bkt] += 1;
+        for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
+            // Policies apply only to n >= 10_000; smaller matrices keep the
+            // shipped result and shipped time.
+            let r1 = if n >= 10_000 {
+                relabel_restarts(bd, cap, n, nnz)
+            } else {
+                r0
+            };
+            let f = if n >= 10_000 && r1 >= r0 {
+                best_after[r1]
+            } else {
+                cur_flops
+            };
+            pol[pi].0[bkt] += (f / base).ln();
+            pol[pi].1[bkt] += 1;
+            if f < cur_flops - 1e-9 {
+                improved[pi] += 1;
+            }
+            let added = if r1 > r0 { cum[r1] - cum[r0] } else { 0.0 };
+            let combined = ord_secs + added;
+            if combined > worst[pi].0 {
+                worst[pi] = (combined, name.clone());
+            }
+        }
+    }
+
+    println!("\nSCORE cur = {:.6}  (worst order() = {:.3}s on {})", aggregate(&cur.0, &cur.1), cur_worst.0, cur_worst.1);
+    println!(
+        "\nn>=10k-only relabel policies:\n{:>9} {:>4} {:>10} {:>9} {:>9} {:>9}  {}",
+        "budget", "cap", "score", "gt_10k", "worst_s", "improved", "worst matrix"
+    );
+    for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
+        let g2 = if pol[pi].1[2] > 0 {
+            (pol[pi].0[2] / pol[pi].1[2] as f64).exp()
+        } else {
+            f64::NAN
+        };
+        println!(
+            "{bd:>9} {cap:>4} {:>10.6} {:>9.6} {:>9.3} {:>9}  {}",
+            aggregate(&pol[pi].0, &pol[pi].1),
+            g2,
+            worst[pi].0,
+            improved[pi],
+            worst[pi].1
+        );
+    }
+}
+
+/// ALLOCATION CENSUS (test-only, machine-independent): total allocator
+/// calls/bytes inside each `order()` call, via the counting global allocator.
+/// Wall-clock is contaminated on shared machines; allocation counts are
+/// deterministic for a given (pattern, code) pair — this is the cost proxy for
+/// output-neutral hot-path work. Prints the corpus total and the top matrices.
+#[test]
+#[ignore]
+fn probe_alloc_census() {
+    let corpus = crate::corpus::corpus();
+    let mut rows: Vec<(usize, usize, String, usize, usize)> = Vec::new();
+    let mut tot = super::alloc_probe::AllocStats {
+        calls: 0,
+        bytes: 0,
+        deallocs: 0,
+        reallocs: 0,
+    };
+    for (name, pat) in &corpus {
+        if pat.n == 0 {
+            continue;
+        }
+        let (_p, st) = super::alloc_probe::measure(|| order(pat));
+        tot = tot + st;
+        rows.push((st.calls, st.bytes, name.clone(), pat.n, pat.nnz()));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    println!("\n--- allocation census: top 25 matrices by order() alloc calls ---");
+    println!("calls\tbytes\tmatrix\tn\tnnz");
+    for (calls, bytes, name, n, nnz) in rows.iter().take(25) {
+        println!("{calls}\t{bytes}\t{name}\t{n}\t{nnz}");
+    }
+    let total_calls: usize = rows.iter().map(|r| r.0).sum();
+    let total_bytes: usize = rows.iter().map(|r| r.1).sum();
+    println!("\nCORPUS TOTAL: calls={total_calls} bytes={total_bytes}");
+    println!(
+        "(measured: calls={} bytes={} deallocs={} reallocs={})",
+        tot.calls, tot.bytes, tot.deallocs, tot.reallocs
+    );
+}
