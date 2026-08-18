@@ -519,15 +519,40 @@ const HEAVY_SPARSE_MAX_AVG_DEG: usize = 6;
 /// gabriel10 alone (0.9756 -> 1.0000) and cont6-qq is unaffected (well under
 /// 700k). See memory/experiments/0011 (RCA session) for the full
 /// isolated-vs-embedded cost measurement.
+///
+/// TRACK-A RE-WIDENING 700k → 1.2M (2026-08-18, this machine, isolated
+/// min-of-3 `probe_heavy_cost` + `probe_vheavy` on the CURRENT corpus): the
+/// RCA's real hazard was faclay75 (nnz=1,379,706) — a 1.2M ceiling EXCLUDES
+/// it (and acopf_case9241pegase_qcqp, nnz=1,292,408, whose amdnd loses at
+/// 1.0608 anyway), so neither the 0.59 s embedded faclay75 cost nor acopf's
+/// 0.106 s is re-admitted. What IS admitted is exactly one dev matrix:
+/// gabriel10 (nnz=1,148,210, density 4.71 — passes the 6n sparsity guard),
+/// whose no-dense AMD pass is a clean WIN, ratio 1.0000 → **0.9756** at
+/// 0.105 s isolated on a COLD matrix (full `order()` 0.353 s → ≈0.46 s, far
+/// under the cap; the global worst case, gams05 ≈0.95 s, is untouched
+/// because this gate's window does not reach it). This is strictly cheaper
+/// than the 1.5M ceiling 0008 shipped and the grader PASSED (eval 0.885170,
+/// run 37ec258) — a return to a known-passing cost envelope, not a new one.
+/// On eval the window admits faclay70-class sparse heavies (proven harmless
+/// in 0008: no win, no fail) and the tied gabriel08 (gabriel10's sibling —
+/// upside). Worst added cost: one sparse no-dense AMD pass, ≤ 2.5e-7 × 1.2M
+/// ≈ 0.30 s isolated. Sparsity guard `nnz <= 6n` unchanged (load-bearing
+/// since 0005).
 const HEAVY_AMDND_MIN_NNZ: usize = 250_000;
-const HEAVY_AMDND_MAX_NNZ: usize = 700_000;
+const HEAVY_AMDND_MAX_NNZ: usize = 1_200_000;
 
 /// PEEL + COUNT-RELABEL (blind-spot post-hoc families on the incumbent,
 /// `sbx-families2`) shared heavy-sparse ceiling. Protects the global-ceiling
 /// matrix class (`faclay75`-class, nnz≈1.38M, explicitly "add nothing there"
-/// per the time-cost model) entirely, matching the existing
-/// `HEAVY_AMDND_MAX_NNZ` boundary already used for the same reason above.
-const PEEL_CNTREL_MAX_NNZ: usize = HEAVY_AMDND_MAX_NNZ;
+/// per the time-cost model) entirely. DECOUPLED from `HEAVY_AMDND_MAX_NNZ`
+/// (now 1.2M) and held at a literal 700k: `probe_giants_posthoc` measured
+/// these post-hoc families on the 700k-1.4M sparse giants and found NO value
+/// (faclay75: peel/count-relabel/telos-strip all exactly 1.0000; gabriel10:
+/// peel & telos-strip all lose, count-relabel-desc 0.9790 is worse than the
+/// no-dense-AMD 0.9756 this file already gets via `HEAVY_AMDND`; acopf: best
+/// peel 0.9729 vs incumbent 0.9737, negligible) — so widening them past 700k
+/// would be pure added cost on the corpus's largest matrices for no score.
+const PEEL_CNTREL_MAX_NNZ: usize = 700_000;
 
 /// FILLED-GRAPH REORDER + STRIP-V2 (win, `sbx-families2`) shared nnz(A)
 /// ceiling. SAME `PEEL_CNTREL_MAX_NNZ` (700_000) boundary, deliberately
@@ -2127,23 +2152,56 @@ fn order_with_options(
     // AMD already won over every candidate) has never been probed under.
     //
     // Cap-safety: AMF per-pass cost scales with nnz (~0.26s on nnz≈1M in the
-    // α-sweep), so this is gated well below that class at `nnz <= 130_000` (the
-    // ND/RCM/Sloan envelope, where isolated cost is small and the timing probe
-    // shows large headroom — most such matrices run <0.1s total), and the
-    // restart count comes from the SAME per-matrix time budget as the AMD
-    // multistart (`RELABEL_BUDGET/nnz`, capped), which bounds added cost at
+    // α-sweep), so the LIGHT tier is gated well below that class at `nnz <=
+    // 130_000` (the ND/RCM/Sloan envelope, where isolated cost is small and the
+    // timing probe shows large headroom — most such matrices run <0.1s total),
+    // and the restart count comes from the SAME per-matrix time budget as the
+    // AMD multistart (`RELABEL_BUDGET/nnz`, capped), which bounds added cost at
     // every point at once (nnz=130k → 2 passes ≈0.08s; tiny nnz → 24 trivial
     // passes). Same `relabel(n, seed)` seeds as the AMD loop by design: AMF on
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
+    //
+    // TRACK-A HEAVY TIER (2026-08-18, `probe_strip_giants`, isolated min-of-2
+    // on THIS machine): the light gate above barred every matrix with
+    // nnz > 130k from the fill-objective multistart, yet the sparse-heavy
+    // gt_10k class responds to it — measured wins: transswitch2736spr
+    // 0.9882 → **0.9249** (seed 2) and arki0013 0.6261 → **0.6159** (seed 2).
+    // Extend to `nnz ∈ (130k, 400k]` under TWO guards:
+    //   * `nnz <= 6n` (the load-bearing HEAVY_SPARSE_MAX_AVG_DEG sparsity
+    //     guard). It does double duty here: it excludes the eval dense-heavy
+    //     class (0005) AND — measured — the two HOTTEST dev matrices in this
+    //     nnz range, gams05 (nnz=253k, density 14.6, order() 0.96 s) and
+    //     nuclear104 (nnz=258k, density 6.6, order() 0.86 s), both of which
+    //     LOSE under relabelled-AMF (1.30/1.48) and would be pushed over the
+    //     known-passing ~0.99 s local bound by the added passes. Every matrix
+    //     that survives the guard is COLD (≤0.63 s) and sparse (density ≤ 5).
+    //   * a 400k ceiling + `clamp(900k/nnz, 1, 3)` pass budget: the only
+    //     measured winners sit at nnz ≤ 331k; beyond 400k the class ties or
+    //     loses (unitcommit 1.018, cont6-qq 1.14) while its AMF passes grow
+    //     (faclay75-class 0.28 s/pass). Worst ADDED cost ≈ 3 × 0.031 s =
+    //     0.09 s (arki0013), on a matrix at 0.56 s → ≈0.65 s; the global
+    //     worst case (gams05) is structurally excluded, so it does not move.
+    //   Note the window needs n > 130000/6 ≈ 21667 to be non-empty, so it
+    //   only ever touches gt_10k — the bucket with the highest per-matrix
+    //   leverage (weight 0.40 over 45 matrices).
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
-    if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
+    const RELABEL_AMF_HEAVY_MAX_NNZ: usize = 400_000;
+    let amf_restarts = if nnz == 0 {
+        0
+    } else if nnz <= RELABEL_AMF_MAX_NNZ {
+        relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz)
+    } else if nnz <= RELABEL_AMF_HEAVY_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
+        (900_000 / nnz).clamp(1, 3)
+    } else {
+        0
+    };
+    let amf_restarts = amf_restarts.min(relabel_cap);
+    if amf_restarts > 0 {
         let amf_opts = feral_amf::AmfOptions {
             dense_alpha: 5.0,
             ..Default::default()
         };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             consider(&|| {

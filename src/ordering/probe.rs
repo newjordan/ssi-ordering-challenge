@@ -3519,3 +3519,353 @@ fn probe_stack() {
         giant_mismatches
     );
 }
+
+/// TRACK-A: untested candidate families on the heavy gt_10k class.
+///
+/// The big tied matrices (faclay75, gabriel10, ...) are gated out of nearly
+/// every candidate family by `n`/`nnz` ceilings, yet their `order()` times are
+/// COLD (0.35-0.55 s vs the ~0.95 s global worst) — unused per-matrix budget.
+/// This probe measures, ISOLATED (min-of-2), on every `n >= 10k, nnz >= 130k`
+/// matrix:
+///   - STRIP candidates (deg k in {6,24,48,64,96}, lcnt64) — the strip
+///     transform's density sweet spot is 3-15 and these giants sit at 3-7,
+///     but `STRIP_MAX_N = 30k` has never let strip touch them.
+///   - relabelled-AMF (seeds 1-3) — 0011's fill-objective multistart, never
+///     offered above nnz 130k.
+///   - the incumbent's exact fill (lnnz) — i.e. whether MINL's 2.4M gate even
+///     fires here, and one order() timing for headroom context.
+/// Ratios are exact; costs are min-of-2 upper bounds on a shared box.
+#[test]
+#[ignore]
+fn probe_strip_giants() {
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\tcand\tk\tcost_s\tratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n < 10_000 || nnz < 130_000 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd_perm) as f64;
+
+        // Current incumbent: ratio + fill (does MINL's 2.4M lnnz gate fire?).
+        {
+            let t = Instant::now();
+            let cur = order(pat);
+            let cur_s = t.elapsed().as_secs_f64();
+            let permuted = permute_pattern(&sp, &cur);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let counts = column_counts_gnp(&permuted, &etree);
+            let lnnz: usize = counts.iter().sum();
+            let cur_r = flops_of(&sp, &cur) as f64 / base;
+            println!("{name}\t{n}\t{nnz}\tINCUMBENT\t0\t{cur_s:.3}\t{cur_r:.4}\tlnnz={lnnz}");
+        }
+
+        // Degree ranking (descending true degree) and lcnt ranking.
+        let mut deg_ranked: Vec<usize> = (0..n).collect();
+        deg_ranked.sort_unstable_by(|&a, &b| {
+            let da = pat.col_ptr[a + 1] - pat.col_ptr[a];
+            let db = pat.col_ptr[b + 1] - pat.col_ptr[b];
+            db.cmp(&da).then(a.cmp(&b))
+        });
+        let amd_permuted = permute_pattern(&sp, &amd_perm);
+        let amd_etree = EliminationTree::from_pattern(&amd_permuted);
+        let amd_counts = column_counts_gnp(&amd_permuted, &amd_etree);
+        let mut lcnt = vec![0usize; n];
+        for (pos, &v) in amd_perm.iter().enumerate() {
+            lcnt[v] = amd_counts[pos];
+        }
+        let mut lcnt_ranked: Vec<usize> = (0..n).collect();
+        lcnt_ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
+
+        for &k in &[6usize, 24, 48, 64, 96] {
+            if k >= n {
+                continue;
+            }
+            let mut cost = f64::INFINITY;
+            let mut ratio = f64::NAN;
+            for _ in 0..2 {
+                let t = Instant::now();
+                if let Some(cand) = strip_candidate(&sp, &deg_ranked, k) {
+                    let perm: Vec<usize> = cand.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&perm, n) {
+                        ratio = flops_of(&sp, &perm) as f64 / base;
+                    }
+                }
+                cost = cost.min(t.elapsed().as_secs_f64());
+            }
+            println!("{name}\t{n}\t{nnz}\tdeg\t{k}\t{cost:.3}\t{ratio:.4}");
+        }
+        {
+            let mut cost = f64::INFINITY;
+            let mut ratio = f64::NAN;
+            for _ in 0..2 {
+                let t = Instant::now();
+                if let Some(cand) = strip_candidate(&sp, &lcnt_ranked, 64) {
+                    let perm: Vec<usize> = cand.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&perm, n) {
+                        ratio = flops_of(&sp, &perm) as f64 / base;
+                    }
+                }
+                cost = cost.min(t.elapsed().as_secs_f64());
+            }
+            println!("{name}\t{n}\t{nnz}\tlcnt\t64\t{cost:.3}\t{ratio:.4}");
+        }
+
+        // Relabelled-AMF (fill objective), seeds 1..=3.
+        let amf_opts = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+        for seed in 1..=3u64 {
+            let mut cost = f64::INFINITY;
+            let mut ratio = f64::NAN;
+            for _ in 0..2 {
+                let t = Instant::now();
+                let q = relabel(n, seed);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                    if let Ok((pb, ..)) = feral_amf::amf_order_opts(&bcore, &amf_opts) {
+                        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                        if is_bijection(&perm, n) {
+                            ratio = flops_of(&sp, &perm) as f64 / base;
+                        }
+                    }
+                }
+                cost = cost.min(t.elapsed().as_secs_f64());
+            }
+            println!("{name}\t{n}\t{nnz}\trlAMF\t{seed}\t{cost:.3}\t{ratio:.4}");
+        }
+    }
+}
+
+/// TRACK-A part 2: the cheap POST-HOC families (PEEL / COUNT-RELABEL /
+/// TELOS-style strip-by-incumbent-count) on the three giant matrices that are
+/// gated OUT of them by the nnz ceilings (faclay75 1.38M, gabriel10 1.15M,
+/// acopf 1.29M — all above PEEL_CNTREL_MAX_NNZ=700k / TELOS_MAX_NNZ=400k).
+/// PEEL is a splice + one exact eval per candidate (no orderer pass), so it is
+/// nearly free even at n=300k; COUNT-RELABEL is two AMD passes; telos-strip is
+/// one sub-AMD pass per k. If none of these move the giants, the giants are
+/// closed. Isolated, min-of-2; ratios exact.
+#[test]
+#[ignore]
+fn probe_giants_posthoc() {
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\tcand\tk\tcost_s\tratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if nnz < 700_000 || nnz > 6 * n {
+            continue; // exactly the gated-out sparse giants
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize).collect();
+        let base = flops_of(&sp, &amd_perm) as f64;
+
+        // Incumbent = full portfolio result.
+        let incumbent = order(pat);
+        let inc_r = flops_of(&sp, &incumbent) as f64 / base;
+        println!("{name}\t{n}\t{nnz}\tINCUMBENT\t0\t0.000\t{inc_r:.4}");
+
+        // Exact incumbent column counts (the ranking all three families use).
+        let permuted = permute_pattern(&sp, &incumbent);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let mut cnt = vec![0usize; n];
+        for (pos, &v) in incumbent.iter().enumerate() {
+            cnt[v] = counts[pos];
+        }
+        let mut ranked: Vec<usize> = (0..n).collect();
+        ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+
+        // PEEL: move t fattest to end, tail by asc degree or asc count.
+        for &t_k in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
+            if t_k >= n { break; }
+            for tail_by_deg in [true, false] {
+                let mut cost = f64::INFINITY;
+                let mut ratio = f64::NAN;
+                for _ in 0..2 {
+                    let tt = Instant::now();
+                    let mut fat = vec![false; n];
+                    for &v in &ranked[..t_k] { fat[v] = true; }
+                    let mut cand: Vec<usize> = Vec::with_capacity(n);
+                    for &v in &incumbent { if !fat[v] { cand.push(v); } }
+                    let mut tail: Vec<usize> = ranked[..t_k].to_vec();
+                    if tail_by_deg {
+                        tail.sort_unstable_by_key(|&v| (pat.col_ptr[v + 1] - pat.col_ptr[v], v));
+                    } else {
+                        tail.sort_unstable_by_key(|&v| (cnt[v], v));
+                    }
+                    cand.extend(tail);
+                    if is_bijection(&cand, n) {
+                        ratio = flops_of(&sp, &cand) as f64 / base;
+                    }
+                    cost = cost.min(tt.elapsed().as_secs_f64());
+                }
+                let mode = if tail_by_deg { "peelD" } else { "peelC" };
+                println!("{name}\t{n}\t{nnz}\t{mode}\t{t_k}\t{cost:.3}\t{ratio:.4}");
+            }
+        }
+
+        // COUNT-RELABEL: relabel by ascending/descending incumbent count, AMD.
+        for desc in [false, true] {
+            let mut cost = f64::INFINITY;
+            let mut ratio = f64::NAN;
+            for _ in 0..2 {
+                let tt = Instant::now();
+                let mut q: Vec<usize> = (0..n).collect();
+                if desc {
+                    q.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+                } else {
+                    q.sort_unstable_by(|&a, &b| cnt[a].cmp(&cnt[b]).then(a.cmp(&b)));
+                }
+                let bpat = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+                if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                    if let Ok(pb) = feral_amd::amd_order(&bcore) {
+                        let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                        if is_bijection(&cand, n) {
+                            ratio = flops_of(&sp, &cand) as f64 / base;
+                        }
+                    }
+                }
+                cost = cost.min(tt.elapsed().as_secs_f64());
+            }
+            let mode = if desc { "cntDESC" } else { "cntASC" };
+            println!("{name}\t{n}\t{nnz}\t{mode}\t0\t{cost:.3}\t{ratio:.4}");
+        }
+
+        // TELOS-style strip by incumbent count, sub-AMD, small k.
+        let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+        for &k in &[1usize, 2, 4, 6, 12, 24] {
+            if k >= n { break; }
+            let mut cost = f64::INFINITY;
+            let mut ratio = f64::NAN;
+            for _ in 0..2 {
+                let tt = Instant::now();
+                if let Some(cand) = strip_general_v2(&sp, &ranked, k, &sub_amd) {
+                    if is_bijection(&cand, n) {
+                        ratio = flops_of(&sp, &cand) as f64 / base;
+                    }
+                }
+                cost = cost.min(tt.elapsed().as_secs_f64());
+            }
+            println!("{name}\t{n}\t{nnz}\ttelosAMD\t{k}\t{cost:.3}\t{ratio:.4}");
+        }
+    }
+}
+
+/// TRACK-A part 3: AMD option variants on the gated-out sparse giants. The
+/// portfolio's AMD α-sweep (aggressive α1/α2/α5/α10, non-aggressive α2/α10,
+/// no-dense α-1 both absorptions) is gated to nnz < 130k (ROBUST) or n < 60k
+/// (MEDIUM), so the nnz>700k giants have only ever seen default AMD and the
+/// non-aggressive no-dense `amdnd`. Sweep the full option grid on them —
+/// one AMD pass each, cheap — to see whether any variant cracks faclay75 or
+/// beats gabriel10's 0.9756. Isolated, min-of-2; ratios exact.
+#[test]
+#[ignore]
+fn probe_giants_amdvars() {
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\tagg\talpha\tcost_s\tratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if nnz < 700_000 || nnz > 6 * n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        for agg in [false, true] {
+            for alpha in [-1.0f64, 2.0, 5.0, 10.0] {
+                let opts = feral_amd::AmdOptions { aggressive: agg, dense_alpha: alpha };
+                let mut cost = f64::INFINITY;
+                let mut ratio = f64::NAN;
+                for _ in 0..2 {
+                    let t = Instant::now();
+                    if let Ok((p, ..)) = feral_amd::amd_order_opts(&core, &opts) {
+                        let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                        if is_bijection(&p, n) {
+                            ratio = flops_of(&sp, &p) as f64 / base;
+                        }
+                    }
+                    cost = cost.min(t.elapsed().as_secs_f64());
+                }
+                println!("{name}\t{n}\t{nnz}\t{agg}\t{alpha}\t{cost:.3}\t{ratio:.4}");
+            }
+        }
+    }
+}
+
+/// Relabelled NON-AGGRESSIVE AMD multistart on the giant sparse class.
+/// `probe_giants_amdvars` showed gabriel10 wins ONLY with non-aggressive AMD
+/// (0.9756) and ties with aggressive — so the portfolio's aggressive
+/// relabelled-AMD loop cannot find that win. Does relabelling the graph under
+/// NON-aggressive AMD push gabriel10 below 0.9756 (or move acopf/faclay75)?
+#[test]
+#[ignore]
+fn probe_giants_rlamdnd() {
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\tseed\tcost_s\tratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if nnz < 700_000 || nnz > 6 * n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let opts = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        for seed in 1..=6u64 {
+            let mut cost = f64::INFINITY;
+            let mut ratio = f64::NAN;
+            for _ in 0..2 {
+                let t = Instant::now();
+                let q = relabel(n, seed);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                    if let Ok((pb, ..)) = feral_amd::amd_order_opts(&bcore, &opts) {
+                        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                        if is_bijection(&perm, n) {
+                            ratio = flops_of(&sp, &perm) as f64 / base;
+                        }
+                    }
+                }
+                cost = cost.min(t.elapsed().as_secs_f64());
+            }
+            println!("{name}\t{n}\t{nnz}\t{seed}\t{cost:.3}\t{ratio:.4}");
+        }
+    }
+}
