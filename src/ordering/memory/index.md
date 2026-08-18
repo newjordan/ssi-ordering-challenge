@@ -4,7 +4,16 @@ The map of the knowledge base. One line per page, grouped by type. Read this
 first; keep it current whenever you add, rename, or retire a page.
 
 ## Current best
-- Best score: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.843417** (relabel α-diversity, [0012](experiments/0012-relabel-alpha-diversity.md);
+  CURRENT-ROUND corpus, 147/108/45). Cost-neutral (zero added generation passes),
+  so cap risk is structurally identical to the frontier. Previous: dev 0.843535
+  (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md)).
+- ⚠️ **DEV CAN NO LONGER RESOLVE OUR WINS.** The last three shipped deltas are
+  −0.0018, −0.0001, −0.0001 while dev and eval share exactly ONE matrix on
+  `(n,nnz)` and recent REJECTIONS sat at +0.0002…+0.0009. Rebuilding the
+  reconstructed eval corpus ([0010](experiments/0010-parallel-research-session.md)a)
+  is now the blocking instrument, not an optimization. It is NOT present in a
+  fresh environment (`~/ssi-ordering-LEARNINGS/` lives outside the repo). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -95,6 +104,13 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   relabelled-**AMF** multistart alongside the relabelled-AMD one (0003): same relabel+compose-back,
   min-fill objective instead of min-degree. Free diversity within a winning family. dev
   0.845333→**0.843535**, all in 1k_10k. Gated nnz≤130k; worst order() 0.945s.
+- [0012-relabel-alpha-diversity.md](experiments/0012-relabel-alpha-diversity.md) — cycle
+  `dense_alpha` across relabel restarts at IDENTICAL pass count: free diversity, zero added
+  cost. dev 0.843535→**0.843417**. Also re-sizes the long-disabled **win C** from measured
+  constants (the "1.5 s" envelope was a unit-convention artifact; nnz cancels, so added cost
+  ≈ `k*budget`) — then DECLINES it anyway at −0.000035, because it was the only change
+  carrying cap risk. Records that **the α axis cannot reach gt_10k by construction** (those
+  matrices afford ~1 restart, so they only ever see grid slot 0).
 - [0010-parallel-research-session.md](experiments/0010-parallel-research-session.md) — **read this
   one.** Eval-corpus reconstruction (427/500 exact, calibrated to 0.15%); the **diversity-beats-quality**
   thesis (four metrics all WORSE than AMD standalone bought −0.0088 together); the **STRIP transform**
