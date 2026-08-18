@@ -188,6 +188,13 @@ mod nested_subgraph;
 /// portfolio currently costs well under a millisecond and the 2 s cap is
 /// effectively unbounded.
 mod exact_dp;
+/// BICONNECTED-DECOMPOSITION ordering — a NEW candidate family that
+/// DECOMPOSES the graph into biconnected components (Tarjan) and orders each
+/// with AMD, articulation points deferred to their parent block. No other
+/// candidate in the portfolio decomposes the graph; the near-AMD mass is
+/// highly decomposable (median ~30% articulation points, 65-399 blocks per
+/// matrix), so this covers a structural blind spot. See its module doc.
+mod biconn;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -264,6 +271,15 @@ const RCM_MAX_NNZ: usize = 180_000;
 /// families leave tied at AMD. Best-of floor makes it zero-downside.
 const SLOAN_MAX_N: usize = 150_000;
 const SLOAN_MAX_NNZ: usize = 180_000;
+
+/// BICONNECTED-DECOMPOSITION envelope. Cost is O(nnz) Tarjan plus per-block
+/// AMD passes that sum to ~one whole-graph AMD pass (a biconnected graph
+/// reproduces the anchor exactly), so the worst case is ~2x the always-run
+/// anchor — safe wherever the anchor is. Worst measured 0.169 s at
+/// nnz=1379706 (`faclay75`). Gated on nnz only (cost tracks nnz, not n) just
+/// above the dev-corpus maximum so the big sparse gt_10k ties the n-capped
+/// gates exclude (`gabriel10`, `unitcommit_200_100_1_mod_8`) are reached.
+const BICONN_MAX_NNZ: usize = 1_500_000;
 
 /// Hand-rolled NESTED-DISSECTION envelope. Our own pure-Rust recursive graph
 /// bisection is O(nnz log n) with a hard work budget, so it is bounded PRIMARILY
@@ -1798,6 +1814,50 @@ fn order_with_options(
         consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 1, 2))
         });
+    }
+
+    // BICONNECTED-DECOMPOSITION ordering — the portfolio's only candidate that
+    // DECOMPOSES the graph before ordering it (Tarjan biconnected components,
+    // per-block AMD on the induced subgraphs, articulation points deferred to
+    // their parent block along the block-cut tree). Every other candidate
+    // orders the whole graph at once. Measured on the full dev corpus
+    // (`probe_biconn`): beats the AMD anchor on 43/300 matrices standalone and,
+    // crucially, wins TWO matrices the entire rest of the portfolio only ties —
+    // `gabriel10` (n=244056, 1.0000 -> 0.9793) and
+    // `unitcommit_200_100_1_mod_8` (n=146830, 0.9978 -> 0.9943) — both sparse
+    // gt_10k matrices that the n-capped candidate gates otherwise leave to the
+    // anchor alone. Cost is O(nnz) Tarjan plus per-block AMD passes that sum to
+    // ~one whole-graph AMD pass (a biconnected graph reproduces the anchor
+    // exactly), worst measured 0.169 s at nnz=1379706 (`faclay75`) — ~2x the
+    // always-run anchor, so it is safe wherever the anchor is. Gated on nnz
+    // only (cost tracks nnz, not n) just above the dev-corpus maximum so the
+    // big gated-out ties are reached. Best-of floor -> zero downside.
+    if nnz < BICONN_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
+        consider(&|| {
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_order(pattern))
+        });
+
+        // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
+        // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
+        // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
+        // local flops, largest-block-first under a 24-restart global budget.
+        // Decomposition shrinks the problem, so this reaches blocks the
+        // whole-graph relabel multi-start is gated out of on the big gt_10k
+        // matrices. Adds crudeoil_lee1_07 (0.9032->0.8781) and syn30m03m
+        // (0.9977->0.9957) over plain biconn; worst isolated cost 0.368s
+        // (nuclear104). Restart 0 is plain AMD, so per-block quality >= plain
+        // biconn; best-of floor makes the composed candidate zero-downside.
+        // CAP-SAFETY (round-2 merge): heavy variant gated at nnz <= 60k —
+        // its measured wins (crudeoil_lee1_07, syn30m03m) are far below this,
+        // and per-block relabel restarts on the hot 100k+ gate-wall class
+        // (ringpack_30_2) added +0.14 s to the portfolio's worst case.
+        if nnz <= 60_000 {
+            consider(&|| {
+                Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                )
+            });
+        }
     }
 
     // Hand-rolled NESTED DISSECTION — our OWN pure-Rust recursive graph bisection

@@ -3624,3 +3624,153 @@ fn probe_exact_dp() {
         -ln_delta_sum * LT1K_LEVERAGE
     );
 }
+/// BICONN blind-spot probe: for every corpus matrix, run the
+/// biconnected-decomposition ordering and score it against the AMD anchor.
+/// Prints per-matrix decomposition stats (block/articulation counts), the
+/// biconn ratio vs AMD, and isolated biconn wall-clock — the three things
+/// needed to decide (a) whether the family wins anywhere the portfolio is
+/// blind to, and (b) how wide it can be gated. Join the `ratio` column
+/// against a full-corpus `order()` run's per-matrix table offline to get the
+/// true marginal-over-portfolio effect.
+#[test]
+#[ignore]
+fn probe_biconn() {
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\tnblocks\tnart\tmaxbc_frac\tbiconn_s\tbiconn_ratio");
+    let mut wins = 0usize;
+    let mut total = 0usize;
+    let mut worst_s = 0.0f64;
+    let mut worst_name = String::new();
+    let mut win_rows: Vec<(String, usize, usize, f64)> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        total += 1;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        let t0 = Instant::now();
+        let bp = biconn::biconn_order(pat);
+        let secs = t0.elapsed().as_secs_f64();
+        let bp_us: Vec<usize> = bp.iter().map(|&x| x as usize).collect();
+        let r = if is_bijection(&bp_us, n) {
+            flops_of(&sp, &bp_us) as f64 / base
+        } else {
+            f64::NAN
+        };
+
+        if r < 0.9999 {
+            wins += 1;
+            win_rows.push((name.clone(), n, pat.nnz(), r));
+        }
+        if secs > worst_s {
+            worst_s = secs;
+            worst_name = name.clone();
+        }
+        println!("{name}\t{n}\t{nnz}\t.\t.\t.\t{secs:.4}\t{r:.4}");    }
+    println!("\nbiconn beats AMD on {wins}/{total} matrices");
+    println!("worst isolated biconn time: {worst_s:.4}s on {worst_name}");
+    win_rows.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+    println!("--- deepest wins (name n nnz ratio) ---");
+    for (name, n, nnz, r) in win_rows.iter().take(40) {
+        println!("WIN\t{name}\t{n}\t{nnz}\t{r:.4}");
+    }
+}
+
+/// STRUCTURAL census of the biconnected decomposition over the corpus:
+/// for each matrix report nblocks, articulation-point count/fraction,
+/// largest-block fraction, and isolated count. Used to size the
+/// per-block-heavy variant (are the big gated-out ties decomposable into
+/// blocks small enough for heavy per-block ordering?).
+#[test]
+#[ignore]
+fn probe_biconn_stats() {
+    let corpus = crate::corpus::corpus();
+    println!("matrix\tn\tnnz\tnblocks\tnart\tart_frac\tmaxblk\tmaxblk_frac\tiso");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let (nb, nart, maxblk, niso) = biconn::biconn_stats(pat);
+        println!(
+            "{name}\t{n}\t{nnz}\t{nb}\t{nart}\t{af:.3}\t{maxblk}\t{mbf:.3}\t{niso}",
+            nnz = pat.nnz(),
+            af = nart as f64 / n as f64,
+            mbf = maxblk as f64 / n as f64,
+        );
+    }
+}
+
+/// Measure the PER-BLOCK-HEAVY biconn variant against the AMD anchor across the
+/// corpus (ratio + isolated time), for offline cross-reference against the
+/// portfolio per-matrix table. Same shape as `probe_biconn`.
+#[test]
+#[ignore]
+fn probe_biconn_heavy() {
+    let corpus = crate::corpus::corpus();
+    println!("\nmatrix\tn\tnnz\theavy_s\theavy_ratio");
+    let mut wins = 0usize;
+    let mut total = 0usize;
+    let mut worst_s = 0.0f64;
+    let mut worst_name = String::new();
+    let mut win_rows: Vec<(String, usize, usize, f64)> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        total += 1;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        let t0 = Instant::now();
+        let hp = biconn::biconn_heavy_order(pat, 24, 32, 150_000);
+        let secs = t0.elapsed().as_secs_f64();
+        let hp_us: Vec<usize> = hp.iter().map(|&x| x as usize).collect();
+        let r = if is_bijection(&hp_us, n) {
+            flops_of(&sp, &hp_us) as f64 / base
+        } else {
+            f64::NAN
+        };
+
+        if r < 0.9999 {
+            wins += 1;
+            win_rows.push((name.clone(), n, nnz, r));
+        }
+        if secs > worst_s {
+            worst_s = secs;
+            worst_name = name.clone();
+        }
+        println!("{name}\t{n}\t{nnz}\t{secs:.4}\t{r:.4}");
+    }
+    println!("\nbiconn_heavy beats AMD on {wins}/{total} matrices");
+    println!("worst isolated biconn_heavy time: {worst_s:.4}s on {worst_name}");
+    win_rows.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+    println!("--- deepest wins (name n nnz ratio) ---");
+    for (name, n, nnz, r) in win_rows.iter().take(50) {
+        println!("WIN\t{name}\t{n}\t{nnz}\t{r:.4}");
+    }
+}
