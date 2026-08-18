@@ -43,6 +43,156 @@
 
 use super::ScoringPattern;
 
+/// Shared body of [`ScoreWorkspace::permute_into`] and
+/// [`PermuteWorkspace`]'s permute: a faithful port of vendor
+/// `feral::ordering::amd::permute_pattern`, parameterized over the buffers so
+/// both workspaces reuse the identical logic (single-sourced so the two paths
+/// cannot drift apart). Buffer invariants (argued per-field in
+/// `permute_into`'s original comments, unchanged here):
+///   - `pcol_ptr[0]` is 0 on entry and is never written (the prefix sum only
+///     reads it), so it stays 0 across calls;
+///   - `pcol_ptr[1..=n]`, `inv_perm`, `offsets`, `prow_idx` are each fully
+///     overwritten on every call (perm is a bijection; the bucket-fill writes
+///     exactly the `nnz` distinct positions), so no reset is needed.
+fn permute_into_bufs(
+    n: usize,
+    perm: &[usize],
+    pat: &ScoringPattern,
+    inv_perm: &mut [usize],
+    pcol_ptr: &mut [usize],
+    prow_idx: &mut [usize],
+    offsets: &mut [usize],
+) {
+    // `inv_perm[old] = new`.
+    for (new, &old) in perm.iter().enumerate() {
+        inv_perm[old] = new;
+    }
+
+    for old_j in 0..n {
+        let new_j = inv_perm[old_j];
+        let nnz_j = pat.col_ptr[old_j + 1] - pat.col_ptr[old_j];
+        pcol_ptr[new_j + 1] = nnz_j;
+    }
+    for j in 0..n {
+        pcol_ptr[j + 1] += pcol_ptr[j];
+    }
+
+    offsets[..n].copy_from_slice(&pcol_ptr[..n]);
+
+    for old_j in 0..n {
+        let new_j = inv_perm[old_j];
+        let start = pat.col_ptr[old_j];
+        let end = pat.col_ptr[old_j + 1];
+        for k in start..end {
+            let new_i = inv_perm[pat.row_idx[k]];
+            let pos = offsets[new_j];
+            prow_idx[pos] = new_i;
+            offsets[new_j] += 1;
+        }
+    }
+
+    // Sort each column's row indices, exactly as the vendor function does.
+    for j in 0..n {
+        let start = pcol_ptr[j];
+        let end = pcol_ptr[j + 1];
+        prow_idx[start..end].sort_unstable();
+    }
+}
+
+/// Reusable workspace for the relabel/perturb → permute → i32-cast path the
+/// relabel multi-starts, hill-climb phase and count-relabel phase run once
+/// PER RESTART. As written against the vendor functions, that path allocated
+/// a fresh `q` (`relabel`/`perturb`), a fresh 4-`Vec` permuted pattern
+/// (`permute_pattern`) and two fresh `Vec<i32>` casts every restart — ~7 heap
+/// allocations, two of them O(nnz), times up to ~48 restarts on the matrices
+/// that receive every phase. This workspace allocates every buffer exactly
+/// ONCE per `order()` call (n and nnz are fixed for the whole call) and
+/// reuses them across every restart. It is separate from [`ScoreWorkspace`]
+/// (rather than more fields on it) because the relabel loops run INSIDE
+/// `consider`, which already holds `ws` mutably borrowed — the generation
+/// path needs its own buffers.
+///
+/// The permute step is literally [`permute_into_bufs`] (the same function the
+/// proven-byte-identical scoring path uses), and the i32 cast is the same
+/// element-wise map the relabel loops did by hand — so the relabelled pattern
+/// fed to `feral_amd::amd_order` / `feral_amf::amf_order_opts` is
+/// bit-identical to the vendor-built one (covered by
+/// `permute_ws_matches_vendor` below).
+pub(crate) struct PermuteWorkspace {
+    n: usize,
+    inv_perm: Vec<usize>,
+    pcol_ptr: Vec<usize>,
+    prow_idx: Vec<usize>,
+    offsets: Vec<usize>,
+    q: Vec<usize>,
+    col_ptr_i32: Vec<i32>,
+    row_idx_i32: Vec<i32>,
+}
+
+impl PermuteWorkspace {
+    pub(crate) fn new(n: usize, nnz: usize) -> Self {
+        PermuteWorkspace {
+            n,
+            inv_perm: vec![0; n],
+            pcol_ptr: vec![0; n + 1],
+            prow_idx: vec![0; nnz],
+            offsets: vec![0; n],
+            q: Vec::with_capacity(n),
+            col_ptr_i32: Vec::with_capacity(n + 1),
+            row_idx_i32: Vec::with_capacity(nnz),
+        }
+    }
+
+    /// Scratch buffer for the caller's relabel/perturb generation (filled by
+    /// `relabel_into`/`perturb_into` in `mod.rs`, then consumed by
+    /// [`permute_q_i32`](Self::permute_q_i32)).
+    pub(crate) fn q_scratch(&mut self) -> &mut Vec<usize> {
+        &mut self.q
+    }
+
+    /// Permute `pat` by the permutation currently held in `self.q`, returning
+    /// the i32-cast permuted pattern plus a read-only view of `q` itself (for
+    /// the compose-back step `pb[k] -> q[pb[k]]`). One `&mut self` borrow in,
+    /// three shared reborrows out — no per-call allocation.
+    pub(crate) fn permute_q_i32(&mut self, pat: &ScoringPattern) -> (&[i32], &[i32], &[usize]) {
+        permute_into_bufs(
+            self.n,
+            &self.q,
+            pat,
+            &mut self.inv_perm,
+            &mut self.pcol_ptr,
+            &mut self.prow_idx,
+            &mut self.offsets,
+        );
+        self.col_ptr_i32.clear();
+        self.col_ptr_i32.extend(self.pcol_ptr.iter().map(|&x| x as i32));
+        self.row_idx_i32.clear();
+        self.row_idx_i32.extend(self.prow_idx.iter().map(|&x| x as i32));
+        (&self.col_ptr_i32, &self.row_idx_i32, &self.q)
+    }
+
+    /// Same as [`permute_q_i32`](Self::permute_q_i32) but permuting by an
+    /// explicit `perm` (for phases that build their relabeling in their own
+    /// buffer, e.g. count-relabel's sorted `q`).
+    #[allow(dead_code)]
+    pub(crate) fn permute_i32(&mut self, pat: &ScoringPattern, perm: &[usize]) -> (&[i32], &[i32]) {
+        permute_into_bufs(
+            self.n,
+            perm,
+            pat,
+            &mut self.inv_perm,
+            &mut self.pcol_ptr,
+            &mut self.prow_idx,
+            &mut self.offsets,
+        );
+        self.col_ptr_i32.clear();
+        self.col_ptr_i32.extend(self.pcol_ptr.iter().map(|&x| x as i32));
+        self.row_idx_i32.clear();
+        self.row_idx_i32.extend(self.prow_idx.iter().map(|&x| x as i32));
+        (&self.col_ptr_i32, &self.row_idx_i32)
+    }
+}
+
 pub(crate) struct ScoreWorkspace {
     n: usize,
 
@@ -103,56 +253,19 @@ impl ScoreWorkspace {
     /// every call — see the field-by-field notes below — so no reset is
     /// needed before this runs).
     fn permute_into(&mut self, pat: &ScoringPattern, perm: &[usize]) {
-        let n = self.n;
-
-        // `inv_perm[old] = new`. Every index 0..n is written exactly once
-        // (perm is a bijection), so this fully overwrites the buffer.
-        for (new, &old) in perm.iter().enumerate() {
-            self.inv_perm[old] = new;
-        }
-
-        // `pcol_ptr[0]` is ALWAYS 0 (set once in `new`, never written again
-        // by this method or the prefix-sum below, which only reads it) — no
-        // reset needed. `pcol_ptr[1..=n]`: `new_j` ranges over all of 0..n
-        // exactly once (inv_perm bijection), so `pcol_ptr[new_j + 1]` is
-        // written for every index 1..=n exactly once — full overwrite.
-        for old_j in 0..n {
-            let new_j = self.inv_perm[old_j];
-            let nnz_j = pat.col_ptr[old_j + 1] - pat.col_ptr[old_j];
-            self.pcol_ptr[new_j + 1] = nnz_j;
-        }
-        for j in 0..n {
-            self.pcol_ptr[j + 1] += self.pcol_ptr[j];
-        }
-
-        // `offsets[..n]` = a copy of the per-column start offsets — full
-        // overwrite via copy_from_slice, not a fresh allocation.
-        self.offsets[..n].copy_from_slice(&self.pcol_ptr[..n]);
-
-        // `prow_idx`: the fill loop below writes exactly `nnz` entries at
-        // exactly the `nnz` distinct positions `0..nnz` (the offsets
-        // bookkeeping is an exact bucket-fill), so it is fully overwritten;
-        // no reset needed even though nothing here zeroes it first.
-        for old_j in 0..n {
-            let new_j = self.inv_perm[old_j];
-            let start = pat.col_ptr[old_j];
-            let end = pat.col_ptr[old_j + 1];
-            for k in start..end {
-                let new_i = self.inv_perm[pat.row_idx[k]];
-                let pos = self.offsets[new_j];
-                self.prow_idx[pos] = new_i;
-                self.offsets[new_j] += 1;
-            }
-        }
-
-        // Sort each column's row indices, exactly as the vendor function
-        // does (downstream code does not strictly require it, but keeping
-        // the invariant avoids any behavioral drift from the vendor path).
-        for j in 0..n {
-            let start = self.pcol_ptr[j];
-            let end = self.pcol_ptr[j + 1];
-            self.prow_idx[start..end].sort_unstable();
-        }
+        // Single-sourced with `PermuteWorkspace`'s permute — see
+        // `permute_into_bufs` for the per-field overwrite/reset invariants
+        // (they are the same invariants the original inline body documented
+        // here; the logic is unchanged, only its location moved).
+        permute_into_bufs(
+            self.n,
+            perm,
+            pat,
+            &mut self.inv_perm,
+            &mut self.pcol_ptr,
+            &mut self.prow_idx,
+            &mut self.offsets,
+        );
     }
 
     /// Same computation as `permute_into`, but ALSO writes the i32-cast
@@ -466,6 +579,54 @@ mod tests {
             let expected_ri: Vec<i32> = expected.row_idx.iter().map(|&x| x as i32).collect();
             assert_eq!(col_ptr_i32, expected_cp, "col_ptr mismatch for perm {perm:?}");
             assert_eq!(row_idx_i32, expected_ri, "row_idx mismatch for perm {perm:?}");
+        }
+    }
+
+    /// `PermuteWorkspace` must produce the same permuted pattern as vendor
+    /// `permute_pattern` (cast to i32), across repeated calls into the SAME
+    /// reused buffers (catching any missing reset), for both the `q`-driven
+    /// and explicit-perm entry points.
+    #[test]
+    fn permute_ws_matches_vendor() {
+        let n = 15;
+        let mut edges = Vec::new();
+        for v in 0..n - 1 {
+            edges.push((v, v + 1));
+        }
+        for v in 0..n - 4 {
+            edges.push((v, v + 4));
+        }
+        let pat = Pattern::from_edges(n, &edges);
+        let sp = scoring_pattern(&pat);
+        let mut pws = PermuteWorkspace::new(n, pat.nnz());
+
+        let perms: Vec<Vec<usize>> = vec![
+            (0..n).collect(),
+            (0..n).rev().collect(),
+            {
+                let mut p: Vec<usize> = (0..n).collect();
+                p.swap(0, 7);
+                p.swap(3, 12);
+                p
+            },
+        ];
+        for perm in &perms {
+            // Explicit-perm entry point.
+            let (cp, ri) = pws.permute_i32(&sp, perm);
+            let expected = feral::ordering::amd::permute_pattern(&sp, perm);
+            let expected_cp: Vec<i32> = expected.col_ptr.iter().map(|&x| x as i32).collect();
+            let expected_ri: Vec<i32> = expected.row_idx.iter().map(|&x| x as i32).collect();
+            assert_eq!(cp, expected_cp.as_slice(), "col_ptr mismatch for perm {perm:?}");
+            assert_eq!(ri, expected_ri.as_slice(), "row_idx mismatch for perm {perm:?}");
+
+            // q-driven entry point: load q with the same perm, expect the
+            // same permuted pattern AND the same q back for compose-back.
+            pws.q_scratch().clear();
+            pws.q_scratch().extend_from_slice(perm);
+            let (cp2, ri2, q2) = pws.permute_q_i32(&sp);
+            assert_eq!(cp2, expected_cp.as_slice(), "q col_ptr mismatch for perm {perm:?}");
+            assert_eq!(ri2, expected_ri.as_slice(), "q row_idx mismatch for perm {perm:?}");
+            assert_eq!(q2, perm.as_slice(), "q view mismatch for perm {perm:?}");
         }
     }
 }

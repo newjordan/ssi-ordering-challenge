@@ -437,28 +437,20 @@ const RELABEL_MAX_RESTARTS: usize = 24;
 /// [`RELABEL_BUDGET`]/[`RELABEL_MAX_RESTARTS`] — shrinking it bought nothing
 /// in that sweep, so it is left alone rather than "rebalanced".
 ///
-/// COST FLAG, unverified: in the SAME "budget = microseconds of restart time"
-/// convention documented on [`RELABEL_BUDGET`], `RELABEL_BUDGET_LARGE`
-/// implies a worst-case restart-time envelope of ~1.5 s at the crossover nnz
-/// (`RELABEL_BUDGET_LARGE / RELABEL_MAX_RESTARTS_LARGE` = 10_000) — a real
-/// jump from the uniform policy's ~0.3 s, on top of every other candidate
-/// this matrix also runs. This is ANALYTIC ONLY and is the single
-/// highest-risk change in this integration; the `nnz <=
+/// COST, now measured (was flagged analytic-only when this tier sat
+/// disabled): `probe_relabel_gt10k` reruns the relabelled-AMD restarts per
+/// matrix and attributes only the NEW restarts' seconds to each policy. At
+/// 1.5M/150 the worst combined `order()` over the 300-matrix dev corpus is
+/// 1.198 s (`ringpack_30_2`; single contaminated sample, so an upper bound,
+/// and the shipped generation path is cheaper than the probe's allocating
+/// one). That clears the 2 s cap with ~40% headroom. The `nnz <=
 /// HEAVY_SPARSE_MAX_AVG_DEG * n` sparsity guard inside `relabel_restarts`
-/// still applies, but it guards DENSITY, not the raw restart-time envelope
-/// this budget implies. Verify with the enforced `time_cap` test before
-/// trusting it, and reduce this tier first if the combined build cannot pass
-/// reliably (a strip-transform gate misconfigured the same way, sized 5-10x
-/// too generous by the same kind of analogy-not-measurement reasoning,
-/// already broke the enforced cap once in this integration — see
-/// `STRIP_MAX_NNZ`'s doc comment).
-// Unused in THIS build (win C disabled — see the fallback rationale where
-// `relabel_budget`/`relabel_cap_bucket` are computed). Kept, not deleted, so
-// this file stays a minimal diff from the aggressive build and the doc
-// comment's risk analysis stays attached to the constants it describes.
-#[allow(dead_code)]
+/// still applies on top.
+// Enabled for `n >= 10_000` (win C) after `probe_relabel_gt10k` measured the
+// true added restart time per matrix: worst combined `order()` 1.198 s
+// (upper-bound sample), clearing the 2 s cap with 40% headroom. See the
+// relabel-AMD loop's "WIN C ENABLED" comment for the full measurement trail.
 const RELABEL_BUDGET_LARGE: usize = 1_500_000;
-#[allow(dead_code)]
 const RELABEL_MAX_RESTARTS_LARGE: usize = 150;
 
 /// HEAVY TIER: where `RELABEL_BUDGET / nnz` rounds to zero, take ONE restart
@@ -927,6 +919,145 @@ thread_local! {
         const { std::cell::Cell::new(u64::MAX) };
 }
 
+// TEST-ONLY duplicate/cost census: every candidate that reaches a scoring
+// decision logs (site, perm-hash, cache-hit) here. Never compiled into the
+// shipped binary; never read by any code path that influences `order()`'s
+// output. Sites: 0=portfolio (`consider` outside the relabel loops),
+// 1=relabel-AMD multi-start, 2=relabel-AMF multi-start, 3=hill-climb,
+// 4=peel, 5=count-relabel, 6=fillg/strip-v2, 7=telos, 8=minl, 9=orbit,
+// 10=pharmakos.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CENSUS_LOG: std::cell::RefCell<Vec<(u8, u64, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static CENSUS_PHASE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// TEST-ONLY: stable FNV-1a hash of a permutation, for the census log and the
+/// per-matrix permutation dump (equality fingerprint) — never used for any
+/// decision that affects `order()`'s output.
+#[cfg(test)]
+pub(crate) fn census_hash(perm: &[usize]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ (perm.len() as u64);
+    for &v in perm {
+        h ^= v as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(test)]
+pub(crate) fn census_record(site: u8, perm: &[usize], cache_hit: bool) {
+    CENSUS_LOG.with(|l| l.borrow_mut().push((site, census_hash(perm), cache_hit)));
+}
+
+/// FxHash-style hasher for the permutation-flops cache (`flops_cache`).
+/// Output-neutral by construction: `HashMap` still resolves equality by full
+/// slice comparison; only the bucket-selection hash changes. The std SipHash
+/// default hashes a `&[usize]` key at roughly 1 byte/cycle — ~2-3 ms per
+/// lookup on n ≈ 340k matrices, paid per candidate — while this multiply-xor
+/// loop runs at word rate. Collision behavior is irrelevant to correctness
+/// (a collision only costs an extra exact slice comparison).
+#[derive(Default, Clone, Copy)]
+struct PermHashBuilder;
+
+impl std::hash::BuildHasher for PermHashBuilder {
+    type Hasher = PermHasher;
+    #[inline]
+    fn build_hasher(&self) -> PermHasher {
+        PermHasher { h: 0 }
+    }
+}
+
+struct PermHasher {
+    h: u64,
+}
+
+impl PermHasher {
+    #[inline(always)]
+    fn add(&mut self, v: u64) {
+        self.h = (self.h.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for PermHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.h
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // `Hash for [usize]` routes through `hash_slice`, which hands the whole
+        // permutation to `write` as ONE byte blob — so this loop must run at
+        // word rate, not byte rate (a per-byte dependent multiply chain is
+        // ~8x slower than the SipHash this replaces).
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+    #[inline(always)]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline(always)]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    #[inline(always)]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    // No `write_length_prefix` override (unstable API); its default
+    // implementation routes through `write_usize`, which is overridden above.
+}
+
+/// Reusable bijection checker: a generation-stamped seen-array avoids the
+/// `vec![false; n]` allocation + full memset the plain [`is_bijection`] pays
+/// per candidate (up to ~90 calls per `order()` on a fully-gated matrix).
+/// Output-neutral: the accept/reject decision is identical — a position is
+/// "seen this call" iff `seen[v] == gen`, and `gen` advances per call.
+/// (Wraparound: after 2^32 calls the array is re-zeroed once; unreachable in
+/// practice within a single `order()` call, but handled anyway.)
+struct BijCheck {
+    seen: Vec<u32>,
+    gen: u32,
+}
+
+impl BijCheck {
+    fn new(n: usize) -> Self {
+        BijCheck { seen: vec![0; n], gen: 0 }
+    }
+    fn is_bijection(&mut self, perm: &[usize], n: usize) -> bool {
+        if perm.len() != n {
+            return false;
+        }
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.seen.fill(0);
+            self.gen = 1;
+        }
+        let g = self.gen;
+        for &v in perm {
+            if v >= n || self.seen[v] == g {
+                return false;
+            }
+            self.seen[v] = g;
+        }
+        true
+    }
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -940,8 +1071,20 @@ fn splitmix64(state: &mut u64) -> u64 {
 
 /// A relabeling of `0..n` derived from a fixed seed (Fisher-Yates over
 /// SplitMix64). Pure function of `(n, seed)` — no wall-clock, no entropy.
+#[allow(dead_code)] // probes use it; the shipped path uses `relabel_into`.
 fn relabel(n: usize, seed: u64) -> Vec<usize> {
-    let mut q: Vec<usize> = (0..n).collect();
+    let mut q = Vec::with_capacity(n);
+    relabel_into(n, seed, &mut q);
+    q
+}
+
+/// [`relabel`] written into caller-provided scratch (cleared, then refilled),
+/// so the relabel multi-start loops allocate the permutation zero times per
+/// restart. Identical SplitMix64 stream and Fisher-Yates walk — the produced
+/// permutation is byte-identical to `relabel(n, seed)`.
+fn relabel_into(n: usize, seed: u64, q: &mut Vec<usize>) {
+    q.clear();
+    q.extend(0..n);
     let mut s = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(0x1234_5678_9ABC_DEF0);
@@ -949,7 +1092,6 @@ fn relabel(n: usize, seed: u64) -> Vec<usize> {
         let j = (splitmix64(&mut s) % (i as u64 + 1)) as usize;
         q.swap(i, j);
     }
-    q
 }
 
 /// Restart count for the budgeted relabelled-AMD multi-start: spend at most
@@ -984,9 +1126,19 @@ const HC_CAP_SMALL: usize = 8;
 /// The relabeling used by the hill-climb phase: the incumbent best permutation
 /// with `swaps` random transpositions applied. Pure function of its arguments
 /// (SplitMix64 stream from `seed`), so both required `order()` runs agree.
+#[allow(dead_code)] // probes use it; the shipped path uses `perturb_into`.
 fn perturb(p: &[usize], seed: u64, swaps: usize) -> Vec<usize> {
+    let mut q = Vec::with_capacity(p.len());
+    perturb_into(p, seed, swaps, &mut q);
+    q
+}
+
+/// [`perturb`] written into caller-provided scratch — byte-identical output,
+/// zero allocation per hill-climb step once the scratch has capacity.
+fn perturb_into(p: &[usize], seed: u64, swaps: usize, q: &mut Vec<usize>) {
     let n = p.len();
-    let mut q = p.to_vec();
+    q.clear();
+    q.extend_from_slice(p);
     let mut s = seed
         .wrapping_mul(0xA076_1D64_78BD_642F)
         .wrapping_add(0xE703_7ED1_A0B4_28DB);
@@ -995,7 +1147,6 @@ fn perturb(p: &[usize], seed: u64, swaps: usize) -> Vec<usize> {
         let j = (splitmix64(&mut s) % n as u64) as usize;
         q.swap(i, j);
     }
-    q
 }
 
 fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
@@ -1417,16 +1568,55 @@ fn order_with_options(
     // scoring calls below route through it.
     let mut ws = ScoreWorkspace::new(n, nnz);
 
-    // Exact-duplicate-candidate memoization, PORTFOLIO-PHASE ONLY (ported
-    // from `sbx-perf`, same scoping rationale: the relabel multi-start and
-    // hill-climb phases measured near-0% within-phase duplicate rates there,
-    // so inserting from them would be pure memory cost with no benefit, and
-    // would make the table's size scale with the relabel-restart budget —
-    // exactly the wrong property to have in THIS build, which raises that
-    // budget for large matrices). Only `consider` inserts; the relabel and
-    // hill-climb loops below only READ it.
-    let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
+    // Exact-duplicate-candidate memoization. EVERY phase inserts on a miss
+    // (portfolio via `consider`, and the hand-rolled phases below): the
+    // `probe_dup_census` measurement on this build found the non-inserting
+    // phases re-scored exact duplicates 2,684 times corpus-wide (23.6% of
+    // telos evals, 12.6% of peel, 61% of orbit) — each wasted pass is a full
+    // O(nnz) symbolic evaluation, while an insert costs one O(n) clone paid
+    // once per UNIQUE candidate. Table size stays bounded by the per-phase
+    // candidate counts (all fixed grids or budgeted loops, ≤ ~220 entries on
+    // the most-served matrices), so memory is not a concern (the harness has
+    // no memory limit; only the 2 s time cap).
+    //
+    // Hasher: the std SipHash default costs ~1 ms per full-length permutation
+    // on the largest matrices (n ≈ 340k), paid on EVERY candidate lookup —
+    // measurable time against the 2 s cap. A FxHash-style multiply-xor hasher
+    // is ~10x cheaper on `&[usize]` keys and is OUTPUT-NEUTRAL: the map still
+    // resolves equality by exact slice comparison, so lookups/inserts return
+    // identical results; only the internal bucket choice changes.
+    let mut flops_cache: std::collections::HashMap<Vec<usize>, u64, PermHashBuilder> =
+        std::collections::HashMap::with_hasher(PermHashBuilder);
     flops_cache.insert(best_perm.clone(), best_flops);
+
+    // Generation-stamped bijection checker, allocated once for this `order()`
+    // call and shared by every candidate site below (the plain `is_bijection`
+    // free function remains for probes/tests). Output-neutral: identical
+    // accept/reject decision, zero per-candidate allocation.
+    let mut bij = BijCheck::new(n);
+
+    // Reusable relabel/permute workspace for the multi-start, hill-climb and
+    // count-relabel generation paths (one allocation per `order()` call
+    // instead of ~7 per restart). `RefCell` because the relabel loops run
+    // inside `consider`, which already holds `ws` mutably borrowed — the
+    // produce closures borrow this cell only for the duration of each call.
+    let pws = std::cell::RefCell::new(scoring_ws::PermuteWorkspace::new(n, nnz));
+
+    // EXTRA-RESTARTS side channel (win C, monotone): relabel-AMD restarts
+    // beyond the uniform-policy count are scored through `consider` like any
+    // candidate (cache-memoized, bijection-checked) but collected into
+    // `extra_best` instead of displacing the incumbent. Downstream local
+    // search (hill-climb, peel, ...) seeds from `best_perm`, and its result
+    // is NOT monotone in that seed — measured: naive win-C let extra winners
+    // reseed hill-climb and REGRESSED chp_shorttermplan2d 0.484 -> 0.515,
+    // netting gt_10k worse (0.776550 vs 0.776113 baseline). With the side
+    // channel the incumbent those phases see is byte-identical to the
+    // uniform-policy run, so the shipped result is exactly
+    // `min(baseline_result, extra seeds)` — every matrix's flops <= baseline,
+    // and `probe_relabel_gt10k`'s pure-min model becomes exact.
+    let extra_mode = std::cell::Cell::new(false);
+    let extra_best: std::cell::RefCell<(u64, Vec<usize>)> =
+        std::cell::RefCell::new((u64::MAX, Vec::new()));
 
     // Try a candidate produced by `f`; keep it if it is a valid bijection with
     // strictly fewer flops. `catch_unwind` guards against a candidate panicking
@@ -1439,20 +1629,32 @@ fn order_with_options(
                 return;
             };
             let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
-            if !is_bijection(&perm, n) {
+            if !bij.is_bijection(&perm, n) {
                 return;
             }
-            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
-                cached
+            let (f, _hit) = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                (cached, true)
             } else {
                 let v = ws.flops(&scoring_pat, &perm);
                 flops_cache.insert(perm.clone(), v);
-                v
+                (v, false)
             };
+            #[cfg(test)]
+            census_record(CENSUS_PHASE.with(|c| c.get()), &perm, _hit);
             // TEST-ONLY: record the best flops over `consider` candidates alone
             // (excludes the AMD anchor), for the runner-up-margin census.
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+            if extra_mode.get() {
+                // Win-C extra restart: score and memoize as usual, but hold
+                // the candidate in the side channel so it cannot reseed the
+                // downstream local-search phases (see `extra_mode` above).
+                let mut eb = extra_best.borrow_mut();
+                if f < eb.0 {
+                    *eb = (f, perm);
+                }
+                return;
+            }
             if f < best_flops {
                 best_flops = f;
                 best_perm = perm;
@@ -2179,34 +2381,53 @@ fn order_with_options(
     // at 1..=restarts, and `restarts` is a pure function of nnz. Best-of floor →
     // zero-downside, and each candidate is bijection-checked before it can win.
     //
-    // WIN C DISABLED in this build (the conservative fallback): the coordinator's
-    // own doc comment on `RELABEL_BUDGET_LARGE` already flags it as "the single
-    // highest-risk change in this integration" (analytic-only, ~1.5s worst-case
-    // ADDED restart-time envelope at the crossover nnz, applied broadly across
-    // all 45 gt_10k dev matrices, not one outlier) — this build reverts `n >=
-    // 10_000` to the SAME uniform policy every other bucket already uses
-    // ([`RELABEL_BUDGET`]/[`RELABEL_MAX_RESTARTS`]), so its worst-case cost
-    // profile is identical to the pre-integration frontier baseline that is
-    // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
-    // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
-    // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
-    let restarts =
-        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
+    // WIN C ENABLED (Track D, measured, monotone): `n >= 10_000` runs the 5x
+    // budget tier, but restarts past the uniform-policy count go through the
+    // `extra_mode` side channel (see its comment) so the result is exactly
+    // `min(uniform-policy result, extra seeds)` — never worse per matrix.
+    // The previous build disabled win C on an ANALYTIC ~1.5 s worst-case
+    // fear; `probe_relabel_gt10k` measures the true added time per matrix
+    // (only the NEW restarts' seconds, on top of a measured `order()`):
+    // worst combined 1.198 s at 1.5M/150 (single contaminated sample = upper
+    // bound; the shipped generation path is the zero-alloc workspace, cheaper
+    // than the probe's), 40% headroom under the 2 s cap. Probe-projected
+    // score 0.843535 -> 0.843297, all of it in `gt_10k` (0.776113 ->
+    // 0.775519, 3 matrices improved); 2M/200 buys only 0.000014 more for
+    // +0.08 s, so the 5x knee is the ship point. The AMF multistart below
+    // keeps the uniform budget (its own nnz <= 130k gate already bounds it,
+    // and the probe sized the AMD family only).
+    let restarts_base =
+        relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
+    let restarts = if n >= 10_000 {
+        relabel_restarts(RELABEL_BUDGET_LARGE, RELABEL_MAX_RESTARTS_LARGE, n, nnz)
+            .min(relabel_cap)
+            .max(restarts_base)
+    } else {
+        restarts_base
+    };
+    #[cfg(test)]
+    CENSUS_PHASE.with(|c| c.set(1));
     for r in 0..restarts {
+        if r == restarts_base {
+            extra_mode.set(true);
+        }
         let seed = r as u64 + 1;
         consider(&|| {
-            let q = relabel(n, seed);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+            // Generation path through the reused workspace: `relabel_into`
+            // and `permute_q_i32` are byte-identical to the `relabel` +
+            // vendor `permute_pattern` + i32 casts they replace (covered by
+            // `permute_ws_matches_vendor`), at zero allocation per restart.
+            let mut p = pws.borrow_mut();
+            relabel_into(n, seed, p.q_scratch());
+            let (bcp, bri, q) = p.permute_q_i32(&scoring_pat);
+            let bcore = feral_ordering_core::CscPattern::new(n, bcp, bri)
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
             let pb = feral_amd::amd_order(&bcore)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
             Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
         });
     }
+    extra_mode.set(false);
 
     // RELABELLED-AMF MULTISTART (`sbx-relabel-amf`): the relabel trick above
     // works because AMD's tie-break reads the vertex numbering, so `AMD(QAQᵀ)`
@@ -2232,6 +2453,8 @@ fn order_with_options(
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
+    #[cfg(test)]
+    CENSUS_PHASE.with(|c| c.set(2));
     if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
         let amf_opts = feral_amf::AmfOptions {
             dense_alpha: 5.0,
@@ -2242,11 +2465,10 @@ fn order_with_options(
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                let mut p = pws.borrow_mut();
+                relabel_into(n, seed, p.q_scratch());
+                let (bcp, bri, q) = p.permute_q_i32(&scoring_pat);
+                let bcore = feral_ordering_core::CscPattern::new(n, bcp, bri)
                     .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                 let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
@@ -2328,30 +2550,28 @@ fn order_with_options(
     for r in 0..hc_r {
         let seed = (r as u64 + 1).wrapping_mul(0x9E37);
         let swaps = if r % 2 == 0 { n / 16 } else { n / 4 };
-        let q = perturb(&best_perm, seed, swaps);
-        let b = permute_pattern(&scoring_pat, &q);
-        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-        let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
-            continue;
-        };
-        let Ok(pb) = feral_amd::amd_order(&bcore) else {
-            continue;
-        };
-        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
-        if is_bijection(&perm, n) {
-            // READ-ONLY cache lookup (no insert) — see the `flops_cache`
-            // declaration's comment: the relabel/hill-climb phases measured
-            // near-0% within-phase duplicate rates in the `sbx-perf` cost
-            // session, so inserting here buys nothing and would make the
-            // table's size scale with the (now much larger, win-C) restart
-            // budget. Still routes through the reused workspace (`ws.flops`
-            // allocates nothing after the first call) even on a miss.
-            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
-                cached
-            } else {
-                ws.flops(&scoring_pat, &perm)
+        let perm: Vec<usize> = {
+            let mut p = pws.borrow_mut();
+            perturb_into(&best_perm, seed, swaps, p.q_scratch());
+            let (bcp, bri, q) = p.permute_q_i32(&scoring_pat);
+            let Some(bcore) = feral_ordering_core::CscPattern::new(n, bcp, bri) else {
+                continue;
             };
+            let Ok(pb) = feral_amd::amd_order(&bcore) else {
+                continue;
+            };
+            pb.iter().map(|&x| q[x as usize]).collect()
+        };
+        if bij.is_bijection(&perm, n) {
+            let (f, _hit) = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                (cached, true)
+            } else {
+                let v = ws.flops(&scoring_pat, &perm);
+                flops_cache.insert(perm.clone(), v);
+                (v, false)
+            };
+            #[cfg(test)]
+            census_record(3, &perm, _hit);
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
             if f < best_flops {
@@ -2429,12 +2649,18 @@ fn order_with_options(
                         tail.sort_unstable_by_key(|&v| (cnt_by_v[v], v));
                     }
                     cand.extend(tail);
-                    if is_bijection(&cand, n) {
-                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                            cached
+                    if bij.is_bijection(&cand, n) {
+                        let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            (cached, true)
                         } else {
-                            ws.flops(&scoring_pat, &cand)
+                            {
+                    let v = ws.flops(&scoring_pat, &cand);
+                    flops_cache.insert(cand.clone(), v);
+                    (v, false)
+                }
                         };
+                        #[cfg(test)]
+                        census_record(4, &cand, _hit);
                         if f < best_flops {
                             best_flops = f;
                             best_perm = cand;
@@ -2458,22 +2684,29 @@ fn order_with_options(
             } else {
                 q.sort_unstable_by(|&a, &b| cnt_by_v[a].cmp(&cnt_by_v[b]).then(a.cmp(&b)));
             }
-            let bpat = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
-            let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
-                continue;
-            };
-            let Ok(pb) = feral_amd::amd_order(&bcore) else {
-                continue;
-            };
-            let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
-            if is_bijection(&cand, n) {
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
+            let cand: Vec<usize> = {
+                let mut p = pws.borrow_mut();
+                let (bcp, bri) = p.permute_i32(&scoring_pat, &q);
+                let Some(bcore) = feral_ordering_core::CscPattern::new(n, bcp, bri) else {
+                    continue;
                 };
+                let Ok(pb) = feral_amd::amd_order(&bcore) else {
+                    continue;
+                };
+                pb.iter().map(|&x| q[x as usize]).collect()
+            };
+            if bij.is_bijection(&cand, n) {
+                let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                    (cached, true)
+                } else {
+                    {
+                    let v = ws.flops(&scoring_pat, &cand);
+                    flops_cache.insert(cand.clone(), v);
+                    (v, false)
+                }
+                };
+                #[cfg(test)]
+                census_record(5, &cand, _hit);
                 if f < best_flops {
                     best_flops = f;
                     best_perm = cand;
@@ -2512,14 +2745,18 @@ fn order_with_options(
 
         let mut try_cand = |cand_opt: Option<Vec<usize>>, best_flops: &mut u64, best_perm: &mut Vec<usize>| {
             let Some(cand) = cand_opt else { return };
-            if !is_bijection(&cand, n) {
+            if !bij.is_bijection(&cand, n) {
                 return;
             }
-            let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                cached
+            let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                (cached, true)
             } else {
-                ws.flops(&scoring_pat, &cand)
+                let v = ws.flops(&scoring_pat, &cand);
+                flops_cache.insert(cand.clone(), v);
+                (v, false)
             };
+            #[cfg(test)]
+            census_record(6, &cand, _hit);
             if f < *best_flops {
                 *best_flops = f;
                 *best_perm = cand;
@@ -2672,14 +2909,20 @@ fn order_with_options(
             let mut round_f = best_flops;
             let mut round_p: Option<Vec<usize>> = None;
             let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
+                if !bij.is_bijection(&cand, n) {
                     return;
                 }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
+                let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                    (cached, true)
                 } else {
-                    ws.flops(&scoring_pat, &cand)
+                    {
+                    let v = ws.flops(&scoring_pat, &cand);
+                    flops_cache.insert(cand.clone(), v);
+                    (v, false)
+                }
                 };
+                #[cfg(test)]
+                census_record(7, &cand, _hit);
                 if f < *round_f {
                     *round_f = f;
                     *round_p = Some(cand);
@@ -2835,12 +3078,18 @@ fn order_with_options(
             }
             if removed_total > 0 {
                 let cand = minl_mcs_peo(n, &adj);
-                if is_bijection(&cand, n) {
-                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                        cached
+                if bij.is_bijection(&cand, n) {
+                    let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        (cached, true)
                     } else {
-                        ws.flops(&scoring_pat, &cand)
+                        {
+                    let v = ws.flops(&scoring_pat, &cand);
+                    flops_cache.insert(cand.clone(), v);
+                    (v, false)
+                }
                     };
+                    #[cfg(test)]
+                    census_record(8, &cand, _hit);
                     if f < best_flops {
                         best_flops = f;
                         best_perm = cand;
@@ -2904,12 +3153,18 @@ fn order_with_options(
                 let removed_total = orbit_batched_delete(&mut adj, &fill, &class);
                 if removed_total > 0 {
                     let cand = minl_mcs_peo(n, &adj);
-                    if is_bijection(&cand, n) {
-                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                            cached
+                    if bij.is_bijection(&cand, n) {
+                        let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            (cached, true)
                         } else {
-                            ws.flops(&scoring_pat, &cand)
+                            {
+                    let v = ws.flops(&scoring_pat, &cand);
+                    flops_cache.insert(cand.clone(), v);
+                    (v, false)
+                }
                         };
+                        #[cfg(test)]
+                        census_record(9, &cand, _hit);
                         if f < best_flops {
                             best_flops = f;
                             best_perm = cand;
@@ -2987,12 +3242,18 @@ fn order_with_options(
                 }
                 tries += 1;
                 if let Some(cand) = pharmakos_terminal_reorder(&scoring_pat, &in_s) {
-                    if is_bijection(&cand, n) {
-                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                            cached
+                    if bij.is_bijection(&cand, n) {
+                        let (f, _hit) = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            (cached, true)
                         } else {
-                            ws.flops(&scoring_pat, &cand)
+                            {
+                    let v = ws.flops(&scoring_pat, &cand);
+                    flops_cache.insert(cand.clone(), v);
+                    (v, false)
+                }
                         };
+                        #[cfg(test)]
+                        census_record(10, &cand, _hit);
                         if f < arena_flops {
                             arena_flops = f;
                             arena_perm = cand;
@@ -3019,6 +3280,14 @@ fn order_with_options(
             best_flops = arena_flops;
             best_perm = arena_perm;
         }
+    }
+
+    // Win-C fold-in: extra relabel-AMD restarts (n >= 10_000 only) join the
+    // final best-of here, AFTER every incumbent-seeded phase has run, so they
+    // can only lower the result — never reseed it (see `extra_mode`).
+    let (extra_flops, extra_perm) = extra_best.into_inner();
+    if extra_flops < best_flops {
+        best_perm = extra_perm;
     }
 
     let _ = best_flops;
@@ -4362,6 +4631,9 @@ fn flops_of(pat: &ScoringPattern, perm: &[usize]) -> u64 {
 }
 
 /// Whether `perm` is a bijection of `0..n` (guards a candidate before scoring).
+/// The shipped path uses [`BijCheck`] (zero per-call allocation); this free
+/// function remains for probes and tests.
+#[allow(dead_code)]
 fn is_bijection(perm: &[usize], n: usize) -> bool {
     if perm.len() != n {
         return false;
