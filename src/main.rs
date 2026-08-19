@@ -385,10 +385,10 @@ fn main() -> ExitCode {
             let score_val = combine(&flop_gms, &BUCKET_WEIGHTS);
             let fill = combine(&fill_gms, &BUCKET_WEIGHTS);
 
-            // Per-bucket breakdown table. Counts are useful public-dev
-            // diagnostics, but disclose the hidden eval corpus distribution.
-            println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
+            // Bucket-level diagnostics disclose both occupancy and relative
+            // performance, so they are emitted only for the public dev corpus.
             if show_matrix_census {
+                println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
                 println!(
                     "{:<8} {:>6} {:>16} {:>16}",
                     "bucket", "count", "flop_geomean", "fill_geomean"
@@ -404,21 +404,6 @@ fn main() -> ExitCode {
                         fmt(fill_gms[i]),
                     );
                 }
-            } else {
-                println!(
-                    "{:<8} {:>16} {:>16}",
-                    "bucket", "flop_geomean", "fill_geomean"
-                );
-                for i in 0..BUCKETS {
-                    let fmt =
-                        |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
-                    println!(
-                        "{:<8} {:>16} {:>16}",
-                        BUCKET_KEYS[i],
-                        fmt(flop_gms[i]),
-                        fmt(fill_gms[i]),
-                    );
-                }
             }
 
             println!(
@@ -428,14 +413,15 @@ fn main() -> ExitCode {
 
             // score.json — top-level `score` is what the grader ranks on;
             // `metrics` is passthrough detail (Hilbert captures it whole and
-            // shows it in the PR report). Public-dev artifacts retain counts;
-            // hidden artifacts omit both the total and per-bucket census.
-            let mut buckets_json = String::new();
-            for i in 0..BUCKETS {
-                let jf =
-                    |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
-                let sep = if i + 1 < BUCKETS { "," } else { "" };
-                if show_matrix_census {
+            // shows it in the PR report). Preserve the public-dev schema, but
+            // hidden artifacts expose aggregate score/tiebreak metrics only.
+            let json = if show_matrix_census {
+                let mut buckets_json = String::new();
+                for i in 0..BUCKETS {
+                    let jf = |g: Option<f64>| {
+                        g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"))
+                    };
+                    let sep = if i + 1 < BUCKETS { "," } else { "" };
                     let _ = write!(
                         buckets_json,
                         "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
@@ -445,32 +431,24 @@ fn main() -> ExitCode {
                         jf(fill_gms[i]),
                         sep,
                     );
-                } else {
-                    let _ = write!(
-                        buckets_json,
-                        "\"{}\": {{ \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
-                        BUCKET_KEYS[i],
-                        jf(flop_gms[i]),
-                        jf(fill_gms[i]),
-                        sep,
-                    );
                 }
-            }
-            let census_json = if show_matrix_census {
                 let total: usize = buckets.iter().map(|b| b.count).sum();
-                format!("\"matrices\": {total}, ")
+                format!(
+                    "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
+                     \"geomean_flop_ratio\": {score_val:.6}, \
+                     \"geomean_fill_ratio\": {fill:.6}, \
+                     \"matrices\": {total}, \
+                     \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
+                     \"buckets\": {{ {buckets_json} }} }} }}\n",
+                    BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
+                )
             } else {
-                String::new()
+                format!(
+                    "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
+                     \"geomean_flop_ratio\": {score_val:.6}, \
+                     \"geomean_fill_ratio\": {fill:.6} }} }}\n"
+                )
             };
-            let json = format!(
-                "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
-                 \"geomean_flop_ratio\": {score_val:.6}, \
-                 \"geomean_fill_ratio\": {fill:.6}, \
-                 {census_json}\
-                 \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
-                 \"buckets\": {{ {buckets_json} }} }} }}\n",
-                BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
-            );
             std::fs::write("score.json", json).expect("write score.json");
             append_results(timestamp, "OK", score_val, fill, &note);
             ExitCode::SUCCESS

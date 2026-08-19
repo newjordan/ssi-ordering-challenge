@@ -22,6 +22,16 @@ fn public_dev_corpus() -> std::path::PathBuf {
     .expect("canonicalize public dev corpus")
 }
 
+fn top_level_score(json: &str) -> f64 {
+    let (_, tail) = json
+        .split_once("\"score\":")
+        .expect("top-level score field");
+    let end = tail
+        .find(|c: char| c == ',' || c == '}')
+        .expect("score field terminator");
+    tail[..end].trim().parse().expect("numeric top-level score")
+}
+
 #[test]
 fn normal_run_succeeds_on_sample_corpus() {
     let dir = std::env::temp_dir().join(format!("ssi-public-output-test-{}", std::process::id()));
@@ -53,6 +63,12 @@ fn normal_run_succeeds_on_sample_corpus() {
     let score = std::fs::read_to_string(dir.join("score.json")).unwrap();
     assert!(score.contains("\"matrices\""), "{score}");
     assert!(score.contains("\"count\""), "{score}");
+    assert!(score.contains("\"weights\""), "{score}");
+    assert!(score.contains("\"buckets\""), "{score}");
+    for key in ["lt_1k", "1k_10k", "gt_10k"] {
+        assert!(stdout.contains(key), "{stdout}");
+        assert!(score.contains(key), "{score}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -90,10 +106,20 @@ fn hidden_corpus_omits_per_matrix_census() {
     assert!(!stdout.contains("nnz(A)"), "{stdout}");
     assert!(!stdout.contains("flops(base)"), "{stdout}");
     assert!(!stdout.contains("count"), "{stdout}");
+    assert!(!stdout.contains("per-bucket ("), "{stdout}");
 
     let score = std::fs::read_to_string(dir.join("score.json")).unwrap();
     assert!(!score.contains("\"matrices\""), "{score}");
     assert!(!score.contains("\"count\""), "{score}");
+    assert!(!score.contains("\"weights\""), "{score}");
+    assert!(!score.contains("\"buckets\""), "{score}");
+    for key in ["lt_1k", "1k_10k", "gt_10k"] {
+        assert!(!stdout.contains(key), "{stdout}");
+        assert!(!score.contains(key), "{score}");
+    }
+    assert!(score.contains("\"geomean_flop_ratio\""), "{score}");
+    assert!(score.contains("\"geomean_fill_ratio\""), "{score}");
+    assert!(top_level_score(&score).is_finite(), "{score}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
