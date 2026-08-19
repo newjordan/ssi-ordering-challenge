@@ -45,6 +45,20 @@ pub fn parse_deps_toml(src: &str) -> Result<Vec<DeclaredDep>, GateError> {
         })?;
         let name = name.trim();
         let value = rest.trim();
+        if name.is_empty() {
+            return Err(GateError(format!(
+                "deps.toml:{}: empty crate name",
+                lineno + 1
+            )));
+        }
+        if !is_valid_crate_name(name) {
+            return Err(GateError(format!(
+                "deps.toml:{}: invalid crate name `{}`; names may contain only ASCII letters, \
+                 digits, hyphens (`-`), and underscores (`_`)",
+                lineno + 1,
+                name.escape_debug()
+            )));
+        }
         if value.starts_with('{') || value.starts_with('[') {
             return Err(GateError(format!(
                 "deps.toml:{}: `{name}` uses a table/array form; only `name = \"version\"` is allowed \
@@ -65,12 +79,17 @@ pub fn parse_deps_toml(src: &str) -> Result<Vec<DeclaredDep>, GateError> {
                 lineno + 1
             )));
         }
-        if name.is_empty() {
-            return Err(GateError(format!("deps.toml:{}: empty crate name", lineno + 1)));
-        }
         deps.push(DeclaredDep { name: name.to_string(), version: version.to_string() });
     }
     Ok(deps)
+}
+
+/// crates.io-compatible package-name characters. Cargo accepts this same
+/// character set in dependency keys; rejecting everything else also makes each
+/// emitted `name=version` record safe to splice into the generated manifest.
+fn is_valid_crate_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 /// A plain version is one or more dot-separated numeric components, optionally
