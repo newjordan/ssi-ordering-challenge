@@ -54,6 +54,11 @@ can execute during compilation without triggering native-code heuristics.
 network-isolated stages contain many consequences, but they do not remove
 reviewer error or malicious behavior that stays within the sandbox.
 
+As a complementary layer, the vendored-tree scan (`scan_vendored_tree`, finding
+A2) rejects any `build.rs` or proc-macro crate outside the exact pinned trusted
+harness closure, so this compile-time-execution residual is confined to the
+reviewed set rather than any crate the transitive closure might pull in.
+
 Local execution has a stronger residual: `prepare-build.sh` and ordinary local
 `cargo run` are reproducibility checks, not a host-security sandbox. They may
 execute approved dependency/build code with the developer's privileges and
