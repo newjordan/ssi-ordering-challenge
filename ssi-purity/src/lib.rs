@@ -513,6 +513,18 @@ fn scan_source(file: &Path, src: &str) -> Result<(), GateError> {
             "`include!` (included source cannot be purity-scanned)",
         );
     }
+    // A `#[path = "..."] mod name;` item has the same blind spot as `include!`:
+    // the compiler accepts a module body from a non-`.rs` file, while
+    // `purity_scan` only collects `.rs` paths. Match the real attribute shape on
+    // the comment-stripped, string-blanked view so whitespace/newlines cannot
+    // evade it and prose inside comments or strings cannot trigger it.
+    if let Some(off) = find_path_attribute(&kw) {
+        let lineno = kw[..off].bytes().filter(|&b| b == b'\n').count();
+        return hit(
+            lineno,
+            "`#[path = \"...\"]` (module source may not be purity-scanned)",
+        );
+    }
     Ok(())
 }
 
@@ -845,6 +857,74 @@ fn find_macro_call(hay: &str, name: &str) -> Option<usize> {
     None
 }
 
+/// If `hay` contains a Rust `#[path = "..."]` attribute, return the byte offset
+/// of its `#`. Comments have already been removed and string interiors blanked,
+/// so only delimiters need to be recognized here. Rust permits insignificant
+/// whitespace (including newlines) between every token in the attribute.
+fn find_path_attribute(hay: &str) -> Option<usize> {
+    let hb = hay.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i < hb.len() && hb[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find('#') {
+        let off = start + rel;
+        let mut i = skip_ws(off + 1);
+        if hb.get(i) != Some(&b'[') {
+            start = off + 1;
+            continue;
+        }
+        i = skip_ws(i + 1);
+        if !hay[i..].starts_with("path") || hb.get(i + 4).is_some_and(|b| is_ident_byte(*b)) {
+            start = off + 1;
+            continue;
+        }
+        i = skip_ws(i + 4);
+        if hb.get(i) != Some(&b'=') {
+            start = off + 1;
+            continue;
+        }
+        i = skip_ws(i + 1);
+        if let Some(after_literal) = string_literal_end(&hb[i..]).map(|len| i + len) {
+            i = skip_ws(after_literal);
+            if hb.get(i) == Some(&b']') {
+                return Some(off);
+            }
+        }
+        start = off + 1;
+    }
+    None
+}
+
+/// Return the length of a normal or raw string literal at the start of `bytes`.
+/// This consumes the already-blanked representation produced by
+/// `strip_comments`, where escaped quotes are spaces and only the true closing
+/// delimiter remains.
+fn string_literal_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() == Some(&b'"') {
+        return bytes[1..]
+            .iter()
+            .position(|&b| b == b'"')
+            .map(|closing| closing + 2);
+    }
+    let (hashes, opener_len) = raw_string_start(bytes)?;
+    let mut i = opener_len;
+    while i < bytes.len() {
+        if bytes[i] == b'"'
+            && bytes
+                .get(i + 1..i + 1 + hashes)
+                .is_some_and(|suffix| suffix.iter().all(|&b| b == b'#'))
+        {
+            return Some(i + 1 + hashes);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// True if `line` contains an attribute named `name`, e.g. `#[no_mangle]` or
 /// `#![no_mangle]` (with optional whitespace).
 fn contains_attr(line: &str, name: &str) -> bool {
@@ -1129,6 +1209,25 @@ mod tests {
     fn include_mention_in_comment_and_string_is_allowed() {
         let src =
             "// include!(\"hidden.inc\") is forbidden\nlet note = \"include!(hidden.inc)\";\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn path_module_of_non_rs_source_is_rejected() {
+        let src = "#[path = \"payload.txt\"]\nmod payload;\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn multiline_path_module_attribute_is_rejected() {
+        let src = "# /* gap */ [\n path\n =\n r#\"payload.txt\"#\n]\nmod payload;\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn path_module_mention_in_comment_and_string_is_allowed() {
+        let src = "// #[path = \"payload.txt\"] mod payload;\n\
+                   let note = \"#[path = \\\"payload.txt\\\"] mod payload;\";\n";
         assert!(scan_source(Path::new("x.rs"), src).is_ok());
     }
 
