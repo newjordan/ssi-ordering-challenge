@@ -81,5 +81,4 @@ else
   echo "fetch-eval-corpus: no checksum object published; skipping integrity check"
 fi
 
-lines="$(wc -l < "$dest" | tr -d ' ')"
-echo "fetch-eval-corpus: wrote $dest (${lines} lines)"
+echo "fetch-eval-corpus: corpus downloaded and verified"

@@ -15,9 +15,23 @@ fn harness_bin() -> std::path::PathBuf {
     p
 }
 
+fn public_dev_corpus() -> std::path::PathBuf {
+    std::fs::canonicalize(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/dev/patterns.jsonl"),
+    )
+    .expect("canonicalize public dev corpus")
+}
+
 #[test]
 fn normal_run_succeeds_on_sample_corpus() {
+    let dir = std::env::temp_dir().join(format!("ssi-public-output-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let corpus = public_dev_corpus();
+
     let out = Command::new(harness_bin())
+        .env("SSI_CORPUS_FILE", &corpus)
+        .current_dir(&dir)
         .args(["--note", "time_cap test: normal"])
         .output()
         .expect("run harness");
@@ -32,6 +46,15 @@ fn normal_run_succeeds_on_sample_corpus() {
         stdout.contains("matrix") && stdout.contains("nnz(A)"),
         "public dev run should retain the per-matrix census:\n{stdout}"
     );
+    assert!(
+        corpus.exists(),
+        "absolute public dev corpus path must never be unlinked"
+    );
+    let score = std::fs::read_to_string(dir.join("score.json")).unwrap();
+    assert!(score.contains("\"matrices\""), "{score}");
+    assert!(score.contains("\"count\""), "{score}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -66,6 +89,11 @@ fn hidden_corpus_omits_per_matrix_census() {
     assert!(!stdout.contains("SECRET_MATRIX_CANARY"), "{stdout}");
     assert!(!stdout.contains("nnz(A)"), "{stdout}");
     assert!(!stdout.contains("flops(base)"), "{stdout}");
+    assert!(!stdout.contains("count"), "{stdout}");
+
+    let score = std::fs::read_to_string(dir.join("score.json")).unwrap();
+    assert!(!score.contains("\"matrices\""), "{score}");
+    assert!(!score.contains("\"count\""), "{score}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -104,9 +132,14 @@ fn hidden_corpus_load_failure_omits_raw_name() {
 fn slow_ordering_is_killed_and_fails_promptly() {
     // Force every order() call to sleep 30s; the 2s cap must kill it and FAIL
     // the run in well under 30s.
+    let dir = std::env::temp_dir().join(format!("ssi-slow-output-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     let start = Instant::now();
     let out = Command::new(harness_bin())
+        .env("SSI_CORPUS_FILE", public_dev_corpus())
         .env("SSI_TEST_SLEEP_MS", "30000")
+        .current_dir(&dir)
         .args(["--note", "time_cap test: slow"])
         .output()
         .expect("run harness");
@@ -124,4 +157,12 @@ fn slow_ordering_is_killed_and_fails_promptly() {
         elapsed < Duration::from_secs(20),
         "cap was not enforced promptly: {elapsed:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fetch_eval_corpus_script_does_not_count_hidden_lines() {
+    let script = include_str!("../.github/scripts/fetch-eval-corpus.sh");
+    assert!(!script.contains("wc -l"), "{script}");
+    assert!(!script.contains("${lines} lines"), "{script}");
 }

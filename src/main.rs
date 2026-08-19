@@ -385,21 +385,40 @@ fn main() -> ExitCode {
             let score_val = combine(&flop_gms, &BUCKET_WEIGHTS);
             let fill = combine(&fill_gms, &BUCKET_WEIGHTS);
 
-            // Per-bucket breakdown table.
+            // Per-bucket breakdown table. Counts are useful public-dev
+            // diagnostics, but disclose the hidden eval corpus distribution.
             println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
-            println!(
-                "{:<8} {:>6} {:>16} {:>16}",
-                "bucket", "count", "flop_geomean", "fill_geomean"
-            );
-            for i in 0..BUCKETS {
-                let fmt = |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+            if show_matrix_census {
                 println!(
                     "{:<8} {:>6} {:>16} {:>16}",
-                    BUCKET_KEYS[i],
-                    buckets[i].count,
-                    fmt(flop_gms[i]),
-                    fmt(fill_gms[i]),
+                    "bucket", "count", "flop_geomean", "fill_geomean"
                 );
+                for i in 0..BUCKETS {
+                    let fmt =
+                        |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+                    println!(
+                        "{:<8} {:>6} {:>16} {:>16}",
+                        BUCKET_KEYS[i],
+                        buckets[i].count,
+                        fmt(flop_gms[i]),
+                        fmt(fill_gms[i]),
+                    );
+                }
+            } else {
+                println!(
+                    "{:<8} {:>16} {:>16}",
+                    "bucket", "flop_geomean", "fill_geomean"
+                );
+                for i in 0..BUCKETS {
+                    let fmt =
+                        |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+                    println!(
+                        "{:<8} {:>16} {:>16}",
+                        BUCKET_KEYS[i],
+                        fmt(flop_gms[i]),
+                        fmt(fill_gms[i]),
+                    );
+                }
             }
 
             println!(
@@ -408,30 +427,46 @@ fn main() -> ExitCode {
             println!("tiebreak (weighted mean of per-bucket geomean fill ratios):                    {fill:.4}");
 
             // score.json — top-level `score` is what the grader ranks on;
-            // `metrics` is passthrough detail (Hilbert captures it whole and shows
-            // it in the PR report). All three buckets are always listed; an empty
-            // bucket has count 0 and null geomeans.
+            // `metrics` is passthrough detail (Hilbert captures it whole and
+            // shows it in the PR report). Public-dev artifacts retain counts;
+            // hidden artifacts omit both the total and per-bucket census.
             let mut buckets_json = String::new();
             for i in 0..BUCKETS {
                 let jf =
                     |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
                 let sep = if i + 1 < BUCKETS { "," } else { "" };
-                let _ = write!(
-                    buckets_json,
-                    "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
-                    BUCKET_KEYS[i],
-                    buckets[i].count,
-                    jf(flop_gms[i]),
-                    jf(fill_gms[i]),
-                    sep,
-                );
+                if show_matrix_census {
+                    let _ = write!(
+                        buckets_json,
+                        "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
+                        BUCKET_KEYS[i],
+                        buckets[i].count,
+                        jf(flop_gms[i]),
+                        jf(fill_gms[i]),
+                        sep,
+                    );
+                } else {
+                    let _ = write!(
+                        buckets_json,
+                        "\"{}\": {{ \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
+                        BUCKET_KEYS[i],
+                        jf(flop_gms[i]),
+                        jf(fill_gms[i]),
+                        sep,
+                    );
+                }
             }
-            let total: usize = buckets.iter().map(|b| b.count).sum();
+            let census_json = if show_matrix_census {
+                let total: usize = buckets.iter().map(|b| b.count).sum();
+                format!("\"matrices\": {total}, ")
+            } else {
+                String::new()
+            };
             let json = format!(
                 "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
                  \"geomean_flop_ratio\": {score_val:.6}, \
                  \"geomean_fill_ratio\": {fill:.6}, \
-                 \"matrices\": {total}, \
+                 {census_json}\
                  \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
                  \"buckets\": {{ {buckets_json} }} }} }}\n",
                 BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
@@ -504,7 +539,15 @@ fn parse_note() -> String {
 }
 
 fn is_public_dev_corpus(path: &Path) -> bool {
-    path == Path::new(corpus::DEV_CORPUS_FILE)
+    // Canonical comparison recognizes absolute paths and symlinked aliases to
+    // the shipped public corpus without trusting a matching relative spelling
+    // in some other working directory. Any resolution failure stays
+    // fail-closed: an unrecognized path is treated as hidden.
+    let repo_dev = repo_root().join(corpus::DEV_CORPUS_FILE);
+    match (std::fs::canonicalize(path), std::fs::canonicalize(repo_dev)) {
+        (Ok(candidate), Ok(public_dev)) => candidate == public_dev,
+        _ => false,
+    }
 }
 
 fn matrix_failure(show_matrix_census: bool, name: &str, detailed: &str, redacted: &str) -> String {
@@ -528,6 +571,19 @@ const _: fn(&Pattern) -> Vec<usize> = ordering::order;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_dev_corpus_recognizes_relative_and_canonical_paths() {
+        let relative = Path::new(corpus::DEV_CORPUS_FILE);
+        assert!(is_public_dev_corpus(relative));
+
+        let canonical = std::fs::canonicalize(repo_root().join(relative))
+            .expect("canonicalize shipped public dev corpus");
+        assert!(is_public_dev_corpus(&canonical));
+        assert!(!is_public_dev_corpus(
+            &std::env::temp_dir().join("hidden-eval.jsonl")
+        ));
+    }
 
     #[test]
     fn hidden_matrix_failures_redact_names_and_details() {
