@@ -44,6 +44,7 @@
 //! FAIL row whose note carries the reason; the scratch dir is disposed on
 //! every exit path.
 
+mod artifacts;
 mod corpus;
 mod failsafe;
 mod purity;
@@ -52,7 +53,6 @@ mod watchdog;
 
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -119,21 +119,26 @@ fn main() -> ExitCode {
     }
 
     let note = parse_note();
+    let repo_root = repo_root();
+    // Preserve the trusted pre-run log before any contestant worker can write
+    // through an absolute path. Artifact publication happens only after all
+    // workers finish and discards any bytes they may have forged.
+    let run_artifacts = match artifacts::RunArtifacts::capture(&repo_root) {
+        Ok(state) => state,
+        Err(e) => {
+            let reason = format!("could not preserve pre-run artifact state: {e}");
+            println!("RUN FAILED: {reason}");
+            if let Err(clear_error) = artifacts::clear_score(&repo_root) {
+                eprintln!("could not clear score.json after failure: {clear_error}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
 
     // --- Stage A analog: purity & license gate, before any scoring. ---
-    let repo_root = repo_root();
     if let Err(e) = purity::check(&repo_root) {
         let reason = format!("Stage A — purity/license: {e}");
-        println!("RUN FAILED ({reason})");
-        let ts = now();
-        append_results(
-            ts,
-            "FAIL",
-            f64::NAN,
-            f64::NAN,
-            &failsafe::compose_note(&reason, &note),
-        );
-        return ExitCode::FAILURE;
+        return finish_failed_run(&run_artifacts, &reason, &note);
     }
 
     let corpus_file = corpus::corpus_path();
@@ -150,15 +155,7 @@ fn main() -> ExitCode {
             "no patterns found at {}. Run from the repo root.",
             corpus_file.display()
         );
-        println!("RUN FAILED: {reason}");
-        append_results(
-            now(),
-            "FAIL",
-            f64::NAN,
-            f64::NAN,
-            &failsafe::compose_note(&reason, &note),
-        );
-        return ExitCode::FAILURE;
+        return finish_failed_run(&run_artifacts, &reason, &note);
     }
 
     println!(
@@ -304,17 +301,7 @@ fn main() -> ExitCode {
     let timestamp = now();
 
     match failed {
-        Some(reason) => {
-            println!("\nRUN FAILED: {reason}");
-            append_results(
-                timestamp,
-                "FAIL",
-                f64::NAN,
-                f64::NAN,
-                &failsafe::compose_note(&reason, &note),
-            );
-            ExitCode::FAILURE
-        }
+        Some(reason) => finish_failed_run_at(&run_artifacts, timestamp, &reason, &note),
         None => {
             // Per-bucket geomeans (None for an empty bucket).
             let flop_gms: [Option<f64>; BUCKETS] =
@@ -376,9 +363,28 @@ fn main() -> ExitCode {
                  \"buckets\": {{ {buckets_json} }} }} }}\n",
                 BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
             );
-            std::fs::write("score.json", json).expect("write score.json");
-            append_results(timestamp, "OK", score_val, fill, &note);
-            ExitCode::SUCCESS
+            let row = result_row(timestamp, "OK", score_val, fill, &note);
+            match run_artifacts.finish_success(&row, &json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    let reason = format!("could not publish trusted run artifacts: {e}");
+                    println!("\nRUN FAILED: {reason}");
+                    let fail_row = result_row(
+                        timestamp,
+                        "FAIL",
+                        f64::NAN,
+                        f64::NAN,
+                        &failsafe::compose_note(&reason, &note),
+                    );
+                    if let Err(record_error) = run_artifacts.finish_failure(&fail_row) {
+                        eprintln!(
+                            "could not clear/rewrite artifacts after publication failure: \
+                             {record_error}"
+                        );
+                    }
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }
@@ -598,13 +604,32 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn append_results(ts: u64, status: &str, score: f64, fill: f64, note: &str) {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("results.tsv")
-        .expect("open results.tsv");
-    writeln!(f, "{ts}\t{status}\t{score:.6}\t{fill:.6}\t{note}").expect("append results.tsv");
+fn finish_failed_run(artifacts: &artifacts::RunArtifacts, reason: &str, note: &str) -> ExitCode {
+    finish_failed_run_at(artifacts, now(), reason, note)
+}
+
+fn finish_failed_run_at(
+    artifacts: &artifacts::RunArtifacts,
+    timestamp: u64,
+    reason: &str,
+    note: &str,
+) -> ExitCode {
+    println!("\nRUN FAILED: {reason}");
+    let row = result_row(
+        timestamp,
+        "FAIL",
+        f64::NAN,
+        f64::NAN,
+        &failsafe::compose_note(reason, note),
+    );
+    if let Err(e) = artifacts.finish_failure(&row) {
+        eprintln!("could not clear/rewrite failed-run artifacts: {e}");
+    }
+    ExitCode::FAILURE
+}
+
+fn result_row(ts: u64, status: &str, score: f64, fill: f64, note: &str) -> String {
+    format!("{ts}\t{status}\t{score:.6}\t{fill:.6}\t{note}")
 }
 
 fn parse_note() -> String {
