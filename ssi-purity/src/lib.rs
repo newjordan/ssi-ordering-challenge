@@ -857,46 +857,117 @@ fn find_macro_call(hay: &str, name: &str) -> Option<usize> {
     None
 }
 
-/// If `hay` contains a Rust `#[path = "..."]` attribute, return the byte offset
-/// of its `#`. Comments have already been removed and string interiors blanked,
-/// so only delimiters need to be recognized here. Rust permits insignificant
-/// whitespace (including newlines) between every token in the attribute.
+/// If `hay` contains a Rust `#[path = "..."]` attribute, either directly or as
+/// an attribute argument to `cfg_attr`, return the byte offset of its `#`.
+/// Comments have already been removed and string interiors blanked, so only
+/// delimiters need to be recognized here. Rust permits insignificant whitespace
+/// (including newlines) between every token in the attribute.
 fn find_path_attribute(hay: &str) -> Option<usize> {
     let hb = hay.as_bytes();
-    let skip_ws = |mut i: usize| {
-        while i < hb.len() && hb[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        i
-    };
     let mut start = 0;
     while let Some(rel) = hay[start..].find('#') {
         let off = start + rel;
-        let mut i = skip_ws(off + 1);
+        let mut i = skip_ascii_whitespace(hb, off + 1);
         if hb.get(i) != Some(&b'[') {
             start = off + 1;
             continue;
         }
-        i = skip_ws(i + 1);
-        if !hay[i..].starts_with("path") || hb.get(i + 4).is_some_and(|b| is_ident_byte(*b)) {
-            start = off + 1;
-            continue;
-        }
-        i = skip_ws(i + 4);
-        if hb.get(i) != Some(&b'=') {
-            start = off + 1;
-            continue;
-        }
-        i = skip_ws(i + 1);
-        if let Some(after_literal) = string_literal_end(&hb[i..]).map(|len| i + len) {
-            i = skip_ws(after_literal);
+        i = skip_ascii_whitespace(hb, i + 1);
+        if let Some(after_literal) = path_name_value_end(hb, i) {
+            i = skip_ascii_whitespace(hb, after_literal);
             if hb.get(i) == Some(&b']') {
                 return Some(off);
             }
         }
+        if cfg_attr_contains_path(hb, i) {
+            return Some(off);
+        }
         start = off + 1;
     }
     None
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn starts_ident(bytes: &[u8], i: usize, name: &[u8]) -> bool {
+    bytes.get(i..i + name.len()) == Some(name)
+        && bytes.get(i + name.len()).is_none_or(|b| !is_ident_byte(*b))
+}
+
+/// If `bytes[i..]` begins with `path = <string>`, return the byte after the
+/// literal. Exact identifier matching keeps benign names such as `pathology`
+/// from being interpreted as the built-in `path` attribute.
+fn path_name_value_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if !starts_ident(bytes, i, b"path") {
+        return None;
+    }
+    i = skip_ascii_whitespace(bytes, i + 4);
+    if bytes.get(i) != Some(&b'=') {
+        return None;
+    }
+    i = skip_ascii_whitespace(bytes, i + 1);
+    string_literal_end(&bytes[i..]).map(|len| i + len)
+}
+
+/// Recognize `cfg_attr(predicate, path = "...", ...)`. Only top-level attribute
+/// arguments after the predicate's comma are inspected, so a similarly named
+/// cfg predicate or a token nested inside another attribute cannot be confused
+/// with the `path` attribute. Nested `cfg_attr` arguments are handled recursively.
+fn cfg_attr_contains_path(bytes: &[u8], mut i: usize) -> bool {
+    if !starts_ident(bytes, i, b"cfg_attr") {
+        return false;
+    }
+    i = skip_ascii_whitespace(bytes, i + b"cfg_attr".len());
+    if bytes.get(i) != Some(&b'(') {
+        return false;
+    }
+
+    let mut paren_depth = 1usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    i += 1;
+    while i < bytes.len() {
+        let char_literal = if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\'') {
+            char_literal_len(&bytes[i + 1..]).map(|len| len + 1)
+        } else if bytes[i] == b'\'' {
+            char_literal_len(&bytes[i..])
+        } else {
+            None
+        };
+        if let Some(len) = char_literal {
+            i += len;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren_depth += 1,
+            b')' if paren_depth == 1 => return false,
+            b')' => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' if bracket_depth > 0 => bracket_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            b',' if paren_depth == 1 && bracket_depth == 0 && brace_depth == 0 => {
+                let attr = skip_ascii_whitespace(bytes, i + 1);
+                if let Some(end) = path_name_value_end(bytes, attr) {
+                    let end = skip_ascii_whitespace(bytes, end);
+                    if matches!(bytes.get(end), Some(b',' | b')')) {
+                        return true;
+                    }
+                }
+                if cfg_attr_contains_path(bytes, attr) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Return the length of a normal or raw string literal at the start of `bytes`.
@@ -1228,6 +1299,21 @@ mod tests {
     fn path_module_mention_in_comment_and_string_is_allowed() {
         let src = "// #[path = \"payload.txt\"] mod payload;\n\
                    let note = \"#[path = \\\"payload.txt\\\"] mod payload;\";\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn cfg_attr_path_module_of_non_rs_source_is_rejected() {
+        let src = "# [ cfg_attr (\n all (),\n path /* gap */ = r##\"payload.txt\"##\n) ]\n\
+                   mod payload;\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn benign_cfg_attr_is_allowed() {
+        let src = "#[cfg_attr(all(), pathology = \"payload.txt\", doc = \"path = payload.txt\")]\n\
+                   mod payload {}\n\
+                   // cfg_attr(all(), path = \"payload.txt\") is prose\n";
         assert!(scan_source(Path::new("x.rs"), src).is_ok());
     }
 
