@@ -41,3 +41,24 @@ fn grader_mode_fails_when_sandbox_selection_is_missing() {
         "unexpected stderr: {stderr}"
     );
 }
+
+#[test]
+fn missing_local_candidate_reports_build_command() {
+    let missing =
+        std::env::temp_dir().join(format!("ssi-missing-candidate-{}", std::process::id()));
+    let _ = std::fs::remove_file(&missing);
+    let output = Command::new(parent_binary())
+        .env_remove("SSI_GRADER_SANDBOX")
+        .env("SSI_CANDIDATE_WORKER", missing)
+        .output()
+        .expect("run trusted parent");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("candidate worker not found")
+            && stderr.contains("cargo build --release --workspace --offline --locked")
+            && stderr.contains("rebuild `ssi-candidate-worker` after ordering edits"),
+        "unexpected stderr: {stderr}"
+    );
+}

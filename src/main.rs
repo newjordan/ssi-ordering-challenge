@@ -482,7 +482,7 @@ fn candidate_worker_path(grader_mode: bool) -> Result<PathBuf, String> {
         if path.is_empty() {
             return Err(format!("{CANDIDATE_WORKER_ENV} is set but empty"));
         }
-        return Ok(PathBuf::from(path));
+        return require_candidate_worker(PathBuf::from(path));
     }
     if grader_mode {
         return Err(format!(
@@ -496,7 +496,26 @@ fn candidate_worker_path(grader_mode: bool) -> Result<PathBuf, String> {
         "ssi-candidate-worker{}",
         std::env::consts::EXE_SUFFIX
     ));
-    Ok(path)
+    require_candidate_worker(path)
+}
+
+fn require_candidate_worker(path: PathBuf) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "candidate worker not found at {}: {error}. Run `cargo build --release --workspace \
+             --offline --locked` before `cargo run`, and rebuild `ssi-candidate-worker` after \
+             ordering edits",
+            path.display()
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(format!(
+            "candidate worker is not a regular file: {}. Run `cargo build --release --workspace \
+             --offline --locked` before `cargo run`",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Resolve the repo root so the gate finds src/ordering/ and deny.toml whether

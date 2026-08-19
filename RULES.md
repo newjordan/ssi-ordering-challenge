@@ -36,10 +36,14 @@ and absolute values shift.
 2. Form a hypothesis. Edit only `src/ordering/` (submodules allowed). To use a
    crate, add it to `src/ordering/deps.toml` (`name = "x.y.z"`, permissive
    pure-Rust only).
-3. Run: `bash scripts/prepare-build.sh && cargo run --release --offline --locked -- --note "<hypothesis>"`
-   (`prepare-build.sh` regenerates `Cargo.toml` from `deps.toml`, vendors, and
-   scans; skip it only if `deps.toml` is unchanged. Requires `cargo-deny`:
-   `cargo install cargo-deny`.)
+3. On a fresh clone or after changing `deps.toml`, run:
+   `bash scripts/prepare-build.sh`. Then build both executables and run:
+   `cargo build --release --workspace --offline --locked && cargo run --release --offline --locked -- --note "<hypothesis>"`.
+   `prepare-build.sh` generates manifests, vendors, and scans, but does **not**
+   build the separate `ssi-candidate-worker`. After every ordering edit, rebuild
+   that worker before running the parent (`cargo build --release -p
+   ssi-candidate-worker --offline --locked` is sufficient incrementally).
+   Requires `cargo-deny`: `cargo install cargo-deny`.
 4. Read the per-matrix table. Attribute wins/losses per family and size bucket
    (NLP, QCP, QP, QCQP; n up to ~340k).
 5. Record findings in the knowledge base (an experiment page + one `log.md`
