@@ -1,7 +1,8 @@
-use ssi_purity::{parse_deps_toml, DeclaredDep};
 use std::fs;
+
 use ssi_purity::filter_declared_deps;
 use ssi_purity::scan_vendored_tree;
+use ssi_purity::{parse_deps_toml, DeclaredDep, TRUSTED_DIRECT_DEPENDENCIES};
 
 #[test]
 fn missing_deps_toml_yields_empty() {
@@ -15,23 +16,54 @@ fn missing_deps_toml_yields_empty() {
 fn present_deps_toml_is_parsed() {
     let dir = std::env::temp_dir().join("ssi-purity-test-withdeps");
     let _ = fs::create_dir_all(&dir);
-    fs::write(dir.join("deps.toml"), "[dependencies]\nrand = \"0.8.5\"\n").unwrap();
+    fs::write(
+        dir.join("deps.toml"),
+        "[dependencies]\nferal-amd = \"0.2.1\"\n",
+    )
+    .unwrap();
     let got = filter_declared_deps(&dir).unwrap();
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].name, "rand");
+    assert_eq!(got[0].name, "feral-amd");
 }
 
 #[test]
-fn parses_simple_version_entries() {
-    let src = "[dependencies]\nrand = \"0.8.5\"\npetgraph = \"0.6.4\"\n";
+fn allows_every_reviewed_exact_entry() {
+    let src = "[dependencies]\n\
+               feral = \"0.11.0\"\n\
+               feral-amd = \"0.2.1\"\n\
+               feral-amf = \"0.2.1\"\n\
+               feral-kahip = \"0.2.1\"\n\
+               feral-metis = \"0.2.1\"\n\
+               feral-ordering-core = \"0.2.1\"\n\
+               feral-scotch = \"0.2.1\"\n";
     let got = parse_deps_toml(src).expect("valid");
-    assert_eq!(
-        got,
-        vec![
-            DeclaredDep { name: "rand".into(), version: "0.8.5".into() },
-            DeclaredDep { name: "petgraph".into(), version: "0.6.4".into() },
-        ]
-    );
+    let expected = TRUSTED_DIRECT_DEPENDENCIES
+        .iter()
+        .map(|(name, version)| DeclaredDep {
+            name: (*name).into(),
+            version: (*version).into(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn disallowed_crate_name_has_actionable_error() {
+    let err = parse_deps_toml("[dependencies]\nrand = \"0.8.5\"\n").unwrap_err();
+    assert!(err
+        .0
+        .contains("`rand` is not in the reviewed direct-dependency allowlist"));
+    assert!(err.0.contains("ask a maintainer to review and approve"));
+}
+
+#[test]
+fn wrong_reviewed_crate_version_has_actionable_error() {
+    let err = parse_deps_toml("[dependencies]\nferal-amd = \"0.2.2\"\n").unwrap_err();
+    assert!(err
+        .0
+        .contains("version `0.2.2` for `feral-amd` is not reviewed"));
+    assert!(err.0.contains("feral-amd = \"0.2.1\""));
+    assert!(err.0.contains("ask a maintainer to review the upgrade"));
 }
 
 #[test]
@@ -202,7 +234,11 @@ fn c_abi_export_and_proc_macro_in_dep_are_allowed() {
     // executes. (This is exactly what feral's capi.rs / serde's proc-macros do.)
     let root = std::env::temp_dir().join("ssi-vendor-cabi-export");
     let _ = std::fs::remove_dir_all(&root);
-    vwrite(&root, "feralish-0.1.0/Cargo.toml", "[package]\nname=\"feralish\"\n");
+    vwrite(
+        &root,
+        "feralish-0.1.0/Cargo.toml",
+        "[package]\nname=\"feralish\"\n",
+    );
     vwrite(
         &root,
         "feralish-0.1.0/src/lib.rs",
@@ -215,7 +251,11 @@ fn c_abi_export_and_proc_macro_in_dep_are_allowed() {
 fn sys_suffix_crate_is_rejected() {
     let root = std::env::temp_dir().join("ssi-vendor-sys");
     let _ = std::fs::remove_dir_all(&root);
-    vwrite(&root, "openssl-sys-0.9/Cargo.toml", "[package]\nname=\"openssl-sys\"\n");
+    vwrite(
+        &root,
+        "openssl-sys-0.9/Cargo.toml",
+        "[package]\nname=\"openssl-sys\"\n",
+    );
     vwrite(&root, "openssl-sys-0.9/src/lib.rs", "pub fn f() {}\n");
     assert!(scan_vendored_tree(&root).is_err());
 }
@@ -228,7 +268,11 @@ fn sys_suffix_crate_with_hyphenated_prerelease_version_is_rejected() {
     // last `-` before a digit, so the name is correctly `foo-sys`.
     let root = std::env::temp_dir().join("ssi-vendor-sys-prerelease");
     let _ = std::fs::remove_dir_all(&root);
-    vwrite(&root, "foo-sys-1.0.0-alpha.1/Cargo.toml", "[package]\nname=\"foo-sys\"\n");
+    vwrite(
+        &root,
+        "foo-sys-1.0.0-alpha.1/Cargo.toml",
+        "[package]\nname=\"foo-sys\"\n",
+    );
     vwrite(&root, "foo-sys-1.0.0-alpha.1/src/lib.rs", "pub fn f() {}\n");
     assert!(scan_vendored_tree(&root).is_err());
 }
@@ -239,7 +283,15 @@ fn non_sys_crate_with_hyphenated_name_passes() {
     // be falsely rejected (guards against over-eager name stripping).
     let root = std::env::temp_dir().join("ssi-vendor-hyphen-ok");
     let _ = std::fs::remove_dir_all(&root);
-    vwrite(&root, "system-deps-1.2.3/Cargo.toml", "[package]\nname=\"system-deps\"\n");
-    vwrite(&root, "system-deps-1.2.3/src/lib.rs", "pub fn f() -> u32 { 1 }\n");
+    vwrite(
+        &root,
+        "system-deps-1.2.3/Cargo.toml",
+        "[package]\nname=\"system-deps\"\n",
+    );
+    vwrite(
+        &root,
+        "system-deps-1.2.3/src/lib.rs",
+        "pub fn f() -> u32 { 1 }\n",
+    );
     assert!(scan_vendored_tree(&root).is_ok());
 }

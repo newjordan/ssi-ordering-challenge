@@ -33,36 +33,43 @@ impl std::fmt::Display for GateError {
 }
 
 mod deps;
-pub use deps::{parse_deps_toml, DeclaredDep};
+pub use deps::{parse_deps_toml, DeclaredDep, TRUSTED_DIRECT_DEPENDENCIES};
 
 /// Run the full Stage-A gate from the repo root.
 pub fn check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
     let ordering_dir = repo_root.join("src/ordering");
     purity_scan(&ordering_dir)?;
-    // Declared deps are validated for shape here; the resolved tree is scanned
-    // for license/source/FFI by the grader after vendoring (scan_vendored_tree).
+    // Declared deps are checked against the reviewed exact-version allowlist
+    // here; the resolved tree is scanned for license/source/native signals by
+    // the grader after vendoring (scan_vendored_tree).
     filter_declared_deps(&ordering_dir)?;
     license_check(repo_root, mode)?;
     Ok(())
 }
 
 /// Read and parse `<ordering_dir>/deps.toml` (absent file = no declared deps).
-/// This is the submission-facing half of the dependency policy; license/source
-/// and FFI enforcement over the RESOLVED transitive tree run in the grader's
-/// tree scan (see `scan_vendored_tree`) after `cargo vendor`.
+/// This is the submission-facing half of the dependency policy: only reviewed
+/// direct name/version pairs are accepted. License/source and native-signal
+/// enforcement over the RESOLVED transitive tree run in the grader's tree scan
+/// (see `scan_vendored_tree`) after `cargo vendor`.
 pub fn filter_declared_deps(ordering_dir: &Path) -> Result<Vec<DeclaredDep>, GateError> {
     let deps_toml = ordering_dir.join("deps.toml");
     let src = match std::fs::read_to_string(&deps_toml) {
         Ok(s) => s,
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(GateError(format!("cannot read {}: {e}", deps_toml.display()))),
+        Err(e) => {
+            return Err(GateError(format!(
+                "cannot read {}: {e}",
+                deps_toml.display()
+            )))
+        }
     };
     parse_deps_toml(&src)
 }
 
 /// Scan a `cargo vendor` output directory for native-code signals, applied
-/// UNIFORMLY to every vendored crate (no trusted allowlist — the dependency
-/// tree is not assumed safe, though feral is vetted).
+/// UNIFORMLY to every vendored crate. The direct-dependency allowlist is not a
+/// transitive trust exemption: the resolved tree is still scanned.
 ///
 /// ## What this scans, and what it deliberately does NOT
 ///
@@ -152,13 +159,11 @@ fn c_build_dependency(manifest: &str) -> Option<String> {
         // A `[build-dependencies.<name>]` table header, including the
         // target-conditional form `[target.'cfg(...)'.build-dependencies.<name>]`.
         if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            let build_dep_name = inner
-                .strip_prefix("build-dependencies.")
-                .or_else(|| {
-                    inner
-                        .rsplit_once(".build-dependencies.")
-                        .map(|(_, name)| name)
-                });
+            let build_dep_name = inner.strip_prefix("build-dependencies.").or_else(|| {
+                inner
+                    .rsplit_once(".build-dependencies.")
+                    .map(|(_, name)| name)
+            });
             if let Some(name) = build_dep_name {
                 let name = name.trim();
                 if TOOLS.contains(&name) {
@@ -700,13 +705,10 @@ fn find_macro_call(hay: &str, name: &str) -> Option<usize> {
         let before_ok = idx == 0 || !is_ident_byte(hb[idx - 1]);
         // `name` <ws> `!` <ws> `(`|`[`|`{` — the macro-invocation shape.
         let after_name = skip_ws(idx + wb.len());
-        let matched = before_ok
-            && after_name < hb.len()
-            && hb[after_name] == b'!'
-            && {
-                let after_bang = skip_ws(after_name + 1);
-                after_bang < hb.len() && matches!(hb[after_bang], b'(' | b'[' | b'{')
-            };
+        let matched = before_ok && after_name < hb.len() && hb[after_name] == b'!' && {
+            let after_bang = skip_ws(after_name + 1);
+            after_bang < hb.len() && matches!(hb[after_bang], b'(' | b'[' | b'{')
+        };
         if matched {
             return Some(idx);
         }
@@ -724,10 +726,10 @@ fn contains_attr(line: &str, name: &str) -> bool {
 
 /// LICENSE: run `cargo-deny check licenses` against the shipped `deny.toml`. In
 /// `FallbackAllowed` mode, a missing `cargo-deny` is tolerated with a printed
-/// note (the submission's declared deps have already been validated for shape by
-/// `filter_declared_deps`; tree-level license enforcement happens in the grader's
-/// vendored-tree scan). In `RequireDeny` mode, a missing `cargo-deny` is fatal:
-/// the authoritative check must run.
+/// note (the submission's declared deps have already been checked against the
+/// reviewed exact-version allowlist by `filter_declared_deps`; tree-level license
+/// enforcement happens in the grader's vendored-tree scan). In `RequireDeny`
+/// mode, a missing `cargo-deny` is fatal: the authoritative check must run.
 fn license_check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
     let deny_toml = repo_root.join("deny.toml");
     if !deny_toml.exists() {
@@ -754,8 +756,8 @@ fn license_check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
             Mode::FallbackAllowed => {
                 eprintln!(
                     "license-check: cargo-deny not installed; skipping license check \
-                     (declared deps were validated for shape; tree-level license enforcement \
-                     happens in the grader's vendored-tree scan). \
+                     (declared deps matched the reviewed exact-version allowlist; tree-level \
+                     license enforcement happens in the grader's vendored-tree scan). \
                      Install with `cargo install cargo-deny` to run the authoritative check the grader uses."
                 );
                 return Ok(());
