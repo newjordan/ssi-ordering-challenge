@@ -213,14 +213,16 @@ runs `prepare-build.sh` (validate `deps.toml` → generate manifest → `cargo
 vendor` the full tree against the **committed** `Cargo.lock`, minimally updated
 for any newly declared crate → `scan_vendored_tree` for
 native/FFI escapes), builds `--offline --locked` from the vendored crates.io
-snapshot, then runs the scored step in a no-network namespace (`unshare -n`). It
+snapshot inside an unprivileged bubblewrap boundary, then launches every scored
+worker in its own PID/network/filesystem namespace. It
 grades a **hidden** eval corpus — disjoint from the dev corpus, drawn from the
 same distribution, regenerated per round — injected via the `SSI_CORPUS_FILE`
 path override, downloaded at run time to a temp path outside the repo tree (so
-the eval bytes are never committed). Scoring runs with no runtime network, a
-2–4 GB memory cap, and determinism re-runs. See
+the eval bytes are never committed). Workers run with no runtime network, no
+parent `/proc` visibility, a minimal read-only filesystem, and determinism
+re-runs. See
 [`DECISION-crate-policy.md`](DECISION-crate-policy.md) for the dependency-policy
-pipeline and its rationale.
+pipeline and [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md) for the exact boundaries.
 
 Because grading runs the identical harness + `ssi-scoring` functions you run
 locally, the number a contestant sees locally is structurally the number the

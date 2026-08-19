@@ -192,3 +192,19 @@ The final review (opus, whole branch) returned "ready to merge with fixes" — n
 3. **The CI build step was `--offline` but not network-isolated** — a dependency's `build.rs` could still egress during compilation (mitigated only by the corpus being fetched after the build). Fixed: the `Setup` build now also runs under `sudo unshare -n` (a vendored `--offline --locked` build needs no network), so build-time `build.rs` egress is blocked too.
 
 The review confirmed the frozen contract, Invariant 2 (one code path), and the closed-form/exact-equivalence scorer tests are all intact; no finding was score-affecting or eval-exfiltrating. Remaining accepted residuals (all documented, low-value for an ordering competition): `find_prebuilt_artifact` matches final extension only (versioned `.so.1` etc. not expected in source crates); `is_plain_version` accepts semver-ish tokens Cargo rejects at resolve; the undeclared-C residual from the option-A decision.
+
+### Security hardening: per-build and per-worker bubblewrap
+
+The earlier `sudo unshare` mechanism above is superseded. The grader now
+installs bubblewrap, then runs the full candidate build through
+`scripts/grader-sandbox.sh` as the non-root runner user. Dependency build
+scripts and proc macros have no network, private process namespaces, a read-only
+checkout/toolchain/system tree, and only `target/` plus private `/tmp` writable.
+
+The trusted scoring parent is no longer placed in the same PID namespace as
+contestant workers. With `SSI_GRADER_SANDBOX=bubblewrap`, every `order()` call
+gets a new namespace and private `/proc`, minimal runtime filesystem, empty
+environment, null stdio, one read-only pattern, and one writable permutation
+file. This closes parent-memory visibility left by one whole-harness namespace.
+Both boundaries have gating Linux self-checks and fail closed in grader mode.
+See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md).

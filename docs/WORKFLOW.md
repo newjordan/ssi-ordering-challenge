@@ -123,6 +123,11 @@ For each `(name, pattern)`:
    - `order()` is run a **second time**; if `perm1 != perm2` the run fails for
      **nondeterminism** (Stage E analog).
 
+   In production, `SSI_GRADER_SANDBOX=bubblewrap` changes each direct worker
+   launch into its own PID/network/filesystem sandbox. The trusted parent is
+   not wrapped with the workers; see
+   [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md).
+
 3. **Stage C — output validation** — `validate_permutation(&perm1, pat.n)`
    ([`src/main.rs`](../src/main.rs)) checks the result is a true
    bijection of `0..n` (right length, every index in range, no duplicates).
@@ -244,8 +249,9 @@ builds a candidate from the validated baseline + **only** the submission's
 workflow grades a **hidden** eval corpus — disjoint from the dev corpus,
 regenerated per round — injected via the `SSI_CORPUS_FILE` path override and
 downloaded at run time to a temp path outside the repo tree (so the eval bytes
-are never committed). Scoring runs in a sandbox (no network, no filesystem,
-2–4 GB memory cap, determinism re-runs).
+are never committed). Dependency code builds in an unprivileged bubblewrap
+boundary, and every scored worker runs in a separate, narrower sandbox (no
+network, private `/proc`, minimal filesystem, determinism re-runs).
 
 Because grading runs the identical harness + `ssi-scoring` functions you run
 locally, the number you see locally is structurally the number the grader

@@ -70,7 +70,7 @@ Per run, `main.rs` executes the grader stages of the proposal in miniature:
 | Proposal stage | Harness implementation |
 |---|---|
 | A — purity & license gate | `purity::check` (RequireDeny mode): scans `src/ordering/` for build.rs / FFI / `#[no_mangle]` / `#[link]` / proc-macros / `include!` escapes, parses `src/ordering/deps.toml`, and runs `cargo-deny` against `deny.toml` (mandatory — a missing `cargo-deny` fails the gate). The grader additionally scans the vendored dependency tree (`ssi_purity::scan_vendored_tree`) for `*-sys` names, prebuilt native blobs, and C-toolchain build-deps. Mirrors the grader's authoritative Stage A — same rules, same `deny.toml`. |
-| B — sandboxed compile & run | `cargo run` here runs each `order()` in a child process (`--worker` mode) supervised by a watchdog (`src/watchdog.rs`) that SIGKILLs it — and reaps its whole process group — at the **2 s/matrix time cap**, and on **every** worker exit (so a fast `order()` cannot leave a background process behind), the same enforcement mechanism the grader uses. Each worker is spawned with `env_clear()` (nothing but the inert `SSI_TEST_SLEEP_MS` test hook is forwarded — in particular the eval-corpus path never reaches `order()`) and a private empty working directory (no repo tree / `score.json` / `results.tsv` view). The grader additionally builds `--offline --locked` against a vendored crates.io snapshot and runs the scored step in a no-network **and** PID namespace (`unshare -n --pid --fork --mount-proc`) with a 2–4 GB memory cap |
+| B — sandboxed compile & run | Local `cargo run` executes each `order()` in a direct child supervised by the 2 s watchdog. Production sets `SSI_GRADER_SANDBOX=bubblewrap`: dependency build scripts/proc macros compile unprivileged in a no-network, filesystem-confined build sandbox, then **each individual worker** gets a fresh PID/network/filesystem namespace with private `/proc`, empty environment, null stdio, read-only pattern input, and only its permutation file writable. The trusted parent remains outside and non-root. See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md). |
 | C — output validation | `validate_permutation`: exact bijection check; a panic in `order()` aborts the worker process (non-zero exit, no perm file), which the parent treats as a failed run |
 | D — trusted scoring | `ssi_scoring::score`: feral's pattern-pure building blocks — `symmetric_pattern → permute_pattern → EliminationTree::from_pattern → column_counts_gnp`, then `nnz(L) = Σ cⱼ` and `flops = Σ cⱼ²`, computed from the permutation alone |
 | E — reproducibility | the ordering is run twice per matrix; outputs must be identical |
@@ -141,12 +141,12 @@ targeted hypotheses. Failure messages name the offending matrix and reason
 | return a malformed/partial permutation | Stage C bijection check fails the run |
 | nondeterministic ordering that "gets lucky" | Stage E double-run equality check |
 | stall/explore unboundedly | 2 s/matrix cap, enforced via SIGKILL of the worker's whole process group in a child process |
-| spawn a child that outlives the cap | the worker leads its own process group, which the watchdog reaps on **every** exit (not just timeout); the grader's scored step additionally runs in a PID namespace (`--pid --fork`) where the kernel SIGKILLs every remaining process when the namespace's init exits — a detached/`setsid`'d daemon cannot survive into the score-upload step |
+| spawn a child that outlives the cap | the worker leads its own process group, which the watchdog reaps on **every** exit; in grader mode each worker is PID 1 in a fresh PID namespace, so descendants cannot escape into a later worker or the score-upload step |
 | read the answer / RHS | doesn't exist: `Pattern` carries structure only; loader drops values |
-| read the hidden eval corpus from disk / env | the worker is spawned with `env_clear()` (the `SSI_CORPUS_FILE` path never reaches `order()`) and a private empty CWD; the parent also unlinks a grader-supplied eval corpus once it is fully in memory, so no worker can read it from disk (the public dev corpus is left in place) |
+| read the hidden eval corpus or trusted-parent memory | every grader worker has an empty environment and a minimal tmpfs root containing only its read-only staged pattern and writable output file. Its private `/proc` contains only that worker namespace, not the trusted parent. The parent also unlinks a grader-supplied eval corpus once resident in memory |
 | hardcode permutations for the corpus | works locally by design (it's the *dev* corpus); defeated in production by the hidden, per-round-regenerated eval corpus + memory cap |
 | edit the harness/scorer/baseline | local honor system; the grader rebuilds the harness and `ssi-scoring` from its own trusted copy and takes only `src/ordering/` from the submission |
-| escape to non-Rust code / deps | three layers: (1) `purity::check` rejects build scripts, FFI, `#[no_mangle]`/`#[link]`, proc-macros, `include!` escapes in `src/ordering/`; (2) declared crates + their whole transitive tree are scanned (`scan_vendored_tree`) for `*-sys`/`links`/C-build-deps/prebuilt blobs, and `cargo-deny` rejects non-permissive licenses and non-crates.io sources; (3) the grader builds `--offline --locked` from a vendored snapshot and scores in a no-network namespace — so no closed-source code can be fetched, and any runtime egress is blocked. See [`DECISION-crate-policy.md`](DECISION-crate-policy.md). |
+| escape to non-Rust code / deps | three layers: (1) `purity::check` rejects direct submission escapes; (2) the transitive vendored tree and licenses/sources are scanned; (3) the full build executes dependency build scripts and proc macros only inside the unprivileged build sandbox, while runtime workers use a still narrower sandbox. See [`DECISION-crate-policy.md`](DECISION-crate-policy.md) and [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md). |
 
 ### Pure Rust via three layers (not stdlib-only)
 
@@ -166,11 +166,11 @@ layers instead of a blanket ban (see [`DECISION-crate-policy.md`](DECISION-crate
    rejects non-permissive licenses and any non-crates.io source. The dependency
    tree is *not* source-token-scanned for FFI — that is unsound (it conflates
    safe C-ABI exports and proc-macros with real foreign imports).
-3. **Environmental backstop** — the grader builds `--offline --locked` from a
-   frozen crates.io vendor snapshot and scores in a no-network namespace. This
-   is what makes "no foreign code executes / no closed-source code enters" true:
-   everything compiled is public crates.io source, nothing is fetched at build
-   or run time, and a submission cannot reach the network at runtime.
+3. **Environmental backstop** — the grader builds `--offline --locked` inside
+   an unprivileged, no-network, filesystem-confined bubblewrap sandbox, then
+   scores every worker inside a separate narrower sandbox. Everything compiled
+   is public vendored source, and candidate code cannot reach runner files,
+   parent `/proc`, or the network at build or run time.
 
 Because both the harness and the grader run the identical `ssi-purity` logic and
 `prepare-build.sh`, local↔grader equivalence holds (Invariant 2). The accepted
@@ -195,14 +195,13 @@ separate scoring code to drift from what you run locally. Grading adds:
    The workflow injects it via `SSI_CORPUS_FILE`, downloaded at run time to a
    temp path outside the repo tree — so the eval bytes are never committed and
    never published. Patterns only — no reference labeling needed.
-2. **The sandbox**: the contestant crate and its declared dependencies are
-   vendored from the frozen crates.io snapshot and built `--offline --locked`
-   (no build-time network); the scored run executes in a fresh network **and**
-   PID namespace (`unshare -n --pid --fork --mount-proc`, loopback only) so
-   `order()` has no runtime egress and any process it detaches is SIGKILLed by
-   the kernel when the namespace exits (it cannot survive into the
-   `Upload score` step), under the 2–4 GB memory cap (which doubles as the
-   anti-lookup-table cap).
+2. **The sandbox**: dependencies build `--offline --locked` inside an
+   unprivileged bubblewrap boundary. The trusted harness parent then launches
+   every `order()` run in a separate, narrower PID/network/filesystem namespace.
+   A worker cannot see the parent in `/proc`, the repository, hidden corpus,
+   another worker, or any writable path except its permutation output. See
+   [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md) for mounts, CI self-checks,
+   assumptions, and residual risks.
 3. **The platform wiring**: Hilbert opens a PR per submission, dispatches the
    workflow on its head commit, reads the uploaded `score.json`, posts the
    score + metrics, and merges (accept) or closes (reject). AMD = 1.00 is the

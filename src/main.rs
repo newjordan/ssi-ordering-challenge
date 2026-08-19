@@ -50,6 +50,7 @@ mod ordering;
 mod pattern_io;
 mod perm_io;
 mod purity;
+mod sandbox;
 mod watchdog;
 
 use std::fmt::Write as _;
@@ -86,6 +87,29 @@ fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(String::as_str) == Some("--worker") {
         return ExitCode::from(worker(&raw_args[2..]) as u8);
+    }
+    if raw_args.get(1).map(String::as_str) == Some("--sandbox-self-check-worker") {
+        return ExitCode::from(sandbox_self_check_worker(&raw_args[2..]) as u8);
+    }
+
+    let worker_sandbox = match sandbox::WorkerSandbox::from_env() {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            eprintln!("RUN FAILED (grader sandbox: {e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    if raw_args.get(1).map(String::as_str) == Some("--sandbox-self-check") {
+        return match sandbox_self_check_parent(&worker_sandbox) {
+            Ok(()) => {
+                println!("per-worker bubblewrap self-check passed");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sandbox self-check failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let note = parse_note();
@@ -165,29 +189,25 @@ fn main() -> ExitCode {
         let run_once = |tag: &str| -> Result<Vec<usize>, String> {
             let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
             let _ = std::fs::remove_file(&out_perm);
-            // Per-worker empty CWD. The pattern and output paths are absolute,
-            // so the worker needs no working-directory view of anything: no repo
-            // tree, no score.json, no results.tsv (F4).
+            // Pre-create the output so grader mode can bind precisely one
+            // writable file. No directory is writable in the worker sandbox.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_perm)
+                .map_err(|e| format!("failed to stage worker output: {e}"))?;
+            // Local mode keeps the historical private empty CWD. Grader mode
+            // replaces the entire filesystem and does not expose this path.
             let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
             std::fs::create_dir_all(&worker_cwd)
                 .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--worker").arg(&pat_file).arg(&out_perm)
-                // The worker runs contestant code; hand it NOTHING. In
-                // particular SSI_CORPUS_FILE must not reach order() (F2).
-                .env_clear()
-                .current_dir(&worker_cwd);
-            // Re-forward ONLY the harness's own time-cap test hook. env_clear()
-            // above also strips this, which would silently defeat the
-            // time_cap::slow_ordering_is_killed_and_fails_promptly regression
-            // test (the pre-existing slow matrix masks it in debug, but a
-            // release run exposes it). It is inert in normal/graded runs — the
-            // grader never sets it — so re-adding just this one named var keeps
-            // the F2 mitigation (SSI_CORPUS_FILE and everything else stay
-            // stripped) while keeping the cap enforcement testable.
-            if let Ok(sleep_ms) = std::env::var("SSI_TEST_SLEEP_MS") {
-                cmd.env("SSI_TEST_SLEEP_MS", sleep_ms);
-            }
+            let mut cmd = worker_sandbox.worker_command(
+                &exe,
+                "--worker",
+                &pat_file,
+                &out_perm,
+                &worker_cwd,
+            )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
@@ -356,6 +376,118 @@ fn worker(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!("worker: failed to write perm to {out}: {e}");
             4
+        }
+    }
+}
+
+/// Exercise the exact per-worker bubblewrap command used by grading. CI runs
+/// this after the sandboxed build, before downloading the hidden corpus.
+fn sandbox_self_check_parent(worker_sandbox: &sandbox::WorkerSandbox) -> Result<(), String> {
+    if !worker_sandbox.is_enabled() {
+        return Err(format!(
+            "{}=bubblewrap is required for this check",
+            sandbox::MODE_ENV
+        ));
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("locate harness executable: {e}"))?;
+    let scratch = failsafe::ScratchDir(
+        std::env::temp_dir().join(format!("ssi-sandbox-check-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(scratch.path())
+        .map_err(|e| format!("create self-check scratch dir: {e}"))?;
+    let input = scratch.path().join("input");
+    let output = scratch.path().join("output");
+    let cwd = scratch.path().join("cwd");
+    std::fs::write(&input, b"read-only sentinel")
+        .map_err(|e| format!("create self-check input: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|e| format!("create self-check output: {e}"))?;
+    std::fs::create_dir(&cwd).map_err(|e| format!("create self-check cwd: {e}"))?;
+
+    let mut cmd = worker_sandbox.worker_command(
+        &exe,
+        "--sandbox-self-check-worker",
+        &input,
+        &output,
+        &cwd,
+    )?;
+    let cfg = watchdog::CapConfig {
+        time_cap: Duration::from_secs(5),
+        poll: Duration::from_millis(10),
+    };
+    let outcome = watchdog::run_capped(&mut cmd, &cfg);
+    let report = std::fs::read_to_string(&output).unwrap_or_default();
+    match outcome {
+        watchdog::WorkerOutcome::Ok if report == "ok\n" => Ok(()),
+        other => Err(format!("worker reported {other:?}: {}", report.trim())),
+    }
+}
+
+fn sandbox_self_check_worker(args: &[String]) -> i32 {
+    let (Some(input), Some(output)) = (args.first(), args.get(1)) else {
+        return 2;
+    };
+    let check = || -> Result<(), String> {
+        if std::process::id() != 1 {
+            return Err(format!(
+                "worker is PID {}, expected PID 1 in its own namespace",
+                std::process::id()
+            ));
+        }
+        if let Some((name, _)) = std::env::vars_os().next() {
+            return Err(format!("worker inherited environment variable {name:?}"));
+        }
+        for hidden in ["/workspace", "/home", "/root", "/tmp"] {
+            if Path::new(hidden).exists() {
+                return Err(format!("unexpected host path is visible: {hidden}"));
+            }
+        }
+        if std::fs::write(input, b"overwrite").is_ok() {
+            return Err("pattern input is writable".to_string());
+        }
+        for fd in 0..=2 {
+            let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                .map_err(|e| format!("inspect fd {fd}: {e}"))?;
+            if target != Path::new("/dev/null") {
+                return Err(format!("fd {fd} is inherited ({})", target.display()));
+            }
+        }
+        let visible_pids = std::fs::read_dir("/proc")
+            .map_err(|e| format!("read private /proc: {e}"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+            })
+            .count();
+        if visible_pids != 1 {
+            return Err(format!(
+                "private /proc exposes {visible_pids} processes, expected one"
+            ));
+        }
+        let routes = std::fs::read_to_string("/proc/net/route")
+            .map_err(|e| format!("read network namespace routes: {e}"))?;
+        if routes.lines().skip(1).any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|destination| destination == "00000000")
+        }) {
+            return Err("network namespace has a default route".to_string());
+        }
+        std::fs::write(output, b"ok\n").map_err(|e| format!("write permitted output: {e}"))
+    };
+
+    match check() {
+        Ok(()) => 0,
+        Err(e) => {
+            let _ = std::fs::write(output, format!("error: {e}\n"));
+            1
         }
     }
 }
