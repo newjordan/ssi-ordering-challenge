@@ -67,6 +67,51 @@ fn wrong_reviewed_crate_version_has_actionable_error() {
 }
 
 #[test]
+fn crate_names_may_use_hyphens_and_underscores() {
+    let got = parse_deps_toml("[dependencies]\nferal-amd = \"0.2.1\"\n")
+        .expect("a reviewed hyphenated crate name should be valid");
+    assert_eq!(got[0].name, "feral-amd");
+
+    let err = parse_deps_toml("[dependencies]\nferal_ordering_core = \"0.2.1\"\n")
+        .expect_err("syntactically valid names must still be explicitly allowlisted");
+    assert!(!err.0.contains("invalid crate name"));
+    assert!(err
+        .0
+        .contains("`feral_ordering_core` is not in the reviewed direct-dependency allowlist"));
+}
+
+#[test]
+fn quoted_crate_names_are_rejected_with_actionable_errors() {
+    for name in ["\"serde\"", "'serde'"] {
+        let src = format!("[dependencies]\n{name} = \"1.0.0\"\n");
+        let err = parse_deps_toml(&src).expect_err("quoted crate name should be rejected");
+        assert!(err.0.contains("deps.toml:2: invalid crate name"));
+        assert!(err.0.contains("ASCII letters"));
+        assert!(err.0.contains("hyphens (`-`)"));
+        assert!(err.0.contains("underscores (`_`)"));
+    }
+}
+
+#[test]
+fn whitespace_and_control_characters_in_crate_names_are_rejected() {
+    for name in ["bad name", "bad\tname", "bad\u{b}name", "bad\0name"] {
+        let src = format!("[dependencies]\n{name} = \"1.0.0\"\n");
+        let err =
+            parse_deps_toml(&src).expect_err("whitespace/control character should be rejected");
+        assert!(err.0.contains("deps.toml:2: invalid crate name"));
+    }
+}
+
+#[test]
+fn separator_characters_in_crate_names_are_rejected() {
+    for name in ["bad.name", "bad/name", "bad\\name", "bad:name", "bad@name"] {
+        let src = format!("[dependencies]\n{name} = \"1.0.0\"\n");
+        let err = parse_deps_toml(&src).expect_err("separator should be rejected");
+        assert!(err.0.contains("deps.toml:2: invalid crate name"));
+    }
+}
+
+#[test]
 fn empty_file_is_ok_and_empty() {
     assert!(parse_deps_toml("").unwrap().is_empty());
     assert!(parse_deps_toml("[dependencies]\n").unwrap().is_empty());
