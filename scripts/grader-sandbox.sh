@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Bubblewrap boundary for untrusted dependency build scripts and proc macros.
-# The worker runtime uses the narrower per-invocation Rust abstraction in
-# src/sandbox.rs; do not replace that with one shared wrapper around the parent.
+# Bubblewrap build boundary. Trusted parent and untrusted candidate are built
+# as separate packages into disjoint target directories.
 set -euo pipefail
 
 MODE="${1:-}"
-if [[ "$MODE" != "build" && "$MODE" != "self-check" ]]; then
-  echo "usage: $0 {build|self-check}" >&2
+if [[ "$MODE" != "trusted-build" && "$MODE" != "candidate-build" && "$MODE" != "self-check" ]]; then
+  echo "usage: $0 {trusted-build|candidate-build|self-check}" >&2
   exit 2
 fi
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -23,8 +22,23 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="$ROOT/target"
+TARGET_ROOT="$ROOT/target"
 SYSROOT="$(rustc --print sysroot)"
+case "$MODE" in
+  trusted-build)
+    PACKAGE="ssi-ordering-challenge"
+    TARGET="$TARGET_ROOT/trusted"
+    ;;
+  candidate-build)
+    PACKAGE="ssi-candidate-worker"
+    TARGET="$TARGET_ROOT/candidate"
+    ;;
+  self-check)
+    PACKAGE=""
+    TARGET="$TARGET_ROOT/sandbox-self-check"
+    ;;
+esac
+rm -rf "$TARGET"
 mkdir -p "$TARGET"
 
 for tool in "$SYSROOT/bin/cargo" "$SYSROOT/bin/rustc"; do
@@ -34,10 +48,9 @@ for tool in "$SYSROOT/bin/cargo" "$SYSROOT/bin/rustc"; do
   fi
 done
 
-# Start from an empty root. System binaries/libraries and the Rust toolchain are
-# read-only; the candidate checkout is read-only except for target/. Build
-# scripts and proc macros therefore cannot inspect HOME, runner temp files, the
-# future eval corpus, or mutate source/configuration.
+# Start from an empty root. The checkout is read-only. A tmpfs hides the host
+# target tree, then exposes only this mode's clean target directory, preventing
+# candidate build scripts from replacing or reading trusted build artifacts.
 BWRAP=(
   bwrap
   --unshare-pid
@@ -63,13 +76,15 @@ done
 BWRAP+=(
   --ro-bind "$SYSROOT" /toolchain
   --ro-bind "$ROOT" /workspace
-  --bind "$TARGET" /workspace/target
+  --tmpfs /workspace/target
+  --dir /workspace/target/build
+  --bind "$TARGET" /workspace/target/build
   --dir /tmp/home
   --dir /tmp/cargo
   --setenv PATH /toolchain/bin:/usr/bin:/bin
   --setenv HOME /tmp/home
   --setenv CARGO_HOME /tmp/cargo
-  --setenv CARGO_TARGET_DIR /workspace/target
+  --setenv CARGO_TARGET_DIR /workspace/target/build
   --setenv CARGO_NET_OFFLINE true
   --setenv RUSTC /toolchain/bin/rustc
   --chdir /workspace
@@ -85,8 +100,8 @@ if [[ "$MODE" == "self-check" ]]; then
       rm -f /workspace/.sandbox-write-probe
       exit 1
     fi
-    touch /workspace/target/.sandbox-write-probe
-    rm /workspace/target/.sandbox-write-probe
+    touch /workspace/target/build/.sandbox-write-probe
+    rm /workspace/target/build/.sandbox-write-probe
     touch /tmp/write-probe
     SSI_REQUIRE_NETWORK_BLOCK=1 /workspace/.github/scripts/assert-no-network.sh
   '
@@ -94,4 +109,5 @@ if [[ "$MODE" == "self-check" ]]; then
   exit 0
 fi
 
-exec "${BWRAP[@]}" -- /toolchain/bin/cargo build --release --offline --locked
+exec "${BWRAP[@]}" -- /toolchain/bin/cargo build \
+  --release --offline --locked --package "$PACKAGE"

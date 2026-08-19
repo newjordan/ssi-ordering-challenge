@@ -204,16 +204,17 @@ leading ordering and its `src/ordering/memory/` notes rather than from scratch.
 ### Running the harness yourself
 
 ```sh
-bash scripts/prepare-build.sh            # regenerate Cargo.toml from deps.toml + vendor + scan
+bash scripts/prepare-build.sh            # generate manifests + vendor + scan
+cargo build --release --workspace --offline --locked
 cargo run --release --offline --locked -- --note "what I tried"
 ```
 
-`prepare-build.sh` validates `src/ordering/deps.toml`, regenerates the trusted
-`Cargo.toml` from `Cargo.toml.in` + your declared crates, vendors the full
-dependency tree, and scans it for native-code signals (`*-sys` names, prebuilt
-blobs, C-toolchain build-deps). Run it whenever you change `deps.toml` (and once
-on a fresh clone). If your `deps.toml` is empty you can skip it and just
-`cargo run --release`.
+`prepare-build.sh` validates `src/ordering/deps.toml`, generates the trusted
+parent manifest from `Cargo.toml.in`, and writes your declared crates only into
+the separate candidate-worker manifest. It then vendors the full dependency
+tree and scans it for native-code signals (`*-sys` names, prebuilt blobs,
+C-toolchain build-deps). Run it whenever you change `deps.toml` and once on a
+fresh clone. Rebuild `ssi-candidate-worker` after ordering edits.
 
 The scored command runs the purity/license gate, scores every dev matrix,
 writes `score.json`, and appends one row to `results.tsv` with timestamp,
@@ -249,9 +250,10 @@ transitive tree** must come from crates.io, be permissively licensed (MIT /
 Apache-2.0 / BSD / Unlicense / Zlib / Unicode-3.0), and be pure Rust — a `*-sys`
 wrapper, a crate that compiles C (a `cc`/`cmake`/`bindgen` build-dependency or a
 `links` native library), or one shipping a prebuilt binary blob is rejected.
-After editing `deps.toml`, run `bash scripts/prepare-build.sh` before `cargo
-run`. See [`docs/DECISION-crate-policy.md`](docs/DECISION-crate-policy.md) for
-the full policy and its rationale.
+After editing `deps.toml`, run `bash scripts/prepare-build.sh`, then rebuild the
+workspace before `cargo run`. See
+[`docs/DECISION-crate-policy.md`](docs/DECISION-crate-policy.md) for the full
+policy and its rationale.
 
 ### Building from a fresh clone
 
@@ -261,10 +263,10 @@ local feral checkout. `prepare-build.sh` fetches and vendors everything once
 (needs network); the subsequent `cargo build/run --offline --locked` needs no
 network. The scoring API and your `order()` contract are unchanged.
 
-> **Generated `Cargo.toml`.** The committed source of truth is `Cargo.toml.in`;
-> `prepare-build.sh` generates `Cargo.toml` (git-ignored) from it plus your
-> `deps.toml`. Don't edit `Cargo.toml` by hand — edit `deps.toml` and re-run the
-> script.
+> **Generated manifests.** The committed sources of truth are `Cargo.toml.in`
+> and `candidate-worker/Cargo.toml.in`. `prepare-build.sh` generates the
+> git-ignored manifests and adds `deps.toml` entries only to the candidate.
+> Don't edit generated manifests by hand.
 
 ### What you can edit
 
@@ -285,12 +287,12 @@ only `src/ordering/` (including its `deps.toml`) from your fork.
 You may **not** touch the harness:
 
 - `src/main.rs`, `src/corpus.rs`, `src/purity.rs` — the contract and gates.
-- `src/watchdog.rs`, `src/perm_io.rs` — the subprocess time-cap enforcement.
+- `src/watchdog.rs`, `src/sandbox.rs` — subprocess caps and sandbox launch.
+- `ssi-worker-protocol/`, `candidate-worker/` — the frozen process boundary.
 - `ssi-scoring/` — the trusted scoring wrapper (also used by the grader).
 - `ssi-purity/` — the shared Stage-A purity gate (also used by the grader).
-- `Cargo.toml.in` / `deny.toml` — the trusted manifest template and license
-  policy. (`Cargo.toml` is generated from `Cargo.toml.in` + your `deps.toml`;
-  don't edit it by hand.)
+- `Cargo.toml.in`, `candidate-worker/Cargo.toml.in`, and `deny.toml` — trusted
+  manifest templates and license policy.
 - `results.tsv` directly (the harness appends to it for you).
 
 The purity gate enforces this mechanically for `src/ordering/`: it rejects
@@ -302,7 +304,7 @@ across their whole transitive tree for native code and non-permissive licenses.
 
 This repo is built to be driven by an agent (see [`RULES.md`](RULES.md), which
 describes the loop) running a tight cycle: read what's known → form a hypothesis →
-edit `src/ordering/` → `cargo run --release` → read the per-matrix table and
+edit `src/ordering/` → rebuild the candidate → `cargo run --release` → read the per-matrix table and
 attribute wins/losses by family and size → record the result → commit if the
 score improved.
 

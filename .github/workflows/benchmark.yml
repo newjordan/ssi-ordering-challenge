@@ -68,28 +68,33 @@ jobs:
       - name: Prepare build (validate deps, vendor, scan tree)
         run: bash scripts/prepare-build.sh
 
-      # Stable step name "Setup": a failure here maps to setup_failed. Build from
-      # the vendored snapshot with no network and the frozen lockfile — nothing
-      # outside vendor/ can enter, so no closed-source or foreign code can be
-      # fetched at build time (docs/DECISION-crate-policy.md, Task 7). The
-      # bubblewrap boundary gives build scripts and proc macros no network, a
-      # private PID namespace, and a read-only checkout; target/ and a private
-      # tmpfs are their only writable filesystems. The eval corpus is fetched
-      # only after this step.
+      # Stable step name "Setup": a failure here maps to setup_failed. Build the
+      # trusted parent and candidate package separately. Their clean target
+      # directories are mounted one at a time, so candidate build scripts cannot
+      # replace the parent executable. The eval corpus is fetched only later.
       - name: Setup
         run: |
           set -euo pipefail
           test "$(id -u)" -ne 0
           scripts/grader-sandbox.sh self-check
-          scripts/grader-sandbox.sh build
+          scripts/grader-sandbox.sh trusted-build
+          scripts/grader-sandbox.sh candidate-build
 
       # Runs the exact Rust command builder used for every order() call. It
       # gates on PID 1/private proc, no default route, empty environment,
-      # /dev/null stdio, read-only input, hidden host paths, and writable output.
+      # /dev/null stdio, read-only input, hidden host paths, writable output, and
+      # watchdog teardown of a candidate descendant.
       - name: Verify per-worker sandbox
         env:
           SSI_GRADER_SANDBOX: bubblewrap
-        run: ./target/release/ssi-ordering-challenge --sandbox-self-check
+          SSI_CANDIDATE_WORKER: ${{ github.workspace }}/target/candidate/release/ssi-candidate-worker
+        run: |
+          set -euo pipefail
+          ./target/trusted/release/ssi-ordering-challenge --grader --sandbox-self-check
+          ./target/trusted/release/ssi-ordering-challenge --grader --sandbox-timeout-self-check
+          cargo test --offline --locked --package ssi-ordering-challenge \
+            sandbox::tests::bubblewrap_timeout_tears_down_candidate_descendants \
+            -- --ignored
 
       # Fetch today's hidden EVAL corpus to a temp path OUTSIDE the repo tree, so
       # the eval bytes never sit at a tracked path and can never be committed
@@ -128,10 +133,11 @@ jobs:
         env:
           SSI_CORPUS_FILE: ${{ steps.corpus.outputs.corpus_file }}
           SSI_GRADER_SANDBOX: bubblewrap
+          SSI_CANDIDATE_WORKER: ${{ github.workspace }}/target/candidate/release/ssi-candidate-worker
         run: |
           set -euo pipefail
           test "$(id -u)" -ne 0
-          exec ./target/release/ssi-ordering-challenge
+          exec ./target/trusted/release/ssi-ordering-challenge --grader
 
       # The score artifact is the channel Hilbert reads. Upload even on failure so
       # a partial/zero score is visible rather than silently lost; the run still

@@ -34,7 +34,7 @@ symbolic analysis, via the `ssi-scoring` crate that the grader also uses.
 
 ```
 ssi-ordering-challenge/            (THE PUBLIC REPO / contestant template)
-├── Cargo.toml            workspace root; harness package + members          [frozen]
+├── Cargo.toml            generated workspace root; trusted parent package   [frozen]
 ├── deny.toml             shared license policy (cargo-deny)                  [frozen]
 ├── benchmark.json        Hilbert import manifest (runner, editablePaths, score)[frozen]
 ├── .github/
@@ -44,12 +44,11 @@ ssi-ordering-challenge/            (THE PUBLIC REPO / contestant template)
 │       └── fetch-eval-corpus.sh  pulls the hidden eval corpus at run time    [frozen]
 ├── src/
 │   ├── main.rs           harness driver (gate, stages, caps, scoring, output);
-│   │                     re-exports the Pattern contract type as crate::Pattern[frozen]
+│   │                     never includes contestant ordering code              [frozen]
 │   ├── corpus.rs         corpus loader (JSONL); honors the SSI_CORPUS_FILE
 │   │                     path override                                         [frozen]
 │   ├── purity.rs         local Stage-A purity & license gate                 [frozen]
 │   ├── watchdog.rs       subprocess supervision + SIGKILL at the time cap    [frozen]
-│   ├── perm_io.rs        parent↔worker permutation wire format               [frozen]
 │   └── ordering/         ★ contestant code — the only editable directory
 │       ├── mod.rs        pub fn order(&Pattern) -> Vec<usize>  (identity starter stub)
 │       └── memory/       your working notes (ships with a placeholder README)
@@ -58,6 +57,8 @@ ssi-ordering-challenge/            (THE PUBLIC REPO / contestant template)
 │       ├── lib.rs        score(), amd_baseline() via feral building blocks
 │       ├── pattern.rs    the Pattern type (structure only)
 │       └── loader.rs     pattern_from_jsonl_line() — the one corpus parser, shared by harness & grader
+├── ssi-worker-protocol/  shared Pattern/permutation binary file contract    [frozen]
+├── candidate-worker/     only package that includes ordering + declared deps[frozen]
 ├── prototype-oracle/     dev-only INDEPENDENT scorer, for the cross-check test
 ├── corpus/dev/           the shipped development corpus (patterns.jsonl sample)
 ├── results.tsv           append-only run log (timestamp, status, score, fill, note; FAIL rows carry the reason in note)
@@ -70,7 +71,7 @@ Per run, `main.rs` executes the grader stages of the proposal in miniature:
 | Proposal stage | Harness implementation |
 |---|---|
 | A — purity & license gate | `purity::check` (RequireDeny mode): scans `src/ordering/` for build.rs / FFI / `#[no_mangle]` / `#[link]` / proc-macros / `include!` escapes, parses `src/ordering/deps.toml`, and runs `cargo-deny` against `deny.toml` (mandatory — a missing `cargo-deny` fails the gate). The grader additionally scans the vendored dependency tree (`ssi_purity::scan_vendored_tree`) for `*-sys` names, prebuilt native blobs, and C-toolchain build-deps. Mirrors the grader's authoritative Stage A — same rules, same `deny.toml`. |
-| B — sandboxed compile & run | Local `cargo run` executes each `order()` in a direct child supervised by the 2 s watchdog. Production sets `SSI_GRADER_SANDBOX=bubblewrap`: dependency build scripts/proc macros compile unprivileged in a no-network, filesystem-confined build sandbox, then **each individual worker** gets a fresh PID/network/filesystem namespace with private `/proc`, empty environment, null stdio, read-only pattern input, and only its permutation file writable. The trusted parent remains outside and non-root. See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md). |
+| B — sandboxed compile & run | The trusted parent and candidate worker are separate packages. Only the candidate includes `src/ordering` and declared dependencies. Local runs execute that sibling binary as a direct child under the 2 s watchdog. Production builds the two packages into disjoint target directories, then starts the candidate executable itself inside a fresh bubblewrap PID/network/filesystem namespace for **each individual worker**. `--grader` rejects a missing sandbox selection. See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md). |
 | C — output validation | `validate_permutation`: exact bijection check; a panic in `order()` aborts the worker process (non-zero exit, no perm file), which the parent treats as a failed run |
 | D — trusted scoring | `ssi_scoring::score`: feral's pattern-pure building blocks — `symmetric_pattern → permute_pattern → EliminationTree::from_pattern → column_counts_gnp`, then `nnz(L) = Σ cⱼ` and `flops = Σ cⱼ²`, computed from the permutation alone |
 | E — reproducibility | the ordering is run twice per matrix; outputs must be identical |
@@ -121,7 +122,8 @@ as `cargo test` fixtures in the `prototype-oracle` crate.
 ## 3. The agent feedback loop
 
 ```
-edit src/ordering/  →  cargo run --release -- --note "hypothesis"
+edit src/ordering/  →  cargo build --release -p ssi-candidate-worker
+                           && cargo run --release -- --note "hypothesis"
        ↑                                 │
        │      per-matrix table + score + FAIL reasons
        └─────────────────────────────────┘
@@ -141,6 +143,7 @@ targeted hypotheses. Failure messages name the offending matrix and reason
 | return a malformed/partial permutation | Stage C bijection check fails the run |
 | nondeterministic ordering that "gets lucky" | Stage E double-run equality check |
 | stall/explore unboundedly | 2 s/matrix cap, enforced via SIGKILL of the worker's whole process group in a child process |
+| run pre-main dependency initialization in the parent | the trusted parent package has no contestant module or contestant dependencies; the separate candidate executable starts inside bubblewrap, so its dynamic loader, `.init_array`, Rust startup, and `main` are all contained |
 | spawn a child that outlives the cap | the worker leads its own process group, which the watchdog reaps on **every** exit; in grader mode each worker is PID 1 in a fresh PID namespace, so descendants cannot escape into a later worker or the score-upload step |
 | read the answer / RHS | doesn't exist: `Pattern` carries structure only; loader drops values |
 | read the hidden eval corpus or trusted-parent memory | every grader worker has an empty environment and a minimal tmpfs root containing only its read-only staged pattern and writable output file. Its private `/proc` contains only that worker namespace, not the trusted parent. The parent also unlinks a grader-supplied eval corpus once resident in memory |

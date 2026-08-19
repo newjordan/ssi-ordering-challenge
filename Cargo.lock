@@ -298,7 +298,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssi-ordering-challenge"
+name = "ssi-candidate-worker"
 version = "0.1.0"
 dependencies = [
  "feral",
@@ -308,9 +308,18 @@ dependencies = [
  "feral-metis",
  "feral-ordering-core",
  "feral-scotch",
+ "ssi-scoring",
+ "ssi-worker-protocol",
+]
+
+[[package]]
+name = "ssi-ordering-challenge"
+version = "0.1.0"
+dependencies = [
  "prototype-oracle",
  "ssi-purity",
  "ssi-scoring",
+ "ssi-worker-protocol",
 ]
 
 [[package]]
@@ -324,6 +333,13 @@ dependencies = [
  "feral",
  "feral-amd",
  "feral-ordering-core",
+]
+
+[[package]]
+name = "ssi-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "ssi-scoring",
 ]
 
 [[package]]

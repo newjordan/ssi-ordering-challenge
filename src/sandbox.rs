@@ -13,24 +13,60 @@ use std::process::{Command, Stdio};
 
 pub const MODE_ENV: &str = "SSI_GRADER_SANDBOX";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerInvocation {
+    Order,
+    SandboxSelfCheck,
+    SandboxTimeoutSelfCheck,
+}
+
+impl WorkerInvocation {
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Order => None,
+            Self::SandboxSelfCheck => Some("--sandbox-self-check"),
+            Self::SandboxTimeoutSelfCheck => Some("--sandbox-timeout-self-check"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum WorkerSandbox {
     Disabled,
-    Bubblewrap { executable: PathBuf },
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Bubblewrap {
+        executable: PathBuf,
+    },
 }
 
 impl WorkerSandbox {
     /// Select the sandbox from the trusted parent's environment.
     ///
-    /// Local development remains unchanged when `SSI_GRADER_SANDBOX` is unset.
-    /// Any non-empty value other than `bubblewrap` is rejected, and requested
-    /// grader isolation fails closed if the platform or binary is unsuitable.
-    pub fn from_env() -> Result<Self, String> {
-        let Some(value) = std::env::var_os(MODE_ENV) else {
-            return Ok(Self::Disabled);
+    /// Local development remains direct when `SSI_GRADER_SANDBOX` is unset.
+    /// `grader_mode` makes that same missing selection a hard error, so the
+    /// production command cannot silently degrade to an unsandboxed worker.
+    pub fn from_env(grader_mode: bool) -> Result<Self, String> {
+        Self::from_value(grader_mode, std::env::var_os(MODE_ENV))
+    }
+
+    fn from_value(grader_mode: bool, value: Option<std::ffi::OsString>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return if grader_mode {
+                Err(format!(
+                    "{MODE_ENV} must be exactly \"bubblewrap\" in --grader mode"
+                ))
+            } else {
+                Ok(Self::Disabled)
+            };
         };
         if value.is_empty() {
-            return Ok(Self::Disabled);
+            return if grader_mode {
+                Err(format!(
+                    "{MODE_ENV} must be exactly \"bubblewrap\" in --grader mode"
+                ))
+            } else {
+                Ok(Self::Disabled)
+            };
         }
         if value != "bubblewrap" {
             return Err(format!(
@@ -49,7 +85,8 @@ impl WorkerSandbox {
         {
             if effective_uid()? == 0 {
                 return Err(
-                    "grader parent is running as root; refusing to launch untrusted code".to_string(),
+                    "grader parent is running as root; refusing to launch untrusted code"
+                        .to_string(),
                 );
             }
             let executable = ["/usr/bin/bwrap", "/bin/bwrap"]
@@ -72,17 +109,19 @@ impl WorkerSandbox {
     /// read-only/minimal filesystem.
     pub fn worker_command(
         &self,
-        harness_exe: &Path,
-        worker_flag: &str,
+        candidate_exe: &Path,
+        invocation: WorkerInvocation,
         input: &Path,
         output: &Path,
         local_cwd: &Path,
     ) -> Result<Command, String> {
         match self {
             Self::Disabled => {
-                let mut cmd = Command::new(harness_exe);
-                cmd.arg(worker_flag)
-                    .arg(input)
+                let mut cmd = Command::new(candidate_exe);
+                if let Some(flag) = invocation.flag() {
+                    cmd.arg(flag);
+                }
+                cmd.arg(input)
                     .arg(output)
                     .env_clear()
                     .current_dir(local_cwd);
@@ -95,7 +134,7 @@ impl WorkerSandbox {
                 Ok(cmd)
             }
             Self::Bubblewrap { executable } => {
-                let harness_exe = canonical_file(harness_exe, "harness executable")?;
+                let candidate_exe = canonical_file(candidate_exe, "candidate executable")?;
                 let input = canonical_file(input, "worker input")?;
                 let output = canonical_file(output, "worker output")?;
 
@@ -129,16 +168,19 @@ impl WorkerSandbox {
                 }
 
                 cmd.arg("--ro-bind")
-                    .arg(&harness_exe)
-                    .arg("/worker")
+                    .arg(&candidate_exe)
+                    .arg("/candidate-worker")
                     .arg("--ro-bind")
                     .arg(&input)
                     .arg("/input/pattern.bin")
                     .arg("--bind")
                     .arg(&output)
                     .arg("/output/permutation.bin")
-                    .args(["--chdir", "/", "--", "/worker", worker_flag])
-                    .args(["/input/pattern.bin", "/output/permutation.bin"]);
+                    .args(["--chdir", "/", "--", "/candidate-worker"]);
+                if let Some(flag) = invocation.flag() {
+                    cmd.arg(flag);
+                }
+                cmd.args(["/input/pattern.bin", "/output/permutation.bin"]);
                 null_stdio(&mut cmd);
                 Ok(cmd)
             }
@@ -186,27 +228,72 @@ mod tests {
     #[test]
     fn disabled_command_clears_environment_and_uses_host_paths() {
         let sandbox = WorkerSandbox::Disabled;
-        let mut cmd = sandbox
+        let cmd = sandbox
             .worker_command(
-                Path::new("/harness"),
-                "--worker",
+                Path::new("/candidate"),
+                WorkerInvocation::Order,
                 Path::new("/pattern"),
                 Path::new("/permutation"),
                 Path::new("/empty"),
             )
             .unwrap();
 
-        assert_eq!(cmd.get_program(), OsStr::new("/harness"));
+        assert_eq!(cmd.get_program(), OsStr::new("/candidate"));
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
-            [
-                OsStr::new("--worker"),
-                OsStr::new("/pattern"),
-                OsStr::new("/permutation")
-            ]
+            [OsStr::new("/pattern"), OsStr::new("/permutation")]
         );
         assert!(cmd.get_envs().all(|(_, value)| value.is_none()));
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/empty")));
+    }
+
+    #[test]
+    fn grader_mode_rejects_missing_or_empty_sandbox_selection() {
+        assert!(WorkerSandbox::from_value(true, None)
+            .unwrap_err()
+            .contains("must be exactly \"bubblewrap\""));
+        assert!(WorkerSandbox::from_value(true, Some("".into()))
+            .unwrap_err()
+            .contains("must be exactly \"bubblewrap\""));
+        assert!(matches!(
+            WorkerSandbox::from_value(false, None).unwrap(),
+            WorkerSandbox::Disabled
+        ));
+    }
+
+    #[test]
+    fn bubblewrap_command_executes_candidate_binary_from_process_start() {
+        let dir = std::env::temp_dir().join(format!("ssi-sandbox-command-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("candidate");
+        let input = dir.join("input");
+        let output = dir.join("output");
+        for path in [&candidate, &input, &output] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        let sandbox = WorkerSandbox::Bubblewrap {
+            executable: PathBuf::from("/test/bwrap"),
+        };
+        let cmd = sandbox
+            .worker_command(&candidate, WorkerInvocation::Order, &input, &output, &dir)
+            .unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let candidate = std::fs::canonicalize(candidate)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(cmd.get_program(), OsStr::new("/test/bwrap"));
+        assert!(args
+            .windows(3)
+            .any(|window| window == ["--ro-bind", &candidate, "/candidate-worker"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--", "/candidate-worker"]));
+        assert!(!args.iter().any(|arg| arg == "--worker"));
     }
 
     #[cfg(target_os = "linux")]
@@ -215,5 +302,48 @@ mod tests {
         let status = "Name:\ttest\nUid:\t1000\t1001\t1002\t1003\n";
         assert_eq!(parse_effective_uid(status), Some(1001));
         assert_eq!(parse_effective_uid("Name:\ttest\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bubblewrap user namespaces and a built candidate worker"]
+    fn bubblewrap_timeout_tears_down_candidate_descendants() {
+        let candidate = std::env::var_os("SSI_CANDIDATE_WORKER")
+            .map(PathBuf::from)
+            .expect("SSI_CANDIDATE_WORKER must name the built candidate");
+        let sandbox = WorkerSandbox::from_value(true, Some("bubblewrap".into())).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ssi-bwrap-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input");
+        let output = dir.join("output");
+        let cwd = dir.join("cwd");
+        std::fs::write(&input, b"sentinel").unwrap();
+        std::fs::write(&output, b"").unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+
+        let mut cmd = sandbox
+            .worker_command(
+                &candidate,
+                WorkerInvocation::SandboxTimeoutSelfCheck,
+                &input,
+                &output,
+                &cwd,
+            )
+            .unwrap();
+        let outcome = crate::watchdog::run_capped(
+            &mut cmd,
+            &crate::watchdog::CapConfig {
+                time_cap: std::time::Duration::from_millis(200),
+                poll: std::time::Duration::from_millis(5),
+            },
+        );
+        assert_eq!(outcome, crate::watchdog::WorkerOutcome::Timeout);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "candidate started\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
