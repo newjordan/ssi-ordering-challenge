@@ -31,12 +31,12 @@ fn normal_run_succeeds_on_sample_corpus() {
 
 #[test]
 fn slow_ordering_is_killed_and_fails_promptly() {
-    // Force every order() call to sleep 30s; the 2s cap must kill it and FAIL
-    // the run in well under 30s.
+    // Select a harness-owned worker that sleeps 30s without calling order().
+    // The 2s cap must kill the real worker process and FAIL the run well under
+    // 30s, while contestant code gets no environment or argv test seam.
     let start = Instant::now();
     let out = Command::new(harness_bin())
-        .env("SSI_TEST_SLEEP_MS", "30000")
-        .args(["--note", "time_cap test: slow"])
+        .arg("--test-time-cap")
         .output()
         .expect("run harness");
     let elapsed = start.elapsed();

@@ -48,7 +48,7 @@ jobs:
       # the license/source gate is authoritative now that submissions may declare
       # crates. A missing cargo-deny is a hard failure, not a fallback.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
 
       # Validate deps.toml, generate the trusted manifest, freeze the lockfile,
       # vendor the FULL transitive tree, and scan it for native/FFI escapes. This

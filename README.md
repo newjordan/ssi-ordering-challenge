@@ -228,8 +228,9 @@ verifying your toolchain before iterating.
 
 > **`cargo-deny` is required.** The gate runs the authoritative `cargo-deny`
 > license check (RequireDeny mode) — install it once with
-> `cargo install cargo-deny`. A missing `cargo-deny` fails the gate rather than
-> skipping it, so your local result matches the grader.
+> `cargo install cargo-deny --version 0.20.2 --locked`. The exact grader version
+> is pinned so policy results cannot drift with a newer release. A missing
+> `cargo-deny` fails the gate rather than skipping it.
 
 ### Using crates
 

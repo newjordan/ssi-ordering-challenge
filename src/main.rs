@@ -80,6 +80,14 @@ pub use ssi_scoring::Pattern;
 /// runs use the identical 2 s cap by construction (Invariant 2).
 const TIME_CAP_PER_MATRIX: Duration = Duration::from_secs(2);
 
+// Harness-owned regression modes. The parent-only flag is accepted by the
+// integration test; it is never forwarded to a production worker. The timeout
+// worker never calls ordering::order(), so contestant code cannot observe
+// either flag through argv or the environment.
+const TEST_TIME_CAP_FLAG: &str = "--test-time-cap";
+const TEST_TIMEOUT_WORKER_FLAG: &str = "--worker-test-timeout";
+const TEST_TIMEOUT_SLEEP: Duration = Duration::from_secs(30);
+
 fn main() -> ExitCode {
     // Worker mode: the ONLY process that runs contestant order(). Reads the
     // pattern the parent serialized, runs order(), writes the permutation, exits.
@@ -87,6 +95,11 @@ fn main() -> ExitCode {
     if raw_args.get(1).map(String::as_str) == Some("--worker") {
         return ExitCode::from(worker(&raw_args[2..]) as u8);
     }
+    if raw_args.get(1).map(String::as_str) == Some(TEST_TIMEOUT_WORKER_FLAG) {
+        std::thread::sleep(TEST_TIMEOUT_SLEEP);
+        return ExitCode::SUCCESS;
+    }
+    let test_time_cap = raw_args.get(1).map(String::as_str) == Some(TEST_TIME_CAP_FLAG);
 
     let note = parse_note();
 
@@ -172,22 +185,17 @@ fn main() -> ExitCode {
             std::fs::create_dir_all(&worker_cwd)
                 .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--worker").arg(&pat_file).arg(&out_perm)
-                // The worker runs contestant code; hand it NOTHING. In
-                // particular SSI_CORPUS_FILE must not reach order() (F2).
-                .env_clear()
-                .current_dir(&worker_cwd);
-            // Re-forward ONLY the harness's own time-cap test hook. env_clear()
-            // above also strips this, which would silently defeat the
-            // time_cap::slow_ordering_is_killed_and_fails_promptly regression
-            // test (the pre-existing slow matrix masks it in debug, but a
-            // release run exposes it). It is inert in normal/graded runs — the
-            // grader never sets it — so re-adding just this one named var keeps
-            // the F2 mitigation (SSI_CORPUS_FILE and everything else stay
-            // stripped) while keeping the cap enforcement testable.
-            if let Ok(sleep_ms) = std::env::var("SSI_TEST_SLEEP_MS") {
-                cmd.env("SSI_TEST_SLEEP_MS", sleep_ms);
+            if test_time_cap {
+                // Test-only harness worker: it sleeps without ever invoking
+                // order(), so the watchdog is exercised while contestant code
+                // cannot inspect the test flag.
+                cmd.arg(TEST_TIMEOUT_WORKER_FLAG);
+            } else {
+                cmd.arg("--worker").arg(&pat_file).arg(&out_perm);
             }
+            // The worker runs contestant code; hand it NOTHING. In particular
+            // SSI_CORPUS_FILE and all test controls must not reach order() (F2).
+            cmd.env_clear().current_dir(&worker_cwd);
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)

@@ -39,7 +39,7 @@ and absolute values shift.
 3. Run: `bash scripts/prepare-build.sh && cargo run --release --offline --locked -- --note "<hypothesis>"`
    (`prepare-build.sh` regenerates `Cargo.toml` from `deps.toml`, vendors, and
    scans; skip it only if `deps.toml` is unchanged. Requires `cargo-deny`:
-   `cargo install cargo-deny`.)
+   `cargo install cargo-deny --version 0.20.2 --locked`.)
 4. Read the per-matrix table. Attribute wins/losses per family and size bucket
    (NLP, QCP, QP, QCQP; n up to ~340k).
 5. Record findings in the knowledge base (an experiment page + one `log.md`

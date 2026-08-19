@@ -32,15 +32,6 @@ use super::*;
 
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub(crate) fn legacy_order(pattern: &Pattern) -> Vec<usize> {
-    // TEST-ONLY hook: when SSI_TEST_SLEEP_MS is set, sleep that long before
-    // ordering. Inert unless the env var is present (never set in normal runs
-    // or on the grader); lets the harness's time-cap test force a breach.
-    if let Ok(ms) = std::env::var("SSI_TEST_SLEEP_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
-    }
-
     legacy_order_with_relabel_cap(pattern, usize::MAX)
 }
 
