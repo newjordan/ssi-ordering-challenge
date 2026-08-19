@@ -21,12 +21,83 @@ fn normal_run_succeeds_on_sample_corpus() {
         .args(["--note", "time_cap test: normal"])
         .output()
         .expect("run harness");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
         "expected success, got {:?}\nstdout:\n{}",
         out.status,
-        String::from_utf8_lossy(&out.stdout)
+        stdout
     );
+    assert!(
+        stdout.contains("matrix") && stdout.contains("nnz(A)"),
+        "public dev run should retain the per-matrix census:\n{stdout}"
+    );
+}
+
+#[test]
+fn hidden_corpus_omits_per_matrix_census() {
+    let dir = std::env::temp_dir().join(format!("ssi-hidden-output-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let corpus = dir.join("hidden.jsonl");
+    std::fs::write(
+        &corpus,
+        concat!(
+            r#"{"n":4,"nnz":12,"indptr":[0,3,6,8,12],"indices":"#,
+            r#"[0,1,3,0,1,3,2,3,0,1,2,3],"hash":"hidden","#,
+            r#""source":"SECRET_MATRIX_CANARY"}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(harness_bin())
+        .env("SSI_CORPUS_FILE", &corpus)
+        .current_dir(&dir)
+        .output()
+        .expect("run harness against hidden corpus");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "expected hidden-corpus success, got {:?}\nstdout:\n{}",
+        out.status,
+        stdout
+    );
+    assert!(!stdout.contains("SECRET_MATRIX_CANARY"), "{stdout}");
+    assert!(!stdout.contains("nnz(A)"), "{stdout}");
+    assert!(!stdout.contains("flops(base)"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hidden_corpus_load_failure_omits_raw_name() {
+    let dir = std::env::temp_dir().join(format!(
+        "ssi-hidden-load-failure-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let corpus = dir.join("malformed-hidden.jsonl");
+    std::fs::write(
+        &corpus,
+        r#"{"source":"SECRET_LOAD_FAILURE_CANARY","n":"not-a-number"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(harness_bin())
+        .env("SSI_CORPUS_FILE", &corpus)
+        .current_dir(&dir)
+        .output()
+        .expect("run harness against malformed hidden corpus");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "malformed hidden corpus should fail");
+    assert!(stdout.contains("failed to load hidden corpus"), "{stdout}");
+    assert!(!stdout.contains("SECRET_LOAD_FAILURE_CANARY"), "{stdout}");
+    assert!(!stderr.contains("SECRET_LOAD_FAILURE_CANARY"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

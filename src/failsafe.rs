@@ -60,6 +60,42 @@ impl Drop for ScratchDir {
     }
 }
 
+/// Owns one staged worker-input file and unlinks it on every scope exit.
+///
+/// The whole scratch directory also has a drop guard, but pattern files contain
+/// one matrix each and should not remain readable until the end of a corpus run.
+/// Construct this guard before writing so even a partial write is cleaned up.
+pub struct StagedFile(PathBuf);
+
+impl StagedFile {
+    pub fn new(path: PathBuf) -> Self {
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Unlink the staged input as soon as both workers have finished.
+    ///
+    /// The drop implementation remains armed, so an error here is retried while
+    /// unwinding the loop iteration and by the enclosing scratch-dir guard.
+    pub fn remove_now(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,10 +139,7 @@ mod tests {
 
     #[test]
     fn compose_note_strips_tabs_and_newlines() {
-        assert_eq!(
-            compose_note("a\tb", "c\nd"),
-            "a b | c d"
-        );
+        assert_eq!(compose_note("a\tb", "c\nd"), "a b | c d");
     }
 
     #[test]
@@ -126,5 +159,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // dropping a guard over a non-existent dir must not panic
         drop(ScratchDir(dir));
+    }
+
+    #[test]
+    fn staged_file_removed_on_drop() {
+        let path =
+            std::env::temp_dir().join(format!("ssi-failsafe-staged-file-{}", std::process::id()));
+        let guard = StagedFile::new(path.clone());
+        std::fs::write(guard.path(), b"pattern bytes").unwrap();
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn staged_file_can_be_removed_promptly() {
+        let path = std::env::temp_dir().join(format!(
+            "ssi-failsafe-prompt-staged-file-{}",
+            std::process::id()
+        ));
+        let guard = StagedFile::new(path.clone());
+        std::fs::write(guard.path(), b"pattern bytes").unwrap();
+        guard.remove_now().unwrap();
+        assert!(!path.exists());
+        // Drop is intentionally still safe after prompt removal.
+        drop(guard);
     }
 }

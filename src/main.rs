@@ -17,7 +17,8 @@
 //!   4. recompute predicted flops and nnz(L) from the permutation with the
 //!      trusted scoring wrapper (Stage D) — your code never reports a number;
 //!
-//! then prints a per-matrix table and a per-bucket breakdown, computes
+//! then, for the public development corpus, prints a per-matrix table; all runs
+//! print a per-bucket breakdown and compute
 //!
 //!     score = weighted mean over size buckets of
 //!             geomean_within_bucket( flops(yours) / flops(AMD) )
@@ -56,12 +57,12 @@ use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ssi_scoring::{
-    combine, geomean, score, size_bucket, validate_permutation, BucketAcc, BUCKETS,
-    BUCKET_KEYS, BUCKET_WEIGHTS,
+    combine, geomean, score, size_bucket, validate_permutation, BucketAcc, BUCKETS, BUCKET_KEYS,
+    BUCKET_WEIGHTS,
 };
 
 // Re-export the contract type at the crate root so contestant code under
@@ -96,17 +97,45 @@ fn main() -> ExitCode {
         let reason = format!("Stage A — purity/license: {e}");
         println!("RUN FAILED ({reason})");
         let ts = now();
-        append_results(ts, "FAIL", f64::NAN, f64::NAN, &failsafe::compose_note(&reason, &note));
+        append_results(
+            ts,
+            "FAIL",
+            f64::NAN,
+            f64::NAN,
+            &failsafe::compose_note(&reason, &note),
+        );
         return ExitCode::FAILURE;
     }
 
     let corpus_file = corpus::corpus_path();
-    let corpus = corpus::corpus();
+    let show_matrix_census = is_public_dev_corpus(&corpus_file);
+    let corpus = match corpus::load(&corpus_file) {
+        Ok(corpus) => corpus,
+        Err(detail) => {
+            if !show_matrix_census {
+                let _ = std::fs::remove_file(&corpus_file);
+            }
+            let reason = if show_matrix_census {
+                detail
+            } else {
+                "failed to load hidden corpus".to_string()
+            };
+            println!("RUN FAILED: {reason}");
+            append_results(
+                now(),
+                "FAIL",
+                f64::NAN,
+                f64::NAN,
+                &failsafe::compose_note(&reason, &note),
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     // The corpus is fully resident in memory now and no worker has run yet.
     // If this is a grader-supplied hidden eval corpus, unlink it so worker
     // children cannot read the eval set from disk (F2). The default dev
     // corpus lives in the repo tree, is public, and is left alone.
-    if corpus_file != Path::new(corpus::DEV_CORPUS_FILE) {
+    if !show_matrix_census {
         let _ = std::fs::remove_file(&corpus_file);
     }
     if corpus.is_empty() {
@@ -115,14 +144,22 @@ fn main() -> ExitCode {
             corpus_file.display()
         );
         println!("RUN FAILED: {reason}");
-        append_results(now(), "FAIL", f64::NAN, f64::NAN, &failsafe::compose_note(&reason, &note));
+        append_results(
+            now(),
+            "FAIL",
+            f64::NAN,
+            f64::NAN,
+            &failsafe::compose_note(&reason, &note),
+        );
         return ExitCode::FAILURE;
     }
 
-    println!(
-        "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
-        "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
-    );
+    if show_matrix_census {
+        println!(
+            "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
+            "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
+        );
+    }
 
     let mut buckets = [BucketAcc::default(); BUCKETS];
     let mut failed: Option<String> = None;
@@ -134,7 +171,10 @@ fn main() -> ExitCode {
         std::env::temp_dir().join(format!("ssi-harness-{}", std::process::id())),
     );
     std::fs::create_dir_all(scratch.path()).expect("create scratch dir");
-    let cap = watchdog::CapConfig { time_cap: TIME_CAP_PER_MATRIX, poll: std::time::Duration::from_millis(10) };
+    let cap = watchdog::CapConfig {
+        time_cap: TIME_CAP_PER_MATRIX,
+        poll: std::time::Duration::from_millis(10),
+    };
 
     for (seq, (name, pat)) in corpus.iter().enumerate() {
         // --- AMD baseline (trusted, in-process) — guarded so a feral panic
@@ -146,7 +186,12 @@ fn main() -> ExitCode {
         })) {
             Ok(b) => b,
             Err(msg) => {
-                failed = Some(format!("{name}: trusted baseline/score panicked — {msg}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &format!("trusted baseline/score panicked — {msg}"),
+                    "trusted baseline/score panicked",
+                ));
                 break;
             }
         };
@@ -154,10 +199,16 @@ fn main() -> ExitCode {
         // Serialize THIS pattern once to the scratch dir; both determinism runs
         // read it. Written by the trusted parent OUTSIDE the timed window, so its
         // cost never counts against the per-matrix cap.
-        let pat_file = scratch.path().join(format!("{seq}-pat.bin"));
-        let _ = std::fs::remove_file(&pat_file);
-        if let Err(e) = pattern_io::write_pattern(&pat_file, pat) {
-            failed = Some(format!("{name}: failed to stage pattern for worker: {e}"));
+        // The per-file guard unlinks it after both runs and on every earlier
+        // break/unwind; the whole-directory guard remains a final fallback.
+        let pat_file = failsafe::StagedFile::new(scratch.path().join(format!("{seq}-pat.bin")));
+        if let Err(e) = pattern_io::write_pattern(pat_file.path(), pat) {
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("failed to stage pattern for worker: {e}"),
+                "failed to stage pattern for worker",
+            ));
             break;
         }
 
@@ -172,11 +223,14 @@ fn main() -> ExitCode {
             std::fs::create_dir_all(&worker_cwd)
                 .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--worker").arg(&pat_file).arg(&out_perm)
+            cmd.arg("--worker")
+                .arg(pat_file.path())
+                .arg(&out_perm)
                 // The worker runs contestant code; hand it NOTHING. In
                 // particular SSI_CORPUS_FILE must not reach order() (F2).
                 .env_clear()
                 .current_dir(&worker_cwd);
+            silence_worker_stdio(&mut cmd);
             // Re-forward ONLY the harness's own time-cap test hook. env_clear()
             // above also strips this, which would silently defeat the
             // time_cap::slow_ordering_is_killed_and_fails_promptly regression
@@ -192,34 +246,82 @@ fn main() -> ExitCode {
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
                     .map_err(|e| format!("worker produced no readable permutation: {e}")),
-                watchdog::WorkerOutcome::Timeout => Err(format!(
-                    "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
-                     Your ordering must return within {:.0}s on every matrix. This matrix is \
-                     n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
-                     gate expensive paths by BOTH n and nnz.",
-                    TIME_CAP_PER_MATRIX.as_secs_f64(),
-                    t0.elapsed().as_secs_f64(),
-                    TIME_CAP_PER_MATRIX.as_secs_f64(),
-                    pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
-                )),
+                watchdog::WorkerOutcome::Timeout => {
+                    if show_matrix_census {
+                        Err(format!(
+                            "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
+                             Your ordering must return within {:.0}s on every matrix. This matrix is \
+                             n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
+                             gate expensive paths by BOTH n and nnz.",
+                            TIME_CAP_PER_MATRIX.as_secs_f64(),
+                            t0.elapsed().as_secs_f64(),
+                            TIME_CAP_PER_MATRIX.as_secs_f64(),
+                            pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
+                        ))
+                    } else {
+                        Err(format!(
+                            "order() exceeded the {:.1}s per-matrix cap and was killed",
+                            TIME_CAP_PER_MATRIX.as_secs_f64()
+                        ))
+                    }
+                }
                 watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
             }
         };
 
         let perm1 = match run_once("a") {
             Ok(p) => p,
-            Err(e) => { failed = Some(format!("{name}: {e}")); break; }
+            Err(e) => {
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &e,
+                    "worker ordering failed",
+                ));
+                break;
+            }
         };
         let perm2 = match run_once("b") {
             Ok(p) => p,
-            Err(e) => { failed = Some(format!("{name}: {e}")); break; }
+            Err(e) => {
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &e,
+                    "worker ordering failed",
+                ));
+                break;
+            }
         };
+        // Neither worker needs the staged input now. Unlink immediately instead
+        // of retaining this matrix until whole-run scratch cleanup. Any failure
+        // aborts before another worker can observe the leftover file; the guard
+        // retries on this loop exit.
+        if let Err(e) = pat_file.remove_now() {
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("failed to remove staged worker pattern: {e}"),
+                "failed to remove staged worker input",
+            ));
+            break;
+        }
         if perm1 != perm2 {
-            failed = Some(format!("{name}: nondeterministic ordering (two runs differ)"));
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                "nondeterministic ordering (two runs differ)",
+                "nondeterministic ordering (two runs differ)",
+            ));
             break;
         }
         if let Err(e) = validate_permutation(&perm1, pat.n) {
-            failed = Some(format!("{name}: invalid permutation — {e}"));
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("invalid permutation — {e}"),
+                "invalid permutation",
+            ));
             break;
         }
 
@@ -227,7 +329,12 @@ fn main() -> ExitCode {
         let yours = match failsafe::catch(std::panic::AssertUnwindSafe(|| score(pat, &perm1))) {
             Ok(s) => s,
             Err(msg) => {
-                failed = Some(format!("{name}: trusted scoring panicked — {msg}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &format!("trusted scoring panicked — {msg}"),
+                    "trusted scoring panicked",
+                ));
                 break;
             }
         };
@@ -238,18 +345,20 @@ fn main() -> ExitCode {
         buckets[b].log_fill_sum += fill_ratio.ln();
         buckets[b].count += 1;
 
-        let line = format!(
-            "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8.3} {:>9}",
-            name,
-            pat.n,
-            pat.nnz(),
-            base.flops,
-            yours.flops,
-            ratio,
-            "(capped)"
-        );
-        println!("{line}");
-        let _ = writeln!(table, "{line}");
+        if show_matrix_census {
+            let line = format!(
+                "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8.3} {:>9}",
+                name,
+                pat.n,
+                pat.nnz(),
+                base.flops,
+                yours.flops,
+                ratio,
+                "(capped)"
+            );
+            println!("{line}");
+            let _ = writeln!(table, "{line}");
+        }
     }
 
     let timestamp = now();
@@ -304,7 +413,8 @@ fn main() -> ExitCode {
             // bucket has count 0 and null geomeans.
             let mut buckets_json = String::new();
             for i in 0..BUCKETS {
-                let jf = |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
+                let jf =
+                    |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
                 let sep = if i + 1 < BUCKETS { "," } else { "" };
                 let _ = write!(
                     buckets_json,
@@ -393,6 +503,69 @@ fn parse_note() -> String {
     String::new()
 }
 
+fn is_public_dev_corpus(path: &Path) -> bool {
+    path == Path::new(corpus::DEV_CORPUS_FILE)
+}
+
+fn matrix_failure(show_matrix_census: bool, name: &str, detailed: &str, redacted: &str) -> String {
+    if show_matrix_census {
+        format!("{name}: {detailed}")
+    } else {
+        format!("hidden matrix: {redacted}")
+    }
+}
+
+fn silence_worker_stdio(cmd: &mut std::process::Command) {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
+
 // `_` reference so `Pattern` import is used even if the type is only named in
 // closures above; keeps the contract type visible at the harness boundary.
 const _: fn(&Pattern) -> Vec<usize> = ordering::order;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_matrix_failures_redact_names_and_details() {
+        let reason = matrix_failure(
+            false,
+            "secret-matrix-name",
+            "timeout at n=1234, nnz=5678",
+            "ordering timed out",
+        );
+        assert_eq!(reason, "hidden matrix: ordering timed out");
+        assert!(!reason.contains("secret-matrix-name"));
+        assert!(!reason.contains("1234"));
+        assert!(!reason.contains("5678"));
+    }
+
+    #[test]
+    fn public_dev_matrix_failures_keep_actionable_details() {
+        let reason = matrix_failure(
+            true,
+            "dev-matrix",
+            "timeout at n=12, nnz=34",
+            "ordering timed out",
+        );
+        assert_eq!(reason, "dev-matrix: timeout at n=12, nnz=34");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_stdio_is_discarded() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo worker-stdout-canary; echo worker-stderr-canary >&2",
+        ]);
+        silence_worker_stdio(&mut cmd);
+        let output = cmd.output().expect("run worker-like command");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
