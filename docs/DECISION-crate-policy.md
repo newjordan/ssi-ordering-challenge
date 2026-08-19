@@ -77,7 +77,8 @@ The purity gate is a **convenience layer** that rejects obviously-invalid submis
 | Import a GPL/AGPL/proprietary-licensed crate | License filter (`cargo-deny` licenses check, RequireDeny) over the whole resolved tree |
 | Ship/link a precompiled native blob | Prebuilt-artifact ban + `*-sys` crate ban (`scan_vendored_tree`, gate) |
 | Declare native compilation (`*-sys`, `links`, `cc`/`cmake`/`bindgen` build-dep) | `scan_vendored_tree` hard-rejects the declared forms (gate) |
-| Undeclared C compile (a `build.rs` shelling out to `cc` on hidden/obfuscated C) | **Accepted residual (low value for an ordering competition):** any such C is boxed by the no-network run, held-out corpus, recomputed score, and determinism re-runs; it cannot exfiltrate or reach an oracle. NOT closed by a no-cc image (option A; see Task 7 record) |
+| Execute arbitrary code at compile time (`build.rs` or proc-macro in the dependency tree) | **Now hard-rejected at the gate** (`scan_vendored_tree`, finding A2): any active `build.rs` or proc-macro crate fails unless it is one of the exact pinned `(name, version)` crates in the trusted harness closure. See "Compile-time code execution (finding A2)" below |
+| Undeclared C compile (a `build.rs` shelling out to `cc` on hidden/obfuscated C) | Now closed at the gate by the A2 build-script rejection above (a `build.rs` is rejected regardless of what it compiles), backstopped by the no-network run, held-out corpus, recomputed score, and determinism re-runs |
 | Call a hosted ML model or external oracle at runtime | No-network scored run (Task 9) |
 | Exfiltrate the eval corpus via network | No-network scored run (Task 9) |
 | Read precomputed permutations from disk | Held-out eval corpus (Stage A/D) + sandboxed run |
@@ -86,6 +87,33 @@ The purity gate is a **convenience layer** that rejects obviously-invalid submis
 | Cfg-gated or macro-generated FFI that evades static scan | No-C-compiler + no-foreign-linker build (sandbox, Stage B) |
 
 Every threat has **at least two layers**; most have three. The gate is the first layer; the sandbox is the authoritative one.
+
+## Compile-time code execution (finding A2)
+
+Security finding **A2** revisited the "accepted residual" stance that earlier
+records took toward compile-time code (a `build.rs` or proc-macro runs arbitrary
+Rust on the grader *during compilation*, before the no-network scored run). The
+Task 7 record argued the residual was low value because a custom no-C-compiler
+image adds little over crates.io-only sourcing + the offline vendored build + the
+no-network run, and because build-time egress is separately blocked by running the
+build under `unshare -n`. That reasoning still holds for *runtime* isolation.
+
+A2 supersedes the residual **at the gate layer only**, as defense-in-depth:
+`scan_vendored_tree` now hard-rejects any vendored crate with an active `build.rs`
+or a proc-macro library target, unless it is one of the exact, `Cargo.lock`-pinned
+`(name, version)` crates already required by the trusted harness closure
+(`TRUSTED_COMPILE_TIME_CRATES` in `ssi-purity`). This does not claim arbitrary
+dependency runtime code is safe — runtime isolation remains the separate,
+authoritative boundary. It closes the pre-compile window instead of relying solely
+on the build/run sandbox to box code that has already executed.
+
+Consequence for contestants: a declared dependency may no longer pull in *any*
+`build.rs` or proc-macro crate outside the pinned set — a real narrowing of the
+"permissive pure-Rust crates" policy. Prefer dependencies (or none) that need
+neither. Maintenance note: because the exemption is pinned to exact versions, a
+version bump of any crate in the trusted closure (or a new compile-time crate
+entering it) fails the gate closed until `TRUSTED_COMPILE_TIME_CRATES` is updated
+to match `Cargo.lock`; the reviewed-allowlist workflow governs those edits.
 
 ## Permissive license allowlist (verbatim)
 

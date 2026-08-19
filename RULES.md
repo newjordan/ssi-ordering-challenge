@@ -59,12 +59,18 @@ and absolute values shift.
 - A local purity & license gate runs before scoring. `src/ordering/` may depend
   on permissive, PURE-RUST crates declared in `src/ordering/deps.toml`. Forbidden
   in your submission code (`src/ordering/`): FFI/`extern`, `#[no_mangle]`/`#[link]`,
-  proc-macro machinery, `build.rs`, and `include!` outside the dir. Forbidden
-  anywhere in the dependency tree: `*-sys` / `links` native wrappers, a `build.rs`
-  that compiles C (i.e. a `cc`/`cmake`/`bindgen` build-dependency), prebuilt
-  native blobs, non-crates.io (git/path) sources, and non-permissive licenses.
-  (The dependency tree is checked for those native/license signals, not
-  source-scanned for FFI tokens.) See `docs/DECISION-crate-policy.md`.
+  proc-macro machinery, `build.rs`, any `include!`, and any `#[path = "..."]`
+  module attribute. (`include!` and `#[path]` are banned outright — not just for
+  paths outside the dir — because the source scanner only reads `.rs` files, so
+  either could pull unscanned code in from another file. Split your ordering into
+  ordinary `mod` submodules instead.) Forbidden anywhere in the dependency tree:
+  `*-sys` / `links` native wrappers, any `build.rs` or proc-macro crate (they run
+  arbitrary code at compile time; only the exact pinned crates in the trusted
+  harness closure are exempt), a `build.rs` that compiles C (i.e. a
+  `cc`/`cmake`/`bindgen` build-dependency), prebuilt native blobs, non-crates.io
+  (git/path) sources, and non-permissive licenses. (The dependency tree is
+  checked for those native/compile-time/license signals, not source-scanned for
+  FFI tokens.) See `docs/DECISION-crate-policy.md`.
 - Any FAIL fails the whole run; read the printed reason.
 
 ## Research
