@@ -1,10 +1,76 @@
 # Decision Record: Permissive-Crate Submission Policy
 
-*Date: 2026-07-02. Amended Invariants 1 (gate definition) and 3 (submission constraints) to allow permissive, pure-Rust third-party crates in `src/ordering/`, subject to a multi-layer filter. Replaced the stdlib-only requirement with a purity-and-license policy that better maps to the design doc's actual guarantees.*
+*Date: 2026-07-02. Amended 2026-08-19 to replace arbitrary crates.io
+dependency acceptance with a reviewed allowlist of exact direct crate
+name/version pairs. Invariants 1 and 3 still permit third-party crates, but only
+after maintainer review and subject to the existing transitive-tree defenses.*
 
 ---
 
-## What changed
+## 2026-08-19 amendment: reviewed direct dependencies
+
+The earlier policy allowed any syntactically valid crates.io dependency to
+reach vendoring and relied on license/native-signal checks afterward. That was
+too permissive: a contestant could cause previously unseen package source and
+build logic to be fetched and processed without prior maintainer review.
+
+The trusted `ssi-purity` parser now accepts only these direct name/version
+pairs:
+
+- `feral = "0.11.0"`
+- `feral-amd = "0.2.1"`
+- `feral-amf = "0.2.1"`
+- `feral-kahip = "0.2.1"`
+- `feral-metis = "0.2.1"`
+- `feral-ordering-core = "0.2.1"`
+- `feral-scotch = "0.2.1"`
+
+The policy data lives in `ssi-purity`, outside contestant-controlled
+`src/ordering/`. The same parser is called by the shared Stage-A gate and by
+`emit-deps`; an unknown name or wrong version therefore fails with an
+actionable review message before `cargo vendor` or any contestant build.
+The parser requires exact string equality for direct versions; the committed
+lockfile and later offline, locked build pin the resolved closure.
+
+### Review process
+
+Adding or upgrading an entry is a trusted-maintainer change, not a submission
+change. The reviewer must inspect the exact crates.io release source, license
+and provenance metadata, build script/proc-macro behavior, native-code signals,
+and the resolved transitive closure. The allowlist, `Cargo.lock`, and policy
+docs are updated together; parser tests must demonstrate acceptance of the new
+exact pair and rejection of nearby names/versions. Existing vendored-tree,
+`cargo-deny`, offline-build, and runtime-isolation gates remain mandatory:
+direct approval is not a transitive trust exemption.
+
+### Supply-chain residuals
+
+This mitigation changes an open-ended fetch surface into a small,
+point-in-time-reviewed set, but it does not prove the approved code benign.
+Crates.io license/provenance metadata can be inaccurate, manual review can miss
+malicious or cfg-gated behavior, and pure Rust, proc-macro, or `build.rs` code
+can execute during compilation without triggering native-code heuristics.
+`Cargo.lock` checksums pin registry artifacts and the grader's offline,
+network-isolated stages contain many consequences, but they do not remove
+reviewer error or malicious behavior that stays within the sandbox.
+
+As a complementary layer, the vendored-tree scan (`scan_vendored_tree`, finding
+A2) rejects any `build.rs` or proc-macro crate outside the exact pinned trusted
+harness closure, so this compile-time-execution residual is confined to the
+reviewed set rather than any crate the transitive closure might pull in.
+
+Local execution has a stronger residual: `prepare-build.sh` and ordinary local
+`cargo run` are reproducibility checks, not a host-security sandbox. They may
+execute approved dependency/build code with the developer's privileges and
+network unless the developer adds isolation. Contributors should run them only
+from a trusted checkout; production grader isolation is the authoritative
+containment boundary.
+
+This amendment supersedes the unrestricted-name portions of the original
+decision and the Task 2 allowlist-retirement note below. The historical record
+is retained to explain how the policy evolved.
+
+## Original 2026-07-02 change
 
 Submissions may now depend on third-party crates from crates.io, subject to the policy filter described below. The previous stdlib-only restriction is removed. Contestants declare dependencies in a new manifest `src/ordering/deps.toml`, which the harness validates before scoring.
 

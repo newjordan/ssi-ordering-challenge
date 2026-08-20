@@ -1,7 +1,8 @@
+use std::fs;
+
 use ssi_purity::filter_declared_deps;
 use ssi_purity::scan_vendored_tree;
-use ssi_purity::{parse_deps_toml, DeclaredDep};
-use std::fs;
+use ssi_purity::{parse_deps_toml, DeclaredDep, TRUSTED_DIRECT_DEPENDENCIES};
 
 #[test]
 fn missing_deps_toml_yields_empty() {
@@ -15,48 +16,68 @@ fn missing_deps_toml_yields_empty() {
 fn present_deps_toml_is_parsed() {
     let dir = std::env::temp_dir().join("ssi-purity-test-withdeps");
     let _ = fs::create_dir_all(&dir);
-    fs::write(dir.join("deps.toml"), "[dependencies]\nrand = \"0.8.5\"\n").unwrap();
+    fs::write(
+        dir.join("deps.toml"),
+        "[dependencies]\nferal-amd = \"0.2.1\"\n",
+    )
+    .unwrap();
     let got = filter_declared_deps(&dir).unwrap();
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].name, "rand");
+    assert_eq!(got[0].name, "feral-amd");
 }
 
 #[test]
-fn parses_simple_version_entries() {
-    let src = "[dependencies]\nrand = \"0.8.5\"\npetgraph = \"0.6.4\"\n";
+fn allows_every_reviewed_exact_entry() {
+    let src = "[dependencies]\n\
+               feral = \"0.11.0\"\n\
+               feral-amd = \"0.2.1\"\n\
+               feral-amf = \"0.2.1\"\n\
+               feral-kahip = \"0.2.1\"\n\
+               feral-metis = \"0.2.1\"\n\
+               feral-ordering-core = \"0.2.1\"\n\
+               feral-scotch = \"0.2.1\"\n";
     let got = parse_deps_toml(src).expect("valid");
-    assert_eq!(
-        got,
-        vec![
-            DeclaredDep {
-                name: "rand".into(),
-                version: "0.8.5".into()
-            },
-            DeclaredDep {
-                name: "petgraph".into(),
-                version: "0.6.4".into()
-            },
-        ]
-    );
+    let expected = TRUSTED_DIRECT_DEPENDENCIES
+        .iter()
+        .map(|(name, version)| DeclaredDep {
+            name: (*name).into(),
+            version: (*version).into(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn disallowed_crate_name_has_actionable_error() {
+    let err = parse_deps_toml("[dependencies]\nrand = \"0.8.5\"\n").unwrap_err();
+    assert!(err
+        .0
+        .contains("`rand` is not in the reviewed direct-dependency allowlist"));
+    assert!(err.0.contains("ask a maintainer to review and approve"));
+}
+
+#[test]
+fn wrong_reviewed_crate_version_has_actionable_error() {
+    let err = parse_deps_toml("[dependencies]\nferal-amd = \"0.2.2\"\n").unwrap_err();
+    assert!(err
+        .0
+        .contains("version `0.2.2` for `feral-amd` is not reviewed"));
+    assert!(err.0.contains("feral-amd = \"0.2.1\""));
+    assert!(err.0.contains("ask a maintainer to review the upgrade"));
 }
 
 #[test]
 fn crate_names_may_use_hyphens_and_underscores() {
-    let src = "[dependencies]\nferal-amd = \"0.2.1\"\nferal_ordering_core = \"0.2.1\"\n";
-    let got = parse_deps_toml(src).expect("crates.io-compatible names should be valid");
-    assert_eq!(
-        got,
-        vec![
-            DeclaredDep {
-                name: "feral-amd".into(),
-                version: "0.2.1".into()
-            },
-            DeclaredDep {
-                name: "feral_ordering_core".into(),
-                version: "0.2.1".into()
-            },
-        ]
-    );
+    let got = parse_deps_toml("[dependencies]\nferal-amd = \"0.2.1\"\n")
+        .expect("a reviewed hyphenated crate name should be valid");
+    assert_eq!(got[0].name, "feral-amd");
+
+    let err = parse_deps_toml("[dependencies]\nferal_ordering_core = \"0.2.1\"\n")
+        .expect_err("syntactically valid names must still be explicitly allowlisted");
+    assert!(!err.0.contains("invalid crate name"));
+    assert!(err
+        .0
+        .contains("`feral_ordering_core` is not in the reviewed direct-dependency allowlist"));
 }
 
 #[test]
