@@ -79,8 +79,14 @@ fn sandbox_self_check(args: &[String]) -> i32 {
                 std::process::id()
             ));
         }
-        if let Some((name, _)) = std::env::vars_os().next() {
-            return Err(format!("worker inherited environment variable {name:?}"));
+        // The parent env_clears and bwrap runs with --clearenv, so nothing is
+        // inherited. bubblewrap itself then sets PWD to its --chdir target ("/")
+        // after clearing; that single variable is injected by the sandbox, not
+        // leaked from the parent, so allow it and reject anything else.
+        for (name, _) in std::env::vars_os() {
+            if name != "PWD" {
+                return Err(format!("worker inherited environment variable {name:?}"));
+            }
         }
         for hidden in ["/workspace", "/home", "/root", "/tmp"] {
             if Path::new(hidden).exists() {

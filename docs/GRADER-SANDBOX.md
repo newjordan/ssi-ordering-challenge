@@ -91,7 +91,8 @@ requires:
 
 - PID 1 and only one visible numeric `/proc` entry;
 - no default network route;
-- no environment entries;
+- no environment entries other than `PWD` (which bubblewrap sets to its
+  `--chdir` target after `--clearenv`; nothing is inherited from the parent);
 - all three standard streams linked to `/dev/null`;
 - no `/workspace`, `/home`, `/root`, or `/tmp`;
 - read-only pattern input and writable permutation output.
