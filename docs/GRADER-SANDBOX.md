@@ -24,7 +24,9 @@ The build gets:
 
 - no network and private PID, IPC, UTS, and cgroup namespaces;
 - an empty environment with only explicit Cargo/toolchain variables;
-- read-only `/workspace`, `/usr`, runtime libraries, and Rust toolchain;
+- read-only `/workspace`, `/usr`, `/etc` (for the system linker: `cc` via
+  `/etc/alternatives` and `ld` via `/etc/ld.so.*`), runtime libraries, and the
+  Rust toolchain;
 - one clean writable target mount and a private `/tmp`;
 - no view of runner HOME, credentials, temp files, or the eval corpus (which is
   downloaded only after the build).

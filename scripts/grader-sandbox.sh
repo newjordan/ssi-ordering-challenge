@@ -67,6 +67,12 @@ BWRAP=(
   --dev /dev
   --tmpfs /tmp
   --ro-bind /usr /usr
+  # /etc is needed read-only for the system linker: `cc` is /usr/bin/cc ->
+  # /etc/alternatives/cc, and ld resolves /etc/ld.so.cache + /etc/ld.so.conf.d.
+  # Without it rustc fails with `linker cc not found` (ENOENT on the dangling
+  # alternatives symlink). No runner secrets live here; HOME/credentials stay
+  # hidden and this bind is read-only.
+  --ro-bind /etc /etc
 )
 for path in /bin /sbin /lib /lib64; do
   if [[ -e "$path" ]]; then
