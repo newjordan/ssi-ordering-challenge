@@ -6,7 +6,7 @@
   "direction": "-",
   "editablePaths": ["src/ordering"],
   "setupCommand": ["bash", "-lc", "command -v cargo >/dev/null 2>&1 || { echo 'Rust toolchain (cargo) not found. Install from https://rustup.rs' >&2; exit 1; }; command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny --locked; bash scripts/prepare-build.sh && cargo build --release --workspace"],
-  "benchmarkCommand": ["bash", "-lc", "cargo run --release"],
+  "benchmarkCommand": ["bash", "-lc", "cargo build --release -p ssi-candidate-worker --offline --locked && cargo run --release"],
   "scorePath": "score.json",
   "runner": { "provider": "github-actions", "workflow": "benchmark.yml" }
 }

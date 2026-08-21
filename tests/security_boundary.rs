@@ -26,6 +26,16 @@ fn trusted_parent_excludes_candidate_entrypoint() {
 }
 
 #[test]
+fn benchmark_command_rebuilds_candidate_worker() {
+    let benchmark_manifest = include_str!("../benchmark.json");
+    let expected = r#""benchmarkCommand": ["bash", "-lc", "cargo build --release -p ssi-candidate-worker --offline --locked && cargo run --release"]"#;
+    assert!(
+        benchmark_manifest.contains(expected),
+        "benchmarkCommand must rebuild the candidate worker before running the trusted parent"
+    );
+}
+
+#[test]
 fn grader_mode_fails_when_sandbox_selection_is_missing() {
     let output = Command::new(parent_binary())
         .arg("--grader")
