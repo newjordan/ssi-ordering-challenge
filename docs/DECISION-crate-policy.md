@@ -1,10 +1,76 @@
 # Decision Record: Permissive-Crate Submission Policy
 
-*Date: 2026-07-02. Amended Invariants 1 (gate definition) and 3 (submission constraints) to allow permissive, pure-Rust third-party crates in `src/ordering/`, subject to a multi-layer filter. Replaced the stdlib-only requirement with a purity-and-license policy that better maps to the design doc's actual guarantees.*
+*Date: 2026-07-02. Amended 2026-08-19 to replace arbitrary crates.io
+dependency acceptance with a reviewed allowlist of exact direct crate
+name/version pairs. Invariants 1 and 3 still permit third-party crates, but only
+after maintainer review and subject to the existing transitive-tree defenses.*
 
 ---
 
-## What changed
+## 2026-08-19 amendment: reviewed direct dependencies
+
+The earlier policy allowed any syntactically valid crates.io dependency to
+reach vendoring and relied on license/native-signal checks afterward. That was
+too permissive: a contestant could cause previously unseen package source and
+build logic to be fetched and processed without prior maintainer review.
+
+The trusted `ssi-purity` parser now accepts only these direct name/version
+pairs:
+
+- `feral = "0.11.0"`
+- `feral-amd = "0.2.1"`
+- `feral-amf = "0.2.1"`
+- `feral-kahip = "0.2.1"`
+- `feral-metis = "0.2.1"`
+- `feral-ordering-core = "0.2.1"`
+- `feral-scotch = "0.2.1"`
+
+The policy data lives in `ssi-purity`, outside contestant-controlled
+`src/ordering/`. The same parser is called by the shared Stage-A gate and by
+`emit-deps`; an unknown name or wrong version therefore fails with an
+actionable review message before `cargo vendor` or any contestant build.
+The parser requires exact string equality for direct versions; the committed
+lockfile and later offline, locked build pin the resolved closure.
+
+### Review process
+
+Adding or upgrading an entry is a trusted-maintainer change, not a submission
+change. The reviewer must inspect the exact crates.io release source, license
+and provenance metadata, build script/proc-macro behavior, native-code signals,
+and the resolved transitive closure. The allowlist, `Cargo.lock`, and policy
+docs are updated together; parser tests must demonstrate acceptance of the new
+exact pair and rejection of nearby names/versions. Existing vendored-tree,
+`cargo-deny`, offline-build, and runtime-isolation gates remain mandatory:
+direct approval is not a transitive trust exemption.
+
+### Supply-chain residuals
+
+This mitigation changes an open-ended fetch surface into a small,
+point-in-time-reviewed set, but it does not prove the approved code benign.
+Crates.io license/provenance metadata can be inaccurate, manual review can miss
+malicious or cfg-gated behavior, and pure Rust, proc-macro, or `build.rs` code
+can execute during compilation without triggering native-code heuristics.
+`Cargo.lock` checksums pin registry artifacts and the grader's offline,
+network-isolated stages contain many consequences, but they do not remove
+reviewer error or malicious behavior that stays within the sandbox.
+
+As a complementary layer, the vendored-tree scan (`scan_vendored_tree`, finding
+A2) rejects any `build.rs` or proc-macro crate outside the exact pinned trusted
+harness closure, so this compile-time-execution residual is confined to the
+reviewed set rather than any crate the transitive closure might pull in.
+
+Local execution has a stronger residual: `prepare-build.sh` and ordinary local
+`cargo run` are reproducibility checks, not a host-security sandbox. They may
+execute approved dependency/build code with the developer's privileges and
+network unless the developer adds isolation. Contributors should run them only
+from a trusted checkout; production grader isolation is the authoritative
+containment boundary.
+
+This amendment supersedes the unrestricted-name portions of the original
+decision and the Task 2 allowlist-retirement note below. The historical record
+is retained to explain how the policy evolved.
+
+## Original 2026-07-02 change
 
 Submissions may now depend on third-party crates from crates.io, subject to the policy filter described below. The previous stdlib-only restriction is removed. Contestants declare dependencies in a new manifest `src/ordering/deps.toml`, which the harness validates before scoring.
 
@@ -77,7 +143,8 @@ The purity gate is a **convenience layer** that rejects obviously-invalid submis
 | Import a GPL/AGPL/proprietary-licensed crate | License filter (`cargo-deny` licenses check, RequireDeny) over the whole resolved tree |
 | Ship/link a precompiled native blob | Prebuilt-artifact ban + `*-sys` crate ban (`scan_vendored_tree`, gate) |
 | Declare native compilation (`*-sys`, `links`, `cc`/`cmake`/`bindgen` build-dep) | `scan_vendored_tree` hard-rejects the declared forms (gate) |
-| Undeclared C compile (a `build.rs` shelling out to `cc` on hidden/obfuscated C) | **Accepted residual (low value for an ordering competition):** any such C is boxed by the no-network run, held-out corpus, recomputed score, and determinism re-runs; it cannot exfiltrate or reach an oracle. NOT closed by a no-cc image (option A; see Task 7 record) |
+| Execute arbitrary code at compile time (`build.rs` or proc-macro in the dependency tree) | **Now hard-rejected at the gate** (`scan_vendored_tree`, finding A2): any active `build.rs` or proc-macro crate fails unless it is one of the exact pinned `(name, version)` crates in the trusted harness closure. See "Compile-time code execution (finding A2)" below |
+| Undeclared C compile (a `build.rs` shelling out to `cc` on hidden/obfuscated C) | Now closed at the gate by the A2 build-script rejection above (a `build.rs` is rejected regardless of what it compiles), backstopped by the no-network run, held-out corpus, recomputed score, and determinism re-runs |
 | Call a hosted ML model or external oracle at runtime | No-network scored run (Task 9) |
 | Exfiltrate the eval corpus via network | No-network scored run (Task 9) |
 | Read precomputed permutations from disk | Held-out eval corpus (Stage A/D) + sandboxed run |
@@ -86,6 +153,33 @@ The purity gate is a **convenience layer** that rejects obviously-invalid submis
 | Cfg-gated or macro-generated FFI that evades static scan | No-C-compiler + no-foreign-linker build (sandbox, Stage B) |
 
 Every threat has **at least two layers**; most have three. The gate is the first layer; the sandbox is the authoritative one.
+
+## Compile-time code execution (finding A2)
+
+Security finding **A2** revisited the "accepted residual" stance that earlier
+records took toward compile-time code (a `build.rs` or proc-macro runs arbitrary
+Rust on the grader *during compilation*, before the no-network scored run). The
+Task 7 record argued the residual was low value because a custom no-C-compiler
+image adds little over crates.io-only sourcing + the offline vendored build + the
+no-network run, and because build-time egress is separately blocked by running the
+build under `unshare -n`. That reasoning still holds for *runtime* isolation.
+
+A2 supersedes the residual **at the gate layer only**, as defense-in-depth:
+`scan_vendored_tree` now hard-rejects any vendored crate with an active `build.rs`
+or a proc-macro library target, unless it is one of the exact, `Cargo.lock`-pinned
+`(name, version)` crates already required by the trusted harness closure
+(`TRUSTED_COMPILE_TIME_CRATES` in `ssi-purity`). This does not claim arbitrary
+dependency runtime code is safe — runtime isolation remains the separate,
+authoritative boundary. It closes the pre-compile window instead of relying solely
+on the build/run sandbox to box code that has already executed.
+
+Consequence for contestants: a declared dependency may no longer pull in *any*
+`build.rs` or proc-macro crate outside the pinned set — a real narrowing of the
+"permissive pure-Rust crates" policy. Prefer dependencies (or none) that need
+neither. Maintenance note: because the exemption is pinned to exact versions, a
+version bump of any crate in the trusted closure (or a new compile-time crate
+entering it) fails the gate closed until `TRUSTED_COMPILE_TIME_CRATES` is updated
+to match `Cargo.lock`; the reviewed-allowlist workflow governs those edits.
 
 ## Permissive license allowlist (verbatim)
 

@@ -33,36 +33,44 @@ impl std::fmt::Display for GateError {
 }
 
 mod deps;
-pub use deps::{parse_deps_toml, DeclaredDep};
+pub use deps::{parse_deps_toml, DeclaredDep, TRUSTED_DIRECT_DEPENDENCIES};
 
 /// Run the full Stage-A gate from the repo root.
 pub fn check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
     let ordering_dir = repo_root.join("src/ordering");
     purity_scan(&ordering_dir)?;
-    // Declared deps are validated for shape here; the resolved tree is scanned
-    // for license/source/FFI by the grader after vendoring (scan_vendored_tree).
+    // Declared deps are checked against the reviewed exact-version allowlist
+    // here; the resolved tree is scanned for license/source/native signals by
+    // the grader after vendoring (scan_vendored_tree).
     filter_declared_deps(&ordering_dir)?;
     license_check(repo_root, mode)?;
     Ok(())
 }
 
 /// Read and parse `<ordering_dir>/deps.toml` (absent file = no declared deps).
-/// This is the submission-facing half of the dependency policy; license/source
-/// and FFI enforcement over the RESOLVED transitive tree run in the grader's
-/// tree scan (see `scan_vendored_tree`) after `cargo vendor`.
+/// This is the submission-facing half of the dependency policy: only reviewed
+/// direct name/version pairs are accepted. License/source and native-signal
+/// enforcement over the RESOLVED transitive tree run in the grader's tree scan
+/// (see `scan_vendored_tree`) after `cargo vendor`.
 pub fn filter_declared_deps(ordering_dir: &Path) -> Result<Vec<DeclaredDep>, GateError> {
     let deps_toml = ordering_dir.join("deps.toml");
     let src = match std::fs::read_to_string(&deps_toml) {
         Ok(s) => s,
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(GateError(format!("cannot read {}: {e}", deps_toml.display()))),
+        Err(e) => {
+            return Err(GateError(format!(
+                "cannot read {}: {e}",
+                deps_toml.display()
+            )))
+        }
     };
     parse_deps_toml(&src)
 }
 
-/// Scan a `cargo vendor` output directory for native-code signals, applied
-/// UNIFORMLY to every vendored crate (no trusted allowlist — the dependency
-/// tree is not assumed safe, though feral is vetted).
+/// Scan a `cargo vendor` output directory for native-code and compile-time-code
+/// signals before any untrusted dependency is compiled. The direct-dependency
+/// allowlist is not a transitive trust exemption: the resolved tree is still
+/// scanned in full.
 ///
 /// ## What this scans, and what it deliberately does NOT
 ///
@@ -70,23 +78,27 @@ pub fn filter_declared_deps(ordering_dir: &Path) -> Result<Vec<DeclaredDep>, Gat
 /// (`src/ordering/`, scanned by `purity_scan`): that is the ordering applied to
 /// solvers. For the DEPENDENCY tree, source-token purity is the wrong tool — a
 /// crate may legitimately *export* a C ABI (`#[no_mangle] pub extern "C" fn`),
-/// define a C-ABI fn, use a proc-macro, or set `links` purely as a
+/// define a C-ABI fn, refer to proc-macro APIs, or set `links` purely as a
 /// single-version guard (e.g. rayon-core links nothing). Rejecting those tokens
-/// would bar a large, safe swath of the ecosystem while proving nothing: the
-/// real guarantee that *no foreign code executes* is the no-C-compiler build
-/// (Task 7) plus the no-network runtime (Task 9).
+/// would bar a large, safe swath of the ecosystem while proving nothing.
 ///
-/// So this scan rejects only sound, near-false-positive-free signals that a
-/// crate carries or compiles NON-Rust code:
+/// This scan rejects sound, near-false-positive-free signals that a crate
+/// carries native code or executes Rust code during compilation:
 ///   - a `*-sys` crate name (native-library-wrapper convention — cheap early
 ///     signal),
 ///   - a prebuilt native artifact committed in the crate (`.a/.so/.dylib/.dll/
 ///     .lib/.o/.obj`) — a linkable blob bypasses "build from source",
 ///   - a C/C++-toolchain build-dependency (`cc`/`cmake`/`bindgen`/`nasm`/`gcc`/
-///     `clang`) — the crate compiles native code from its build script.
-/// These are hard rejections; the no-C-compiler build backstops anything a
-/// static scan cannot decide, and must never be used to justify allowing what
-/// the scan finds.
+///     `clang`),
+///   - an active package build script, and
+///   - a proc-macro library target.
+///
+/// The last two checks exempt only the exact, pinned compile-time crates already
+/// required by the trusted harness closure. This keeps the shipped scorer
+/// buildable while preventing a submission from adding new code that executes
+/// on the grader during compilation. It is deliberately not a claim that
+/// arbitrary dependency runtime code is safe; runtime isolation remains a
+/// separate boundary.
 pub fn scan_vendored_tree(vendor_dir: &Path) -> Result<(), GateError> {
     let Ok(entries) = std::fs::read_dir(vendor_dir) else {
         return Ok(()); // no vendor dir = no third-party deps to scan
@@ -110,15 +122,34 @@ pub fn scan_vendored_tree(vendor_dir: &Path) -> Result<(), GateError> {
                  dependencies must be pure Rust (no native library to link)"
             )));
         }
-        // A C/C++-toolchain build-dependency compiles native code from build.rs.
         let manifest = crate_dir.join("Cargo.toml");
-        if let Ok(toml) = std::fs::read_to_string(&manifest) {
-            if let Some(tool) = c_build_dependency(&toml) {
+        let toml = std::fs::read_to_string(&manifest).map_err(|e| {
+            GateError(format!(
+                "dependency-scan: cannot read vendored manifest {}: {e}",
+                manifest.display()
+            ))
+        })?;
+        let is_trusted_compile_time_crate = trusted_compile_time_crate(&toml);
+        if !is_trusted_compile_time_crate {
+            if let Some(script) = active_build_script(&crate_dir, &toml) {
                 return Err(GateError(format!(
-                    "dependency-scan: `{crate_name}` has a `{tool}` build-dependency; \
-                     it would compile native (C/C++) code — dependencies must be pure Rust"
+                    "dependency-scan: `{crate_name}` has an active build script (`{script}`); \
+                     dependency build scripts execute untrusted code during compilation"
                 )));
             }
+            if is_proc_macro_crate(&toml) {
+                return Err(GateError(format!(
+                    "dependency-scan: `{crate_name}` is a proc-macro crate; dependency \
+                     proc-macros execute untrusted code during compilation"
+                )));
+            }
+        }
+        // A C/C++-toolchain build-dependency compiles native code from build.rs.
+        if let Some(tool) = c_build_dependency(&toml) {
+            return Err(GateError(format!(
+                "dependency-scan: `{crate_name}` has a `{tool}` build-dependency; \
+                 it would compile native (C/C++) code — dependencies must be pure Rust"
+            )));
         }
         // A prebuilt native artifact committed in the crate is a linkable blob
         // that bypasses building from source.
@@ -131,6 +162,118 @@ pub fn scan_vendored_tree(vendor_dir: &Path) -> Result<(), GateError> {
         }
     }
     Ok(())
+}
+
+/// Exact crates in the committed, trusted harness closure that already execute
+/// at compile time. Versions are pinned by Cargo.lock. The exception is limited
+/// to the build-script/proc-macro checks; native-code checks still apply.
+const TRUSTED_COMPILE_TIME_CRATES: &[(&str, &str)] = &[
+    ("crossbeam-utils", "0.8.21"),
+    ("libm", "0.2.16"),
+    ("num-traits", "0.2.19"),
+    ("paste", "1.0.15"),
+    ("proc-macro2", "1.0.106"),
+    ("pulp", "0.22.3"),
+    ("quote", "1.0.46"),
+    ("rayon-core", "1.13.0"),
+    ("serde", "1.0.228"),
+    ("serde_core", "1.0.228"),
+    ("serde_derive", "1.0.228"),
+    ("serde_json", "1.0.150"),
+    ("zmij", "1.0.21"),
+];
+
+fn trusted_compile_time_crate(manifest: &str) -> bool {
+    let Some(name) = manifest_value(manifest, "package", "name").and_then(toml_string) else {
+        return false;
+    };
+    let Some(version) = manifest_value(manifest, "package", "version").and_then(toml_string) else {
+        return false;
+    };
+    TRUSTED_COMPILE_TIME_CRATES.contains(&(name, version))
+}
+
+/// Return the active package build-script path. `build = false` explicitly
+/// disables Cargo's automatic root `build.rs` discovery and is therefore safe.
+fn active_build_script(crate_dir: &Path, manifest: &str) -> Option<String> {
+    match manifest_value(manifest, "package", "build") {
+        Some("false") => None,
+        Some(value) => Some(toml_string(value).unwrap_or(value).to_string()),
+        None if crate_dir.join("build.rs").is_file() => Some("build.rs".to_string()),
+        None => None,
+    }
+}
+
+fn is_proc_macro_crate(manifest: &str) -> bool {
+    manifest_value(manifest, "lib", "proc-macro") == Some("true")
+        || manifest_value(manifest, "lib", "crate-type")
+            .is_some_and(|value| toml_string_list_contains(value, "proc-macro"))
+}
+
+/// Read a simple scalar from a Cargo manifest table. `cargo vendor` emits
+/// normalized manifests with one assignment per line; dotted root keys are
+/// accepted too so `package.build = "..."` cannot bypass the check.
+fn manifest_value<'a>(manifest: &'a str, table: &str, key: &str) -> Option<&'a str> {
+    let mut current_table = "";
+    for raw in manifest.lines() {
+        let line = strip_toml_comment(raw).trim();
+        if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current_table = header.trim();
+            continue;
+        }
+        let Some((left, right)) = line.split_once('=') else {
+            continue;
+        };
+        let left = left.trim();
+        let in_table = current_table == table && left == key;
+        let dotted_root = current_table.is_empty()
+            && left.strip_prefix(table).and_then(|s| s.strip_prefix('.')) == Some(key);
+        if in_table || dotted_root {
+            return Some(right.trim());
+        }
+    }
+    None
+}
+
+fn toml_string(value: &str) -> Option<&str> {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+}
+
+fn toml_string_list_contains(value: &str, needle: &str) -> bool {
+    value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(|items| {
+            items
+                .split(',')
+                .any(|item| toml_string(item.trim()) == Some(needle))
+        })
+}
+
+/// Remove a TOML line comment without treating `#` inside a quoted string as a
+/// comment marker.
+fn strip_toml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(b'"') if byte == b'\\' => escaped = true,
+            Some(q) if byte == q => quote = None,
+            Some(_) => {}
+            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+            None if byte == b'#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
 }
 
 /// C/C++-toolchain crates whose presence as a build-dependency means the crate
@@ -152,13 +295,11 @@ fn c_build_dependency(manifest: &str) -> Option<String> {
         // A `[build-dependencies.<name>]` table header, including the
         // target-conditional form `[target.'cfg(...)'.build-dependencies.<name>]`.
         if let Some(inner) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            let build_dep_name = inner
-                .strip_prefix("build-dependencies.")
-                .or_else(|| {
-                    inner
-                        .rsplit_once(".build-dependencies.")
-                        .map(|(_, name)| name)
-                });
+            let build_dep_name = inner.strip_prefix("build-dependencies.").or_else(|| {
+                inner
+                    .rsplit_once(".build-dependencies.")
+                    .map(|(_, name)| name)
+            });
             if let Some(name) = build_dep_name {
                 let name = name.trim();
                 if TOOLS.contains(&name) {
@@ -302,11 +443,9 @@ fn purity_scan(ordering_dir: &Path) -> Result<(), GateError> {
 /// any real use of these constructs in code still trips the gate.
 fn scan_source(file: &Path, src: &str) -> Result<(), GateError> {
     let where_ = file.display();
-    // Two views of the source with comments removed: `kw` also blanks string
-    // interiors (so a keyword inside a string is not matched); `paths` keeps
-    // string contents (so `include!("../x")` still shows its `..` escape).
+    // This view removes comments and blanks string interiors so prose/data cannot
+    // trigger a forbidden-token match.
     let kw = strip_comments(src, true);
-    let paths = strip_comments(src, false);
     let hit = |lineno: usize, what: &str| {
         Err(GateError(format!(
             "purity: {where_}:{} uses {what}, which is forbidden in submissions (no foreign-function interface / non-Rust escape)",
@@ -368,15 +507,27 @@ fn scan_source(file: &Path, src: &str) -> Result<(), GateError> {
             return hit(lineno, "inline assembly (`asm!`/`global_asm!`)");
         }
     }
-    // `include!` is allowed only for paths inside src/ordering/. We cannot resolve
-    // the literal robustly without parsing, so we reject any `include!` whose line
-    // also contains `..` — the only way to escape the directory. This runs on the
-    // string-preserving view so the `..` inside the path literal is visible.
-    for (lineno, line) in paths.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.contains("include!") && trimmed.contains("..") {
-            return hit(lineno, "an `include!` of a path outside src/ordering/");
-        }
+    // Ban `include!` entirely. `purity_scan` walks only `.rs` files, so allowing
+    // even an in-directory include would let forbidden Rust tokens hide in a
+    // `.inc`/`.txt` file that the source scanner never opens.
+    if let Some(off) = find_macro_call(&kw, "include") {
+        let lineno = kw[..off].bytes().filter(|&b| b == b'\n').count();
+        return hit(
+            lineno,
+            "`include!` (included source cannot be purity-scanned)",
+        );
+    }
+    // A `#[path = "..."] mod name;` item has the same blind spot as `include!`:
+    // the compiler accepts a module body from a non-`.rs` file, while
+    // `purity_scan` only collects `.rs` paths. Match the real attribute shape on
+    // the comment-stripped, string-blanked view so whitespace/newlines cannot
+    // evade it and prose inside comments or strings cannot trigger it.
+    if let Some(off) = find_path_attribute(&kw) {
+        let lineno = kw[..off].bytes().filter(|&b| b == b'\n').count();
+        return hit(
+            lineno,
+            "`#[path = \"...\"]` (module source may not be purity-scanned)",
+        );
     }
     Ok(())
 }
@@ -399,10 +550,8 @@ fn scan_source(file: &Path, src: &str) -> Result<(), GateError> {
 /// code, so blanking them can only remove non-code tokens. Char-literal interiors
 /// are left as-is (at most one char/escape — they cannot spell a forbidden word).
 ///
-/// `blank_strings` controls that interior blanking: `true` for the keyword scan
-/// (so a token inside a string is not matched), `false` for the `include!` scan,
-/// which must read the string PATH to see a `..` escape — blanking it would hide
-/// the escape and open a bypass.
+/// `blank_strings` controls that interior blanking; the source-purity scan uses
+/// `true` so tokens appearing only inside string data are never matched.
 fn strip_comments(src: &str, blank_strings: bool) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
@@ -700,17 +849,153 @@ fn find_macro_call(hay: &str, name: &str) -> Option<usize> {
         let before_ok = idx == 0 || !is_ident_byte(hb[idx - 1]);
         // `name` <ws> `!` <ws> `(`|`[`|`{` — the macro-invocation shape.
         let after_name = skip_ws(idx + wb.len());
-        let matched = before_ok
-            && after_name < hb.len()
-            && hb[after_name] == b'!'
-            && {
-                let after_bang = skip_ws(after_name + 1);
-                after_bang < hb.len() && matches!(hb[after_bang], b'(' | b'[' | b'{')
-            };
+        let matched = before_ok && after_name < hb.len() && hb[after_name] == b'!' && {
+            let after_bang = skip_ws(after_name + 1);
+            after_bang < hb.len() && matches!(hb[after_bang], b'(' | b'[' | b'{')
+        };
         if matched {
             return Some(idx);
         }
         start = idx + 1;
+    }
+    None
+}
+
+/// If `hay` contains a Rust `#[path = "..."]` attribute, either directly or as
+/// an attribute argument to `cfg_attr`, return the byte offset of its `#`.
+/// Comments have already been removed and string interiors blanked, so only
+/// delimiters need to be recognized here. Rust permits insignificant whitespace
+/// (including newlines) between every token in the attribute.
+fn find_path_attribute(hay: &str) -> Option<usize> {
+    let hb = hay.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find('#') {
+        let off = start + rel;
+        let mut i = skip_ascii_whitespace(hb, off + 1);
+        if hb.get(i) != Some(&b'[') {
+            start = off + 1;
+            continue;
+        }
+        i = skip_ascii_whitespace(hb, i + 1);
+        if let Some(after_literal) = path_name_value_end(hb, i) {
+            i = skip_ascii_whitespace(hb, after_literal);
+            if hb.get(i) == Some(&b']') {
+                return Some(off);
+            }
+        }
+        if cfg_attr_contains_path(hb, i) {
+            return Some(off);
+        }
+        start = off + 1;
+    }
+    None
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn starts_ident(bytes: &[u8], i: usize, name: &[u8]) -> bool {
+    bytes.get(i..i + name.len()) == Some(name)
+        && bytes.get(i + name.len()).is_none_or(|b| !is_ident_byte(*b))
+}
+
+/// If `bytes[i..]` begins with `path = <string>`, return the byte after the
+/// literal. Exact identifier matching keeps benign names such as `pathology`
+/// from being interpreted as the built-in `path` attribute.
+fn path_name_value_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if !starts_ident(bytes, i, b"path") {
+        return None;
+    }
+    i = skip_ascii_whitespace(bytes, i + 4);
+    if bytes.get(i) != Some(&b'=') {
+        return None;
+    }
+    i = skip_ascii_whitespace(bytes, i + 1);
+    string_literal_end(&bytes[i..]).map(|len| i + len)
+}
+
+/// Recognize `cfg_attr(predicate, path = "...", ...)`. Only top-level attribute
+/// arguments after the predicate's comma are inspected, so a similarly named
+/// cfg predicate or a token nested inside another attribute cannot be confused
+/// with the `path` attribute. Nested `cfg_attr` arguments are handled recursively.
+fn cfg_attr_contains_path(bytes: &[u8], mut i: usize) -> bool {
+    if !starts_ident(bytes, i, b"cfg_attr") {
+        return false;
+    }
+    i = skip_ascii_whitespace(bytes, i + b"cfg_attr".len());
+    if bytes.get(i) != Some(&b'(') {
+        return false;
+    }
+
+    let mut paren_depth = 1usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    i += 1;
+    while i < bytes.len() {
+        let char_literal = if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\'') {
+            char_literal_len(&bytes[i + 1..]).map(|len| len + 1)
+        } else if bytes[i] == b'\'' {
+            char_literal_len(&bytes[i..])
+        } else {
+            None
+        };
+        if let Some(len) = char_literal {
+            i += len;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren_depth += 1,
+            b')' if paren_depth == 1 => return false,
+            b')' => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' if bracket_depth > 0 => bracket_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            b',' if paren_depth == 1 && bracket_depth == 0 && brace_depth == 0 => {
+                let attr = skip_ascii_whitespace(bytes, i + 1);
+                if let Some(end) = path_name_value_end(bytes, attr) {
+                    let end = skip_ascii_whitespace(bytes, end);
+                    if matches!(bytes.get(end), Some(b',' | b')')) {
+                        return true;
+                    }
+                }
+                if cfg_attr_contains_path(bytes, attr) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Return the length of a normal or raw string literal at the start of `bytes`.
+/// This consumes the already-blanked representation produced by
+/// `strip_comments`, where escaped quotes are spaces and only the true closing
+/// delimiter remains.
+fn string_literal_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.first() == Some(&b'"') {
+        return bytes[1..]
+            .iter()
+            .position(|&b| b == b'"')
+            .map(|closing| closing + 2);
+    }
+    let (hashes, opener_len) = raw_string_start(bytes)?;
+    let mut i = opener_len;
+    while i < bytes.len() {
+        if bytes[i] == b'"'
+            && bytes
+                .get(i + 1..i + 1 + hashes)
+                .is_some_and(|suffix| suffix.iter().all(|&b| b == b'#'))
+        {
+            return Some(i + 1 + hashes);
+        }
+        i += 1;
     }
     None
 }
@@ -724,10 +1009,10 @@ fn contains_attr(line: &str, name: &str) -> bool {
 
 /// LICENSE: run `cargo-deny check licenses` against the shipped `deny.toml`. In
 /// `FallbackAllowed` mode, a missing `cargo-deny` is tolerated with a printed
-/// note (the submission's declared deps have already been validated for shape by
-/// `filter_declared_deps`; tree-level license enforcement happens in the grader's
-/// vendored-tree scan). In `RequireDeny` mode, a missing `cargo-deny` is fatal:
-/// the authoritative check must run.
+/// note (the submission's declared deps have already been checked against the
+/// reviewed exact-version allowlist by `filter_declared_deps`; tree-level license
+/// enforcement happens in the grader's vendored-tree scan). In `RequireDeny`
+/// mode, a missing `cargo-deny` is fatal: the authoritative check must run.
 fn license_check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
     let deny_toml = repo_root.join("deny.toml");
     if !deny_toml.exists() {
@@ -754,8 +1039,8 @@ fn license_check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
             Mode::FallbackAllowed => {
                 eprintln!(
                     "license-check: cargo-deny not installed; skipping license check \
-                     (declared deps were validated for shape; tree-level license enforcement \
-                     happens in the grader's vendored-tree scan). \
+                     (declared deps matched the reviewed exact-version allowlist; tree-level \
+                     license enforcement happens in the grader's vendored-tree scan). \
                      Install with `cargo install cargo-deny` to run the authoritative check the grader uses."
                 );
                 return Ok(());
@@ -842,11 +1127,11 @@ mod tests {
     }
 
     #[test]
-    fn include_escape_hidden_in_string_is_still_rejected() {
-        // The `include!` check reads the string-preserving view, so a `..` escape
-        // inside the path literal is still seen even though the keyword scan blanks
-        // string interiors.
-        let src = "include!(\"../../../etc/passwd\");\n";
+    fn include_of_non_rs_source_is_rejected() {
+        // Regression: purity_scan walks only `.rs` files. An allowed include of
+        // `hidden.inc` could therefore compile forbidden tokens the scanner never
+        // opened. The policy now rejects every real `include!` invocation.
+        let src = "include!(\"hidden.inc\");\n";
         assert!(scan_source(Path::new("x.rs"), src).is_err());
     }
 
@@ -990,9 +1275,50 @@ mod tests {
     }
 
     #[test]
-    fn include_outside_dir_is_rejected() {
-        let src = "include!(\"../../../etc/passwd\");\n";
+    fn multiline_include_invocation_is_rejected() {
+        let src = "include\n!\n(\"hidden.inc\");\n";
         assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn include_mention_in_comment_and_string_is_allowed() {
+        let src =
+            "// include!(\"hidden.inc\") is forbidden\nlet note = \"include!(hidden.inc)\";\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn path_module_of_non_rs_source_is_rejected() {
+        let src = "#[path = \"payload.txt\"]\nmod payload;\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn multiline_path_module_attribute_is_rejected() {
+        let src = "# /* gap */ [\n path\n =\n r#\"payload.txt\"#\n]\nmod payload;\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn path_module_mention_in_comment_and_string_is_allowed() {
+        let src = "// #[path = \"payload.txt\"] mod payload;\n\
+                   let note = \"#[path = \\\"payload.txt\\\"] mod payload;\";\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn cfg_attr_path_module_of_non_rs_source_is_rejected() {
+        let src = "# [ cfg_attr (\n all (),\n path /* gap */ = r##\"payload.txt\"##\n) ]\n\
+                   mod payload;\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn benign_cfg_attr_is_allowed() {
+        let src = "#[cfg_attr(all(), pathology = \"payload.txt\", doc = \"path = payload.txt\")]\n\
+                   mod payload {}\n\
+                   // cfg_attr(all(), path = \"payload.txt\") is prose\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
     }
 
     #[test]

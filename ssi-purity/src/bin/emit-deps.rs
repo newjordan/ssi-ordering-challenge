@@ -1,7 +1,7 @@
-//! `emit-deps <deps.toml>` — shape-validate the submission's deps.toml and
-//! print `name=version` per validated dependency to stdout. Exit 1 on any
-//! rejection (message to stderr). A missing file is empty (exit 0). Called by
-//! scripts/prepare-build.sh.
+//! `emit-deps <deps.toml>` — validate the submission's deps.toml against the
+//! reviewed direct-dependency name/version allowlist and print `name=version`
+//! per accepted dependency to stdout. Exit 1 on any rejection (message to
+//! stderr). A missing file is empty (exit 0). Called by scripts/prepare-build.sh.
 
 use std::path::Path;
 use std::process::ExitCode;
