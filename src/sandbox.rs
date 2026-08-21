@@ -139,12 +139,25 @@ impl WorkerSandbox {
                 let output = canonical_file(output, "worker output")?;
 
                 let mut cmd = Command::new(executable);
+                // NOTE: deliberately NO `--new-session`. The watchdog enforces
+                // the time cap by SIGKILLing the worker's whole process group
+                // (`kill -KILL -<pgid>`, see watchdog::run_capped). `--new-session`
+                // would setsid() the sandboxed processes into their own session,
+                // so that group-kill could never reach them and the watchdog's
+                // `child.wait()` would hang while the candidate + any descendant
+                // survived the cap. `--die-with-parent` only fires when the harness
+                // (bwrap's parent) dies, not when bwrap is signalled, so it does not
+                // cover the timeout path. Keeping the sandbox in bwrap's process
+                // group lets one group-kill reap bwrap, the PID-1 candidate, and its
+                // descendants together; killing PID 1 collapses the namespace.
+                // `--new-session` guards against TIOCSTI tty injection, but the
+                // worker has /dev/null stdio and no controlling terminal, so there
+                // is nothing to inject into here.
                 cmd.env_clear().args([
                     "--unshare-pid",
                     "--unshare-net",
                     "--unshare-ipc",
                     "--unshare-uts",
-                    "--new-session",
                     "--die-with-parent",
                     "--as-pid-1",
                     "--cap-drop",
