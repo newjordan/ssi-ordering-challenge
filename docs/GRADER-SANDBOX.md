@@ -65,15 +65,6 @@ target/trusted/release/ssi-ordering-challenge --grader
 - exactly one writable bind mount: the pre-created permutation output file;
 - no Linux capabilities, repo, corpus file, HOME, runner temp, or parent files.
 
-The worker deliberately stays in bubblewrap's process group (no `--new-session`)
-so the watchdog's time-cap `kill -KILL -<pgid>` reaps bwrap, the PID-1 candidate,
-and any descendant together; killing PID 1 collapses the namespace. A
-`--new-session` would `setsid()` the sandbox into its own group, out of the
-watchdog's reach, so the cap kill could not tear it down (and the supervising
-`wait()` would hang). The worker has `/dev/null` stdio and no controlling
-terminal, so `--new-session`'s only benefit — blocking TIOCSTI tty injection —
-does not apply.
-
 This must remain per worker. Wrapping the whole harness in one PID namespace is
 not equivalent: workers in that shared namespace can enumerate the trusted
 parent in `/proc` and may be able to inspect its memory. Keeping the trusted
