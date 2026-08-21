@@ -61,6 +61,16 @@ jobs:
           sudo apt-get install --yes --no-install-recommends bubblewrap
           bwrap --version
 
+      # Ubuntu 24.04 (the ubuntu-latest image) enables an AppArmor policy that
+      # restricts unprivileged user namespaces, which stops bubblewrap from
+      # configuring loopback in its --unshare-net namespace (bwrap fails with
+      # RTM_NEWADDR: Operation not permitted). Relax it so the unprivileged
+      # grader sandbox can create its PID/network/filesystem namespaces. This
+      # is the only namespace-related root operation; the trusted parent and
+      # all untrusted code still run as the runner user.
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       # Validate deps.toml, generate the trusted manifest, freeze the lockfile,
       # vendor the FULL transitive tree, and scan it for native/FFI escapes. This
       # is the ONLY step that uses the network (cargo vendor fetches from the
