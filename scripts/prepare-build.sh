@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate Cargo.toml from Cargo.toml.in + validated src/ordering/deps.toml.
 # Runs in BOTH the local harness and the grader (Invariant 2). Exit non-zero on
-# any validation failure; the full transitive-tree license/FFI scan is added in
-# Task 6 (after `cargo vendor`).
+# any validation failure. Only reviewed exact direct dependencies are emitted;
+# the full transitive-tree license/native scan runs after `cargo vendor`.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -33,8 +33,9 @@ write_manifest() {
 # `cargo run -p ssi-purity` works even on a clean clone.
 write_manifest ""
 
-# Shape-validate deps.toml via ssi-purity (the ONE parser). Emits one
-# `name=version` line per validated dep to stdout, or exits non-zero.
+# Validate deps.toml against ssi-purity's trusted exact-version allowlist (the
+# ONE parser/policy gate). Emits one `name=version` line per accepted dependency
+# to stdout, or exits non-zero. This completes before any vendor or build step.
 GEN="$(cargo run --quiet -p ssi-purity --bin emit-deps -- "$DEPS_TOML")" || {
   echo "prepare-build: deps.toml rejected (see error above)" >&2
   exit 1
@@ -45,14 +46,10 @@ write_manifest "$GEN"
 echo "prepare-build: wrote $OUT"
 
 # Vendor the full transitive tree. The COMMITTED Cargo.lock is authoritative:
-# `cargo vendor` performs a MINIMAL lock update — it honors every existing pin
-# and resolves only crates a contestant newly declared in deps.toml (absent from
-# the baseline lock). We deliberately do NOT run `cargo generate-lockfile` here:
-# that recreates the lock from scratch, floating every transitive dep to the
-# newest semver-compatible release at vendor time, which would defeat the frozen
-# lockfile and make the `--locked` build/run (benchmark.yml) non-reproducible
-# across time (issue #21). This step needs network (to fetch declared crates);
-# the later build is offline.
+# `cargo vendor` honors its existing pins while resolving an approved direct
+# dependency not yet represented in the baseline lock. The trusted parser above
+# enforces each direct name/version pair exactly. This step needs network to
+# fetch crate archives; the later build is offline and locked.
 mkdir -p .cargo
 CARGO_NET_OFFLINE=false cargo vendor vendor > .cargo/vendor-source.toml
 cat .cargo/config.base.toml .cargo/vendor-source.toml > .cargo/config.toml
