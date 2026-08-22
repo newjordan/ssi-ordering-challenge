@@ -140,6 +140,7 @@ jobs:
       # /proc would expose trusted-parent memory to workers. Requested sandbox
       # mode fails closed if bubblewrap cannot establish the boundary.
       - name: Benchmark
+        id: benchmark
         env:
           SSI_CORPUS_FILE: ${{ steps.corpus.outputs.corpus_file }}
           SSI_GRADER_SANDBOX: bubblewrap
@@ -149,12 +150,11 @@ jobs:
           test "$(id -u)" -ne 0
           exec ./target/trusted/release/ssi-ordering-challenge --grader
 
-      # The score artifact is the channel Hilbert reads. Upload even on failure so
-      # a partial/zero score is visible rather than silently lost; the run still
-      # concludes `failure` (the harness exits non-zero on any gate failure),
-      # which is what Hilbert keys its accept/reject decision on.
+      # The score artifact is the channel Hilbert reads. A failed benchmark must
+      # never publish a stale or worker-forged score; the harness also clears
+      # score.json authoritatively before returning failure.
       - name: Upload score
-        if: always()
+        if: ${{ success() && steps.benchmark.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (SHA-pinned: org requires it)
         with:
           name: score
