@@ -1,2 +1,0 @@
-recon-graded 0.854109 | worst ~0.55s (vs frontier 0.91s) | tests green
-src: sbx-timing-rca | 2026-08-06 | drop AmindNorm + D density-window gate (20<nnz/n<50, nnz<1M) on 4 gt_10k matrices
