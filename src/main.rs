@@ -519,10 +519,76 @@ fn require_candidate_worker(path: PathBuf) -> Result<PathBuf, String> {
 }
 
 /// Resolve the repo root so the gate finds src/ordering/ and deny.toml whether
-/// the binary is launched from the repo root or elsewhere. Uses CARGO_MANIFEST_DIR
-/// at compile time (the harness package dir), falling back to ".".
+/// the binary is launched from the repo root or elsewhere. Prefer the package
+/// directory embedded by Cargo, then walk up from the executable and current
+/// directory. The latter is required for grader builds: the build sandbox
+/// deliberately exposes the checkout as `/workspace`, which does not exist
+/// after the resulting trusted binary returns to the host runner.
 fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    let compiled = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let executable = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    resolve_repo_root(compiled, executable.as_deref(), cwd.as_deref())
+}
+
+fn resolve_repo_root(
+    compiled: &Path,
+    executable: Option<&Path>,
+    cwd: Option<&Path>,
+) -> PathBuf {
+    find_repo_root(compiled)
+        .or_else(|| executable.and_then(find_repo_root))
+        .or_else(|| cwd.and_then(find_repo_root))
+        .unwrap_or_else(|| compiled.to_path_buf())
+}
+
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|path| {
+            path.join("deny.toml").is_file() && path.join("src/ordering").is_dir()
+        })
+        .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod repo_root_tests {
+    use super::*;
+
+    const MISSING_SANDBOX_ROOT: &str = "/__ssi_missing_build_sandbox_workspace__";
+
+    #[test]
+    fn uses_valid_compiled_manifest_directory() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(resolve_repo_root(expected, None, None), expected);
+    }
+
+    #[test]
+    fn falls_back_from_build_sandbox_path_to_executable_location() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let executable = expected.join("target/trusted/release/ssi-ordering-challenge");
+        assert_eq!(
+            resolve_repo_root(
+                Path::new(MISSING_SANDBOX_ROOT),
+                Some(&executable),
+                Some(Path::new("/")),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn falls_back_to_current_directory_when_executable_is_external() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            resolve_repo_root(
+                Path::new(MISSING_SANDBOX_ROOT),
+                Some(Path::new("/tmp/ssi-ordering-challenge")),
+                Some(expected),
+            ),
+            expected
+        );
+    }
 }
 
 fn now() -> u64 {
