@@ -17,7 +17,8 @@
 //!   4. recompute predicted flops and nnz(L) from the permutation with the
 //!      trusted scoring wrapper (Stage D) — your code never reports a number;
 //!
-//! then prints a per-matrix table and a per-bucket breakdown, computes
+//! then, for the public development corpus, prints a per-matrix table and a
+//! per-bucket breakdown; all runs compute
 //!
 //!     score = weighted mean over size buckets of
 //!             geomean_within_bucket( flops(yours) / flops(AMD) )
@@ -44,32 +45,24 @@
 //! FAIL row whose note carries the reason; the scratch dir is disposed on
 //! every exit path.
 
+mod artifacts;
 mod corpus;
 mod failsafe;
-mod ordering;
-mod pattern_io;
-mod perm_io;
 mod purity;
+mod sandbox;
 mod watchdog;
 
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
-use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ssi_scoring::{
-    combine, geomean, score, size_bucket, validate_permutation, BucketAcc, BUCKETS,
-    BUCKET_KEYS, BUCKET_WEIGHTS,
+    combine, geomean, score, size_bucket, validate_permutation, BucketAcc, BUCKETS, BUCKET_KEYS,
+    BUCKET_WEIGHTS,
 };
 
-// Re-export the contract type at the crate root so contestant code under
-// src/ordering/ imports it as `crate::Pattern`. The type is defined in
-// ssi_scoring (the one scoring path, Invariant 2); this is a pure alias, so a
-// local `Pattern` is the identical type the grader scores. Naming the crate's
-// defining type at its root is idiomatic Rust and keeps the import path honest
-// (no module-name clutter, no second file named pattern.rs).
 pub use ssi_scoring::Pattern;
 
 /// Per-matrix time cap, ENFORCED: order() runs in a child process that is
@@ -79,47 +72,108 @@ pub use ssi_scoring::Pattern;
 /// gates a submission on the server is exactly this constant — local and graded
 /// runs use the identical 2 s cap by construction (Invariant 2).
 const TIME_CAP_PER_MATRIX: Duration = Duration::from_secs(2);
+const CANDIDATE_WORKER_ENV: &str = "SSI_CANDIDATE_WORKER";
 
-// Harness-owned regression modes. The parent-only flag is accepted by the
-// integration test; it is never forwarded to a production worker. The timeout
-// worker never calls ordering::order(), so contestant code cannot observe
-// either flag through argv or the environment.
+/// Parent-only regression flag, accepted from the time-cap integration test:
+/// every worker is launched in the candidate binary's harness-owned
+/// `--worker-test-timeout` mode, which sleeps past the cap without ever calling
+/// `order()`. Production workers receive neither this flag nor any test
+/// environment variable, so contestant code cannot observe the test seam.
 const TEST_TIME_CAP_FLAG: &str = "--test-time-cap";
-const TEST_TIMEOUT_WORKER_FLAG: &str = "--worker-test-timeout";
-const TEST_TIMEOUT_SLEEP: Duration = Duration::from_secs(30);
 
 fn main() -> ExitCode {
-    // Worker mode: the ONLY process that runs contestant order(). Reads the
-    // pattern the parent serialized, runs order(), writes the permutation, exits.
     let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(String::as_str) == Some("--worker") {
-        return ExitCode::from(worker(&raw_args[2..]) as u8);
+    let grader_mode = raw_args.iter().any(|arg| arg == "--grader");
+    let worker_sandbox = match sandbox::WorkerSandbox::from_env(grader_mode) {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            eprintln!("RUN FAILED (grader sandbox: {e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    let candidate_worker = match candidate_worker_path(grader_mode) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("RUN FAILED (candidate worker: {e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    if raw_args.iter().any(|arg| arg == "--sandbox-self-check") {
+        return match sandbox_self_check_parent(&worker_sandbox, &candidate_worker) {
+            Ok(()) => {
+                println!("per-worker bubblewrap self-check passed");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sandbox self-check failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
-    if raw_args.get(1).map(String::as_str) == Some(TEST_TIMEOUT_WORKER_FLAG) {
-        std::thread::sleep(TEST_TIMEOUT_SLEEP);
-        return ExitCode::SUCCESS;
+    if raw_args
+        .iter()
+        .any(|arg| arg == "--sandbox-timeout-self-check")
+    {
+        return match sandbox_timeout_self_check_parent(&worker_sandbox, &candidate_worker) {
+            Ok(()) => {
+                println!("bubblewrap timeout teardown self-check passed");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sandbox timeout self-check failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
-    let test_time_cap = raw_args.get(1).map(String::as_str) == Some(TEST_TIME_CAP_FLAG);
+    let test_time_cap = raw_args.iter().any(|arg| arg == TEST_TIME_CAP_FLAG);
 
     let note = parse_note();
+    let repo_root = repo_root();
+    // Preserve the trusted pre-run log before any contestant worker can write
+    // through an absolute path. Artifact publication happens only after all
+    // workers finish and discards any bytes they may have forged.
+    let run_artifacts = match artifacts::RunArtifacts::capture(&repo_root) {
+        Ok(state) => state,
+        Err(e) => {
+            let reason = format!("could not preserve pre-run artifact state: {e}");
+            println!("RUN FAILED: {reason}");
+            if let Err(clear_error) = artifacts::clear_score(&repo_root) {
+                eprintln!("could not clear score.json after failure: {clear_error}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
 
     // --- Stage A analog: purity & license gate, before any scoring. ---
-    let repo_root = repo_root();
     if let Err(e) = purity::check(&repo_root) {
         let reason = format!("Stage A — purity/license: {e}");
-        println!("RUN FAILED ({reason})");
-        let ts = now();
-        append_results(ts, "FAIL", f64::NAN, f64::NAN, &failsafe::compose_note(&reason, &note));
-        return ExitCode::FAILURE;
+        return finish_failed_run(&run_artifacts, &reason, &note);
     }
 
     let corpus_file = corpus::corpus_path();
-    let corpus = corpus::corpus();
+    let show_matrix_census = is_public_dev_corpus(&repo_root, &corpus_file);
+    let corpus = match corpus::load(&corpus_file) {
+        Ok(corpus) => corpus,
+        Err(detail) => {
+            // A malformed hidden corpus must neither remain on disk nor leak
+            // matrix names through the parse error into public logs.
+            if !show_matrix_census {
+                let _ = std::fs::remove_file(&corpus_file);
+            }
+            let reason = if show_matrix_census {
+                detail
+            } else {
+                "failed to load hidden corpus".to_string()
+            };
+            return finish_failed_run(&run_artifacts, &reason, &note);
+        }
+    };
     // The corpus is fully resident in memory now and no worker has run yet.
     // If this is a grader-supplied hidden eval corpus, unlink it so worker
     // children cannot read the eval set from disk (F2). The default dev
-    // corpus lives in the repo tree, is public, and is left alone.
-    if corpus_file != Path::new(corpus::DEV_CORPUS_FILE) {
+    // corpus lives in the repo tree, is public, and is left alone — matched
+    // by canonical path so an absolute spelling of it is never deleted.
+    if !show_matrix_census {
         let _ = std::fs::remove_file(&corpus_file);
     }
     if corpus.is_empty() {
@@ -127,27 +181,29 @@ fn main() -> ExitCode {
             "no patterns found at {}. Run from the repo root.",
             corpus_file.display()
         );
-        println!("RUN FAILED: {reason}");
-        append_results(now(), "FAIL", f64::NAN, f64::NAN, &failsafe::compose_note(&reason, &note));
-        return ExitCode::FAILURE;
+        return finish_failed_run(&run_artifacts, &reason, &note);
     }
 
-    println!(
-        "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
-        "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
-    );
+    if show_matrix_census {
+        println!(
+            "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
+            "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
+        );
+    }
 
     let mut buckets = [BucketAcc::default(); BUCKETS];
     let mut failed: Option<String> = None;
     let mut table = String::new();
 
-    // Resolve our own executable + a scratch dir for worker perm files.
-    let exe = std::env::current_exe().expect("locate harness executable");
+    // Create a scratch dir for worker protocol files.
     let scratch = failsafe::ScratchDir(
         std::env::temp_dir().join(format!("ssi-harness-{}", std::process::id())),
     );
     std::fs::create_dir_all(scratch.path()).expect("create scratch dir");
-    let cap = watchdog::CapConfig { time_cap: TIME_CAP_PER_MATRIX, poll: std::time::Duration::from_millis(10) };
+    let cap = watchdog::CapConfig {
+        time_cap: TIME_CAP_PER_MATRIX,
+        poll: std::time::Duration::from_millis(10),
+    };
 
     for (seq, (name, pat)) in corpus.iter().enumerate() {
         // --- AMD baseline (trusted, in-process) — guarded so a feral panic
@@ -159,7 +215,12 @@ fn main() -> ExitCode {
         })) {
             Ok(b) => b,
             Err(msg) => {
-                failed = Some(format!("{name}: trusted baseline/score panicked — {msg}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &format!("trusted baseline/score panicked — {msg}"),
+                    "trusted baseline/score panicked",
+                ));
                 break;
             }
         };
@@ -167,10 +228,16 @@ fn main() -> ExitCode {
         // Serialize THIS pattern once to the scratch dir; both determinism runs
         // read it. Written by the trusted parent OUTSIDE the timed window, so its
         // cost never counts against the per-matrix cap.
-        let pat_file = scratch.path().join(format!("{seq}-pat.bin"));
-        let _ = std::fs::remove_file(&pat_file);
-        if let Err(e) = pattern_io::write_pattern(&pat_file, pat) {
-            failed = Some(format!("{name}: failed to stage pattern for worker: {e}"));
+        // The per-file guard unlinks it after both runs and on every earlier
+        // break/unwind; the whole-directory guard remains a final fallback.
+        let pat_file = failsafe::StagedFile::new(scratch.path().join(format!("{seq}-pat.bin")));
+        if let Err(e) = ssi_worker_protocol::write_pattern(pat_file.path(), pat) {
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("failed to stage pattern for worker: {e}"),
+                "failed to stage pattern for worker",
+            ));
             break;
         }
 
@@ -178,56 +245,113 @@ fn main() -> ExitCode {
         let run_once = |tag: &str| -> Result<Vec<usize>, String> {
             let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
             let _ = std::fs::remove_file(&out_perm);
-            // Per-worker empty CWD. The pattern and output paths are absolute,
-            // so the worker needs no working-directory view of anything: no repo
-            // tree, no score.json, no results.tsv (F4).
+            // Pre-create the output so grader mode can bind precisely one
+            // writable file. No directory is writable in the worker sandbox.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_perm)
+                .map_err(|e| format!("failed to stage worker output: {e}"))?;
+            // Local mode keeps the historical private empty CWD. Grader mode
+            // replaces the entire filesystem and does not expose this path.
             let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
             std::fs::create_dir_all(&worker_cwd)
                 .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
-            let mut cmd = std::process::Command::new(&exe);
-            if test_time_cap {
-                // Test-only harness worker: it sleeps without ever invoking
-                // order(), so the watchdog is exercised while contestant code
-                // cannot inspect the test flag.
-                cmd.arg(TEST_TIMEOUT_WORKER_FLAG);
+            let invocation = if test_time_cap {
+                // Test-only harness-owned worker mode: it sleeps without ever
+                // invoking order(), so the watchdog is exercised against a real
+                // child while contestant code cannot inspect the test flag.
+                sandbox::WorkerInvocation::TestTimeout
             } else {
-                cmd.arg("--worker").arg(&pat_file).arg(&out_perm);
-            }
-            // The worker runs contestant code; hand it NOTHING. In particular
-            // SSI_CORPUS_FILE and all test controls must not reach order() (F2).
-            cmd.env_clear().current_dir(&worker_cwd);
+                sandbox::WorkerInvocation::Order
+            };
+            let mut cmd = worker_sandbox.worker_command(
+                &candidate_worker,
+                invocation,
+                pat_file.path(),
+                &out_perm,
+                &worker_cwd,
+            )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
-                watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
+                watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(&out_perm)
                     .map_err(|e| format!("worker produced no readable permutation: {e}")),
-                watchdog::WorkerOutcome::Timeout => Err(format!(
-                    "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
-                     Your ordering must return within {:.0}s on every matrix. This matrix is \
-                     n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
-                     gate expensive paths by BOTH n and nnz.",
-                    TIME_CAP_PER_MATRIX.as_secs_f64(),
-                    t0.elapsed().as_secs_f64(),
-                    TIME_CAP_PER_MATRIX.as_secs_f64(),
-                    pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
-                )),
+                watchdog::WorkerOutcome::Timeout => {
+                    if show_matrix_census {
+                        Err(format!(
+                            "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
+                             Your ordering must return within {:.0}s on every matrix. This matrix is \
+                             n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
+                             gate expensive paths by BOTH n and nnz.",
+                            TIME_CAP_PER_MATRIX.as_secs_f64(),
+                            t0.elapsed().as_secs_f64(),
+                            TIME_CAP_PER_MATRIX.as_secs_f64(),
+                            pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
+                        ))
+                    } else {
+                        Err(format!(
+                            "order() exceeded the {:.1}s per-matrix cap and was killed",
+                            TIME_CAP_PER_MATRIX.as_secs_f64()
+                        ))
+                    }
+                }
                 watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
             }
         };
 
         let perm1 = match run_once("a") {
             Ok(p) => p,
-            Err(e) => { failed = Some(format!("{name}: {e}")); break; }
+            Err(e) => {
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &e,
+                    "worker ordering failed",
+                ));
+                break;
+            }
         };
         let perm2 = match run_once("b") {
             Ok(p) => p,
-            Err(e) => { failed = Some(format!("{name}: {e}")); break; }
+            Err(e) => {
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &e,
+                    "worker ordering failed",
+                ));
+                break;
+            }
         };
+        // Neither worker needs the staged input now. Unlink immediately instead
+        // of retaining this matrix until whole-run scratch cleanup. Any failure
+        // aborts before another worker can observe the leftover file; the guard
+        // retries on this loop exit.
+        if let Err(e) = pat_file.remove_now() {
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("failed to remove staged worker pattern: {e}"),
+                "failed to remove staged worker input",
+            ));
+            break;
+        }
         if perm1 != perm2 {
-            failed = Some(format!("{name}: nondeterministic ordering (two runs differ)"));
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                "nondeterministic ordering (two runs differ)",
+                "nondeterministic ordering (two runs differ)",
+            ));
             break;
         }
         if let Err(e) = validate_permutation(&perm1, pat.n) {
-            failed = Some(format!("{name}: invalid permutation — {e}"));
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("invalid permutation — {e}"),
+                "invalid permutation",
+            ));
             break;
         }
 
@@ -235,7 +359,12 @@ fn main() -> ExitCode {
         let yours = match failsafe::catch(std::panic::AssertUnwindSafe(|| score(pat, &perm1))) {
             Ok(s) => s,
             Err(msg) => {
-                failed = Some(format!("{name}: trusted scoring panicked — {msg}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &format!("trusted scoring panicked — {msg}"),
+                    "trusted scoring panicked",
+                ));
                 break;
             }
         };
@@ -246,34 +375,26 @@ fn main() -> ExitCode {
         buckets[b].log_fill_sum += fill_ratio.ln();
         buckets[b].count += 1;
 
-        let line = format!(
-            "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8.3} {:>9}",
-            name,
-            pat.n,
-            pat.nnz(),
-            base.flops,
-            yours.flops,
-            ratio,
-            "(capped)"
-        );
-        println!("{line}");
-        let _ = writeln!(table, "{line}");
+        if show_matrix_census {
+            let line = format!(
+                "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8.3} {:>9}",
+                name,
+                pat.n,
+                pat.nnz(),
+                base.flops,
+                yours.flops,
+                ratio,
+                "(capped)"
+            );
+            println!("{line}");
+            let _ = writeln!(table, "{line}");
+        }
     }
 
     let timestamp = now();
 
     match failed {
-        Some(reason) => {
-            println!("\nRUN FAILED: {reason}");
-            append_results(
-                timestamp,
-                "FAIL",
-                f64::NAN,
-                f64::NAN,
-                &failsafe::compose_note(&reason, &note),
-            );
-            ExitCode::FAILURE
-        }
+        Some(reason) => finish_failed_run_at(&run_artifacts, timestamp, &reason, &note),
         None => {
             // Per-bucket geomeans (None for an empty bucket).
             let flop_gms: [Option<f64>; BUCKETS] =
@@ -284,21 +405,25 @@ fn main() -> ExitCode {
             let score_val = combine(&flop_gms, &BUCKET_WEIGHTS);
             let fill = combine(&fill_gms, &BUCKET_WEIGHTS);
 
-            // Per-bucket breakdown table.
-            println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
-            println!(
-                "{:<8} {:>6} {:>16} {:>16}",
-                "bucket", "count", "flop_geomean", "fill_geomean"
-            );
-            for i in 0..BUCKETS {
-                let fmt = |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+            // Bucket-level diagnostics disclose both occupancy and relative
+            // performance, so they are emitted only for the public dev corpus.
+            if show_matrix_census {
+                println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
                 println!(
                     "{:<8} {:>6} {:>16} {:>16}",
-                    BUCKET_KEYS[i],
-                    buckets[i].count,
-                    fmt(flop_gms[i]),
-                    fmt(fill_gms[i]),
+                    "bucket", "count", "flop_geomean", "fill_geomean"
                 );
+                for i in 0..BUCKETS {
+                    let fmt =
+                        |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+                    println!(
+                        "{:<8} {:>6} {:>16} {:>16}",
+                        BUCKET_KEYS[i],
+                        buckets[i].count,
+                        fmt(flop_gms[i]),
+                        fmt(fill_gms[i]),
+                    );
+                }
             }
 
             println!(
@@ -307,72 +432,340 @@ fn main() -> ExitCode {
             println!("tiebreak (weighted mean of per-bucket geomean fill ratios):                    {fill:.4}");
 
             // score.json — top-level `score` is what the grader ranks on;
-            // `metrics` is passthrough detail (Hilbert captures it whole and shows
-            // it in the PR report). All three buckets are always listed; an empty
-            // bucket has count 0 and null geomeans.
-            let mut buckets_json = String::new();
-            for i in 0..BUCKETS {
-                let jf = |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
-                let sep = if i + 1 < BUCKETS { "," } else { "" };
-                let _ = write!(
-                    buckets_json,
-                    "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
-                    BUCKET_KEYS[i],
-                    buckets[i].count,
-                    jf(flop_gms[i]),
-                    jf(fill_gms[i]),
-                    sep,
-                );
+            // `metrics` is passthrough detail (Hilbert captures it whole and
+            // shows it in the PR report). Preserve the public-dev schema, but
+            // hidden artifacts expose aggregate score/tiebreak metrics only.
+            let json = if show_matrix_census {
+                let mut buckets_json = String::new();
+                for i in 0..BUCKETS {
+                    let jf = |g: Option<f64>| {
+                        g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"))
+                    };
+                    let sep = if i + 1 < BUCKETS { "," } else { "" };
+                    let _ = write!(
+                        buckets_json,
+                        "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
+                        BUCKET_KEYS[i],
+                        buckets[i].count,
+                        jf(flop_gms[i]),
+                        jf(fill_gms[i]),
+                        sep,
+                    );
+                }
+                let total: usize = buckets.iter().map(|b| b.count).sum();
+                format!(
+                    "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
+                     \"geomean_flop_ratio\": {score_val:.6}, \
+                     \"geomean_fill_ratio\": {fill:.6}, \
+                     \"matrices\": {total}, \
+                     \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
+                     \"buckets\": {{ {buckets_json} }} }} }}\n",
+                    BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
+                )
+            } else {
+                format!(
+                    "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
+                     \"geomean_flop_ratio\": {score_val:.6}, \
+                     \"geomean_fill_ratio\": {fill:.6} }} }}\n"
+                )
+            };
+            let row = result_row(timestamp, "OK", score_val, fill, &note);
+            match run_artifacts.finish_success(&row, &json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    let reason = format!("could not publish trusted run artifacts: {e}");
+                    println!("\nRUN FAILED: {reason}");
+                    let fail_row = result_row(
+                        timestamp,
+                        "FAIL",
+                        f64::NAN,
+                        f64::NAN,
+                        &failsafe::compose_note(&reason, &note),
+                    );
+                    if let Err(record_error) = run_artifacts.finish_failure(&fail_row) {
+                        eprintln!(
+                            "could not clear/rewrite artifacts after publication failure: \
+                             {record_error}"
+                        );
+                    }
+                    ExitCode::FAILURE
+                }
             }
-            let total: usize = buckets.iter().map(|b| b.count).sum();
-            let json = format!(
-                "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
-                 \"geomean_flop_ratio\": {score_val:.6}, \
-                 \"geomean_fill_ratio\": {fill:.6}, \
-                 \"matrices\": {total}, \
-                 \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
-                 \"buckets\": {{ {buckets_json} }} }} }}\n",
-                BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
-            );
-            std::fs::write("score.json", json).expect("write score.json");
-            append_results(timestamp, "OK", score_val, fill, &note);
-            ExitCode::SUCCESS
         }
     }
 }
 
-/// `--worker <pattern_file> <out_perm>`: read the one pattern the parent
-/// serialized for this matrix, run the contestant order(), write the
-/// permutation. The parent supervises this under the time cap and SIGKILLs it on
-/// breach. A panic aborts the process (non-zero exit, no perm file) — the parent
-/// treats that as a FAIL.
-fn worker(args: &[String]) -> i32 {
-    let (Some(pattern_file), Some(out)) = (args.first(), args.get(1)) else {
-        eprintln!("--worker: usage: --worker <pattern_file> <out_perm>");
-        return 2;
-    };
-    let pat = match pattern_io::read_pattern(Path::new(pattern_file)) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("worker: failed to read pattern from {pattern_file}: {e}");
-            return 3;
-        }
-    };
-    let perm = ordering::order(&pat);
-    match perm_io::write_perm(Path::new(out), &perm) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("worker: failed to write perm to {out}: {e}");
-            4
-        }
+/// Exercise the exact per-worker bubblewrap command used by grading. CI runs
+/// this after the sandboxed build, before downloading the hidden corpus.
+fn sandbox_self_check_parent(
+    worker_sandbox: &sandbox::WorkerSandbox,
+    candidate_worker: &Path,
+) -> Result<(), String> {
+    if !worker_sandbox.is_enabled() {
+        return Err(format!(
+            "{}=bubblewrap is required for this check",
+            sandbox::MODE_ENV
+        ));
     }
+    let scratch = failsafe::ScratchDir(
+        std::env::temp_dir().join(format!("ssi-sandbox-check-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(scratch.path())
+        .map_err(|e| format!("create self-check scratch dir: {e}"))?;
+    let input = scratch.path().join("input");
+    let output = scratch.path().join("output");
+    let cwd = scratch.path().join("cwd");
+    std::fs::write(&input, b"read-only sentinel")
+        .map_err(|e| format!("create self-check input: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|e| format!("create self-check output: {e}"))?;
+    std::fs::create_dir(&cwd).map_err(|e| format!("create self-check cwd: {e}"))?;
+
+    let mut cmd = worker_sandbox.worker_command(
+        candidate_worker,
+        sandbox::WorkerInvocation::SandboxSelfCheck,
+        &input,
+        &output,
+        &cwd,
+    )?;
+    let cfg = watchdog::CapConfig {
+        time_cap: Duration::from_secs(5),
+        poll: Duration::from_millis(10),
+    };
+    let outcome = watchdog::run_capped(&mut cmd, &cfg);
+    let report = std::fs::read_to_string(&output).unwrap_or_default();
+    match outcome {
+        watchdog::WorkerOutcome::Ok if report == "ok\n" => Ok(()),
+        other => Err(format!("worker reported {other:?}: {}", report.trim())),
+    }
+}
+
+fn sandbox_timeout_self_check_parent(
+    worker_sandbox: &sandbox::WorkerSandbox,
+    candidate_worker: &Path,
+) -> Result<(), String> {
+    if !worker_sandbox.is_enabled() {
+        return Err(format!(
+            "{}=bubblewrap is required for this check",
+            sandbox::MODE_ENV
+        ));
+    }
+    let scratch = failsafe::ScratchDir(
+        std::env::temp_dir().join(format!("ssi-sandbox-timeout-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(scratch.path())
+        .map_err(|e| format!("create timeout-check scratch dir: {e}"))?;
+    let input = scratch.path().join("input");
+    let output = scratch.path().join("output");
+    let cwd = scratch.path().join("cwd");
+    std::fs::write(&input, b"read-only sentinel")
+        .map_err(|e| format!("create timeout-check input: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|e| format!("create timeout-check output: {e}"))?;
+    std::fs::create_dir(&cwd).map_err(|e| format!("create timeout-check cwd: {e}"))?;
+
+    let mut cmd = worker_sandbox.worker_command(
+        candidate_worker,
+        sandbox::WorkerInvocation::SandboxTimeoutSelfCheck,
+        &input,
+        &output,
+        &cwd,
+    )?;
+    let cfg = watchdog::CapConfig {
+        time_cap: Duration::from_millis(200),
+        poll: Duration::from_millis(5),
+    };
+    let outcome = watchdog::run_capped(&mut cmd, &cfg);
+    let report = std::fs::read_to_string(&output).unwrap_or_default();
+    match outcome {
+        watchdog::WorkerOutcome::Timeout if report == "candidate started\n" => Ok(()),
+        other => Err(format!("worker reported {other:?}: {}", report.trim())),
+    }
+}
+
+fn candidate_worker_path(grader_mode: bool) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(CANDIDATE_WORKER_ENV) {
+        if path.is_empty() {
+            return Err(format!("{CANDIDATE_WORKER_ENV} is set but empty"));
+        }
+        return require_candidate_worker(PathBuf::from(path));
+    }
+    if grader_mode {
+        return Err(format!(
+            "{CANDIDATE_WORKER_ENV} must name the separately built candidate binary in --grader mode"
+        ));
+    }
+
+    let mut path =
+        std::env::current_exe().map_err(|e| format!("locate trusted parent executable: {e}"))?;
+    path.set_file_name(format!(
+        "ssi-candidate-worker{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    require_candidate_worker(path)
+}
+
+fn require_candidate_worker(path: PathBuf) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "candidate worker not found at {}: {error}. Run `cargo build --release --workspace \
+             --offline --locked` before `cargo run`, and rebuild `ssi-candidate-worker` after \
+             ordering edits",
+            path.display()
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(format!(
+            "candidate worker is not a regular file: {}. Run `cargo build --release --workspace \
+             --offline --locked` before `cargo run`",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Resolve the repo root so the gate finds src/ordering/ and deny.toml whether
-/// the binary is launched from the repo root or elsewhere. Uses CARGO_MANIFEST_DIR
-/// at compile time (the harness package dir), falling back to ".".
+/// the binary is launched from the repo root or elsewhere. Prefer the package
+/// directory embedded by Cargo, then walk up from the executable and current
+/// directory. The latter is required for grader builds: the build sandbox
+/// deliberately exposes the checkout as `/workspace`, which does not exist
+/// after the resulting trusted binary returns to the host runner.
 fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    let compiled = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let executable = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    resolve_repo_root(compiled, executable.as_deref(), cwd.as_deref())
+}
+
+fn resolve_repo_root(
+    compiled: &Path,
+    executable: Option<&Path>,
+    cwd: Option<&Path>,
+) -> PathBuf {
+    find_repo_root(compiled)
+        .or_else(|| executable.and_then(find_repo_root))
+        .or_else(|| cwd.and_then(find_repo_root))
+        .unwrap_or_else(|| compiled.to_path_buf())
+}
+
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|path| {
+            path.join("deny.toml").is_file() && path.join("src/ordering").is_dir()
+        })
+        .map(Path::to_path_buf)
+}
+
+fn is_public_dev_corpus(repo_root: &Path, path: &Path) -> bool {
+    // Canonical comparison recognizes absolute paths and symlinked aliases to
+    // the shipped public corpus without trusting a matching relative spelling
+    // in some other working directory. Any resolution failure stays
+    // fail-closed: an unrecognized path is treated as hidden.
+    let repo_dev = repo_root.join(corpus::DEV_CORPUS_FILE);
+    match (std::fs::canonicalize(path), std::fs::canonicalize(repo_dev)) {
+        (Ok(candidate), Ok(public_dev)) => candidate == public_dev,
+        _ => false,
+    }
+}
+
+fn matrix_failure(show_matrix_census: bool, name: &str, detailed: &str, redacted: &str) -> String {
+    if show_matrix_census {
+        format!("{name}: {detailed}")
+    } else {
+        format!("hidden matrix: {redacted}")
+    }
+}
+
+#[cfg(test)]
+mod repo_root_tests {
+    use super::*;
+
+    const MISSING_SANDBOX_ROOT: &str = "/__ssi_missing_build_sandbox_workspace__";
+
+    #[test]
+    fn uses_valid_compiled_manifest_directory() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(resolve_repo_root(expected, None, None), expected);
+    }
+
+    #[test]
+    fn falls_back_from_build_sandbox_path_to_executable_location() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let executable = expected.join("target/trusted/release/ssi-ordering-challenge");
+        assert_eq!(
+            resolve_repo_root(
+                Path::new(MISSING_SANDBOX_ROOT),
+                Some(&executable),
+                Some(Path::new("/")),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn falls_back_to_current_directory_when_executable_is_external() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            resolve_repo_root(
+                Path::new(MISSING_SANDBOX_ROOT),
+                Some(Path::new("/tmp/ssi-ordering-challenge")),
+                Some(expected),
+            ),
+            expected
+        );
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+
+    #[test]
+    fn public_dev_corpus_recognizes_relative_and_canonical_paths() {
+        let root = repo_root();
+        let relative = Path::new(corpus::DEV_CORPUS_FILE);
+        assert!(is_public_dev_corpus(&root, relative));
+
+        let canonical = std::fs::canonicalize(root.join(relative))
+            .expect("canonicalize shipped public dev corpus");
+        assert!(is_public_dev_corpus(&root, &canonical));
+        assert!(!is_public_dev_corpus(
+            &root,
+            &std::env::temp_dir().join("hidden-eval.jsonl")
+        ));
+    }
+
+    #[test]
+    fn hidden_matrix_failures_redact_names_and_details() {
+        let reason = matrix_failure(
+            false,
+            "secret-matrix-name",
+            "timeout at n=1234, nnz=5678",
+            "ordering timed out",
+        );
+        assert_eq!(reason, "hidden matrix: ordering timed out");
+        assert!(!reason.contains("secret-matrix-name"));
+        assert!(!reason.contains("1234"));
+        assert!(!reason.contains("5678"));
+    }
+
+    #[test]
+    fn public_dev_matrix_failures_keep_actionable_details() {
+        let reason = matrix_failure(
+            true,
+            "dev-matrix",
+            "timeout at n=12, nnz=34",
+            "ordering timed out",
+        );
+        assert_eq!(reason, "dev-matrix: timeout at n=12, nnz=34");
+    }
 }
 
 fn now() -> u64 {
@@ -382,13 +775,32 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn append_results(ts: u64, status: &str, score: f64, fill: f64, note: &str) {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("results.tsv")
-        .expect("open results.tsv");
-    writeln!(f, "{ts}\t{status}\t{score:.6}\t{fill:.6}\t{note}").expect("append results.tsv");
+fn finish_failed_run(artifacts: &artifacts::RunArtifacts, reason: &str, note: &str) -> ExitCode {
+    finish_failed_run_at(artifacts, now(), reason, note)
+}
+
+fn finish_failed_run_at(
+    artifacts: &artifacts::RunArtifacts,
+    timestamp: u64,
+    reason: &str,
+    note: &str,
+) -> ExitCode {
+    println!("\nRUN FAILED: {reason}");
+    let row = result_row(
+        timestamp,
+        "FAIL",
+        f64::NAN,
+        f64::NAN,
+        &failsafe::compose_note(reason, note),
+    );
+    if let Err(e) = artifacts.finish_failure(&row) {
+        eprintln!("could not clear/rewrite failed-run artifacts: {e}");
+    }
+    ExitCode::FAILURE
+}
+
+fn result_row(ts: u64, status: &str, score: f64, fill: f64, note: &str) -> String {
+    format!("{ts}\t{status}\t{score:.6}\t{fill:.6}\t{note}")
 }
 
 fn parse_note() -> String {
@@ -400,7 +812,3 @@ fn parse_note() -> String {
     }
     String::new()
 }
-
-// `_` reference so `Pattern` import is used even if the type is only named in
-// closures above; keeps the contract type visible at the harness boundary.
-const _: fn(&Pattern) -> Vec<usize> = ordering::order;

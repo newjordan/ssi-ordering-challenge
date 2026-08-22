@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -16,10 +15,12 @@ def run(*args: str) -> str:
 
 
 def rustfmt(source: str) -> str:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".rs") as candidate:
-        candidate.write(source)
-        candidate.flush()
-        return run(
+    # Feed the source on stdin: with a file argument rustfmt prepends a
+    # "<name>:\n\n" header to --emit stdout, which would make this comparison
+    # unconditionally unequal (added files always fail, edited files are
+    # always misclassified as pre-existing debt).
+    return subprocess.run(
+        (
             "rustfmt",
             "--edition",
             "2021",
@@ -27,8 +28,12 @@ def rustfmt(source: str) -> str:
             "stdout",
             "--config",
             "skip_children=true",
-            candidate.name,
-        )
+        ),
+        check=True,
+        text=True,
+        input=source,
+        stdout=subprocess.PIPE,
+    ).stdout
 
 
 def base_source(base: str, path: str) -> str | None:

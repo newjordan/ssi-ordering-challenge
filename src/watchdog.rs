@@ -90,8 +90,8 @@ fn kill_group(child: &mut std::process::Child) {
     let pid = child.id();
     let killed = trusted_kill_path()
         .map(|kill| {
-            // `--` is load-bearing on GNU kill: without it, a negative PGID can
-            // be parsed as another signal option instead of the group target.
+            // `--` is load-bearing on GNU kill: without it, the negative PGID
+            // is parsed as an option and can end up signalling pid -1.
             kill_group_command(kill, pid)
                 .status()
                 .map(|s| s.success())

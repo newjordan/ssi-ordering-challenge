@@ -40,5 +40,11 @@ jobs:
       - name: Test watchdog process isolation offline
         run: cargo test --locked --offline --bin ssi-ordering-challenge watchdog::tests
 
+      # The time-cap integration tests drive the trusted parent, which spawns
+      # the separately built ssi-candidate-worker; `cargo test --test time_cap`
+      # alone would not build that sibling workspace package.
+      - name: Build workspace for integration tests
+        run: cargo build --release --locked --offline --workspace
+
       - name: Test enforced time cap offline
         run: cargo test --release --locked --offline --test time_cap

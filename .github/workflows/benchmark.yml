@@ -50,6 +50,27 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
 
+      # Bubblewrap is used twice: once around the release build (where
+      # dependency build.rs/proc macros can execute), then independently around
+      # every order() worker. Package installation is the only root operation;
+      # the trusted grader parent and all untrusted code run as the runner user.
+      - name: Install bubblewrap
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          bwrap --version
+
+      # Ubuntu 24.04 (the ubuntu-latest image) enables an AppArmor policy that
+      # restricts unprivileged user namespaces, which stops bubblewrap from
+      # configuring loopback in its --unshare-net namespace (bwrap fails with
+      # RTM_NEWADDR: Operation not permitted). Relax it so the unprivileged
+      # grader sandbox can create its PID/network/filesystem namespaces. This
+      # is the only namespace-related root operation; the trusted parent and
+      # all untrusted code still run as the runner user.
+      - name: Allow unprivileged user namespaces (Ubuntu 24.04)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       # Validate deps.toml, generate the trusted manifest, freeze the lockfile,
       # vendor the FULL transitive tree, and scan it for native/FFI escapes. This
       # is the ONLY step that uses the network (cargo vendor fetches from the
@@ -57,23 +78,33 @@ jobs:
       - name: Prepare build (validate deps, vendor, scan tree)
         run: bash scripts/prepare-build.sh
 
-      # Stable step name "Setup": a failure here maps to setup_failed. Build from
-      # the vendored snapshot with no network and the frozen lockfile — nothing
-      # outside vendor/ can enter, so no closed-source or foreign code can be
-      # fetched at build time (docs/DECISION-crate-policy.md, Task 7). The build
-      # runs in a network namespace too: a vendored `--offline` build needs no
-      # network, and isolating it means a dependency's build.rs cannot phone home
-      # or exfiltrate even during compilation (the eval corpus is fetched AFTER
-      # this step, so it is not on disk here regardless).
+      # Stable step name "Setup": a failure here maps to setup_failed. Build the
+      # trusted parent and candidate package separately. Their clean target
+      # directories are mounted one at a time, so candidate build scripts cannot
+      # replace the parent executable. The eval corpus is fetched only later.
       - name: Setup
         run: |
           set -euo pipefail
-          # `sudo` resets PATH to secure_path (dropping ~/.cargo/bin), so pass the
-          # runner's PATH + HOME + cargo/rustup homes through explicitly, else the
-          # inner `cargo` is not found. `env VAR=…` bypasses sudo's secure_path.
-          sudo env "PATH=$PATH" "HOME=$HOME" \
-            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            unshare -n bash -c 'ip link set lo up 2>/dev/null || true; exec cargo build --release --offline --locked'
+          test "$(id -u)" -ne 0
+          scripts/grader-sandbox.sh self-check
+          scripts/grader-sandbox.sh trusted-build
+          scripts/grader-sandbox.sh candidate-build
+
+      # Runs the exact Rust command builder used for every order() call. It
+      # gates on PID 1/private proc, no default route, empty environment,
+      # /dev/null stdio, read-only input, hidden host paths, writable output, and
+      # watchdog teardown of a candidate descendant.
+      - name: Verify per-worker sandbox
+        env:
+          SSI_GRADER_SANDBOX: bubblewrap
+          SSI_CANDIDATE_WORKER: ${{ github.workspace }}/target/candidate/release/ssi-candidate-worker
+        run: |
+          set -euo pipefail
+          ./target/trusted/release/ssi-ordering-challenge --grader --sandbox-self-check
+          ./target/trusted/release/ssi-ordering-challenge --grader --sandbox-timeout-self-check
+          cargo test --offline --locked --package ssi-ordering-challenge \
+            sandbox::tests::bubblewrap_timeout_tears_down_candidate_descendants \
+            -- --ignored
 
       # Fetch today's hidden EVAL corpus to a temp path OUTSIDE the repo tree, so
       # the eval bytes never sit at a tracked path and can never be committed
@@ -102,41 +133,28 @@ jobs:
       # produced no eval file the value is empty, which the seam treats as unset
       # and falls back to the dev corpus (default-preserving).
       #
-      # NETWORK ISOLATION: the scored run executes in a fresh network namespace
-      # (`unshare -n`, loopback only) so an untrusted submission's order() cannot
-      # reach the internet — it cannot call a hosted model or exfiltrate the eval
-      # corpus at runtime (docs/DECISION-crate-policy.md, Task 9). The corpus is
-      # already on local disk by this point, so no network is needed to score.
-      # Isolating only this process leaves the runner agent's control-plane
-      # connection intact (unlike a global `iptables OUTPUT DROP`). `set -euo
-      # pipefail` + the explicit `unshare` mean a failure to establish isolation
-      # fails the step LOUDLY rather than silently scoring un-isolated.
+      # The trusted parent stays outside the sandbox to load/score the hidden
+      # corpus. SSI_GRADER_SANDBOX makes each of the two order() runs per matrix
+      # launch in its OWN bubblewrap PID/network/filesystem namespace. This is
+      # deliberately not one shared namespace around the harness: a shared
+      # /proc would expose trusted-parent memory to workers. Requested sandbox
+      # mode fails closed if bubblewrap cannot establish the boundary.
       - name: Benchmark
+        id: benchmark
         env:
           SSI_CORPUS_FILE: ${{ steps.corpus.outputs.corpus_file }}
+          SSI_GRADER_SANDBOX: bubblewrap
+          SSI_CANDIDATE_WORKER: ${{ github.workspace }}/target/candidate/release/ssi-candidate-worker
         run: |
           set -euo pipefail
-          # `sudo` resets PATH to secure_path (dropping ~/.cargo/bin); pass the
-          # runner's PATH + HOME + cargo/rustup homes (and SSI_CORPUS_FILE)
-          # through so the inner `cargo` resolves. `env VAR=…` bypasses
-          # sudo's secure_path.
-          sudo env "PATH=$PATH" "HOME=$HOME" \
-            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
-            "SSI_CORPUS_FILE=${SSI_CORPUS_FILE:-}" \
-            unshare -n --pid --fork --mount-proc bash -c '
-              ip link set lo up 2>/dev/null || true
-              # Best-effort sanity check (logged, non-gating): confirm egress is
-              # actually blocked inside the namespace before the scored run.
-              bash .github/scripts/assert-no-network.sh || true
-              exec cargo run --release --offline --locked
-            '
+          test "$(id -u)" -ne 0
+          exec ./target/trusted/release/ssi-ordering-challenge --grader
 
-      # The score artifact is the channel Hilbert reads. Upload even on failure so
-      # a partial/zero score is visible rather than silently lost; the run still
-      # concludes `failure` (the harness exits non-zero on any gate failure),
-      # which is what Hilbert keys its accept/reject decision on.
+      # The score artifact is the channel Hilbert reads. A failed benchmark must
+      # never publish a stale or worker-forged score; the harness also clears
+      # score.json authoritatively before returning failure.
       - name: Upload score
-        if: always()
+        if: ${{ success() && steps.benchmark.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (SHA-pinned: org requires it)
         with:
           name: score
