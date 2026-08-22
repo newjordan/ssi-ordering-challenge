@@ -70,34 +70,44 @@ fn read_prefix(path: &std::path::Path) -> String {
     String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
-/// Load the development corpus as `(source, Pattern)` pairs, in file order,
-/// through the shared `ssi_scoring::load_corpus_jsonl` reader (the single JSONL
-/// parser — Invariant 2). Returns an empty vec when the corpus file is absent so
-/// the caller can print an actionable "run from the repo root" message; panics
-/// on a present-but-unparseable file or an unresolved Git LFS pointer.
-pub fn corpus() -> Vec<(String, Pattern)> {
-    let path = corpus_path();
+/// Load `path` as `(source, Pattern)` pairs through the shared JSONL reader.
+///
+/// Returns an empty vec when the file is absent. Parse/LFS errors are returned
+/// so the harness can redact details for a hidden corpus before writing logs.
+pub fn load(path: &std::path::Path) -> Result<Vec<(String, Pattern)>, String> {
     // If the corpus is an unresolved Git LFS pointer (clone without git-lfs),
     // fail loudly with a fix, not a confusing parse error. Only the first line
     // matters (the pointer's `version` marker), so read a small prefix rather
     // than slurping the whole corpus (~99 MB) just to check it.
-    if is_lfs_pointer(&read_prefix(&path)) {
-        panic!(
+    if is_lfs_pointer(&read_prefix(path)) {
+        return Err(format!(
             "{} is an unresolved Git LFS pointer, not the corpus.\n\
              Install git-lfs and fetch the real file:\n\
              \x20   git lfs install && git lfs pull",
             path.display()
-        );
+        ));
     }
-    match ssi_scoring::load_corpus_jsonl(&path) {
-        Ok(c) => c,
+    match ssi_scoring::load_corpus_jsonl(path) {
+        Ok(c) => Ok(c),
         Err(e) => {
             if path.exists() {
-                panic!("failed to load {}: {e}", path.display());
+                Err(format!("failed to load {}: {e}", path.display()))
+            } else {
+                Ok(Vec::new())
             }
-            Vec::new()
         }
     }
+}
+
+/// Load the resolved corpus with fail-loud behavior, for tests.
+///
+/// The main harness uses [`load`] directly so hidden-corpus errors can be
+/// redacted. Developer probes live in the candidate-worker package, which
+/// carries its own test-only corpus shim.
+#[cfg(test)]
+pub fn corpus() -> Vec<(String, Pattern)> {
+    let path = corpus_path();
+    load(&path).unwrap_or_else(|e| panic!("{e}"))
 }
 
 #[cfg(test)]
@@ -108,7 +118,10 @@ mod tests {
     fn corpus_path_defaults_to_dev_when_env_unset() {
         // Contestants never set SSI_CORPUS_FILE; the default must be the public
         // dev corpus so local runs are unchanged (contract-invisible seam).
-        assert_eq!(resolve_corpus_path_from(None), PathBuf::from(DEV_CORPUS_FILE));
+        assert_eq!(
+            resolve_corpus_path_from(None),
+            PathBuf::from(DEV_CORPUS_FILE)
+        );
     }
 
     #[test]
@@ -116,14 +129,23 @@ mod tests {
         // The grader workflow sets SSI_CORPUS_FILE to the downloaded eval corpus
         // at a temp path outside the repo tree (§1 of the publish plan).
         let eval = "/tmp/eval.jsonl";
-        assert_eq!(resolve_corpus_path_from(Some(eval.to_string())), PathBuf::from(eval));
+        assert_eq!(
+            resolve_corpus_path_from(Some(eval.to_string())),
+            PathBuf::from(eval)
+        );
     }
 
     #[test]
     fn corpus_path_treats_blank_env_as_unset() {
         // A defined-but-empty env var must not silently point the harness at "".
-        assert_eq!(resolve_corpus_path_from(Some(String::new())), PathBuf::from(DEV_CORPUS_FILE));
-        assert_eq!(resolve_corpus_path_from(Some("   ".to_string())), PathBuf::from(DEV_CORPUS_FILE));
+        assert_eq!(
+            resolve_corpus_path_from(Some(String::new())),
+            PathBuf::from(DEV_CORPUS_FILE)
+        );
+        assert_eq!(
+            resolve_corpus_path_from(Some("   ".to_string())),
+            PathBuf::from(DEV_CORPUS_FILE)
+        );
     }
 
     #[test]
@@ -140,6 +162,17 @@ mod tests {
             assert_eq!(pat_a.col_ptr, pat_b.col_ptr);
             assert_eq!(pat_a.row_idx, pat_b.row_idx);
         }
+    }
+
+    #[test]
+    fn load_returns_parse_error_instead_of_panicking() {
+        let dir = std::env::temp_dir().join("ssi-corpus-load-error-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("malformed.jsonl");
+        std::fs::write(&path, r#"{"source":"SECRET_NAME","n":"bad"}"#).unwrap();
+        let error = load(&path).unwrap_err();
+        assert!(error.contains("SECRET_NAME"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -17,7 +17,8 @@
 //!   4. recompute predicted flops and nnz(L) from the permutation with the
 //!      trusted scoring wrapper (Stage D) — your code never reports a number;
 //!
-//! then prints a per-matrix table and a per-bucket breakdown, computes
+//! then, for the public development corpus, prints a per-matrix table and a
+//! per-bucket breakdown; all runs compute
 //!
 //!     score = weighted mean over size buckets of
 //!             geomean_within_bucket( flops(yours) / flops(AMD) )
@@ -142,12 +143,29 @@ fn main() -> ExitCode {
     }
 
     let corpus_file = corpus::corpus_path();
-    let corpus = corpus::corpus();
+    let show_matrix_census = is_public_dev_corpus(&repo_root, &corpus_file);
+    let corpus = match corpus::load(&corpus_file) {
+        Ok(corpus) => corpus,
+        Err(detail) => {
+            // A malformed hidden corpus must neither remain on disk nor leak
+            // matrix names through the parse error into public logs.
+            if !show_matrix_census {
+                let _ = std::fs::remove_file(&corpus_file);
+            }
+            let reason = if show_matrix_census {
+                detail
+            } else {
+                "failed to load hidden corpus".to_string()
+            };
+            return finish_failed_run(&run_artifacts, &reason, &note);
+        }
+    };
     // The corpus is fully resident in memory now and no worker has run yet.
     // If this is a grader-supplied hidden eval corpus, unlink it so worker
     // children cannot read the eval set from disk (F2). The default dev
-    // corpus lives in the repo tree, is public, and is left alone.
-    if corpus_file != Path::new(corpus::DEV_CORPUS_FILE) {
+    // corpus lives in the repo tree, is public, and is left alone — matched
+    // by canonical path so an absolute spelling of it is never deleted.
+    if !show_matrix_census {
         let _ = std::fs::remove_file(&corpus_file);
     }
     if corpus.is_empty() {
@@ -158,10 +176,12 @@ fn main() -> ExitCode {
         return finish_failed_run(&run_artifacts, &reason, &note);
     }
 
-    println!(
-        "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
-        "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
-    );
+    if show_matrix_census {
+        println!(
+            "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
+            "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
+        );
+    }
 
     let mut buckets = [BucketAcc::default(); BUCKETS];
     let mut failed: Option<String> = None;
@@ -187,7 +207,12 @@ fn main() -> ExitCode {
         })) {
             Ok(b) => b,
             Err(msg) => {
-                failed = Some(format!("{name}: trusted baseline/score panicked — {msg}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &format!("trusted baseline/score panicked — {msg}"),
+                    "trusted baseline/score panicked",
+                ));
                 break;
             }
         };
@@ -195,77 +220,122 @@ fn main() -> ExitCode {
         // Serialize THIS pattern once to the scratch dir; both determinism runs
         // read it. Written by the trusted parent OUTSIDE the timed window, so its
         // cost never counts against the per-matrix cap.
-        let pat_file = scratch.path().join(format!("{seq}-pat.bin"));
-        let _ = std::fs::remove_file(&pat_file);
-        if let Err(e) = ssi_worker_protocol::write_pattern(&pat_file, pat) {
-            failed = Some(format!("{name}: failed to stage pattern for worker: {e}"));
+        // The per-file guard unlinks it after both runs and on every earlier
+        // break/unwind; the whole-directory guard remains a final fallback.
+        let pat_file = failsafe::StagedFile::new(scratch.path().join(format!("{seq}-pat.bin")));
+        if let Err(e) = ssi_worker_protocol::write_pattern(pat_file.path(), pat) {
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("failed to stage pattern for worker: {e}"),
+                "failed to stage pattern for worker",
+            ));
             break;
         }
 
         // --- contestant ordering: capped subprocess, run twice ---
-        let run_once =
-            |tag: &str| -> Result<Vec<usize>, String> {
-                let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
-                let _ = std::fs::remove_file(&out_perm);
-                // Pre-create the output so grader mode can bind precisely one
-                // writable file. No directory is writable in the worker sandbox.
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&out_perm)
-                    .map_err(|e| format!("failed to stage worker output: {e}"))?;
-                // Local mode keeps the historical private empty CWD. Grader mode
-                // replaces the entire filesystem and does not expose this path.
-                let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
-                std::fs::create_dir_all(&worker_cwd)
-                    .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
-                let mut cmd = worker_sandbox.worker_command(
-                    &candidate_worker,
-                    sandbox::WorkerInvocation::Order,
-                    &pat_file,
-                    &out_perm,
-                    &worker_cwd,
-                )?;
-                let t0 = Instant::now();
-                match watchdog::run_capped(&mut cmd, &cap) {
-                    watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(&out_perm)
-                        .map_err(|e| format!("worker produced no readable permutation: {e}")),
-                    watchdog::WorkerOutcome::Timeout => Err(format!(
-                    "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
-                     Your ordering must return within {:.0}s on every matrix. This matrix is \
-                     n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
-                     gate expensive paths by BOTH n and nnz.",
-                    TIME_CAP_PER_MATRIX.as_secs_f64(),
-                    t0.elapsed().as_secs_f64(),
-                    TIME_CAP_PER_MATRIX.as_secs_f64(),
-                    pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
-                )),
-                    watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
+        let run_once = |tag: &str| -> Result<Vec<usize>, String> {
+            let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
+            let _ = std::fs::remove_file(&out_perm);
+            // Pre-create the output so grader mode can bind precisely one
+            // writable file. No directory is writable in the worker sandbox.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out_perm)
+                .map_err(|e| format!("failed to stage worker output: {e}"))?;
+            // Local mode keeps the historical private empty CWD. Grader mode
+            // replaces the entire filesystem and does not expose this path.
+            let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
+            std::fs::create_dir_all(&worker_cwd)
+                .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
+            let mut cmd = worker_sandbox.worker_command(
+                &candidate_worker,
+                sandbox::WorkerInvocation::Order,
+                pat_file.path(),
+                &out_perm,
+                &worker_cwd,
+            )?;
+            let t0 = Instant::now();
+            match watchdog::run_capped(&mut cmd, &cap) {
+                watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(&out_perm)
+                    .map_err(|e| format!("worker produced no readable permutation: {e}")),
+                watchdog::WorkerOutcome::Timeout => {
+                    if show_matrix_census {
+                        Err(format!(
+                            "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
+                             Your ordering must return within {:.0}s on every matrix. This matrix is \
+                             n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
+                             gate expensive paths by BOTH n and nnz.",
+                            TIME_CAP_PER_MATRIX.as_secs_f64(),
+                            t0.elapsed().as_secs_f64(),
+                            TIME_CAP_PER_MATRIX.as_secs_f64(),
+                            pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
+                        ))
+                    } else {
+                        Err(format!(
+                            "order() exceeded the {:.1}s per-matrix cap and was killed",
+                            TIME_CAP_PER_MATRIX.as_secs_f64()
+                        ))
+                    }
                 }
-            };
+                watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
+            }
+        };
 
         let perm1 = match run_once("a") {
             Ok(p) => p,
             Err(e) => {
-                failed = Some(format!("{name}: {e}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &e,
+                    "worker ordering failed",
+                ));
                 break;
             }
         };
         let perm2 = match run_once("b") {
             Ok(p) => p,
             Err(e) => {
-                failed = Some(format!("{name}: {e}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &e,
+                    "worker ordering failed",
+                ));
                 break;
             }
         };
+        // Neither worker needs the staged input now. Unlink immediately instead
+        // of retaining this matrix until whole-run scratch cleanup. Any failure
+        // aborts before another worker can observe the leftover file; the guard
+        // retries on this loop exit.
+        if let Err(e) = pat_file.remove_now() {
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("failed to remove staged worker pattern: {e}"),
+                "failed to remove staged worker input",
+            ));
+            break;
+        }
         if perm1 != perm2 {
-            failed = Some(format!(
-                "{name}: nondeterministic ordering (two runs differ)"
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                "nondeterministic ordering (two runs differ)",
+                "nondeterministic ordering (two runs differ)",
             ));
             break;
         }
         if let Err(e) = validate_permutation(&perm1, pat.n) {
-            failed = Some(format!("{name}: invalid permutation — {e}"));
+            failed = Some(matrix_failure(
+                show_matrix_census,
+                name,
+                &format!("invalid permutation — {e}"),
+                "invalid permutation",
+            ));
             break;
         }
 
@@ -273,7 +343,12 @@ fn main() -> ExitCode {
         let yours = match failsafe::catch(std::panic::AssertUnwindSafe(|| score(pat, &perm1))) {
             Ok(s) => s,
             Err(msg) => {
-                failed = Some(format!("{name}: trusted scoring panicked — {msg}"));
+                failed = Some(matrix_failure(
+                    show_matrix_census,
+                    name,
+                    &format!("trusted scoring panicked — {msg}"),
+                    "trusted scoring panicked",
+                ));
                 break;
             }
         };
@@ -284,18 +359,20 @@ fn main() -> ExitCode {
         buckets[b].log_fill_sum += fill_ratio.ln();
         buckets[b].count += 1;
 
-        let line = format!(
-            "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8.3} {:>9}",
-            name,
-            pat.n,
-            pat.nnz(),
-            base.flops,
-            yours.flops,
-            ratio,
-            "(capped)"
-        );
-        println!("{line}");
-        let _ = writeln!(table, "{line}");
+        if show_matrix_census {
+            let line = format!(
+                "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8.3} {:>9}",
+                name,
+                pat.n,
+                pat.nnz(),
+                base.flops,
+                yours.flops,
+                ratio,
+                "(capped)"
+            );
+            println!("{line}");
+            let _ = writeln!(table, "{line}");
+        }
     }
 
     let timestamp = now();
@@ -312,21 +389,25 @@ fn main() -> ExitCode {
             let score_val = combine(&flop_gms, &BUCKET_WEIGHTS);
             let fill = combine(&fill_gms, &BUCKET_WEIGHTS);
 
-            // Per-bucket breakdown table.
-            println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
-            println!(
-                "{:<8} {:>6} {:>16} {:>16}",
-                "bucket", "count", "flop_geomean", "fill_geomean"
-            );
-            for i in 0..BUCKETS {
-                let fmt = |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+            // Bucket-level diagnostics disclose both occupancy and relative
+            // performance, so they are emitted only for the public dev corpus.
+            if show_matrix_census {
+                println!("\nper-bucket (geomean of ratio vs AMD, within bucket):");
                 println!(
                     "{:<8} {:>6} {:>16} {:>16}",
-                    BUCKET_KEYS[i],
-                    buckets[i].count,
-                    fmt(flop_gms[i]),
-                    fmt(fill_gms[i]),
+                    "bucket", "count", "flop_geomean", "fill_geomean"
                 );
+                for i in 0..BUCKETS {
+                    let fmt =
+                        |g: Option<f64>| g.map_or_else(|| "—".to_string(), |v| format!("{v:.4}"));
+                    println!(
+                        "{:<8} {:>6} {:>16} {:>16}",
+                        BUCKET_KEYS[i],
+                        buckets[i].count,
+                        fmt(flop_gms[i]),
+                        fmt(fill_gms[i]),
+                    );
+                }
             }
 
             println!(
@@ -335,34 +416,43 @@ fn main() -> ExitCode {
             println!("tiebreak (weighted mean of per-bucket geomean fill ratios):                    {fill:.4}");
 
             // score.json — top-level `score` is what the grader ranks on;
-            // `metrics` is passthrough detail (Hilbert captures it whole and shows
-            // it in the PR report). All three buckets are always listed; an empty
-            // bucket has count 0 and null geomeans.
-            let mut buckets_json = String::new();
-            for i in 0..BUCKETS {
-                let jf =
-                    |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
-                let sep = if i + 1 < BUCKETS { "," } else { "" };
-                let _ = write!(
-                    buckets_json,
-                    "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
-                    BUCKET_KEYS[i],
-                    buckets[i].count,
-                    jf(flop_gms[i]),
-                    jf(fill_gms[i]),
-                    sep,
-                );
-            }
-            let total: usize = buckets.iter().map(|b| b.count).sum();
-            let json = format!(
-                "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
-                 \"geomean_flop_ratio\": {score_val:.6}, \
-                 \"geomean_fill_ratio\": {fill:.6}, \
-                 \"matrices\": {total}, \
-                 \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
-                 \"buckets\": {{ {buckets_json} }} }} }}\n",
-                BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
-            );
+            // `metrics` is passthrough detail (Hilbert captures it whole and
+            // shows it in the PR report). Preserve the public-dev schema, but
+            // hidden artifacts expose aggregate score/tiebreak metrics only.
+            let json = if show_matrix_census {
+                let mut buckets_json = String::new();
+                for i in 0..BUCKETS {
+                    let jf = |g: Option<f64>| {
+                        g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"))
+                    };
+                    let sep = if i + 1 < BUCKETS { "," } else { "" };
+                    let _ = write!(
+                        buckets_json,
+                        "\"{}\": {{ \"count\": {}, \"geomean_flop_ratio\": {}, \"geomean_fill_ratio\": {} }}{}",
+                        BUCKET_KEYS[i],
+                        buckets[i].count,
+                        jf(flop_gms[i]),
+                        jf(fill_gms[i]),
+                        sep,
+                    );
+                }
+                let total: usize = buckets.iter().map(|b| b.count).sum();
+                format!(
+                    "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
+                     \"geomean_flop_ratio\": {score_val:.6}, \
+                     \"geomean_fill_ratio\": {fill:.6}, \
+                     \"matrices\": {total}, \
+                     \"weights\": {{ \"lt_1k\": {:.2}, \"1k_10k\": {:.2}, \"gt_10k\": {:.2} }}, \
+                     \"buckets\": {{ {buckets_json} }} }} }}\n",
+                    BUCKET_WEIGHTS[0], BUCKET_WEIGHTS[1], BUCKET_WEIGHTS[2],
+                )
+            } else {
+                format!(
+                    "{{ \"score\": {score_val:.6}, \"metrics\": {{ \
+                     \"geomean_flop_ratio\": {score_val:.6}, \
+                     \"geomean_fill_ratio\": {fill:.6} }} }}\n"
+                )
+            };
             let row = result_row(timestamp, "OK", score_val, fill, &note);
             match run_artifacts.finish_success(&row, &json) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -557,6 +647,26 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+fn is_public_dev_corpus(repo_root: &Path, path: &Path) -> bool {
+    // Canonical comparison recognizes absolute paths and symlinked aliases to
+    // the shipped public corpus without trusting a matching relative spelling
+    // in some other working directory. Any resolution failure stays
+    // fail-closed: an unrecognized path is treated as hidden.
+    let repo_dev = repo_root.join(corpus::DEV_CORPUS_FILE);
+    match (std::fs::canonicalize(path), std::fs::canonicalize(repo_dev)) {
+        (Ok(candidate), Ok(public_dev)) => candidate == public_dev,
+        _ => false,
+    }
+}
+
+fn matrix_failure(show_matrix_census: bool, name: &str, detailed: &str, redacted: &str) -> String {
+    if show_matrix_census {
+        format!("{name}: {detailed}")
+    } else {
+        format!("hidden matrix: {redacted}")
+    }
+}
+
 #[cfg(test)]
 mod repo_root_tests {
     use super::*;
@@ -594,6 +704,51 @@ mod repo_root_tests {
             ),
             expected
         );
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+
+    #[test]
+    fn public_dev_corpus_recognizes_relative_and_canonical_paths() {
+        let root = repo_root();
+        let relative = Path::new(corpus::DEV_CORPUS_FILE);
+        assert!(is_public_dev_corpus(&root, relative));
+
+        let canonical = std::fs::canonicalize(root.join(relative))
+            .expect("canonicalize shipped public dev corpus");
+        assert!(is_public_dev_corpus(&root, &canonical));
+        assert!(!is_public_dev_corpus(
+            &root,
+            &std::env::temp_dir().join("hidden-eval.jsonl")
+        ));
+    }
+
+    #[test]
+    fn hidden_matrix_failures_redact_names_and_details() {
+        let reason = matrix_failure(
+            false,
+            "secret-matrix-name",
+            "timeout at n=1234, nnz=5678",
+            "ordering timed out",
+        );
+        assert_eq!(reason, "hidden matrix: ordering timed out");
+        assert!(!reason.contains("secret-matrix-name"));
+        assert!(!reason.contains("1234"));
+        assert!(!reason.contains("5678"));
+    }
+
+    #[test]
+    fn public_dev_matrix_failures_keep_actionable_details() {
+        let reason = matrix_failure(
+            true,
+            "dev-matrix",
+            "timeout at n=12, nnz=34",
+            "ordering timed out",
+        );
+        assert_eq!(reason, "dev-matrix: timeout at n=12, nnz=34");
     }
 }
 
