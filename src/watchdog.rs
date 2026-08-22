@@ -81,8 +81,10 @@ pub fn run_capped(cmd: &mut Command, cfg: &CapConfig) -> WorkerOutcome {
 }
 
 /// SIGKILL the worker and every process it spawned. On unix the worker leads
-/// its own process group (see `run_capped`), so `kill -KILL -<pgid>` reaps the
-/// whole subtree; `pgid` equals the worker pid we set with `process_group(0)`.
+/// its own process group (see `run_capped`), so `kill -KILL -- -<pgid>` reaps
+/// the whole subtree; `pgid` equals the worker pid we set with
+/// `process_group(0)`. The `--` is required: without it, some Linux `kill`
+/// implementations parse the negative pgid as an option and signal pid -1.
 /// Falls back to a single-pid kill on non-unix.
 #[cfg(unix)]
 fn kill_group(child: &mut std::process::Child) {
@@ -91,6 +93,7 @@ fn kill_group(child: &mut std::process::Child) {
     // the grader watchdog family's use of `ps`/`kill`.
     let killed = Command::new("kill")
         .arg("-KILL")
+        .arg("--")
         .arg(format!("-{pid}"))
         .status()
         .map(|s| s.success())
