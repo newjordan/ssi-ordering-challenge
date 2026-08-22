@@ -30,30 +30,9 @@ even at modest n (and the corpus reaches n ≈ 340k). Any ND path must:
   the inner loop blows the cap. Detect and fall back to AMD-style here.
 
 ## Status in `src/ordering/`
-**In the portfolio, via libraries and hand-rolled variants** — no longer a lead.
-
-- `feral_metis` (multilevel ND, AMD base case) — three work levels plus, since
-  [0002](../experiments/0002-measured-gates-metis-kahip.md), five *shape*
-  variants (`max_imbalance`, `nd_to_amd_switch`, an extra seed).
-- `feral_scotch` (default + more separator trials), `feral_kahip` (Fast, plus
-  seed 2 and Eco mode).
-- Hand-rolled `nd_order` (BFS median-level separator) and `ndfm_order` (greedy
-  graph-growing + minimum-side separator), both with hard work budgets and
-  iterative task stacks.
-
-> **Correction (2026-07-26).** This page previously said ND was "lead only" and
-> that the demo hybrid "breaches the cap on dense matrices". Both are stale. The
-> cap-breach risk was specific to that demo's exact-MD O(deg^2)/pivot base case;
-> the library partitioners all use a near-linear AMD base case and stay inside
-> their gates. What IS true is that KaHIP is the single most expensive candidate
-> measured (up to 0.65 s at n~22k), which is why it has the tightest gate.
-
-**The honest result:** ND is *not* the headroom this knowledge base expected it
-to be. A 12-variant sweep across METIS/Scotch/KaHIP improved only 7 of 260
-matrices ([0002](../experiments/0002-measured-gates-metis-kahip.md)). It does win
-big where it wins — `mpbp_34` 0.567->0.452, `mpbp_35` 0.588->0.469 (both KaHIP,
-both in the heaviest bucket) — but on most of this corpus's KKT patterns AMD
-still beats every separator.
+Lead only — a reference ND+AMD demo exists in memory but is not a drop-in (it
+breaks the cap). Porting it to a quotient-graph base case is the top open
+question. See [open-questions.md](../open-questions.md).
 
 ## Links
 - Literature: _(add George 1973 and Karypis–Kumar 1998 notes)_
