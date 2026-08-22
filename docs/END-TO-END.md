@@ -115,7 +115,7 @@ optimization problem to a single score:
   (`ssi-scoring/src/loader.rs`), which routes every line through that core, so
   no second parser can silently disagree. The parent parses once and hands each
   worker subprocess the already-parsed `Pattern` (serialized via
-  `src/pattern_io.rs`), so the worker never re-reads or re-parses the corpus.
+  `ssi-worker-protocol`), so the worker never re-reads or re-parses the corpus.
 - **`flops = Σ c_j²`, `nnz_l = Σ c_j`.** `c_j` is the exact column count of the
   factor L for column `j` (Gilbert–Ng–Peyton). `Σ c_j` is the fill (nnz of L);
   `Σ c_j²` is a deterministic, hardware-independent proxy for the LDLᵀ
@@ -126,10 +126,11 @@ optimization problem to a single score:
 
 ## 4. The run: input → gates → score
 
-Driven by (regenerate the manifest from `deps.toml` first, then run):
+Driven by (regenerate manifests, build both packages, then run):
 
 ```sh
 bash scripts/prepare-build.sh                       # validate deps.toml → vendor → scan tree
+cargo build --release --workspace --offline --locked
 cargo run --release --offline --locked -- --note "what I tried"
 ```
 
@@ -141,7 +142,7 @@ partial credit):
 |---|---|---|
 | **A — purity & license** | scan `src/ordering/` for foreign-code escapes (`build.rs`, FFI, `#[no_mangle]`/`#[link]`, proc-macros, `include!` escapes); parse `src/ordering/deps.toml`; run `cargo-deny` (RequireDeny — mandatory). The grader also scans the vendored dependency tree for `*-sys`/`links`/C-build-deps/prebuilt blobs. | `src/purity.rs` → `ssi-purity` |
 | **load corpus** | parse every line of the corpus file into `(name, Pattern)`, once | `corpus::corpus()` (`src/corpus.rs`) |
-| **B — run order()** | run `order()` **twice** in a killable child process, timed against a 2 s/matrix cap; a panic or cap breach fails the run | `src/main.rs` (`run_once`) |
+| **B — run order()** | launch the separate `ssi-candidate-worker` (the only package linking ordering code/deps) **twice** in a killable child process, timed against a 2 s/matrix cap; a panic or cap breach fails the run | `src/main.rs` (`run_once`) |
 | **C — validate** | the returned permutation must be a true bijection of `0..n` | `validate_permutation` (`src/main.rs`) |
 | **E — determinism** | the two `order()` runs must return byte-identical permutations | `src/main.rs` (`perm1 != perm2`) |
 | **D — score** | `score(pattern, perm)` — the same function used for the baseline | `src/main.rs` (`let yours = score`) |
@@ -173,6 +174,7 @@ claim *"the score is a correct, stable, value-independent function of
 | **Exact equivalence (pins)** | `tests/exact_equivalence.rs` | Pinned `(nnz_l, flops)` for the identity ordering on three committed sample matrices (`st_e09`, `ex8_5_2`, `gilbert`), so *any* drift in the scoring path breaks the build immediately. `gilbert` (a hub-last arrow) has a closed-form pin (nnz_l = 2·1000+1 = 2001) proving the numbers are genuine, not transcribed. |
 | **Narrow input** | by construction (no test) | The corpus format (`patterns.jsonl`) carries no values — only `n`, `indptr`, `indices` — and `Pattern` has no field for values, so a contestant has nothing to peek at. The property holds structurally, not by assertion. (The former `tests/narrow_input.rs` demonstrated value-dropping on the `.mtx` `load_pattern` path; that loader is retired with the dual-reader design.) |
 | **Submission self-checks** | `src/ordering/mod.rs` (`mod tests`) | The shipped starter `order()` returns a valid bijection of `0..n` and handles the empty pattern — the contract the harness enforces. (These are the stub's own tests; you extend them as you build a real ordering.) |
+| **Sandbox/package boundary** | `tests/security_boundary.rs`, `src/sandbox.rs` | The parent excludes the candidate entrypoint, bubblewrap starts the candidate executable directly, and `--grader` rejects a missing sandbox selection. Linux CI additionally exercises timeout/descendant teardown inside bubblewrap. |
 
 There is **no loader-agreement test** anymore: with a single shared JSONL
 reader, the "two parsers might disagree" failure it guarded against cannot
@@ -187,8 +189,8 @@ occur (it is prevented by construction, not by assertion). See
 read results.tsv + src/ordering/memory/   →   form a hypothesis
         │
         ▼
-edit src/ordering/   →   cargo run --release -- --note "hypothesis"
-        ▲                        │
+edit src/ordering/   →   cargo build --release -p ssi-candidate-worker
+        ▲                 && cargo run --release -- --note "hypothesis"
         │   per-matrix table + score + any FAIL reason
         └────────────────────────┘
    write findings to src/ordering/memory/ ; commit when the score improves
@@ -213,14 +215,16 @@ runs `prepare-build.sh` (validate `deps.toml` → generate manifest → `cargo
 vendor` the full tree against the **committed** `Cargo.lock`, minimally updated
 for any newly declared crate → `scan_vendored_tree` for
 native/FFI escapes), builds `--offline --locked` from the vendored crates.io
-snapshot, then runs the scored step in a no-network namespace (`unshare -n`). It
+snapshot inside an unprivileged bubblewrap boundary, then launches every scored
+worker in its own PID/network/filesystem namespace. It
 grades a **hidden** eval corpus — disjoint from the dev corpus, drawn from the
 same distribution, regenerated per round — injected via the `SSI_CORPUS_FILE`
 path override, downloaded at run time to a temp path outside the repo tree (so
-the eval bytes are never committed). Scoring runs with no runtime network, a
-2–4 GB memory cap, and determinism re-runs. See
+the eval bytes are never committed). Workers run with no runtime network, no
+parent `/proc` visibility, a minimal read-only filesystem, and determinism
+re-runs. See
 [`DECISION-crate-policy.md`](DECISION-crate-policy.md) for the dependency-policy
-pipeline and its rationale.
+pipeline and [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md) for the exact boundaries.
 
 Because grading runs the identical harness + `ssi-scoring` functions you run
 locally, the number a contestant sees locally is structurally the number the

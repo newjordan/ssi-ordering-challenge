@@ -15,9 +15,27 @@ fn harness_bin() -> std::path::PathBuf {
     p
 }
 
+fn candidate_bin() -> std::path::PathBuf {
+    let mut path = harness_bin();
+    path.set_file_name(format!(
+        "ssi-candidate-worker{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    path
+}
+
 #[test]
 fn normal_run_succeeds_on_sample_corpus() {
+    let corpus =
+        std::env::temp_dir().join(format!("ssi-time-cap-corpus-{}.jsonl", std::process::id()));
+    std::fs::write(
+        &corpus,
+        "{\"n\":2,\"nnz\":4,\"indptr\":[0,2,4],\"indices\":[0,1,0,1],\"hash\":\"time-cap\",\"source\":\"time-cap\"}\n",
+    )
+    .unwrap();
     let out = Command::new(harness_bin())
+        .env("SSI_CANDIDATE_WORKER", candidate_bin())
+        .env("SSI_CORPUS_FILE", corpus)
         .args(["--note", "time_cap test: normal"])
         .output()
         .expect("run harness");
@@ -35,6 +53,7 @@ fn slow_ordering_is_killed_and_fails_promptly() {
     // the run in well under 30s.
     let start = Instant::now();
     let out = Command::new(harness_bin())
+        .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_TEST_SLEEP_MS", "30000")
         .args(["--note", "time_cap test: slow"])
         .output()

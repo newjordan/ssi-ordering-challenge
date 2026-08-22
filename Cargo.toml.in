@@ -6,19 +6,22 @@ license = "MIT"
 description = "Fill-reducing ordering challenge for sparse symmetric indefinite factorization"
 
 [workspace]
-members = ["ssi-scoring", "ssi-purity", "prototype-oracle"]
+members = [
+    "ssi-scoring",
+    "ssi-purity",
+    "ssi-worker-protocol",
+    "candidate-worker",
+    "prototype-oracle",
+]
+default-members = ["."]
 
-# THE HARNESS depends on the scoring wrapper (trusted code). It is the ONLY
-# scoring code path shared with the grader (Invariant 2). Contestants may declare
-# permissive, pure-Rust crates via src/ordering/deps.toml; prepare-build.sh
-# regenerates the [dependencies] below from this template + the validated
-# deps.toml. The purity gate enforces those crates (and their whole transitive
-# tree) are pure Rust and permissively licensed (Invariant 3). See
-# docs/DECISION-crate-policy.md.
+# The trusted parent depends only on frozen workspace packages. Contestant
+# ordering code and dependencies live exclusively in candidate-worker; this
+# prevents their pre-main initialization from entering the parent process.
 [dependencies]
 ssi-scoring = { path = "ssi-scoring" }
 ssi-purity = { path = "ssi-purity" }
-# === GENERATED DEPS BELOW (prepare-build.sh; do not edit by hand) ===
+ssi-worker-protocol = { path = "ssi-worker-protocol" }
 
 # Dev-only oracle: the original prototype Σc² scorer + synthetic pattern
 # generators. Used only by the cross-check tests in tests/; never linked into

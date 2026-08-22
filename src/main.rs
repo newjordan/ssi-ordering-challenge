@@ -46,30 +46,22 @@
 
 mod corpus;
 mod failsafe;
-mod ordering;
-mod pattern_io;
-mod perm_io;
 mod purity;
+mod sandbox;
 mod watchdog;
 
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ssi_scoring::{
-    combine, geomean, score, size_bucket, validate_permutation, BucketAcc, BUCKETS,
-    BUCKET_KEYS, BUCKET_WEIGHTS,
+    combine, geomean, score, size_bucket, validate_permutation, BucketAcc, BUCKETS, BUCKET_KEYS,
+    BUCKET_WEIGHTS,
 };
 
-// Re-export the contract type at the crate root so contestant code under
-// src/ordering/ imports it as `crate::Pattern`. The type is defined in
-// ssi_scoring (the one scoring path, Invariant 2); this is a pure alias, so a
-// local `Pattern` is the identical type the grader scores. Naming the crate's
-// defining type at its root is idiomatic Rust and keeps the import path honest
-// (no module-name clutter, no second file named pattern.rs).
 pub use ssi_scoring::Pattern;
 
 /// Per-matrix time cap, ENFORCED: order() runs in a child process that is
@@ -79,13 +71,51 @@ pub use ssi_scoring::Pattern;
 /// gates a submission on the server is exactly this constant — local and graded
 /// runs use the identical 2 s cap by construction (Invariant 2).
 const TIME_CAP_PER_MATRIX: Duration = Duration::from_secs(2);
+const CANDIDATE_WORKER_ENV: &str = "SSI_CANDIDATE_WORKER";
 
 fn main() -> ExitCode {
-    // Worker mode: the ONLY process that runs contestant order(). Reads the
-    // pattern the parent serialized, runs order(), writes the permutation, exits.
     let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.get(1).map(String::as_str) == Some("--worker") {
-        return ExitCode::from(worker(&raw_args[2..]) as u8);
+    let grader_mode = raw_args.iter().any(|arg| arg == "--grader");
+    let worker_sandbox = match sandbox::WorkerSandbox::from_env(grader_mode) {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            eprintln!("RUN FAILED (grader sandbox: {e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    let candidate_worker = match candidate_worker_path(grader_mode) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("RUN FAILED (candidate worker: {e})");
+            return ExitCode::FAILURE;
+        }
+    };
+    if raw_args.iter().any(|arg| arg == "--sandbox-self-check") {
+        return match sandbox_self_check_parent(&worker_sandbox, &candidate_worker) {
+            Ok(()) => {
+                println!("per-worker bubblewrap self-check passed");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sandbox self-check failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw_args
+        .iter()
+        .any(|arg| arg == "--sandbox-timeout-self-check")
+    {
+        return match sandbox_timeout_self_check_parent(&worker_sandbox, &candidate_worker) {
+            Ok(()) => {
+                println!("bubblewrap timeout teardown self-check passed");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("sandbox timeout self-check failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let note = parse_note();
@@ -96,7 +126,13 @@ fn main() -> ExitCode {
         let reason = format!("Stage A — purity/license: {e}");
         println!("RUN FAILED ({reason})");
         let ts = now();
-        append_results(ts, "FAIL", f64::NAN, f64::NAN, &failsafe::compose_note(&reason, &note));
+        append_results(
+            ts,
+            "FAIL",
+            f64::NAN,
+            f64::NAN,
+            &failsafe::compose_note(&reason, &note),
+        );
         return ExitCode::FAILURE;
     }
 
@@ -115,7 +151,13 @@ fn main() -> ExitCode {
             corpus_file.display()
         );
         println!("RUN FAILED: {reason}");
-        append_results(now(), "FAIL", f64::NAN, f64::NAN, &failsafe::compose_note(&reason, &note));
+        append_results(
+            now(),
+            "FAIL",
+            f64::NAN,
+            f64::NAN,
+            &failsafe::compose_note(&reason, &note),
+        );
         return ExitCode::FAILURE;
     }
 
@@ -128,13 +170,15 @@ fn main() -> ExitCode {
     let mut failed: Option<String> = None;
     let mut table = String::new();
 
-    // Resolve our own executable + a scratch dir for worker perm files.
-    let exe = std::env::current_exe().expect("locate harness executable");
+    // Create a scratch dir for worker protocol files.
     let scratch = failsafe::ScratchDir(
         std::env::temp_dir().join(format!("ssi-harness-{}", std::process::id())),
     );
     std::fs::create_dir_all(scratch.path()).expect("create scratch dir");
-    let cap = watchdog::CapConfig { time_cap: TIME_CAP_PER_MATRIX, poll: std::time::Duration::from_millis(10) };
+    let cap = watchdog::CapConfig {
+        time_cap: TIME_CAP_PER_MATRIX,
+        poll: std::time::Duration::from_millis(10),
+    };
 
     for (seq, (name, pat)) in corpus.iter().enumerate() {
         // --- AMD baseline (trusted, in-process) — guarded so a feral panic
@@ -156,43 +200,40 @@ fn main() -> ExitCode {
         // cost never counts against the per-matrix cap.
         let pat_file = scratch.path().join(format!("{seq}-pat.bin"));
         let _ = std::fs::remove_file(&pat_file);
-        if let Err(e) = pattern_io::write_pattern(&pat_file, pat) {
+        if let Err(e) = ssi_worker_protocol::write_pattern(&pat_file, pat) {
             failed = Some(format!("{name}: failed to stage pattern for worker: {e}"));
             break;
         }
 
         // --- contestant ordering: capped subprocess, run twice ---
-        let run_once = |tag: &str| -> Result<Vec<usize>, String> {
-            let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
-            let _ = std::fs::remove_file(&out_perm);
-            // Per-worker empty CWD. The pattern and output paths are absolute,
-            // so the worker needs no working-directory view of anything: no repo
-            // tree, no score.json, no results.tsv (F4).
-            let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
-            std::fs::create_dir_all(&worker_cwd)
-                .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.arg("--worker").arg(&pat_file).arg(&out_perm)
-                // The worker runs contestant code; hand it NOTHING. In
-                // particular SSI_CORPUS_FILE must not reach order() (F2).
-                .env_clear()
-                .current_dir(&worker_cwd);
-            // Re-forward ONLY the harness's own time-cap test hook. env_clear()
-            // above also strips this, which would silently defeat the
-            // time_cap::slow_ordering_is_killed_and_fails_promptly regression
-            // test (the pre-existing slow matrix masks it in debug, but a
-            // release run exposes it). It is inert in normal/graded runs — the
-            // grader never sets it — so re-adding just this one named var keeps
-            // the F2 mitigation (SSI_CORPUS_FILE and everything else stay
-            // stripped) while keeping the cap enforcement testable.
-            if let Ok(sleep_ms) = std::env::var("SSI_TEST_SLEEP_MS") {
-                cmd.env("SSI_TEST_SLEEP_MS", sleep_ms);
-            }
-            let t0 = Instant::now();
-            match watchdog::run_capped(&mut cmd, &cap) {
-                watchdog::WorkerOutcome::Ok => perm_io::read_perm(&out_perm)
-                    .map_err(|e| format!("worker produced no readable permutation: {e}")),
-                watchdog::WorkerOutcome::Timeout => Err(format!(
+        let run_once =
+            |tag: &str| -> Result<Vec<usize>, String> {
+                let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
+                let _ = std::fs::remove_file(&out_perm);
+                // Pre-create the output so grader mode can bind precisely one
+                // writable file. No directory is writable in the worker sandbox.
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&out_perm)
+                    .map_err(|e| format!("failed to stage worker output: {e}"))?;
+                // Local mode keeps the historical private empty CWD. Grader mode
+                // replaces the entire filesystem and does not expose this path.
+                let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
+                std::fs::create_dir_all(&worker_cwd)
+                    .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
+                let mut cmd = worker_sandbox.worker_command(
+                    &candidate_worker,
+                    sandbox::WorkerInvocation::Order,
+                    &pat_file,
+                    &out_perm,
+                    &worker_cwd,
+                )?;
+                let t0 = Instant::now();
+                match watchdog::run_capped(&mut cmd, &cap) {
+                    watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(&out_perm)
+                        .map_err(|e| format!("worker produced no readable permutation: {e}")),
+                    watchdog::WorkerOutcome::Timeout => Err(format!(
                     "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
                      Your ordering must return within {:.0}s on every matrix. This matrix is \
                      n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
@@ -202,20 +243,28 @@ fn main() -> ExitCode {
                     TIME_CAP_PER_MATRIX.as_secs_f64(),
                     pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
                 )),
-                watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
-            }
-        };
+                    watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
+                }
+            };
 
         let perm1 = match run_once("a") {
             Ok(p) => p,
-            Err(e) => { failed = Some(format!("{name}: {e}")); break; }
+            Err(e) => {
+                failed = Some(format!("{name}: {e}"));
+                break;
+            }
         };
         let perm2 = match run_once("b") {
             Ok(p) => p,
-            Err(e) => { failed = Some(format!("{name}: {e}")); break; }
+            Err(e) => {
+                failed = Some(format!("{name}: {e}"));
+                break;
+            }
         };
         if perm1 != perm2 {
-            failed = Some(format!("{name}: nondeterministic ordering (two runs differ)"));
+            failed = Some(format!(
+                "{name}: nondeterministic ordering (two runs differ)"
+            ));
             break;
         }
         if let Err(e) = validate_permutation(&perm1, pat.n) {
@@ -304,7 +353,8 @@ fn main() -> ExitCode {
             // bucket has count 0 and null geomeans.
             let mut buckets_json = String::new();
             for i in 0..BUCKETS {
-                let jf = |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
+                let jf =
+                    |g: Option<f64>| g.map_or_else(|| "null".to_string(), |v| format!("{v:.6}"));
                 let sep = if i + 1 < BUCKETS { "," } else { "" };
                 let _ = write!(
                     buckets_json,
@@ -333,38 +383,212 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--worker <pattern_file> <out_perm>`: read the one pattern the parent
-/// serialized for this matrix, run the contestant order(), write the
-/// permutation. The parent supervises this under the time cap and SIGKILLs it on
-/// breach. A panic aborts the process (non-zero exit, no perm file) — the parent
-/// treats that as a FAIL.
-fn worker(args: &[String]) -> i32 {
-    let (Some(pattern_file), Some(out)) = (args.first(), args.get(1)) else {
-        eprintln!("--worker: usage: --worker <pattern_file> <out_perm>");
-        return 2;
+/// Exercise the exact per-worker bubblewrap command used by grading. CI runs
+/// this after the sandboxed build, before downloading the hidden corpus.
+fn sandbox_self_check_parent(
+    worker_sandbox: &sandbox::WorkerSandbox,
+    candidate_worker: &Path,
+) -> Result<(), String> {
+    if !worker_sandbox.is_enabled() {
+        return Err(format!(
+            "{}=bubblewrap is required for this check",
+            sandbox::MODE_ENV
+        ));
+    }
+    let scratch = failsafe::ScratchDir(
+        std::env::temp_dir().join(format!("ssi-sandbox-check-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(scratch.path())
+        .map_err(|e| format!("create self-check scratch dir: {e}"))?;
+    let input = scratch.path().join("input");
+    let output = scratch.path().join("output");
+    let cwd = scratch.path().join("cwd");
+    std::fs::write(&input, b"read-only sentinel")
+        .map_err(|e| format!("create self-check input: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|e| format!("create self-check output: {e}"))?;
+    std::fs::create_dir(&cwd).map_err(|e| format!("create self-check cwd: {e}"))?;
+
+    let mut cmd = worker_sandbox.worker_command(
+        candidate_worker,
+        sandbox::WorkerInvocation::SandboxSelfCheck,
+        &input,
+        &output,
+        &cwd,
+    )?;
+    let cfg = watchdog::CapConfig {
+        time_cap: Duration::from_secs(5),
+        poll: Duration::from_millis(10),
     };
-    let pat = match pattern_io::read_pattern(Path::new(pattern_file)) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("worker: failed to read pattern from {pattern_file}: {e}");
-            return 3;
-        }
-    };
-    let perm = ordering::order(&pat);
-    match perm_io::write_perm(Path::new(out), &perm) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("worker: failed to write perm to {out}: {e}");
-            4
-        }
+    let outcome = watchdog::run_capped(&mut cmd, &cfg);
+    let report = std::fs::read_to_string(&output).unwrap_or_default();
+    match outcome {
+        watchdog::WorkerOutcome::Ok if report == "ok\n" => Ok(()),
+        other => Err(format!("worker reported {other:?}: {}", report.trim())),
     }
 }
 
+fn sandbox_timeout_self_check_parent(
+    worker_sandbox: &sandbox::WorkerSandbox,
+    candidate_worker: &Path,
+) -> Result<(), String> {
+    if !worker_sandbox.is_enabled() {
+        return Err(format!(
+            "{}=bubblewrap is required for this check",
+            sandbox::MODE_ENV
+        ));
+    }
+    let scratch = failsafe::ScratchDir(
+        std::env::temp_dir().join(format!("ssi-sandbox-timeout-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(scratch.path())
+        .map_err(|e| format!("create timeout-check scratch dir: {e}"))?;
+    let input = scratch.path().join("input");
+    let output = scratch.path().join("output");
+    let cwd = scratch.path().join("cwd");
+    std::fs::write(&input, b"read-only sentinel")
+        .map_err(|e| format!("create timeout-check input: {e}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|e| format!("create timeout-check output: {e}"))?;
+    std::fs::create_dir(&cwd).map_err(|e| format!("create timeout-check cwd: {e}"))?;
+
+    let mut cmd = worker_sandbox.worker_command(
+        candidate_worker,
+        sandbox::WorkerInvocation::SandboxTimeoutSelfCheck,
+        &input,
+        &output,
+        &cwd,
+    )?;
+    let cfg = watchdog::CapConfig {
+        time_cap: Duration::from_millis(200),
+        poll: Duration::from_millis(5),
+    };
+    let outcome = watchdog::run_capped(&mut cmd, &cfg);
+    let report = std::fs::read_to_string(&output).unwrap_or_default();
+    match outcome {
+        watchdog::WorkerOutcome::Timeout if report == "candidate started\n" => Ok(()),
+        other => Err(format!("worker reported {other:?}: {}", report.trim())),
+    }
+}
+
+fn candidate_worker_path(grader_mode: bool) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(CANDIDATE_WORKER_ENV) {
+        if path.is_empty() {
+            return Err(format!("{CANDIDATE_WORKER_ENV} is set but empty"));
+        }
+        return require_candidate_worker(PathBuf::from(path));
+    }
+    if grader_mode {
+        return Err(format!(
+            "{CANDIDATE_WORKER_ENV} must name the separately built candidate binary in --grader mode"
+        ));
+    }
+
+    let mut path =
+        std::env::current_exe().map_err(|e| format!("locate trusted parent executable: {e}"))?;
+    path.set_file_name(format!(
+        "ssi-candidate-worker{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    require_candidate_worker(path)
+}
+
+fn require_candidate_worker(path: PathBuf) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "candidate worker not found at {}: {error}. Run `cargo build --release --workspace \
+             --offline --locked` before `cargo run`, and rebuild `ssi-candidate-worker` after \
+             ordering edits",
+            path.display()
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(format!(
+            "candidate worker is not a regular file: {}. Run `cargo build --release --workspace \
+             --offline --locked` before `cargo run`",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 /// Resolve the repo root so the gate finds src/ordering/ and deny.toml whether
-/// the binary is launched from the repo root or elsewhere. Uses CARGO_MANIFEST_DIR
-/// at compile time (the harness package dir), falling back to ".".
+/// the binary is launched from the repo root or elsewhere. Prefer the package
+/// directory embedded by Cargo, then walk up from the executable and current
+/// directory. The latter is required for grader builds: the build sandbox
+/// deliberately exposes the checkout as `/workspace`, which does not exist
+/// after the resulting trusted binary returns to the host runner.
 fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    let compiled = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let executable = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    resolve_repo_root(compiled, executable.as_deref(), cwd.as_deref())
+}
+
+fn resolve_repo_root(
+    compiled: &Path,
+    executable: Option<&Path>,
+    cwd: Option<&Path>,
+) -> PathBuf {
+    find_repo_root(compiled)
+        .or_else(|| executable.and_then(find_repo_root))
+        .or_else(|| cwd.and_then(find_repo_root))
+        .unwrap_or_else(|| compiled.to_path_buf())
+}
+
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|path| {
+            path.join("deny.toml").is_file() && path.join("src/ordering").is_dir()
+        })
+        .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod repo_root_tests {
+    use super::*;
+
+    const MISSING_SANDBOX_ROOT: &str = "/__ssi_missing_build_sandbox_workspace__";
+
+    #[test]
+    fn uses_valid_compiled_manifest_directory() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(resolve_repo_root(expected, None, None), expected);
+    }
+
+    #[test]
+    fn falls_back_from_build_sandbox_path_to_executable_location() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let executable = expected.join("target/trusted/release/ssi-ordering-challenge");
+        assert_eq!(
+            resolve_repo_root(
+                Path::new(MISSING_SANDBOX_ROOT),
+                Some(&executable),
+                Some(Path::new("/")),
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn falls_back_to_current_directory_when_executable_is_external() {
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            resolve_repo_root(
+                Path::new(MISSING_SANDBOX_ROOT),
+                Some(Path::new("/tmp/ssi-ordering-challenge")),
+                Some(expected),
+            ),
+            expected
+        );
+    }
 }
 
 fn now() -> u64 {
@@ -392,7 +616,3 @@ fn parse_note() -> String {
     }
     String::new()
 }
-
-// `_` reference so `Pattern` import is used even if the type is only named in
-// closures above; keeps the contract type visible at the harness boundary.
-const _: fn(&Pattern) -> Vec<usize> = ordering::order;

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Regenerate Cargo.toml from Cargo.toml.in + validated src/ordering/deps.toml.
+# Regenerate the trusted parent and candidate-worker manifests. Contestant
+# dependencies are written only to candidate-worker/Cargo.toml.
 # Runs in BOTH the local harness and the grader (Invariant 2). Exit non-zero on
 # any validation failure. Only reviewed exact direct dependencies are emitted;
 # the full transitive-tree license/native scan runs after `cargo vendor`.
@@ -10,28 +11,34 @@ cd "$ROOT"
 DEPS_TOML="src/ordering/deps.toml"
 TEMPLATE="Cargo.toml.in"
 OUT="Cargo.toml"
+CANDIDATE_TEMPLATE="candidate-worker/Cargo.toml.in"
+CANDIDATE_OUT="candidate-worker/Cargo.toml"
 
 [ -f "$TEMPLATE" ] || { echo "prepare-build: missing $TEMPLATE" >&2; exit 2; }
+[ -f "$CANDIDATE_TEMPLATE" ] || {
+  echo "prepare-build: missing $CANDIDATE_TEMPLATE" >&2
+  exit 2
+}
 
-# Helper: write $OUT = template up-to-and-including the marker, then the given
-# generated dep lines (may be empty), then the remainder of the template.
-write_manifest() {
+# Write the candidate manifest up to its generated-dependency marker, then add
+# the validated dependency declarations. The trusted parent manifest is copied
+# byte-for-byte and never receives contestant-controlled dependency entries.
+write_candidate_manifest() {
   local gen="$1"
-  awk '1; /=== GENERATED DEPS BELOW/ {exit}' "$TEMPLATE" > "$OUT"
+  awk '1; /=== GENERATED CANDIDATE DEPS BELOW/ {exit}' \
+    "$CANDIDATE_TEMPLATE" > "$CANDIDATE_OUT"
   if [ -n "$gen" ]; then
     while IFS='=' read -r name version; do
       [ -z "$name" ] && continue
-      printf '%s = "%s"\n' "$name" "$version" >> "$OUT"
+      printf '%s = "%s"\n' "$name" "$version" >> "$CANDIDATE_OUT"
     done <<< "$gen"
   fi
-  awk 'f; /=== GENERATED DEPS BELOW/ {f=1}' "$TEMPLATE" >> "$OUT"
 }
 
-# BOOTSTRAP: `Cargo.toml` is generated (git-ignored), so a fresh checkout has
-# none — but the emit-deps step below needs a manifest for `cargo` to resolve
-# the workspace. Write a valid deps-free manifest from the template first, so
-# `cargo run -p ssi-purity` works even on a clean clone.
-write_manifest ""
+# Both manifests are generated and git-ignored. Bootstrap the candidate with no
+# declared dependencies so Cargo can load the workspace before emit-deps runs.
+cp "$TEMPLATE" "$OUT"
+write_candidate_manifest ""
 
 # Validate deps.toml against ssi-purity's trusted exact-version allowlist (the
 # ONE parser/policy gate). Emits one `name=version` line per accepted dependency
@@ -41,9 +48,9 @@ GEN="$(cargo run --quiet -p ssi-purity --bin emit-deps -- "$DEPS_TOML")" || {
   exit 1
 }
 
-# Rewrite Cargo.toml with the validated declared deps.
-write_manifest "$GEN"
-echo "prepare-build: wrote $OUT"
+# Rewrite only the untrusted candidate package with validated declared deps.
+write_candidate_manifest "$GEN"
+echo "prepare-build: wrote $OUT and $CANDIDATE_OUT"
 
 # Vendor the full transitive tree. The COMMITTED Cargo.lock is authoritative:
 # `cargo vendor` honors its existing pins while resolving an approved direct
