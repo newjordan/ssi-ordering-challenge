@@ -99,10 +99,12 @@ pub fn load(path: &std::path::Path) -> Result<Vec<(String, Pattern)>, String> {
     }
 }
 
-/// Load the resolved corpus for developer probes and tests.
+/// Load the resolved corpus with fail-loud behavior, for tests.
 ///
 /// The main harness uses [`load`] directly so hidden-corpus errors can be
-/// redacted. Legacy developer-only callers retain the fail-loud behavior.
+/// redacted. Developer probes live in the candidate-worker package, which
+/// carries its own test-only corpus shim.
+#[cfg(test)]
 pub fn corpus() -> Vec<(String, Pattern)> {
     let path = corpus_path();
     load(&path).unwrap_or_else(|e| panic!("{e}"))

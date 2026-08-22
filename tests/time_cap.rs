@@ -2,10 +2,12 @@
 //! order() worker, and a normal run over the sample corpus still succeeds.
 //! Drives the release binary the way a contestant does.
 
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-fn harness_bin() -> std::path::PathBuf {
+fn harness_bin() -> PathBuf {
     // The integration test binary runs from target/<profile>/deps; the harness
     // binary is two levels up at target/<profile>/ssi-ordering-challenge.
     let mut p = std::env::current_exe().unwrap();
@@ -15,11 +17,34 @@ fn harness_bin() -> std::path::PathBuf {
     p
 }
 
-fn public_dev_corpus() -> std::path::PathBuf {
+fn candidate_bin() -> PathBuf {
+    let mut path = harness_bin();
+    path.set_file_name(format!(
+        "ssi-candidate-worker{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    path
+}
+
+fn public_dev_corpus() -> PathBuf {
     std::fs::canonicalize(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/dev/patterns.jsonl"),
     )
     .expect("canonicalize public dev corpus")
+}
+
+/// The trusted parent publishes score.json/results.tsv at the repo root
+/// regardless of its CWD, so concurrent harness runs from different tests
+/// would clobber each other's artifacts. Serialize every harness invocation.
+fn harness_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn score_json_path() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("score.json")
 }
 
 fn top_level_score(json: &str) -> f64 {
@@ -34,12 +59,14 @@ fn top_level_score(json: &str) -> f64 {
 
 #[test]
 fn normal_run_succeeds_on_sample_corpus() {
+    let _serialize = harness_lock();
     let dir = std::env::temp_dir().join(format!("ssi-public-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let corpus = public_dev_corpus();
 
     let out = Command::new(harness_bin())
+        .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_CORPUS_FILE", &corpus)
         .current_dir(&dir)
         .args(["--note", "time_cap test: normal"])
@@ -60,7 +87,7 @@ fn normal_run_succeeds_on_sample_corpus() {
         corpus.exists(),
         "absolute public dev corpus path must never be unlinked"
     );
-    let score = std::fs::read_to_string(dir.join("score.json")).unwrap();
+    let score = std::fs::read_to_string(score_json_path()).unwrap();
     assert!(score.contains("\"matrices\""), "{score}");
     assert!(score.contains("\"count\""), "{score}");
     assert!(score.contains("\"weights\""), "{score}");
@@ -75,6 +102,7 @@ fn normal_run_succeeds_on_sample_corpus() {
 
 #[test]
 fn hidden_corpus_omits_per_matrix_census() {
+    let _serialize = harness_lock();
     let dir = std::env::temp_dir().join(format!("ssi-hidden-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -91,6 +119,7 @@ fn hidden_corpus_omits_per_matrix_census() {
     .unwrap();
 
     let out = Command::new(harness_bin())
+        .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_CORPUS_FILE", &corpus)
         .current_dir(&dir)
         .output()
@@ -108,7 +137,7 @@ fn hidden_corpus_omits_per_matrix_census() {
     assert!(!stdout.contains("count"), "{stdout}");
     assert!(!stdout.contains("per-bucket ("), "{stdout}");
 
-    let score = std::fs::read_to_string(dir.join("score.json")).unwrap();
+    let score = std::fs::read_to_string(score_json_path()).unwrap();
     assert!(!score.contains("\"matrices\""), "{score}");
     assert!(!score.contains("\"count\""), "{score}");
     assert!(!score.contains("\"weights\""), "{score}");
@@ -126,6 +155,7 @@ fn hidden_corpus_omits_per_matrix_census() {
 
 #[test]
 fn hidden_corpus_load_failure_omits_raw_name() {
+    let _serialize = harness_lock();
     let dir = std::env::temp_dir().join(format!(
         "ssi-hidden-load-failure-test-{}",
         std::process::id()
@@ -140,6 +170,7 @@ fn hidden_corpus_load_failure_omits_raw_name() {
     .unwrap();
 
     let out = Command::new(harness_bin())
+        .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_CORPUS_FILE", &corpus)
         .current_dir(&dir)
         .output()
@@ -158,11 +189,13 @@ fn hidden_corpus_load_failure_omits_raw_name() {
 fn slow_ordering_is_killed_and_fails_promptly() {
     // Force every order() call to sleep 30s; the 2s cap must kill it and FAIL
     // the run in well under 30s.
+    let _serialize = harness_lock();
     let dir = std::env::temp_dir().join(format!("ssi-slow-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let start = Instant::now();
     let out = Command::new(harness_bin())
+        .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_CORPUS_FILE", public_dev_corpus())
         .env("SSI_TEST_SLEEP_MS", "30000")
         .current_dir(&dir)

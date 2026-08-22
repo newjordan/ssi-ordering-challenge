@@ -6,16 +6,18 @@ scoring wrapper, and back out to the files on disk. Where `HARNESS-DESIGN.md`
 explains *why* the pieces exist, this explains *how the bytes flow* and points
 at the exact code for each step.
 
-The whole flow is driven by two commands — regenerate the manifest from
-`deps.toml` (validate → vendor → scan), then run the scored harness offline:
+Set up the generated manifests and build both executables once, then run the
+scored harness offline:
 
 ```
 bash scripts/prepare-build.sh
+cargo build --release --workspace --offline --locked
 cargo run --release --offline --locked -- --note "what I tried"
 ```
 
 `prepare-build.sh` must run once on a fresh clone and whenever `src/ordering/deps.toml`
-changes; the second command runs `fn main()` in [`src/main.rs`](../src/main.rs).
+changes. Rebuild the workspace after editing ordering code; `cargo run` starts
+the trusted parent, which finds the sibling candidate worker.
 
 ---
 
@@ -49,7 +51,8 @@ contract `Pattern`.
 
 The type your `order()` receives is `Pattern`
 ([`ssi-scoring/src/pattern.rs`](../ssi-scoring/src/pattern.rs:23)), re-exported
-at the harness crate root (as `crate::Pattern`, in `src/main.rs`) so the
+at the candidate crate root (as `crate::Pattern`, in
+`candidate-worker/src/main.rs`) so the
 signature is identical on both sides:
 
 ```rust
@@ -111,10 +114,11 @@ For each `(name, pattern)`:
 2. **Stage B — run your `order()`, twice, in a killable subprocess**
    ([`src/main.rs`](../src/main.rs), `run_once`): the parent serializes the
    matrix's already-parsed `Pattern` once to a scratch file
-   ([`src/pattern_io.rs`](../src/pattern_io.rs)), then each call re-launches this
-   same binary in `--worker` mode (passing that pattern file), which
-   reads the pattern, runs `order()`, and writes the permutation to a scratch
-   file. The parent supervises that child with the watchdog
+   through the shared `ssi-worker-protocol` crate. Each call launches the
+   separate `ssi-candidate-worker` executable, which alone links
+   `src/ordering` and contestant dependencies, reads the pattern, runs
+   `order()`, and writes the permutation to a scratch file. The parent
+   supervises that child with the watchdog
    ([`src/watchdog.rs`](../src/watchdog.rs)):
    - if the child exceeds `TIME_CAP_PER_MATRIX = 2s` it is **SIGKILLed** and the
      run fails for a **cap violation** — enforced, not merely measured;
@@ -122,6 +126,13 @@ For each `(name, pattern)`:
      `order()`) the run fails;
    - `order()` is run a **second time**; if `perm1 != perm2` the run fails for
      **nondeterminism** (Stage E analog).
+
+   In production, `--grader`, `SSI_GRADER_SANDBOX=bubblewrap`, and
+   `SSI_CANDIDATE_WORKER=<separately-built-path>` make each candidate launch
+   start inside its own PID/network/filesystem sandbox. The trusted parent is
+   not wrapped with the workers, and `--grader` rejects a missing sandbox
+   selection; see
+   [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md).
 
 3. **Stage C — output validation** — `validate_permutation(&perm1, pat.n)`
    ([`src/main.rs`](../src/main.rs)) checks the result is a true
@@ -221,8 +232,8 @@ dissection, minimum-fill, local-search refinement — are in `README.md` →
 read results.tsv + src/ordering/memory/
         │
         ▼
-edit src/ordering/      ──►   cargo run --release -- --note "hypothesis"
-        ▲                              │
+edit src/ordering/      ──►   cargo build --release -p ssi-candidate-worker
+        ▲                       && cargo run --release -- --note "hypothesis"
         │        per-matrix table + score + any FAIL reason
         └──────────────────────────────┘
         write findings to src/ordering/memory/ ; commit when the score improves
@@ -237,15 +248,17 @@ recorded there; keep the reasoning behind each step in `src/ordering/memory/`.
 
 ## 6. How this maps to the production grader
 
-**The grader is this same harness binary**, run in the repo's own GitHub Actions
+**The grader uses this same trusted parent binary**, run in the repo's own GitHub Actions
 (`.github/workflows/benchmark.yml`) and dispatched by the Hilbert platform. It
 builds a candidate from the validated baseline + **only** the submission's
-`src/ordering/`, runs the workflow, and reads the uploaded `score.json`. The
+`src/ordering/`, builds the parent and candidate into disjoint target
+directories, runs the workflow, and reads the uploaded `score.json`. The
 workflow grades a **hidden** eval corpus — disjoint from the dev corpus,
 regenerated per round — injected via the `SSI_CORPUS_FILE` path override and
 downloaded at run time to a temp path outside the repo tree (so the eval bytes
-are never committed). Scoring runs in a sandbox (no network, no filesystem,
-2–4 GB memory cap, determinism re-runs).
+are never committed). Dependency code builds in an unprivileged bubblewrap
+boundary, and every scored worker runs in a separate, narrower sandbox (no
+network, private `/proc`, minimal filesystem, determinism re-runs).
 
 Because grading runs the identical harness + `ssi-scoring` functions you run
 locally, the number you see locally is structurally the number the grader
