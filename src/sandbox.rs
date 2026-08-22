@@ -18,6 +18,10 @@ pub enum WorkerInvocation {
     Order,
     SandboxSelfCheck,
     SandboxTimeoutSelfCheck,
+    /// Harness-owned time-cap regression mode: the candidate binary sleeps past
+    /// the cap without ever calling `order()`, so the watchdog is exercised
+    /// against a real child while contestant code never sees a test seam.
+    TestTimeout,
 }
 
 impl WorkerInvocation {
@@ -26,6 +30,7 @@ impl WorkerInvocation {
             Self::Order => None,
             Self::SandboxSelfCheck => Some("--sandbox-self-check"),
             Self::SandboxTimeoutSelfCheck => Some("--sandbox-timeout-self-check"),
+            Self::TestTimeout => Some("--worker-test-timeout"),
         }
     }
 }
@@ -121,15 +126,13 @@ impl WorkerSandbox {
                 if let Some(flag) = invocation.flag() {
                     cmd.arg(flag);
                 }
+                // The worker runs contestant code; hand it NOTHING beyond its
+                // pattern/output arguments. No environment entry — test control
+                // included — ever reaches order() (F2).
                 cmd.arg(input)
                     .arg(output)
                     .env_clear()
                     .current_dir(local_cwd);
-                // This hook exists only for the local watchdog regression test.
-                // Grader workers receive no environment entries at all.
-                if let Ok(sleep_ms) = std::env::var("SSI_TEST_SLEEP_MS") {
-                    cmd.env("SSI_TEST_SLEEP_MS", sleep_ms);
-                }
                 null_stdio(&mut cmd);
                 Ok(cmd)
             }

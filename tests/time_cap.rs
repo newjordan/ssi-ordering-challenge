@@ -187,8 +187,10 @@ fn hidden_corpus_load_failure_omits_raw_name() {
 
 #[test]
 fn slow_ordering_is_killed_and_fails_promptly() {
-    // Force every order() call to sleep 30s; the 2s cap must kill it and FAIL
-    // the run in well under 30s.
+    // The parent-only --test-time-cap flag selects a harness-owned worker mode
+    // that sleeps 30s without ever calling order(). The 2s cap must kill that
+    // real worker process and FAIL the run well under 30s, while contestant
+    // code gets no environment or argv test seam.
     let _serialize = harness_lock();
     let dir = std::env::temp_dir().join(format!("ssi-slow-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -197,9 +199,8 @@ fn slow_ordering_is_killed_and_fails_promptly() {
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_CORPUS_FILE", public_dev_corpus())
-        .env("SSI_TEST_SLEEP_MS", "30000")
         .current_dir(&dir)
-        .args(["--note", "time_cap test: slow"])
+        .args(["--test-time-cap", "--note", "time_cap test: slow"])
         .output()
         .expect("run harness");
     let elapsed = start.elapsed();

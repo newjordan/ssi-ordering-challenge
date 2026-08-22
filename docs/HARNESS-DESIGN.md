@@ -71,7 +71,7 @@ Per run, `main.rs` executes the grader stages of the proposal in miniature:
 | Proposal stage | Harness implementation |
 |---|---|
 | A — purity & license gate | `purity::check` (RequireDeny mode): scans `src/ordering/` for build.rs / FFI / `#[no_mangle]` / `#[link]` / proc-macros / `include!` escapes, parses `src/ordering/deps.toml`, and runs `cargo-deny` against `deny.toml` (mandatory — a missing `cargo-deny` fails the gate). The grader additionally scans the vendored dependency tree (`ssi_purity::scan_vendored_tree`) for `*-sys` names, prebuilt native blobs, and C-toolchain build-deps. Mirrors the grader's authoritative Stage A — same rules, same `deny.toml`. |
-| B — sandboxed compile & run | The trusted parent and candidate worker are separate packages. Only the candidate includes `src/ordering` and declared dependencies. Local runs execute that sibling binary as a direct child under the 2 s watchdog. Production builds the two packages into disjoint target directories, then starts the candidate executable itself inside a fresh bubblewrap PID/network/filesystem namespace for **each individual worker**. `--grader` rejects a missing sandbox selection. See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md). |
+| B — sandboxed compile & run | The trusted parent and candidate worker are separate packages. Only the candidate includes `src/ordering` and declared dependencies. Local runs execute that sibling binary as a direct child under the 2 s watchdog, spawned with `env_clear()` and only its pattern/output arguments (the eval-corpus path and harness test controls never reach `order()`). Production builds the two packages into disjoint target directories, then starts the candidate executable itself inside a fresh bubblewrap PID/network/filesystem namespace for **each individual worker**. `--grader` rejects a missing sandbox selection. See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md). |
 | C — output validation | `validate_permutation`: exact bijection check; a panic in `order()` aborts the worker process (non-zero exit, no perm file), which the parent treats as a failed run |
 | D — trusted scoring | `ssi_scoring::score`: feral's pattern-pure building blocks — `symmetric_pattern → permute_pattern → EliminationTree::from_pattern → column_counts_gnp`, then `nnz(L) = Σ cⱼ` and `flops = Σ cⱼ²`, computed from the permutation alone |
 | E — reproducibility | the ordering is run twice per matrix; outputs must be identical |
@@ -188,7 +188,8 @@ changes — those are shared via `ssi-scoring`, and **the grader is this same
 harness binary**. Grading runs in the repo's own GitHub Actions
 (`.github/workflows/benchmark.yml`), which the Hilbert platform dispatches against
 a candidate built from the validated baseline + the submission's `src/ordering/`
-only. The workflow installs `cargo-deny`, runs `prepare-build.sh` (validate
+only. The workflow installs `cargo-deny` 0.20.2 exactly, runs
+`prepare-build.sh` (validate
 `deps.toml` → vendor → scan tree), builds `--offline --locked`, and runs the
 scored step in a no-network namespace, then uploads `score.json`; there is no
 separate scoring code to drift from what you run locally. Grading adds:
@@ -216,6 +217,12 @@ the server's gate.
 
 ## 6. Verification built into `cargo test`
 
+- **Time-cap integration** (`tests/time_cap.rs`): a parent-only regression flag
+  (`--test-time-cap`) selects a harness-owned candidate-worker mode that sleeps
+  without ever calling `order()`. The production watchdog must kill that real
+  child at the two-second cap. Production workers receive neither the test flag
+  nor a test environment variable, so contestant code cannot detect the test
+  seam.
 - **Closed-form scorer tests** (`ssi-scoring`): dense 3×3 → flops 14;
   tridiagonal → nnz(L) = 2n−1; arrow hub-first → n(n+1)/2; hub-last →
   near-zero fill. Mathematical facts (Invariant 4), ported to the feral scorer.

@@ -48,7 +48,7 @@ jobs:
       # the license/source gate is authoritative now that submissions may declare
       # crates. A missing cargo-deny is a hard failure, not a fallback.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.20.2 --locked
 
       # Bubblewrap is used twice: once around the release build (where
       # dependency build.rs/proc macros can execute), then independently around

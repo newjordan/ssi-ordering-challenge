@@ -10,6 +10,7 @@ Set up the generated manifests and build both executables once, then run the
 scored harness offline:
 
 ```
+cargo install cargo-deny --version 0.20.2 --locked  # once per toolchain
 bash scripts/prepare-build.sh
 cargo build --release --workspace --offline --locked
 cargo run --release --offline --locked -- --note "what I tried"
@@ -17,7 +18,9 @@ cargo run --release --offline --locked -- --note "what I tried"
 
 `prepare-build.sh` must run once on a fresh clone and whenever `src/ordering/deps.toml`
 changes. Rebuild the workspace after editing ordering code; `cargo run` starts
-the trusted parent, which finds the sibling candidate worker.
+the trusted parent, which finds the sibling candidate worker. The exact
+`cargo-deny` version matches the benchmark workflow, preventing license-policy
+behavior from floating between local and graded runs.
 
 ---
 
@@ -268,3 +271,10 @@ submission, dispatch, score comment, accept/close); the contract, the metric,
 the baseline, and the scoring path are unchanged. See
 [`HARNESS-DESIGN.md`](HARNESS-DESIGN.md) §4–§5 for the anti-cheat analysis and
 the precise list of grader-only additions.
+
+Pull requests use a separate non-secret workflow
+(`.github/workflows/pr-security.yml`) for formatting, purity-policy unit tests,
+watchdog process-isolation tests, and the enforced time-cap regression. Its
+job-level condition admits only branches from this repository; fork PRs are
+skipped before GitHub assigns a runner. The grading workflow remains
+`workflow_dispatch`-only and is the only workflow that reads eval secrets.

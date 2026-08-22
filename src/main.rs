@@ -74,6 +74,13 @@ pub use ssi_scoring::Pattern;
 const TIME_CAP_PER_MATRIX: Duration = Duration::from_secs(2);
 const CANDIDATE_WORKER_ENV: &str = "SSI_CANDIDATE_WORKER";
 
+/// Parent-only regression flag, accepted from the time-cap integration test:
+/// every worker is launched in the candidate binary's harness-owned
+/// `--worker-test-timeout` mode, which sleeps past the cap without ever calling
+/// `order()`. Production workers receive neither this flag nor any test
+/// environment variable, so contestant code cannot observe the test seam.
+const TEST_TIME_CAP_FLAG: &str = "--test-time-cap";
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().collect();
     let grader_mode = raw_args.iter().any(|arg| arg == "--grader");
@@ -118,6 +125,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    let test_time_cap = raw_args.iter().any(|arg| arg == TEST_TIME_CAP_FLAG);
 
     let note = parse_note();
     let repo_root = repo_root();
@@ -249,9 +257,17 @@ fn main() -> ExitCode {
             let worker_cwd = scratch.path().join(format!("{seq}-{tag}-cwd"));
             std::fs::create_dir_all(&worker_cwd)
                 .map_err(|e| format!("failed to stage worker cwd: {e}"))?;
+            let invocation = if test_time_cap {
+                // Test-only harness-owned worker mode: it sleeps without ever
+                // invoking order(), so the watchdog is exercised against a real
+                // child while contestant code cannot inspect the test flag.
+                sandbox::WorkerInvocation::TestTimeout
+            } else {
+                sandbox::WorkerInvocation::Order
+            };
             let mut cmd = worker_sandbox.worker_command(
                 &candidate_worker,
-                sandbox::WorkerInvocation::Order,
+                invocation,
                 pat_file.path(),
                 &out_perm,
                 &worker_cwd,

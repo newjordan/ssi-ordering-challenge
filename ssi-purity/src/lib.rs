@@ -1032,7 +1032,7 @@ fn license_check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
             Mode::RequireDeny => {
                 return Err(GateError(
                     "license-check: cargo-deny is REQUIRED for grading but is not installed. \
-                     Install it with `cargo install cargo-deny`."
+                     Install it with `cargo install cargo-deny --version 0.20.2 --locked`."
                         .to_string(),
                 ));
             }
@@ -1041,7 +1041,8 @@ fn license_check(repo_root: &Path, mode: Mode) -> Result<(), GateError> {
                     "license-check: cargo-deny not installed; skipping license check \
                      (declared deps matched the reviewed exact-version allowlist; tree-level \
                      license enforcement happens in the grader's vendored-tree scan). \
-                     Install with `cargo install cargo-deny` to run the authoritative check the grader uses."
+                     Install with `cargo install cargo-deny --version 0.20.2 --locked` to run \
+                     the authoritative check the grader uses."
                 );
                 return Ok(());
             }

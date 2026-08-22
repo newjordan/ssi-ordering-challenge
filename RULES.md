@@ -44,7 +44,8 @@ and absolute values shift.
    that worker and run the parent with
    `cargo build --release -p ssi-candidate-worker --offline --locked && cargo run --release --offline --locked -- --note "<hypothesis>"`.
    The machine-readable `benchmarkCommand` performs this incremental rebuild.
-   Requires `cargo-deny`: `cargo install cargo-deny`.
+   Requires `cargo-deny`:
+   `cargo install cargo-deny --version 0.20.2 --locked`.
 4. Read the per-matrix table. Attribute wins/losses per family and size bucket
    (NLP, QCP, QP, QCQP; n up to ~340k).
 5. Record findings in the knowledge base (an experiment page + one `log.md`

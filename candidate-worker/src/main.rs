@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         Some("--sandbox-self-check") => sandbox_self_check(&args[1..]),
         Some("--sandbox-timeout-self-check") => timeout_self_check(&args[1..]),
         Some("--sandbox-timeout-child") => timeout_child(),
+        Some("--worker-test-timeout") => test_timeout_worker(),
         _ => run_ordering(&args),
     };
     ExitCode::from(code as u8)
@@ -166,4 +167,13 @@ fn timeout_child() -> i32 {
     loop {
         std::thread::sleep(Duration::from_secs(60));
     }
+}
+
+/// Harness-owned time-cap regression mode (parent `--test-time-cap` runs):
+/// sleep far past the 2 s cap without ever calling `ordering::order()`, so the
+/// watchdog is exercised against a real worker while contestant code cannot
+/// observe any test flag or environment variable.
+fn test_timeout_worker() -> i32 {
+    std::thread::sleep(Duration::from_secs(30));
+    0
 }

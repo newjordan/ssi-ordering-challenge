@@ -82,27 +82,45 @@ pub fn run_capped(cmd: &mut Command, cfg: &CapConfig) -> WorkerOutcome {
 
 /// SIGKILL the worker and every process it spawned. On unix the worker leads
 /// its own process group (see `run_capped`), so `kill -KILL -- -<pgid>` reaps
-/// the whole subtree; `pgid` equals the worker pid we set with
-/// `process_group(0)`. The `--` is required: without it, some Linux `kill`
-/// implementations parse the negative pgid as an option and signal pid -1.
-/// Falls back to a single-pid kill on non-unix.
+/// the whole subtree; `pgid` equals the worker pid set with `process_group(0)`.
+/// If no trusted kill utility is available or group signaling fails, falls
+/// back to the direct child; non-unix platforms always use that fallback.
 #[cfg(unix)]
 fn kill_group(child: &mut std::process::Child) {
     let pid = child.id();
-    // Negative target = process group. Std-only: shell out to `kill`, matching
-    // the grader watchdog family's use of `ps`/`kill`.
-    let killed = Command::new("kill")
-        .arg("-KILL")
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .status()
-        .map(|s| s.success())
+    let killed = trusted_kill_path()
+        .map(|kill| {
+            // `--` is load-bearing on GNU kill: without it, the negative PGID
+            // is parsed as an option and can end up signalling pid -1.
+            kill_group_command(kill, pid)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
     if !killed {
-        // Group kill failed (e.g. worker died before setpgid took effect);
-        // fall back to signalling the worker pid directly.
+        // No trusted kill utility, or the group kill failed (e.g. worker died
+        // before setpgid took effect): signal the direct worker pid via std.
         let _ = child.kill();
     }
+}
+
+#[cfg(unix)]
+fn trusted_kill_path() -> Option<&'static std::path::Path> {
+    ["/bin/kill", "/usr/bin/kill"]
+        .into_iter()
+        .map(std::path::Path::new)
+        .find(|path| path.is_file())
+}
+
+#[cfg(unix)]
+fn kill_group_command(kill: &std::path::Path, pgid: u32) -> Command {
+    let mut command = Command::new(kill);
+    command
+        .arg("-KILL")
+        .arg("--")
+        .arg(format!("-{pgid}"));
+    command
 }
 
 #[cfg(not(unix))]
@@ -143,7 +161,8 @@ mod tests {
 
     #[test]
     fn slow_command_times_out_promptly() {
-        // sleep 10s under a 0.2s cap: must return Timeout well before 10s.
+        // On Linux this catches ambiguous GNU kill parsing: `-<pgid>` without
+        // a preceding `--` is treated as a signal option and sleep runs 10s.
         let mut cmd = Command::new("sleep");
         cmd.arg("10");
         let cfg = CapConfig {
@@ -157,6 +176,25 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "watchdog did not kill promptly: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_group_kill_uses_trusted_path_and_option_terminator() {
+        let kill = trusted_kill_path().expect("Linux runner has /bin/kill or /usr/bin/kill");
+        assert!(kill.is_absolute(), "kill path must not depend on PATH: {kill:?}");
+
+        let command = kill_group_command(kill, 12345);
+        assert_eq!(command.get_program(), kill.as_os_str());
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("kill arguments are ASCII"))
+            .collect();
+        assert_eq!(
+            args,
+            ["-KILL", "--", "-12345"],
+            "`--` must terminate options before the negative process-group ID"
         );
     }
 
