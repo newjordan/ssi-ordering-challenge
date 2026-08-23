@@ -892,8 +892,17 @@ fn find_macro_call(hay: &str, name: &str) -> Option<usize> {
 /// caller-supplied macro, so this shape is a sound, near-false-positive-free
 /// signal. It runs on the comment-stripped, string-blanked view, so the shape
 /// appearing in prose or string data does not trip it.
+///
+/// The name is matched with a deliberately GENEROUS notion of identifier: an
+/// ASCII ident byte OR any non-ASCII byte. Rust accepts non-ASCII (Unicode)
+/// identifiers, including as metavariable names, so an ASCII-only scan would let
+/// `$\u{65e5}!(…)` re-open the exact #50 bypass under a renamed metavariable. Any
+/// byte >= 0x80 belongs to a multi-byte UTF-8 identifier codepoint here (the view
+/// is valid UTF-8 and comments/strings are already removed), so accepting it is
+/// both necessary to close the bypass and safe against false positives.
 fn find_metavariable_macro_call(hay: &str) -> Option<usize> {
     let hb = hay.as_bytes();
+    let is_metavar_name_byte = |b: u8| is_ident_byte(b) || b >= 0x80;
     let skip_ws = |mut j: usize| {
         while j < hb.len() && hb[j].is_ascii_whitespace() {
             j += 1;
@@ -903,9 +912,10 @@ fn find_metavariable_macro_call(hay: &str) -> Option<usize> {
     let mut start = 0;
     while let Some(rel) = hay[start..].find('$') {
         let off = start + rel;
-        // `$` then a contiguous identifier (the metavariable name).
+        // `$` then a contiguous identifier (the metavariable name), spelled with
+        // ASCII ident bytes and/or non-ASCII (Unicode) identifier codepoints.
         let mut name_end = off + 1;
-        while name_end < hb.len() && is_ident_byte(hb[name_end]) {
+        while name_end < hb.len() && is_metavar_name_byte(hb[name_end]) {
             name_end += 1;
         }
         if name_end > off + 1 {
@@ -1504,6 +1514,19 @@ mod tests {
         // `include!(`, so only the metavariable-invocation shape catches it.
         let src = "macro_rules! invoke2 { ($m:path, $a:expr) => { $m!($a); } }\n\
                    invoke2! { include, \"payload.txt\" }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn macro_metavariable_with_non_ascii_name_is_rejected() {
+        // Issue #50 follow-up: Rust accepts non-ASCII identifiers, including as
+        // `macro_rules!` metavariable names. Renaming the metavariable from `$m`
+        // to a Unicode name (`$日`) is enough to re-open POC A if the name scan is
+        // ASCII-only — the smuggled `asm!` still compiles and executes. The
+        // invocation shape `$<name>!(…)` must be recognized whatever bytes the
+        // name is spelled with.
+        let src = "macro_rules! invoke { ($\u{65e5}:path, $o:expr) => { unsafe { $\u{65e5}!(\"nop\", out(reg) $o) } } }\n\
+                   pub fn f() { let mut x = 0u64; invoke!(core::arch::asm, x); }\n";
         assert!(scan_source(Path::new("x.rs"), src).is_err());
     }
 
