@@ -807,7 +807,7 @@ fn parse_note() -> String {
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len() {
         if args[i] == "--note" && i + 1 < args.len() {
-            return args[i + 1].replace(['\t', '\n'], " ");
+            return failsafe::sanitize(&args[i + 1]);
         }
     }
     String::new()
