@@ -529,6 +529,21 @@ fn scan_source(file: &Path, src: &str) -> Result<(), GateError> {
             "`#[path = \"...\"]` (module source may not be purity-scanned)",
         );
     }
+    // A `macro_rules!` body can route a forbidden macro name through a
+    // metavariable and invoke it as `$m!(...)`, so `asm!`/`include!` never appear
+    // in a forbidden position while the banned construct still compiles (#50).
+    // The forbidden NAME is supplied at the call site (e.g.
+    // `invoke!(core::arch::asm, x)`, where `asm` is followed by `,`), so the
+    // literal-token checks above cannot see it. Catch the invocation SHAPE
+    // instead: a metavariable `$name` immediately followed by `!` + delimiter.
+    if let Some(off) = find_metavariable_macro_call(&kw) {
+        let lineno = kw[..off].bytes().filter(|&b| b == b'\n').count();
+        return hit(
+            lineno,
+            "a `macro_rules!` metavariable invoked as a macro (`$m!(…)`), which can \
+             smuggle a forbidden macro (`asm!`/`include!`) past the token scanner",
+        );
+    }
     Ok(())
 }
 
@@ -857,6 +872,53 @@ fn find_macro_call(hay: &str, name: &str) -> Option<usize> {
             return Some(idx);
         }
         start = idx + 1;
+    }
+    None
+}
+
+/// If `hay` contains a declarative-macro metavariable invoked AS a macro — the
+/// shape `$<ident> ! <delim>` — return the byte offset of the `$`. This closes
+/// the #50 bypass: a `macro_rules!` body that invokes `$m!(...)` where `$m`
+/// captured a forbidden macro path (`core::arch::asm`, `include`, …) at the call
+/// site. The forbidden NAME is then supplied by the caller and never appears in
+/// a forbidden position, so the literal-token checks miss it — but the invocation
+/// shape here does not.
+///
+/// A metavariable reference is `$` immediately followed by the name (Rust does
+/// not permit whitespace there); whitespace between the name, the `!`, and the
+/// delimiter IS insignificant and is skipped, matching `find_macro_call`. A named
+/// macro path such as `$crate::helper!()` is not matched: after `$crate` the next
+/// token is `::`, not `!`. A benign ordering submission has no reason to invoke a
+/// caller-supplied macro, so this shape is a sound, near-false-positive-free
+/// signal. It runs on the comment-stripped, string-blanked view, so the shape
+/// appearing in prose or string data does not trip it.
+fn find_metavariable_macro_call(hay: &str) -> Option<usize> {
+    let hb = hay.as_bytes();
+    let skip_ws = |mut j: usize| {
+        while j < hb.len() && hb[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let mut start = 0;
+    while let Some(rel) = hay[start..].find('$') {
+        let off = start + rel;
+        // `$` then a contiguous identifier (the metavariable name).
+        let mut name_end = off + 1;
+        while name_end < hb.len() && is_ident_byte(hb[name_end]) {
+            name_end += 1;
+        }
+        if name_end > off + 1 {
+            // <ws> `!` <ws> `(`|`[`|`{` — the macro-invocation shape.
+            let bang = skip_ws(name_end);
+            if bang < hb.len() && hb[bang] == b'!' {
+                let delim = skip_ws(bang + 1);
+                if delim < hb.len() && matches!(hb[delim], b'(' | b'[' | b'{') {
+                    return Some(off);
+                }
+            }
+        }
+        start = off + 1;
     }
     None
 }
@@ -1419,6 +1481,63 @@ mod tests {
     #[test]
     fn asm_in_string_is_allowed() {
         let src = "pub fn f() -> &'static str { \"asm! global_asm!\" }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn macro_metavariable_asm_invocation_is_rejected() {
+        // Issue #50 POC A: the forbidden macro name is routed through a
+        // `macro_rules!` metavariable and invoked as `$m!(...)`, so `asm!` never
+        // appears as a literal call at any forbidden position — yet real inline
+        // assembly compiles and executes. The token scanner must reject the
+        // metavariable-as-macro invocation shape.
+        let src = "macro_rules! invoke { ($m:path, $o:expr) => { unsafe { $m!(\"nop\", out(reg) $o) } } }\n\
+                   pub fn f() { let mut x = 0u64; invoke!(core::arch::asm, x); }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn macro_metavariable_include_invocation_is_rejected() {
+        // Issue #50 POC B: `include!` smuggled through the same trick pulls an
+        // unscanned non-`.rs` source file into the build (re-opening the #27
+        // class). `include` appears only as a call argument (`, `), never as
+        // `include!(`, so only the metavariable-invocation shape catches it.
+        let src = "macro_rules! invoke2 { ($m:path, $a:expr) => { $m!($a); } }\n\
+                   invoke2! { include, \"payload.txt\" }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn macro_metavariable_invocation_split_across_lines_is_rejected() {
+        // Whitespace/newlines between `$m`, `!`, and the delimiter are
+        // insignificant in Rust, exactly like the asm line-split evasion (#16).
+        let src = "macro_rules! m { ($x:path) => { $x\n!\n(\"nop\") } }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_err());
+    }
+
+    #[test]
+    fn benign_macro_without_metavariable_invocation_is_allowed() {
+        // A normal declarative macro that expands to expressions — no
+        // metavariable is invoked AS a macro — must still pass.
+        let src = "macro_rules! sq { ($x:expr) => { $x * $x } }\npub fn f() -> i32 { sq!(3) }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn crate_qualified_macro_path_is_allowed() {
+        // `$crate::helper!(...)` invokes a NAMED macro (`helper`) in the
+        // submission crate, not a metavariable: the `$` is followed by `crate::`,
+        // not by `!`, so it must not trip the new check.
+        let src = "macro_rules! m { () => { $crate::helper!() } }\n\
+                   macro_rules! helper { () => { 0 } }\n";
+        assert!(scan_source(Path::new("x.rs"), src).is_ok());
+    }
+
+    #[test]
+    fn metavariable_mention_in_comment_and_string_is_allowed() {
+        // The `$m!(...)` shape appearing only in prose or string data is not code.
+        let src = "// a bypass would write $m!(core::arch::asm)\n\
+                   let note = \"$m!(include, x)\";\n";
         assert!(scan_source(Path::new("x.rs"), src).is_ok());
     }
 
