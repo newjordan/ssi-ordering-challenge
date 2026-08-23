@@ -63,7 +63,20 @@ target/trusted/release/ssi-ordering-challenge --grader
 - an empty tmpfs root containing only read-only runtime libraries, the
   candidate executable, and the one staged pattern;
 - exactly one writable bind mount: the pre-created permutation output file;
-- no Linux capabilities, repo, corpus file, HOME, runner temp, or parent files.
+- no Linux capabilities, repo, corpus file, HOME, runner temp, or parent files;
+- per-worker resource limits applied by wrapping bubblewrap in `prlimit`
+  (util-linux), inherited across bwrap into the worker:
+  - a size-capped root tmpfs (`--tmpfs / --size`, 64 MiB) so writes to `/`
+    cannot exhaust RAM;
+  - `RLIMIT_FSIZE` sized to the exact `8 + 8·n` permutation output (plus a
+    small slack) so a runaway write to the output file hits `SIGXFSZ` instead
+    of filling the disk;
+  - `RLIMIT_AS` at the documented 2–4 GB per-matrix memory ceiling (4 GiB);
+  - `RLIMIT_NPROC` (4096) to bound a fork bomb;
+  - `RLIMIT_CORE` 0 to suppress core dumps.
+
+  `prlimit` is required in `--grader` mode; its absence is a hard failure, like
+  a missing bubblewrap.
 
 This must remain per worker. Wrapping the whole harness in one PID namespace is
 not equivalent: workers in that shared namespace can enumerate the trusted
@@ -95,7 +108,10 @@ requires:
   `--chdir` target after `--clearenv`; nothing is inherited from the parent);
 - all three standard streams linked to `/dev/null`;
 - no `/workspace`, `/home`, `/root`, or `/tmp`;
-- read-only pattern input and writable permutation output.
+- read-only pattern input and writable permutation output;
+- live per-worker resource limits: `/proc/self/limits` shows finite (not
+  `unlimited`) caps on file size, process count, and address space, and the
+  root filesystem is a size-capped tmpfs.
 
 The workflow also runs `--grader --sandbox-timeout-self-check`: the candidate
 starts a descendant and blocks, then the watchdog must time out and tear down
@@ -117,7 +133,14 @@ Linux-only.
   contestant-editable submission paths. The package split prevents Rust linkage
   and target replacement; it does not defend a workflow or trusted-source
   compromise.
-- The watchdog limits each worker to two seconds, but this slice does not add a
-  cgroup memory limit. Runner-level resource limits remain a separate defense.
+- Per-worker limits are enforced with `prlimit` rlimits, not a cgroup. This is
+  portable to the unprivileged runner user (no cgroup delegation needed) but has
+  two consequences. `RLIMIT_NPROC` is per-real-UID — it counts the trusted
+  parent's own tasks too — so it cannot be as tight as a per-cgroup `pids.max`;
+  4096 bounds a runaway well below the observed ~24k while staying clear of any
+  legitimate task count. `RLIMIT_AS` caps virtual address space, not RSS; the
+  64 MiB `--size` cap on the root tmpfs is what bounds tmpfs RAM. A per-worker
+  memory cgroup (`memory.max`) would be a stricter belt-and-braces defense where
+  cgroup delegation is available.
 - Build output and compiler diagnostics are visible to the trusted workflow.
   Worker standard streams are not.
