@@ -28,13 +28,29 @@ AMD's cost profile as the bar any expensive candidate path must not exceed.
   nested dissection beats a purely greedy local heuristic.
 
 ## Status in `src/ordering/`
-**Implemented** — `src/ordering/amd.rs` is a stdlib-only quotient-graph AMD port
-(cs_amd style), wired in via `mod.rs::order()`. It is also the harness baseline
-(`feral_amd::amd_order`, a different AMD variant) that every run is scored
-against, so our score sits at the AMD-vs-AMD ceiling: **0.9992** on the dev
-corpus (see [0001](../experiments/0001-amd-quotient-graph.md)). There is no
-headroom against AMD by doing AMD — beating 1.00 needs a different family
-(nested dissection) on the structured/grid-like matrices.
+**It is the anchor of the portfolio.** `order()` calls
+`feral_amd::amd_order(&core)` with library-default options — bit-for-bit the
+grader's baseline — and takes it as the floor before considering anything else.
+That is what guarantees `ratio <= 1.0` on every matrix; see
+[best-of-portfolio](best-of-portfolio.md).
+
+The portfolio also carries **~10 further AMD variants** as ordinary candidates,
+because AMD's two options change the ordering materially:
+`aggressive` (element absorption) x `dense_alpha` in {-1, 1, 2, 5, 10, 16}, where
+`dense_alpha < 0` disables dense-row detection entirely so AMD never defers the
+dense KKT coupling rows. Those are gated to `n < 150k && nnz < 130k`.
+
+> **Correction (2026-07-26).** An earlier version of this page said
+> "`src/ordering/amd.rs` is a stdlib-only quotient-graph AMD port ... 0.9992".
+> That file no longer exists — the hand-rolled port was replaced by the
+> `feral-amd` crate declared in `deps.toml`, and the corpus has been rebaselined
+> since (300 matrices), so 0.9992 is expired. Current score:
+> [index.md](../index.md).
+
+The old conclusion still holds and is worth keeping: **there is no headroom in
+doing AMD-vs-AMD.** What the corpus shows now is stronger than that — 122 of 300
+matrices tie AMD at exactly 1.000 even against METIS, Scotch, KaHIP, RCM, Sloan,
+AMF and two hand-rolled ND variants. On this corpus AMD is not a soft baseline.
 
 ## Links
 - Literature: _(add Amestoy-Davis-Duff 1996 note)_
