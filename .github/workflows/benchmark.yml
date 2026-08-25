@@ -54,12 +54,19 @@ jobs:
       # dependency build.rs/proc macros can execute), then independently around
       # every order() worker. Package installation is the only root operation;
       # the trusted grader parent and all untrusted code run as the runner user.
-      - name: Install bubblewrap
+      #
+      # prlimit (util-linux) wraps every worker's bwrap to carry the per-worker
+      # rlimits, so grader mode fails closed without it. It ships in the base
+      # image rather than a package we install; assert it here so a missing tool
+      # is one clear line instead of every worker exiting nonzero with its
+      # stderr on /dev/null.
+      - name: Install sandbox tools
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap
           bwrap --version
+          prlimit --version
 
       # Ubuntu 24.04 (the ubuntu-latest image) enables an AppArmor policy that
       # restricts unprivileged user namespaces, which stops bubblewrap from
