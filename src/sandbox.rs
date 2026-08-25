@@ -47,6 +47,13 @@ const OUTPUT_SLACK_BYTES: u64 = 4096;
 /// string rather than a permutation.
 const SELF_CHECK_OUTPUT_BYTES: u64 = 64 * 1024;
 
+/// Ceiling on the computed output cap. `8 + 8*n` is saturating, and a saturated
+/// `u64::MAX` is exactly `RLIM_INFINITY` — the one value that would turn the cap
+/// OFF rather than making it large. Clamping keeps `--fsize` finite for every
+/// `n`. 1 GiB is ~134M columns, far above the corpus, so it never binds a
+/// legitimate write.
+const MAX_OUTPUT_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Per-worker resource limits applied in grader mode. `for_order` sizes the
 /// writable output to the exact permutation this matrix produces so a runaway
 /// write hits `SIGXFSZ` immediately (issue #48); the other caps are fixed.
@@ -65,7 +72,8 @@ impl WorkerLimits {
     pub fn for_order(n: usize) -> Self {
         let max_output_bytes = 8u64
             .saturating_add((n as u64).saturating_mul(8))
-            .saturating_add(OUTPUT_SLACK_BYTES);
+            .saturating_add(OUTPUT_SLACK_BYTES)
+            .min(MAX_OUTPUT_CEILING_BYTES);
         Self {
             root_tmpfs_bytes: ROOT_TMPFS_BYTES,
             max_output_bytes,
@@ -478,8 +486,13 @@ mod tests {
     fn worker_limits_for_order_caps_output_to_permutation_size() {
         // A valid permutation of 0..n serializes to exactly 8 + 8*n bytes.
         assert_eq!(WorkerLimits::for_order(4).max_output_bytes(), 8 + 32 + 4096);
-        // Huge n must not overflow the cap arithmetic.
-        assert!(WorkerLimits::for_order(usize::MAX).max_output_bytes() >= 4096);
+        // Huge n must neither overflow the arithmetic nor saturate to
+        // u64::MAX, which prlimit would read as RLIM_INFINITY — an unbounded
+        // output file, i.e. the cap silently off. It clamps to a finite ceiling.
+        assert_eq!(
+            WorkerLimits::for_order(usize::MAX).max_output_bytes(),
+            MAX_OUTPUT_CEILING_BYTES
+        );
     }
 
     #[test]

@@ -56,6 +56,12 @@ and absolute values shift.
 - `order()` must return a bijection of `0..n`, deterministically, within
   2 s/matrix. The cap is ENFORCED: `order()` runs in a child process that is
   SIGKILLed at 2 s.
+- There is also a 4 GiB per-matrix memory cap on the graded run, applied to the
+  worker's address space. It is far above what an ordering needs (the
+  factorization that would need it runs outside your code), so it constrains
+  only lookup tables and other bulk allocation. Unlike the time cap it is NOT
+  applied to local runs, so a submission that allocates past it will pass
+  locally and fail when graded.
 - The corpus reaches n ≈ 340,000, and the families (NLP/QCP/QP/QCQP) include
   DENSE KKT rows / hub nodes. Cost scales with density (nnz, max-degree), not
   just n: an O(deg²)-per-pivot or O(n²) inner loop will blow the cap on a dense

@@ -137,13 +137,24 @@ Linux-only.
   compromise.
 - Per-worker limits are enforced with `prlimit` rlimits, not a cgroup. This is
   portable to the unprivileged runner user (no cgroup delegation needed) but has
-  two consequences. `RLIMIT_NPROC` is per-real-UID — it counts the trusted
-  parent's own tasks too — so it cannot be as tight as a per-cgroup `pids.max`;
-  4096 bounds a runaway well below the observed ~24k while staying clear of any
-  legitimate task count. `RLIMIT_AS` caps virtual address space, not RSS; the
-  64 MiB `--size` cap on the root tmpfs is what bounds tmpfs RAM. A per-worker
-  memory cgroup (`memory.max`) would be a stricter belt-and-braces defense where
-  cgroup delegation is available.
+  two consequences. `RLIMIT_NPROC` is accounted per user, not per worker, so it
+  cannot be as tight as a per-cgroup `pids.max`; 4096 bounds a runaway well below
+  the observed ~24k while staying clear of any legitimate task count. (How much
+  of the budget the worker actually gets to itself depends on the kernel: since
+  5.14 the count is kept per `(user_namespace, uid)` via ucounts, and bubblewrap
+  puts each worker in its own user namespace, so the cap is likely tighter in
+  practice than a shared per-UID count would be. The choice of 4096 does not
+  depend on which behaviour holds.) `RLIMIT_AS` caps virtual address space, not
+  RSS; the 64 MiB `--size` cap on the root tmpfs is what bounds tmpfs RAM. A
+  per-worker memory cgroup (`memory.max`) would be a stricter belt-and-braces
+  defense where cgroup delegation is available.
+- `prlimit` is given one value per resource, which sets the soft AND hard limit,
+  so the worker cannot raise a cap back after `exec`. The cost is that on a host
+  whose own hard limit is already below one of these values, the unprivileged
+  parent cannot set it and `prlimit` exits nonzero — every worker fails rather
+  than running uncapped. That is the intended direction (fail closed), and
+  `--grader --sandbox-self-check` gates it with a visible error before any
+  grading starts, because a worker's own stderr goes to `/dev/null`.
 - `/dev` is held read-only rather than size-capped. bubblewrap consumes `--size`
   only in its `--tmpfs` handler and rejects `--size` before `--dev`, so the /dev
   tmpfs cannot take a size the way `/` does. Read-only is the tighter bound
@@ -152,5 +163,11 @@ Linux-only.
   alone does not bound a tmpfs: many small files each stay under the per-file
   cap while the total is unlimited, which is why each writable tmpfs needs its
   own bound.
+- The remaining RAM-charged shmem path is the one with no mount point to cap:
+  anonymous shared memory (`memfd_create`, `MAP_SHARED | MAP_ANONYMOUS`). It is
+  bounded without a size cap — `RLIMIT_FSIZE` limits each memfd, `RLIMIT_NOFILE`
+  limits how many the worker can hold open at once, and anything it maps counts
+  against `RLIMIT_AS` — so no separate control is needed. /dev/shm needs none
+  either: bubblewrap creates it inside the /dev tmpfs, which is read-only.
 - Build output and compiler diagnostics are visible to the trusted workflow.
   Worker standard streams are not.
