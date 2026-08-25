@@ -74,11 +74,41 @@ candidate executable is the process started inside bubblewrap, so its loader,
 Rust startup, dependency `.init_array` entries, and `main` all begin after the
 namespace and filesystem boundary exists.
 
-When the environment variable is absent, local Linux/macOS development keeps
-direct subprocess behavior. The local parent finds a sibling
-`ssi-candidate-worker`, so local setup builds the workspace before
-`cargo run --release`. Production additionally passes `--grader`; in that mode
-an unset or empty `SSI_GRADER_SANDBOX` is a hard failure. Unsupported
+## Local per-worker boundary (default)
+
+The pushed-back winning submission is untrusted code, and the local development
+loop in `RULES.md` runs it (`cargo run --release`). Local runs therefore
+sandbox `order()` **by default** rather than executing it directly on the
+contestant's host (issue #47). With `SSI_GRADER_SANDBOX` unset, `from_env`
+selects the host-native sandbox:
+
+- **Linux** → the same per-worker **bubblewrap** command described above (fresh
+  PID/network/mount namespace, network unshared, minimal read-only filesystem,
+  one writable output).
+- **macOS** → **`sandbox-exec` (Seatbelt)**, since bubblewrap does not exist
+  there. The profile denies all network and every filesystem write except the
+  one pre-created output file, while allowing the reads (runtime libraries, the
+  dyld shared cache), `mach-lookup`, and `sysctl-read` a dynamically linked Rust
+  binary needs to start. The parent still `env_clear()`s, nulls stdio, and runs
+  the worker in a private cwd. The output path is canonicalized before it goes
+  into the write-allow rule (Seatbelt matches resolved paths, and macOS
+  `/var`→`/private/var`).
+
+If no native sandbox is available (e.g. a Linux host without `bwrap`), the run
+**fails closed** with an actionable message — it never silently degrades to
+direct execution. The explicit, at-your-own-risk opt-out
+`SSI_ALLOW_UNSANDBOXED_WORKER=1` restores direct execution and prints a loud
+warning on every run; it is honored only in local mode and ignored under
+`--grader`.
+
+The build phase has a matching local wrapper,
+`scripts/local-candidate-build.sh`: on Linux it reuses the bubblewrap build
+boundary, on macOS it runs `cargo build -p ssi-candidate-worker` under
+`sandbox-exec` with network denied and writes confined to the build/cache/temp
+roots. The trusted parent build is unaffected.
+
+Production additionally passes `--grader`; in that mode an unset or empty
+`SSI_GRADER_SANDBOX` is a hard failure, and the opt-out is ignored. Unsupported
 platforms, root execution, missing bubblewrap, missing candidate/input/output
 files, and spawn failures are also hard failures.
 

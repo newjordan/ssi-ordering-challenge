@@ -87,10 +87,20 @@ fn main() -> ExitCode {
     let worker_sandbox = match sandbox::WorkerSandbox::from_env(grader_mode) {
         Ok(sandbox) => sandbox,
         Err(e) => {
-            eprintln!("RUN FAILED (grader sandbox: {e})");
+            eprintln!("RUN FAILED (worker sandbox: {e})");
             return ExitCode::FAILURE;
         }
     };
+    // A local run reaches Disabled only through the explicit opt-out; make that
+    // choice loud so it is never a silent regression to unsandboxed execution.
+    if !grader_mode && !worker_sandbox.is_enabled() {
+        eprintln!(
+            "WARNING: {}=1 — running the candidate worker WITHOUT a sandbox. \
+             A malicious pushed-back submission can reach your network and files. \
+             Unset it to sandbox order() (issue #47).",
+            sandbox::ALLOW_UNSANDBOXED_ENV
+        );
+    }
     let candidate_worker = match candidate_worker_path(grader_mode) {
         Ok(path) => path,
         Err(e) => {

@@ -57,8 +57,12 @@ fn missing_local_candidate_reports_build_command() {
     let missing =
         std::env::temp_dir().join(format!("ssi-missing-candidate-{}", std::process::id()));
     let _ = std::fs::remove_file(&missing);
+    // Opt out of the default local worker sandbox so this test reaches the
+    // candidate-path check regardless of whether the runner has bwrap installed
+    // (the sandbox selection now runs before the candidate lookup).
     let output = Command::new(parent_binary())
         .env_remove("SSI_GRADER_SANDBOX")
+        .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
         .env("SSI_CANDIDATE_WORKER", missing)
         .output()
         .expect("run trusted parent");

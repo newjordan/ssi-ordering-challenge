@@ -46,6 +46,16 @@ and absolute values shift.
    The machine-readable `benchmarkCommand` performs this incremental rebuild.
    Requires `cargo-deny`:
    `cargo install cargo-deny --version 0.20.2 --locked`.
+
+   > **Local runs are sandboxed by default.** The pushed-back winning submission
+   > is untrusted code; `cargo run` executes it, so `order()` runs inside a
+   > per-worker sandbox automatically — bubblewrap on Linux, `sandbox-exec`
+   > (Seatbelt) on macOS — with no network and no host writes except its one
+   > output file (issue #47). If no sandbox is available the run fails closed with
+   > instructions. For matching build-phase containment, build the untrusted
+   > worker with `bash scripts/local-candidate-build.sh` instead of a bare
+   > `cargo build -p ssi-candidate-worker`. The at-your-own-risk opt-out
+   > `SSI_ALLOW_UNSANDBOXED_WORKER=1` disables both and prints a loud warning.
 4. Read the per-matrix table. Attribute wins/losses per family and size bucket
    (NLP, QCP, QP, QCQP; n up to ~340k).
 5. Record findings in the knowledge base (an experiment page + one `log.md`
