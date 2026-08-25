@@ -40,6 +40,13 @@ jobs:
       - name: Test watchdog process isolation offline
         run: cargo test --locked --offline --bin ssi-ordering-challenge watchdog::tests
 
+      # `read_permutation` bounds an untrusted worker's output file by the staged
+      # dimension inside the trusted parent. The workspace sets
+      # `default-members = ["."]`, so a root `cargo test` never reaches this
+      # crate; name it explicitly or the bound can regress unnoticed.
+      - name: Test worker protocol bounds offline
+        run: cargo test --locked --offline -p ssi-worker-protocol
+
       # The time-cap integration tests drive the trusted parent, which spawns
       # the separately built ssi-candidate-worker; `cargo test --test time_cap`
       # alone would not build that sibling workspace package.

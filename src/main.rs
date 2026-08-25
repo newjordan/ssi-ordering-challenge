@@ -274,8 +274,10 @@ fn main() -> ExitCode {
             )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
-                watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(&out_perm)
-                    .map_err(|e| format!("worker produced no readable permutation: {e}")),
+                watchdog::WorkerOutcome::Ok => {
+                    ssi_worker_protocol::read_permutation(&out_perm, pat.n)
+                        .map_err(|e| format!("worker produced no readable permutation: {e}"))
+                }
                 watchdog::WorkerOutcome::Timeout => {
                     if show_matrix_census {
                         Err(format!(
