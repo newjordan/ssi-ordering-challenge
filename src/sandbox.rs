@@ -597,6 +597,21 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_local_default_is_bubblewrap_or_fails_closed_never_disabled() {
+        // The security-critical invariant, robust to how CI runs: the local
+        // default must NEVER be a silent Disabled. With bwrap present and a
+        // non-root euid it is Bubblewrap; otherwise it fails closed (root
+        // refusal, or bwrap absent) — but never unsandboxed.
+        match WorkerSandbox::select(false, None, false) {
+            Ok(WorkerSandbox::Bubblewrap { .. }) => {}
+            Ok(WorkerSandbox::Disabled) => panic!("local default must not be unsandboxed"),
+            Ok(other) => panic!("unexpected local sandbox on Linux: {other:?}"),
+            Err(_) => {} // fail-closed is acceptable (root, or bwrap missing)
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_command_denies_network_and_allows_only_the_output() {
