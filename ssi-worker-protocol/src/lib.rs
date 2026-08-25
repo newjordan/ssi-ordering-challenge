@@ -177,7 +177,10 @@ mod tests {
         let path = temp_file("permutation.bin");
         let permutation = vec![3, 1, 0, 2];
         write_permutation(&path, &permutation).unwrap();
-        assert_eq!(read_permutation(&path, permutation.len()).unwrap(), permutation);
+        assert_eq!(
+            read_permutation(&path, permutation.len()).unwrap(),
+            permutation
+        );
     }
 
     #[test]
