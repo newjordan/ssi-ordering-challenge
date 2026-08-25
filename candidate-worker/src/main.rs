@@ -149,7 +149,32 @@ fn sandbox_self_check(args: &[String]) -> i32 {
         let fs_type = fields.nth(2).unwrap_or("");
         let options = fields.next().unwrap_or("");
         if fs_type != "tmpfs" || !options.split(',').any(|opt| opt.starts_with("size=")) {
-            return Err(format!("root filesystem is not a size-capped tmpfs: {root}"));
+            return Err(format!(
+                "root filesystem is not a size-capped tmpfs: {root}"
+            ));
+        }
+        // `--dev` mounts a second RAM-charged tmpfs that bubblewrap's `--size`
+        // cannot cap, so it is held read-only instead (issue #49). Assert both
+        // the mount flag and the behaviour: a writable /dev is an unbounded
+        // memory sink that per-file RLIMIT_FSIZE does not bound, because many
+        // small files each stay under the per-file cap.
+        let dev = mounts
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some("/dev"))
+            .ok_or_else(|| "no /dev mount in /proc/mounts".to_string())?;
+        if !dev
+            .split_whitespace()
+            .nth(3)
+            .unwrap_or("")
+            .split(',')
+            .any(|opt| opt == "ro")
+        {
+            return Err(format!("/dev is not mounted read-only: {dev}"));
+        }
+        let probe = "/dev/ssi-sandbox-write-probe";
+        if std::fs::write(probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(probe);
+            return Err("/dev accepted a new file; its tmpfs is an uncapped RAM sink".to_string());
         }
         std::fs::write(output, b"ok\n").map_err(|error| format!("write permitted output: {error}"))
     };
@@ -182,7 +207,9 @@ fn check_soft_limit(limits: &str, name: &str, max_allowed: u64) -> Result<(), St
         .parse()
         .map_err(|_| format!("{name} soft limit is not a number: {soft:?}"))?;
     if value > max_allowed {
-        return Err(format!("{name} soft limit {value} exceeds expected cap {max_allowed}"));
+        return Err(format!(
+            "{name} soft limit {value} exceeds expected cap {max_allowed}"
+        ));
     }
     Ok(())
 }
@@ -219,7 +246,8 @@ fn timeout_child() -> i32 {
 mod limit_tests {
     use super::check_soft_limit;
 
-    const SAMPLE: &str = "Limit                     Soft Limit           Hard Limit           Units\n\
+    const SAMPLE: &str =
+        "Limit                     Soft Limit           Hard Limit           Units\n\
         Max file size             65536                65536                bytes\n\
         Max processes             4096                 4096                 processes\n\
         Max address space         unlimited            unlimited            bytes\n";

@@ -67,7 +67,8 @@ target/trusted/release/ssi-ordering-challenge --grader
 - per-worker resource limits applied by wrapping bubblewrap in `prlimit`
   (util-linux), inherited across bwrap into the worker:
   - a size-capped root tmpfs (`--tmpfs / --size`, 64 MiB) so writes to `/`
-    cannot exhaust RAM;
+    cannot exhaust RAM, and a read-only `/dev` (`--remount-ro /dev`) so the
+    second, RAM-charged tmpfs bubblewrap mounts there cannot be filled either;
   - `RLIMIT_FSIZE` sized to the exact `8 + 8·n` permutation output (plus a
     small slack) so a runaway write to the output file hits `SIGXFSZ` instead
     of filling the disk;
@@ -110,8 +111,9 @@ requires:
 - no `/workspace`, `/home`, `/root`, or `/tmp`;
 - read-only pattern input and writable permutation output;
 - live per-worker resource limits: `/proc/self/limits` shows finite (not
-  `unlimited`) caps on file size, process count, and address space, and the
-  root filesystem is a size-capped tmpfs.
+  `unlimited`) caps on file size, process count, and address space, the
+  root filesystem is a size-capped tmpfs, and `/dev` is mounted read-only and
+  refuses a new file.
 
 The workflow also runs `--grader --sandbox-timeout-self-check`: the candidate
 starts a descendant and blocks, then the watchdog must time out and tear down
@@ -142,5 +144,13 @@ Linux-only.
   64 MiB `--size` cap on the root tmpfs is what bounds tmpfs RAM. A per-worker
   memory cgroup (`memory.max`) would be a stricter belt-and-braces defense where
   cgroup delegation is available.
+- `/dev` is held read-only rather than size-capped. bubblewrap consumes `--size`
+  only in its `--tmpfs` handler and rejects `--size` before `--dev`, so the /dev
+  tmpfs cannot take a size the way `/` does. Read-only is the tighter bound
+  anyway (zero writable bytes), and the remount is non-recursive, so the device
+  nodes bind-mounted under /dev stay usable. Note that per-file `RLIMIT_FSIZE`
+  alone does not bound a tmpfs: many small files each stay under the per-file
+  cap while the total is unlimited, which is why each writable tmpfs needs its
+  own bound.
 - Build output and compiler diagnostics are visible to the trusted workflow.
   Worker standard streams are not.

@@ -278,9 +278,20 @@ impl WorkerSandbox {
                 // mounted immediately after it.
                 cmd.arg("--size")
                     .arg(limits.root_tmpfs_bytes.to_string())
-                    .args([
-                        "--tmpfs", "/", "--proc", "/proc", "--dev", "/dev",
-                    ]);
+                    .args(["--tmpfs", "/", "--proc", "/proc", "--dev", "/dev"]);
+                // `--dev` mounts a SECOND tmpfs, which is also RAM-charged. It
+                // cannot be size-capped the same way: bubblewrap consumes
+                // `--size` only in its `--tmpfs` handler and dies with "--size
+                // must be followed by --tmpfs" otherwise (bubblewrap.c,
+                // `next_size_arg`). Left alone it is an unbounded RAM sink that
+                // the per-file RLIMIT_FSIZE does not cover, because many small
+                // files each stay under the per-file cap while the total does
+                // not. Remount it read-only instead — zero writable bytes is a
+                // strictly tighter bound than any size cap. The remount is
+                // non-recursive and applies to the /dev tmpfs itself, so the
+                // device nodes bubblewrap bind-mounted under it (/dev/null,
+                // /dev/urandom, ...) stay readable and writable as devices.
+                cmd.args(["--remount-ro", "/dev"]);
 
                 // The Rust binary is normally dynamically linked to libc and
                 // libgcc. Expose only runtime-library trees, read-only; do not
@@ -482,9 +493,37 @@ mod tests {
     }
 
     #[test]
+    fn bubblewrap_command_makes_dev_read_only() {
+        let argv = bubblewrap_order_command(4);
+        // `--dev /dev` mounts a SECOND tmpfs, and bubblewrap's `--size` composes
+        // only with `--tmpfs` (`--size N --dev /dev` dies with "--size must be
+        // followed by --tmpfs"), so that tmpfs cannot be size-capped the way `/`
+        // is. Remount it read-only instead: zero writable bytes is a strictly
+        // tighter bound than any size cap, and it closes the many-small-files
+        // RAM fill that the per-file RLIMIT_FSIZE does not cover (issue #49).
+        let dev = argv
+            .iter()
+            .position(|arg| arg == "--dev")
+            .unwrap_or_else(|| panic!("no --dev mount to harden: {argv:?}"));
+        let remount = argv
+            .windows(2)
+            .position(|w| w == ["--remount-ro", "/dev"])
+            .unwrap_or_else(|| {
+                panic!("/dev tmpfs must be remounted read-only (issue #49): {argv:?}")
+            });
+        assert!(
+            remount > dev,
+            "--remount-ro /dev must follow the --dev mount it hardens: {argv:?}"
+        );
+    }
+
+    #[test]
     fn bubblewrap_command_wraps_bwrap_in_prlimit_with_resource_caps() {
         let argv = bubblewrap_order_command(4);
-        assert_eq!(argv[0], "/test/prlimit", "worker must be wrapped in prlimit");
+        assert_eq!(
+            argv[0], "/test/prlimit",
+            "worker must be wrapped in prlimit"
+        );
         assert!(
             argv.contains(&"--nproc=4096".to_string()),
             "fork-bomb cap missing (issue #52): {argv:?}"
