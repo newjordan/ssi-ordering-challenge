@@ -33,7 +33,14 @@ later via Yukon.
 - **Build phase** (`scripts/local-candidate-build.sh`): builds the untrusted
   `ssi-candidate-worker` under the same containment — bubblewrap on Linux (reuses
   `grader-sandbox.sh candidate-build`), `sandbox-exec` with network denied on
-  macOS. The trusted parent build is untouched.
+  macOS. This is the **default local build path**: `benchmark.json`'s
+  `benchmarkCommand` runs the wrapper (not a bare `cargo build -p
+  ssi-candidate-worker`), and `setupCommand` warms only the trusted parent
+  (`cargo build -p ssi-ordering-challenge`, no `--workspace`) so no default path
+  compiles the candidate unsandboxed. A dependency build script or proc-macro
+  declared via `src/ordering/deps.toml` runs arbitrary code at build time, so
+  this must be contained just like the execute phase. The trusted parent build
+  is untouched.
 - **Grader mode is unchanged**: `--grader` still requires
   `SSI_GRADER_SANDBOX=bubblewrap`, and ignores the opt-out.
 
@@ -48,10 +55,15 @@ later via Yukon.
     valid permutation.
   - `SSI_ALLOW_UNSANDBOXED_WORKER=1` → loud warning, `$HOME` write succeeds, and
     **exactly 600 C2 connections** — proving the sandbox is what blocks the RCE.
-- **Build phase:** a full clean rebuild under `sandbox-exec` succeeds with
-  network denied and writes confined to `target/`, `CARGO_HOME`, `TMPDIR`.
-- **Regression:** `cargo test --release` green (new Seatbelt selection/command
-  tests; `security_boundary` unchanged for the grader path).
+- **Build phase (default path):** the `benchmarkCommand` build step
+  (`scripts/local-candidate-build.sh`) was driven with a `build.rs` payload that
+  opens a TCP connection and writes a host file (the compile-time analogue of a
+  malicious dependency). Under the default wrapper it reports
+  `network=BLOCKED host_write=BLOCKED` (0 C2, no host write); the same payload
+  under a bare `cargo build` connects and writes. Writes stay confined to
+  `target/`, `CARGO_HOME`, `TMPDIR`.
+- **Regression:** `cargo test --release` green (Seatbelt selection/command tests;
+  `security_boundary` asserts the default build path routes through the sandbox).
 
 ## Residual (deferred to Yukon)
 

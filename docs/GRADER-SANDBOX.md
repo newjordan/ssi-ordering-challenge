@@ -101,11 +101,16 @@ direct execution. The explicit, at-your-own-risk opt-out
 warning on every run; it is honored only in local mode and ignored under
 `--grader`.
 
-The build phase has a matching local wrapper,
+The build phase is sandboxed by default too, via
 `scripts/local-candidate-build.sh`: on Linux it reuses the bubblewrap build
 boundary, on macOS it runs `cargo build -p ssi-candidate-worker` under
 `sandbox-exec` with network denied and writes confined to the build/cache/temp
-roots. The trusted parent build is unaffected.
+roots. This is the default local build path — `benchmark.json`'s
+`benchmarkCommand` runs the wrapper and its `setupCommand` warms only the trusted
+parent (`-p ssi-ordering-challenge`, not `--workspace`), so no default path
+compiles the untrusted candidate (its `deps.toml` dependencies can carry build
+scripts/proc-macros that execute at compile time) outside a sandbox. The trusted
+parent build is unaffected.
 
 Production additionally passes `--grader`; in that mode an unset or empty
 `SSI_GRADER_SANDBOX` is a hard failure, and the opt-out is ignored. Unsupported

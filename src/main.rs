@@ -624,16 +624,16 @@ fn candidate_worker_path(grader_mode: bool) -> Result<PathBuf, String> {
 fn require_candidate_worker(path: PathBuf) -> Result<PathBuf, String> {
     let canonical = std::fs::canonicalize(&path).map_err(|error| {
         format!(
-            "candidate worker not found at {}: {error}. Run `cargo build --release --workspace \
-             --offline --locked` before `cargo run`, and rebuild `ssi-candidate-worker` after \
-             ordering edits",
+            "candidate worker not found at {}: {error}. Build the untrusted candidate worker \
+             (sandboxed) with `bash scripts/local-candidate-build.sh` before `cargo run`, and \
+             rebuild `ssi-candidate-worker` after ordering edits",
             path.display()
         )
     })?;
     if !canonical.is_file() {
         return Err(format!(
-            "candidate worker is not a regular file: {}. Run `cargo build --release --workspace \
-             --offline --locked` before `cargo run`",
+            "candidate worker is not a regular file: {}. Build the untrusted candidate worker \
+             (sandboxed) with `bash scripts/local-candidate-build.sh` before `cargo run`",
             canonical.display()
         ));
     }
