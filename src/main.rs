@@ -281,11 +281,14 @@ fn main() -> ExitCode {
                 pat_file.path(),
                 &out_perm,
                 &worker_cwd,
+                &sandbox::WorkerLimits::for_order(pat.n),
             )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
-                watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(&out_perm)
-                    .map_err(|e| format!("worker produced no readable permutation: {e}")),
+                watchdog::WorkerOutcome::Ok => {
+                    ssi_worker_protocol::read_permutation(&out_perm, pat.n)
+                        .map_err(|e| format!("worker produced no readable permutation: {e}"))
+                }
                 watchdog::WorkerOutcome::Timeout => {
                     if show_matrix_census {
                         Err(format!(
@@ -540,6 +543,7 @@ fn sandbox_self_check_parent(
         &input,
         &output,
         &cwd,
+        &sandbox::WorkerLimits::for_self_check(),
     )?;
     let cfg = watchdog::CapConfig {
         time_cap: Duration::from_secs(5),
@@ -586,6 +590,7 @@ fn sandbox_timeout_self_check_parent(
         &input,
         &output,
         &cwd,
+        &sandbox::WorkerLimits::for_self_check(),
     )?;
     let cfg = watchdog::CapConfig {
         time_cap: Duration::from_millis(200),
@@ -817,7 +822,7 @@ fn parse_note() -> String {
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len() {
         if args[i] == "--note" && i + 1 < args.len() {
-            return args[i + 1].replace(['\t', '\n'], " ");
+            return failsafe::sanitize(&args[i + 1]);
         }
     }
     String::new()

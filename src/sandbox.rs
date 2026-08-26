@@ -21,6 +21,91 @@ pub const MODE_ENV: &str = "SSI_GRADER_SANDBOX";
 /// mode; `--grader` ignores it entirely.
 pub const ALLOW_UNSANDBOXED_ENV: &str = "SSI_ALLOW_UNSANDBOXED_WORKER";
 
+/// Size cap for the worker's root tmpfs. bubblewrap mounts `/` as tmpfs, whose
+/// pages are charged to RAM (page cache), not runner disk. Without a `--size`
+/// bound a submission can memory-exhaust the whole grading job — trusted parent
+/// included — by writing to `/` (issue #49). The worker legitimately writes
+/// nothing to `/`; its only writable path is the bound output file. 64 MiB
+/// leaves slack for transient runtime files while making a fill attack fail
+/// against this cap instead of the machine.
+const ROOT_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Address-space cap for the worker (`RLIMIT_AS`). The cost doc fixes a 2–4 GB
+/// per-matrix memory cap that "doubles as the anti-lookup-table cap"; the
+/// factorization that needs it runs in the trusted parent, so an ordering-only
+/// worker never approaches this. Enforcing the documented ceiling here also
+/// stops an in-process allocation OOM that the tmpfs `--size` cap does not
+/// cover.
+const ADDRESS_SPACE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Process cap for the worker (`RLIMIT_NPROC`). A legitimate ordering forks
+/// nothing (rayon uses threads within one process); a fork bomb (issue #52) can
+/// otherwise spawn tens of thousands. `RLIMIT_NPROC` is per-real-UID — it counts
+/// the trusted parent's own tasks too — so it cannot be set as tight as a
+/// per-cgroup `pids.max` (which would need cgroup delegation the unprivileged
+/// runner user does not get). 4096 bounds a runaway well below the observed
+/// ~24k while staying clear of any legitimate steady-state task count.
+const MAX_PROCESSES: u64 = 4096;
+
+/// Headroom added above the exact permutation size when capping the writable
+/// output file, so the exact valid write always succeeds.
+const OUTPUT_SLACK_BYTES: u64 = 4096;
+
+/// Output-file cap for the sandbox self-checks, which write a short diagnostic
+/// string rather than a permutation.
+const SELF_CHECK_OUTPUT_BYTES: u64 = 64 * 1024;
+
+/// Ceiling on the computed output cap. `8 + 8*n` is saturating, and a saturated
+/// `u64::MAX` is exactly `RLIM_INFINITY` — the one value that would turn the cap
+/// OFF rather than making it large. Clamping keeps `--fsize` finite for every
+/// `n`. 1 GiB is ~134M columns, far above the corpus, so it never binds a
+/// legitimate write.
+const MAX_OUTPUT_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Per-worker resource limits applied in grader mode. `for_order` sizes the
+/// writable output to the exact permutation this matrix produces so a runaway
+/// write hits `SIGXFSZ` immediately (issue #48); the other caps are fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerLimits {
+    root_tmpfs_bytes: u64,
+    max_output_bytes: u64,
+    address_space_bytes: u64,
+    max_processes: u64,
+}
+
+impl WorkerLimits {
+    /// Limits for a real `order()` invocation on a pattern of dimension `n`. A
+    /// valid permutation output is exactly `8 + 8*n` bytes (see
+    /// `ssi_worker_protocol::write_permutation`).
+    pub fn for_order(n: usize) -> Self {
+        let max_output_bytes = 8u64
+            .saturating_add((n as u64).saturating_mul(8))
+            .saturating_add(OUTPUT_SLACK_BYTES)
+            .min(MAX_OUTPUT_CEILING_BYTES);
+        Self {
+            root_tmpfs_bytes: ROOT_TMPFS_BYTES,
+            max_output_bytes,
+            address_space_bytes: ADDRESS_SPACE_BYTES,
+            max_processes: MAX_PROCESSES,
+        }
+    }
+
+    /// Limits for the sandbox self-checks (diagnostic output, not a permutation).
+    pub fn for_self_check() -> Self {
+        Self {
+            root_tmpfs_bytes: ROOT_TMPFS_BYTES,
+            max_output_bytes: SELF_CHECK_OUTPUT_BYTES,
+            address_space_bytes: ADDRESS_SPACE_BYTES,
+            max_processes: MAX_PROCESSES,
+        }
+    }
+
+    #[cfg(test)]
+    fn max_output_bytes(&self) -> u64 {
+        self.max_output_bytes
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerInvocation {
     Order,
@@ -51,7 +136,13 @@ pub enum WorkerSandbox {
     /// Linux bubblewrap: fresh PID/network/mount namespaces per worker. Used by
     /// the grader and, by default, by local runs on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Bubblewrap { executable: PathBuf },
+    Bubblewrap {
+        executable: PathBuf,
+        /// `prlimit` (util-linux) wraps bubblewrap to apply per-worker rlimits
+        /// (file size, address space, process count). Kept as a resolved path
+        /// so the worker command never depends on `PATH`.
+        prlimit: PathBuf,
+    },
     /// macOS `sandbox-exec` (Seatbelt): the default for local runs on macOS,
     /// where bubblewrap does not exist. Denies network and all filesystem writes
     /// except the single staged output file.
@@ -128,11 +219,15 @@ impl WorkerSandbox {
                         .to_string(),
                 );
             }
-            find_tool(&["/usr/bin/bwrap", "/bin/bwrap"])
-                .map(|executable| Self::Bubblewrap { executable })
-                .ok_or_else(|| {
-                    "bubblewrap requested but /usr/bin/bwrap and /bin/bwrap are absent".to_string()
-                })
+            let executable = find_tool(&["/usr/bin/bwrap", "/bin/bwrap"]).ok_or_else(|| {
+                "bubblewrap requested but /usr/bin/bwrap and /bin/bwrap are absent".to_string()
+            })?;
+            let prlimit = find_tool(&["/usr/bin/prlimit", "/bin/prlimit"]).ok_or_else(|| {
+                "per-worker resource limits require prlimit (util-linux) but \
+                 /usr/bin/prlimit and /bin/prlimit are absent"
+                    .to_string()
+            })?;
+            Ok(Self::Bubblewrap { executable, prlimit })
         }
     }
 
@@ -148,13 +243,22 @@ impl WorkerSandbox {
                         .to_string(),
                 );
             }
-            return match find_tool(&["/usr/bin/bwrap", "/bin/bwrap"]) {
-                Some(executable) => Ok(Self::Bubblewrap { executable }),
-                None => Err(fail_closed_message(
+            // Local Linux runs get the same per-worker resource caps as the
+            // grader (issues #48/#49/#52): bubblewrap for isolation, prlimit for
+            // the rlimits. Both are required — fail closed if either is absent.
+            let Some(executable) = find_tool(&["/usr/bin/bwrap", "/bin/bwrap"]) else {
+                return Err(fail_closed_message(
                     "bubblewrap (bwrap)",
                     "install it, e.g. `apt-get install bubblewrap`",
-                )),
+                ));
             };
+            let Some(prlimit) = find_tool(&["/usr/bin/prlimit", "/bin/prlimit"]) else {
+                return Err(fail_closed_message(
+                    "prlimit (util-linux)",
+                    "install it, e.g. `apt-get install util-linux`",
+                ));
+            };
+            return Ok(Self::Bubblewrap { executable, prlimit });
         }
         #[cfg(target_os = "macos")]
         {
@@ -189,9 +293,14 @@ impl WorkerSandbox {
         input: &Path,
         output: &Path,
         local_cwd: &Path,
+        limits: &WorkerLimits,
     ) -> Result<Command, String> {
         match self {
             Self::Disabled => {
+                // Local development runs contestant code directly; it is
+                // arbitrary-code-by-design (issue #47) and gets no sandbox, so
+                // the grader resource limits do not apply here.
+                let _ = limits;
                 let mut cmd = Command::new(candidate_exe);
                 if let Some(flag) = invocation.flag() {
                     cmd.arg(flag);
@@ -206,13 +315,34 @@ impl WorkerSandbox {
                 null_stdio(&mut cmd);
                 Ok(cmd)
             }
-            Self::Bubblewrap { executable } => {
+            Self::Bubblewrap {
+                executable,
+                prlimit,
+            } => {
                 let candidate_exe = canonical_file(candidate_exe, "candidate executable")?;
                 let input = canonical_file(input, "worker input")?;
                 let output = canonical_file(output, "worker output")?;
 
-                let mut cmd = Command::new(executable);
-                cmd.env_clear().args([
+                // Wrap bubblewrap in prlimit so per-worker rlimits are set on
+                // the process that execs bwrap and inherited across it into the
+                // worker. bubblewrap provides namespace/mount isolation but no
+                // resource limits; these caps close the "missing per-worker
+                // resource limits" family (issues #48, #52, and the in-process
+                // memory vector of #49) that isolation alone does not cover:
+                //   --fsize caps the single writable output file (issue #48),
+                //   --nproc bounds a fork bomb (issue #52),
+                //   --as    enforces the documented per-matrix memory cap,
+                //   --core  suppresses core dumps that would fill the scratch.
+                let mut cmd = Command::new(prlimit);
+                cmd.env_clear()
+                    .arg(format!("--nproc={}", limits.max_processes))
+                    .arg(format!("--fsize={}", limits.max_output_bytes))
+                    .arg(format!("--as={}", limits.address_space_bytes))
+                    .arg("--core=0")
+                    .arg("--")
+                    .arg(executable);
+
+                cmd.args([
                     "--unshare-pid",
                     "--unshare-net",
                     "--unshare-ipc",
@@ -223,13 +353,26 @@ impl WorkerSandbox {
                     "--cap-drop",
                     "ALL",
                     "--clearenv",
-                    "--tmpfs",
-                    "/",
-                    "--proc",
-                    "/proc",
-                    "--dev",
-                    "/dev",
                 ]);
+                // Size-cap the root tmpfs so a submission cannot exhaust RAM by
+                // writing to `/` (issue #49). `--size` applies to the tmpfs
+                // mounted immediately after it.
+                cmd.arg("--size")
+                    .arg(limits.root_tmpfs_bytes.to_string())
+                    .args(["--tmpfs", "/", "--proc", "/proc", "--dev", "/dev"]);
+                // `--dev` mounts a SECOND tmpfs, which is also RAM-charged. It
+                // cannot be size-capped the same way: bubblewrap consumes
+                // `--size` only in its `--tmpfs` handler and dies with "--size
+                // must be followed by --tmpfs" otherwise (bubblewrap.c,
+                // `next_size_arg`). Left alone it is an unbounded RAM sink that
+                // the per-file RLIMIT_FSIZE does not cover, because many small
+                // files each stay under the per-file cap while the total does
+                // not. Remount it read-only instead — zero writable bytes is a
+                // strictly tighter bound than any size cap. The remount is
+                // non-recursive and applies to the /dev tmpfs itself, so the
+                // device nodes bubblewrap bind-mounted under it (/dev/null,
+                // /dev/urandom, ...) stay readable and writable as devices.
+                cmd.args(["--remount-ro", "/dev"]);
 
                 // The Rust binary is normally dynamically linked to libc and
                 // libgcc. Expose only runtime-library trees, read-only; do not
@@ -258,6 +401,15 @@ impl WorkerSandbox {
                 Ok(cmd)
             }
             Self::Seatbelt { executable } => {
+                // macOS/Darwin does not enforce RLIMIT_AS (setrlimit is refused
+                // and large allocations are not bounded), and there is no
+                // unprivileged memory-cgroup equivalent, so the per-worker
+                // resource caps (#48/#49/#52) cannot be applied here. macOS
+                // local runs rely on Seatbelt's network-deny + write-confinement
+                // and the per-matrix time cap; full resource isolation is
+                // deferred to the Yukon managed sandbox. Only the Linux/grader
+                // bubblewrap path enforces the prlimit caps.
+                let _ = limits;
                 // Resolve symlinks: Seatbelt matches on the canonical path, and
                 // macOS temp/output paths route through /var -> /private/var, so
                 // an unresolved literal in the write-allow rule would never match.
@@ -379,6 +531,7 @@ mod tests {
                 Path::new("/pattern"),
                 Path::new("/permutation"),
                 Path::new("/empty"),
+                &WorkerLimits::for_order(4),
             )
             .unwrap();
 
@@ -453,7 +606,14 @@ mod tests {
             executable: PathBuf::from("/usr/bin/sandbox-exec"),
         };
         let cmd = sandbox
-            .worker_command(&candidate, WorkerInvocation::Order, &input, &output, &dir)
+            .worker_command(
+                &candidate,
+                WorkerInvocation::Order,
+                &input,
+                &output,
+                &dir,
+                &WorkerLimits::for_order(4),
+            )
             .unwrap();
         assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/sandbox-exec"));
 
@@ -523,7 +683,14 @@ mod tests {
         std::fs::File::create(&output).unwrap();
 
         let mut cmd = sandbox
-            .worker_command(&candidate, WorkerInvocation::Order, &input, &output, &cwd)
+            .worker_command(
+                &candidate,
+                WorkerInvocation::Order,
+                &input,
+                &output,
+                &cwd,
+                &WorkerLimits::for_order(n),
+            )
             .unwrap();
         let outcome = crate::watchdog::run_capped(
             &mut cmd,
@@ -534,7 +701,7 @@ mod tests {
         );
         assert_eq!(outcome, crate::watchdog::WorkerOutcome::Ok);
 
-        let perm = ssi_worker_protocol::read_permutation(&output).unwrap();
+        let perm = ssi_worker_protocol::read_permutation(&output, n).unwrap();
         ssi_scoring::validate_permutation(&perm, n).expect("worker returned a valid bijection");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -551,9 +718,17 @@ mod tests {
         }
         let sandbox = WorkerSandbox::Bubblewrap {
             executable: PathBuf::from("/test/bwrap"),
+            prlimit: PathBuf::from("/test/prlimit"),
         };
         let cmd = sandbox
-            .worker_command(&candidate, WorkerInvocation::Order, &input, &output, &dir)
+            .worker_command(
+                &candidate,
+                WorkerInvocation::Order,
+                &input,
+                &output,
+                &dir,
+                &WorkerLimits::for_order(4),
+            )
             .unwrap();
         let args: Vec<_> = cmd
             .get_args()
@@ -564,7 +739,12 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        assert_eq!(cmd.get_program(), OsStr::new("/test/bwrap"));
+        // The worker is now launched through prlimit, which execs bwrap after
+        // its option terminator; bwrap in turn execs the candidate.
+        assert_eq!(cmd.get_program(), OsStr::new("/test/prlimit"));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--", "/test/bwrap"]));
         assert!(args
             .windows(3)
             .any(|window| window == ["--ro-bind", &candidate, "/candidate-worker"]));
@@ -572,6 +752,111 @@ mod tests {
             .windows(2)
             .any(|window| window == ["--", "/candidate-worker"]));
         assert!(!args.iter().any(|arg| arg == "--worker"));
+    }
+
+    fn bubblewrap_order_command(n: usize) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!("ssi-sandbox-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("candidate");
+        let input = dir.join("input");
+        let output = dir.join("output");
+        for path in [&candidate, &input, &output] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        let sandbox = WorkerSandbox::Bubblewrap {
+            executable: PathBuf::from("/test/bwrap"),
+            prlimit: PathBuf::from("/test/prlimit"),
+        };
+        let cmd = sandbox
+            .worker_command(
+                &candidate,
+                WorkerInvocation::Order,
+                &input,
+                &output,
+                &dir,
+                &WorkerLimits::for_order(n),
+            )
+            .unwrap();
+        std::iter::once(cmd.get_program())
+            .chain(cmd.get_args())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn worker_limits_for_order_caps_output_to_permutation_size() {
+        // A valid permutation of 0..n serializes to exactly 8 + 8*n bytes.
+        assert_eq!(WorkerLimits::for_order(4).max_output_bytes(), 8 + 32 + 4096);
+        // Huge n must neither overflow the arithmetic nor saturate to
+        // u64::MAX, which prlimit would read as RLIM_INFINITY — an unbounded
+        // output file, i.e. the cap silently off. It clamps to a finite ceiling.
+        assert_eq!(
+            WorkerLimits::for_order(usize::MAX).max_output_bytes(),
+            MAX_OUTPUT_CEILING_BYTES
+        );
+    }
+
+    #[test]
+    fn bubblewrap_command_caps_root_tmpfs_size() {
+        let argv = bubblewrap_order_command(4);
+        assert!(
+            argv.windows(4)
+                .any(|w| w == ["--size", "67108864", "--tmpfs", "/"]),
+            "root tmpfs must be size-capped before it is mounted (issue #49): {argv:?}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_command_makes_dev_read_only() {
+        let argv = bubblewrap_order_command(4);
+        // `--dev /dev` mounts a SECOND tmpfs, and bubblewrap's `--size` composes
+        // only with `--tmpfs` (`--size N --dev /dev` dies with "--size must be
+        // followed by --tmpfs"), so that tmpfs cannot be size-capped the way `/`
+        // is. Remount it read-only instead: zero writable bytes is a strictly
+        // tighter bound than any size cap, and it closes the many-small-files
+        // RAM fill that the per-file RLIMIT_FSIZE does not cover (issue #49).
+        let dev = argv
+            .iter()
+            .position(|arg| arg == "--dev")
+            .unwrap_or_else(|| panic!("no --dev mount to harden: {argv:?}"));
+        let remount = argv
+            .windows(2)
+            .position(|w| w == ["--remount-ro", "/dev"])
+            .unwrap_or_else(|| {
+                panic!("/dev tmpfs must be remounted read-only (issue #49): {argv:?}")
+            });
+        assert!(
+            remount > dev,
+            "--remount-ro /dev must follow the --dev mount it hardens: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_command_wraps_bwrap_in_prlimit_with_resource_caps() {
+        let argv = bubblewrap_order_command(4);
+        assert_eq!(
+            argv[0], "/test/prlimit",
+            "worker must be wrapped in prlimit"
+        );
+        assert!(
+            argv.contains(&"--nproc=4096".to_string()),
+            "fork-bomb cap missing (issue #52): {argv:?}"
+        );
+        assert!(
+            argv.contains(&"--fsize=4136".to_string()),
+            "output-file size cap missing or not sized to 8+8n+slack (issue #48): {argv:?}"
+        );
+        assert!(
+            argv.contains(&"--as=4294967296".to_string()),
+            "address-space cap missing: {argv:?}"
+        );
+        // prlimit's option terminator must precede the bwrap program.
+        let term = argv.iter().position(|a| a == "--").expect("prlimit --");
+        assert_eq!(
+            argv[term + 1],
+            "/test/bwrap",
+            "bwrap must follow prlimit's `--`: {argv:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -608,6 +893,7 @@ mod tests {
                 &input,
                 &output,
                 &cwd,
+                &WorkerLimits::for_self_check(),
             )
             .unwrap();
         let outcome = crate::watchdog::run_capped(

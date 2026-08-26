@@ -20,6 +20,13 @@ if ! command -v bwrap >/dev/null 2>&1; then
   echo "grader-sandbox: bubblewrap is required" >&2
   exit 1
 fi
+# Every order() worker is launched as prlimit -> bwrap -> candidate, so grader
+# mode cannot apply its per-worker rlimits without prlimit. Fail here, where the
+# message is visible, rather than per worker with stderr on /dev/null.
+if ! command -v prlimit >/dev/null 2>&1; then
+  echo "grader-sandbox: prlimit (util-linux) is required for per-worker resource limits" >&2
+  exit 1
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_ROOT="$ROOT/target"

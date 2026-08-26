@@ -27,9 +27,12 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-/// Strip tab/newline so a value is safe for a single TSV field.
-fn sanitize(s: &str) -> String {
-    s.replace(['\t', '\n'], " ")
+/// Strip tab/CR/newline so a value is safe as a single TSV field. Every char
+/// that `artifacts::rewrite_results` rejects in a row (`\t`, `\r`, `\n`) must be
+/// removed here so a note (e.g. pasted with CRLF endings) cannot break artifact
+/// publication (issue #51).
+pub fn sanitize(s: &str) -> String {
+    s.replace(['\t', '\r', '\n'], " ")
 }
 
 /// Compose the `results.tsv` note column for a FAIL row: the failure reason,
@@ -140,6 +143,26 @@ mod tests {
     #[test]
     fn compose_note_strips_tabs_and_newlines() {
         assert_eq!(compose_note("a\tb", "c\nd"), "a b | c d");
+    }
+
+    #[test]
+    fn sanitize_strips_carriage_returns() {
+        // A '\r' must not survive: artifacts::rewrite_results rejects any row
+        // containing '\r' or '\n' (issue #51).
+        let out = sanitize("line one\r\nline two");
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\n'));
+        assert_eq!(out, "line one  line two");
+    }
+
+    #[test]
+    fn compose_note_strips_carriage_returns() {
+        // A note pasted with CRLF line endings must round-trip into a single
+        // sanitized TSV field, not blow up artifact publication (issue #51).
+        let note = compose_note("matrix too large", "pasted\r\nwith crlf");
+        assert!(!note.contains('\r'));
+        assert!(!note.contains('\n'));
+        assert_eq!(note, "matrix too large | pasted  with crlf");
     }
 
     #[test]

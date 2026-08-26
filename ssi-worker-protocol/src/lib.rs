@@ -93,9 +93,30 @@ pub fn write_permutation(path: &Path, permutation: &[usize]) -> std::io::Result<
     fs::File::create(path)?.write_all(&buf)
 }
 
-pub fn read_permutation(path: &Path) -> std::io::Result<Vec<usize>> {
-    let mut bytes = Vec::new();
-    fs::File::open(path)?.read_to_end(&mut bytes)?;
+/// Read a permutation the worker wrote, given the dimension `expected_n` of the
+/// pattern the parent staged. A valid permutation is exactly `8 + 8*expected_n`
+/// bytes, so any longer file is rejected from its length ALONE before its
+/// contents are allocated. This runs in the trusted parent against a file an
+/// untrusted worker controls: without the bound, a worker that writes a
+/// multi-GB self-consistent file would drive an equally large allocation here.
+pub fn read_permutation(path: &Path, expected_n: usize) -> std::io::Result<Vec<usize>> {
+    let max_bytes = expected_n
+        .checked_mul(8)
+        .and_then(|body| body.checked_add(8))
+        .ok_or_else(|| invalid_data("expected permutation size overflows this platform"))?;
+
+    let file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > max_bytes as u64 {
+        return Err(invalid_data(&format!(
+            "permutation file is {file_len} bytes, exceeds {max_bytes} for n={expected_n}"
+        )));
+    }
+
+    // Bound the read to the budget even if the length check above raced a
+    // growing file: `take` caps the allocation regardless of the real size.
+    let mut bytes = Vec::with_capacity(max_bytes);
+    file.take(max_bytes as u64).read_to_end(&mut bytes)?;
     if bytes.len() < 8 {
         return Err(invalid_data("permutation file too short"));
     }
@@ -156,7 +177,23 @@ mod tests {
         let path = temp_file("permutation.bin");
         let permutation = vec![3, 1, 0, 2];
         write_permutation(&path, &permutation).unwrap();
-        assert_eq!(read_permutation(&path).unwrap(), permutation);
+        assert_eq!(
+            read_permutation(&path, permutation.len()).unwrap(),
+            permutation
+        );
+    }
+
+    #[test]
+    fn permutation_longer_than_expected_dimension_is_rejected() {
+        // A self-consistent permutation file whose header count exceeds the
+        // dimension the parent staged. The old length-only check accepted it and
+        // allocated `count` usizes in the TRUSTED parent; a malicious worker that
+        // wrote a multi-GB self-consistent file could exhaust parent memory. With
+        // the expected dimension known, the read must reject before allocating.
+        let path = temp_file("oversized-permutation.bin");
+        let bloated = vec![0usize; 4096];
+        write_permutation(&path, &bloated).unwrap();
+        assert!(read_permutation(&path, 4).is_err());
     }
 
     #[test]
@@ -170,6 +207,6 @@ mod tests {
 
         let permutation_path = temp_file("bad-permutation.bin");
         std::fs::write(&permutation_path, u64::MAX.to_le_bytes()).unwrap();
-        assert!(read_permutation(&permutation_path).is_err());
+        assert!(read_permutation(&permutation_path, 0).is_err());
     }
 }
