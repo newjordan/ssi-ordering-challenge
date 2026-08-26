@@ -47,6 +47,13 @@ jobs:
       - name: Test worker protocol bounds offline
         run: cargo test --locked --offline -p ssi-worker-protocol
 
+      # The per-worker resource limits (#48, #49, #52) are argv the trusted
+      # command builder emits: the root tmpfs size cap, the read-only /dev, and
+      # the prlimit wrap carrying RLIMIT_FSIZE/NPROC/AS. The watchdog step above
+      # filters to `watchdog::tests`, so it does not reach them.
+      - name: Test per-worker sandbox limits offline
+        run: cargo test --locked --offline --bin ssi-ordering-challenge sandbox::tests
+
       # The time-cap integration tests drive the trusted parent, which spawns
       # the separately built ssi-candidate-worker; `cargo test --test time_cap`
       # alone would not build that sibling workspace package.
@@ -55,3 +62,10 @@ jobs:
 
       - name: Test enforced time cap offline
         run: cargo test --release --locked --offline --test time_cap
+
+      # The worker half of the same defense: it asserts from inside the sandbox
+      # that the caps are live. `default-members = ["."]` keeps a root
+      # `cargo test` out of this crate, so name it explicitly. Reuses the
+      # release artifacts the workspace build above already produced.
+      - name: Test worker resource-limit assertions offline
+        run: cargo test --release --locked --offline -p ssi-candidate-worker limit_tests

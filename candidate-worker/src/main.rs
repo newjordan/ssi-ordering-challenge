@@ -129,6 +129,53 @@ fn sandbox_self_check(args: &[String]) -> i32 {
         }) {
             return Err("network namespace has a default route".to_string());
         }
+        // Per-worker resource limits must be live, not "unlimited" (issues #48,
+        // #49, #52). Assert the caps are present and sane without pinning exact
+        // bytes, so the check proves the mechanism regardless of tuning.
+        let limits = std::fs::read_to_string("/proc/self/limits")
+            .map_err(|error| format!("read /proc/self/limits: {error}"))?;
+        check_soft_limit(&limits, "Max file size", 1024 * 1024)?;
+        check_soft_limit(&limits, "Max processes", 8192)?;
+        check_soft_limit(&limits, "Max address space", 8u64 * 1024 * 1024 * 1024)?;
+        // The root tmpfs must be size-bounded (issue #49): an unbounded `/`
+        // tmpfs charges RAM without limit.
+        let mounts = std::fs::read_to_string("/proc/mounts")
+            .map_err(|error| format!("read /proc/mounts: {error}"))?;
+        let root = mounts
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some("/"))
+            .ok_or_else(|| "no root mount in /proc/mounts".to_string())?;
+        let mut fields = root.split_whitespace();
+        let fs_type = fields.nth(2).unwrap_or("");
+        let options = fields.next().unwrap_or("");
+        if fs_type != "tmpfs" || !options.split(',').any(|opt| opt.starts_with("size=")) {
+            return Err(format!(
+                "root filesystem is not a size-capped tmpfs: {root}"
+            ));
+        }
+        // `--dev` mounts a second RAM-charged tmpfs that bubblewrap's `--size`
+        // cannot cap, so it is held read-only instead (issue #49). Assert both
+        // the mount flag and the behaviour: a writable /dev is an unbounded
+        // memory sink that per-file RLIMIT_FSIZE does not bound, because many
+        // small files each stay under the per-file cap.
+        let dev = mounts
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some("/dev"))
+            .ok_or_else(|| "no /dev mount in /proc/mounts".to_string())?;
+        if !dev
+            .split_whitespace()
+            .nth(3)
+            .unwrap_or("")
+            .split(',')
+            .any(|opt| opt == "ro")
+        {
+            return Err(format!("/dev is not mounted read-only: {dev}"));
+        }
+        let probe = "/dev/ssi-sandbox-write-probe";
+        if std::fs::write(probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(probe);
+            return Err("/dev accepted a new file; its tmpfs is an uncapped RAM sink".to_string());
+        }
         std::fs::write(output, b"ok\n").map_err(|error| format!("write permitted output: {error}"))
     };
 
@@ -139,6 +186,32 @@ fn sandbox_self_check(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// Assert a `/proc/self/limits` row has a finite soft limit at or below
+/// `max_allowed`. The resource name may contain spaces, so match it as a line
+/// prefix and read the soft limit as the first token that follows.
+fn check_soft_limit(limits: &str, name: &str, max_allowed: u64) -> Result<(), String> {
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with(name))
+        .ok_or_else(|| format!("/proc/self/limits missing {name:?}"))?;
+    let soft = line[name.len()..]
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("{name:?} row has no soft limit"))?;
+    if soft == "unlimited" {
+        return Err(format!("{name} is unlimited; resource cap not applied"));
+    }
+    let value: u64 = soft
+        .parse()
+        .map_err(|_| format!("{name} soft limit is not a number: {soft:?}"))?;
+    if value > max_allowed {
+        return Err(format!(
+            "{name} soft limit {value} exceeds expected cap {max_allowed}"
+        ));
+    }
+    Ok(())
 }
 
 fn timeout_self_check(args: &[String]) -> i32 {
@@ -166,6 +239,38 @@ fn timeout_self_check(args: &[String]) -> i32 {
 fn timeout_child() -> i32 {
     loop {
         std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::check_soft_limit;
+
+    const SAMPLE: &str =
+        "Limit                     Soft Limit           Hard Limit           Units\n\
+        Max file size             65536                65536                bytes\n\
+        Max processes             4096                 4096                 processes\n\
+        Max address space         unlimited            unlimited            bytes\n";
+
+    #[test]
+    fn finite_limit_within_bound_passes() {
+        assert!(check_soft_limit(SAMPLE, "Max file size", 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn limit_over_bound_fails() {
+        assert!(check_soft_limit(SAMPLE, "Max file size", 1024).is_err());
+    }
+
+    #[test]
+    fn unlimited_soft_limit_fails() {
+        let err = check_soft_limit(SAMPLE, "Max address space", u64::MAX).unwrap_err();
+        assert!(err.contains("unlimited"), "{err}");
+    }
+
+    #[test]
+    fn missing_row_fails() {
+        assert!(check_soft_limit(SAMPLE, "Max stack size", u64::MAX).is_err());
     }
 }
 

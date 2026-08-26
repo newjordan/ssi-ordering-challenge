@@ -271,6 +271,7 @@ fn main() -> ExitCode {
                 pat_file.path(),
                 &out_perm,
                 &worker_cwd,
+                &sandbox::WorkerLimits::for_order(pat.n),
             )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
@@ -532,6 +533,7 @@ fn sandbox_self_check_parent(
         &input,
         &output,
         &cwd,
+        &sandbox::WorkerLimits::for_self_check(),
     )?;
     let cfg = watchdog::CapConfig {
         time_cap: Duration::from_secs(5),
@@ -578,6 +580,7 @@ fn sandbox_timeout_self_check_parent(
         &input,
         &output,
         &cwd,
+        &sandbox::WorkerLimits::for_self_check(),
     )?;
     let cfg = watchdog::CapConfig {
         time_cap: Duration::from_millis(200),
