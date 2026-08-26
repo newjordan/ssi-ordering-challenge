@@ -227,7 +227,10 @@ impl WorkerSandbox {
                  /usr/bin/prlimit and /bin/prlimit are absent"
                     .to_string()
             })?;
-            Ok(Self::Bubblewrap { executable, prlimit })
+            Ok(Self::Bubblewrap {
+                executable,
+                prlimit,
+            })
         }
     }
 
@@ -258,7 +261,10 @@ impl WorkerSandbox {
                     "install it, e.g. `apt-get install util-linux`",
                 ));
             };
-            return Ok(Self::Bubblewrap { executable, prlimit });
+            return Ok(Self::Bubblewrap {
+                executable,
+                prlimit,
+            });
         }
         #[cfg(target_os = "macos")]
         {
