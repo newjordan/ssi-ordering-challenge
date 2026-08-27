@@ -99,10 +99,20 @@ fn main() -> ExitCode {
     let worker_sandbox = match sandbox::WorkerSandbox::from_env(grader_mode) {
         Ok(sandbox) => sandbox,
         Err(e) => {
-            eprintln!("RUN FAILED (grader sandbox: {e})");
+            eprintln!("RUN FAILED (worker sandbox: {e})");
             return ExitCode::FAILURE;
         }
     };
+    // A local run reaches Disabled only through the explicit opt-out; make that
+    // choice loud so it is never a silent regression to unsandboxed execution.
+    if !grader_mode && !worker_sandbox.is_enabled() {
+        eprintln!(
+            "WARNING: {}=1 — running the candidate worker WITHOUT a sandbox. \
+             A malicious pushed-back submission can reach your network and files. \
+             Unset it to sandbox order() (issue #47).",
+            sandbox::ALLOW_UNSANDBOXED_ENV
+        );
+    }
     let candidate_worker = match candidate_worker_path(grader_mode) {
         Ok(path) => path,
         Err(e) => {
@@ -644,16 +654,16 @@ fn candidate_worker_path(grader_mode: bool) -> Result<PathBuf, String> {
 fn require_candidate_worker(path: PathBuf) -> Result<PathBuf, String> {
     let canonical = std::fs::canonicalize(&path).map_err(|error| {
         format!(
-            "candidate worker not found at {}: {error}. Run `cargo build --release --workspace \
-             --offline --locked` before `cargo run`, and rebuild `ssi-candidate-worker` after \
-             ordering edits",
+            "candidate worker not found at {}: {error}. Build the untrusted candidate worker \
+             (sandboxed) with `bash scripts/local-candidate-build.sh` before `cargo run`, and \
+             rebuild `ssi-candidate-worker` after ordering edits",
             path.display()
         )
     })?;
     if !canonical.is_file() {
         return Err(format!(
-            "candidate worker is not a regular file: {}. Run `cargo build --release --workspace \
-             --offline --locked` before `cargo run`",
+            "candidate worker is not a regular file: {}. Build the untrusted candidate worker \
+             (sandboxed) with `bash scripts/local-candidate-build.sh` before `cargo run`",
             canonical.display()
         ));
     }

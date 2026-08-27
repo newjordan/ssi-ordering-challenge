@@ -37,15 +37,27 @@ and absolute values shift.
    select only a reviewed crate/version from the dependency allowlist below by
    adding its exact `name = "x.y.z"` entry to `src/ordering/deps.toml`.
 3. On a fresh clone or after changing `deps.toml`, run:
-   `bash scripts/prepare-build.sh`, then build the workspace with
-   `cargo build --release --workspace --offline --locked`.
+   `bash scripts/prepare-build.sh`, then build the trusted parent with
+   `cargo build --release -p ssi-ordering-challenge --offline --locked`.
    `prepare-build.sh` generates manifests, vendors, and scans, but does **not**
    build the separate `ssi-candidate-worker`. For every ordering edit, rebuild
-   that worker and run the parent with
-   `cargo build --release -p ssi-candidate-worker --offline --locked && cargo run --release --offline --locked -- --note "<hypothesis>"`.
-   The machine-readable `benchmarkCommand` performs this incremental rebuild.
+   that worker **through the build sandbox** and run the parent with
+   `bash scripts/local-candidate-build.sh && cargo run --release --offline --locked -- --note "<hypothesis>"`.
+   The machine-readable `benchmarkCommand` performs this sandboxed rebuild.
    Requires `cargo-deny`:
    `cargo install cargo-deny --version 0.20.2 --locked`.
+
+   > **Both build and run are sandboxed by default.** The pushed-back winning
+   > submission is untrusted code (issue #47). `scripts/local-candidate-build.sh`
+   > compiles it inside a sandbox — a dependency build script or proc-macro would
+   > otherwise run arbitrary code at build time — and `cargo run` then executes
+   > `order()` inside a per-worker sandbox: bubblewrap on Linux, `sandbox-exec`
+   > (Seatbelt) on macOS, both with no network and no host writes except the one
+   > output file. Do **not** bare-build the candidate with
+   > `cargo build -p ssi-candidate-worker` or `cargo build --workspace`; that
+   > compiles untrusted code unsandboxed. If no sandbox is available the build and
+   > the run each fail closed with instructions. The at-your-own-risk opt-out
+   > `SSI_ALLOW_UNSANDBOXED_WORKER=1` disables both and prints a loud warning.
 4. Read the per-matrix table. Attribute wins/losses per family and size bucket
    (NLP, QCP, QP, QCQP; n up to ~340k).
 5. Record findings in the knowledge base (an experiment page + one `log.md`

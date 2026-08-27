@@ -138,6 +138,14 @@ which runs `fn main()` (`src/main.rs`). It executes the production grader's
 five stages in miniature; **any failure on any matrix fails the whole run** (no
 partial credit):
 
+> **Local runs sandbox the worker by default.** Because a pushed-back winning
+> submission is untrusted, each `order()` invocation runs inside a per-worker
+> sandbox even locally — bubblewrap on Linux, `sandbox-exec` (Seatbelt) on
+> macOS — with no network and no host writes except its output file (issue #47).
+> No native sandbox → the run fails closed; `SSI_ALLOW_UNSANDBOXED_WORKER=1` is
+> the loud opt-out. See [`GRADER-SANDBOX.md`](GRADER-SANDBOX.md) → "Local
+> per-worker boundary".
+
 | Stage | What happens | Code |
 |---|---|---|
 | **A — purity & license** | scan `src/ordering/` for foreign-code escapes (`build.rs`, FFI, `#[no_mangle]`/`#[link]`, proc-macros, `include!` escapes); parse `src/ordering/deps.toml`; run `cargo-deny` (RequireDeny — mandatory). The grader also scans the vendored dependency tree for `*-sys`/`links`/C-build-deps/prebuilt blobs. | `src/purity.rs` → `ssi-purity` |

@@ -235,10 +235,17 @@ leading ordering and its `src/ordering/memory/` notes rather than from scratch.
 ### Running the harness yourself
 
 ```sh
-bash scripts/prepare-build.sh            # generate manifests + vendor + scan
-cargo build --release --workspace --offline --locked
+bash scripts/prepare-build.sh                                    # generate manifests + vendor + scan
+cargo build --release -p ssi-ordering-challenge --offline --locked   # trusted parent
+bash scripts/local-candidate-build.sh                            # untrusted candidate, sandboxed
 cargo run --release --offline --locked -- --note "what I tried"
 ```
+
+The candidate worker (`src/ordering` and its declared dependencies) is
+untrusted, so it is compiled through `scripts/local-candidate-build.sh` — a
+sandbox that denies network and confines writes, since a dependency build script
+or proc-macro would otherwise run arbitrary code at build time (issue #47). Do
+not bare-build it with `cargo build --workspace` or `-p ssi-candidate-worker`.
 
 `prepare-build.sh` checks `src/ordering/deps.toml` against the trusted direct
 name/version allowlist before any fetch or build, generates the trusted parent
@@ -247,8 +254,9 @@ candidate-worker manifest. It then vendors the resolved dependency tree and
 scans it for native-code signals (`*-sys` names, prebuilt blobs, C-toolchain
 build-deps). The later build is offline and locked. Run preparation whenever
 you change `deps.toml` (and once on a fresh clone). After every ordering edit,
-rebuild `ssi-candidate-worker` before running the parent; the machine-readable
-`benchmarkCommand` does this automatically.
+rebuild `ssi-candidate-worker` (sandboxed, via `scripts/local-candidate-build.sh`)
+before running the parent; the machine-readable `benchmarkCommand` does this
+automatically.
 
 The scored command runs the purity/license gate, scores every dev matrix,
 writes `score.json`, and appends one row to `results.tsv` with timestamp,
@@ -290,8 +298,10 @@ Any other crate name or version is rejected with review instructions before
 rejected. Every accepted crate **and its whole transitive tree** must come from
 crates.io, be permissively licensed (MIT / Apache-2.0 / BSD / Unlicense / Zlib /
 Unicode-3.0), and pass the native-code signal scan. After editing `deps.toml`,
-run `bash scripts/prepare-build.sh`, then rebuild the workspace. After editing
-ordering code, rebuild `ssi-candidate-worker` before `cargo run`.
+run `bash scripts/prepare-build.sh`, then rebuild the trusted parent
+(`cargo build --release -p ssi-ordering-challenge`). After editing ordering
+code, rebuild `ssi-candidate-worker` (sandboxed) with
+`bash scripts/local-candidate-build.sh` before `cargo run`.
 
 The allowlist lives in the trusted `ssi-purity` gate, outside the
 contestant-controlled submission directory. Adding or upgrading a crate is a
@@ -304,8 +314,10 @@ benign. Registry license metadata may be wrong, static scans can miss
 obfuscated behavior, and pure Rust or build-script code can still be
 malicious. Cargo lockfile checksums freeze the reviewed registry artifacts, and
 the production grader adds offline builds plus network-isolated scoring.
-Local builds are not a host-security sandbox, so run them only from a trusted
-checkout. See
+Locally, both the candidate build (`scripts/local-candidate-build.sh`) and the
+`order()` run are sandboxed by default (issue #47) — network denied, writes
+confined — but namespace/Seatbelt isolation is not a VM, so still run from a
+trusted checkout. See
 [`docs/DECISION-crate-policy.md`](docs/DECISION-crate-policy.md) for the full
 policy, review process, and residuals.
 

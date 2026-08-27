@@ -26,12 +26,35 @@ fn trusted_parent_excludes_candidate_entrypoint() {
 }
 
 #[test]
-fn benchmark_command_rebuilds_candidate_worker() {
+fn benchmark_command_builds_candidate_worker_through_the_sandbox() {
+    // The untrusted candidate worker (`src/ordering` + its declared deps) must
+    // never be compiled outside a sandbox on any default path: a dependency
+    // build script or proc-macro runs arbitrary code at BUILD time (issue #47).
+    // The benchmark rebuilds it through `scripts/local-candidate-build.sh`
+    // (bubblewrap on Linux, sandbox-exec on macOS, network denied, writes
+    // confined) before running the trusted parent.
     let benchmark_manifest = include_str!("../benchmark.json");
-    let expected = r#""benchmarkCommand": ["bash", "-lc", "cargo build --release -p ssi-candidate-worker --offline --locked && cargo run --release"]"#;
+    let expected = r#""benchmarkCommand": ["bash", "-lc", "bash scripts/local-candidate-build.sh && cargo run --release"]"#;
     assert!(
         benchmark_manifest.contains(expected),
-        "benchmarkCommand must rebuild the candidate worker before running the trusted parent"
+        "benchmarkCommand must build the untrusted candidate worker through \
+         scripts/local-candidate-build.sh before running the trusted parent"
+    );
+    // No default path may bare-build the candidate: neither a `-p
+    // ssi-candidate-worker` build nor a `--workspace` build (which pulls the
+    // candidate in) may appear unsandboxed. `setupCommand` warms only the
+    // trusted parent; the sandboxed benchmark step compiles the candidate.
+    assert!(
+        !benchmark_manifest.contains("cargo build --release -p ssi-candidate-worker"),
+        "benchmark.json must not bare-build the candidate worker (bypasses the build sandbox)"
+    );
+    assert!(
+        !benchmark_manifest.contains("cargo build --release --workspace"),
+        "benchmark.json must not `--workspace`-build (compiles the candidate unsandboxed)"
+    );
+    assert!(
+        benchmark_manifest.contains("cargo build --release -p ssi-ordering-challenge"),
+        "setupCommand must warm the trusted parent build (not the untrusted candidate)"
     );
 }
 
@@ -57,8 +80,12 @@ fn missing_local_candidate_reports_build_command() {
     let missing =
         std::env::temp_dir().join(format!("ssi-missing-candidate-{}", std::process::id()));
     let _ = std::fs::remove_file(&missing);
+    // Opt out of the default local worker sandbox so this test reaches the
+    // candidate-path check regardless of whether the runner has bwrap installed
+    // (the sandbox selection now runs before the candidate lookup).
     let output = Command::new(parent_binary())
         .env_remove("SSI_GRADER_SANDBOX")
+        .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
         .env("SSI_CANDIDATE_WORKER", missing)
         .output()
         .expect("run trusted parent");
@@ -67,7 +94,7 @@ fn missing_local_candidate_reports_build_command() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("candidate worker not found")
-            && stderr.contains("cargo build --release --workspace --offline --locked")
+            && stderr.contains("scripts/local-candidate-build.sh")
             && stderr.contains("rebuild `ssi-candidate-worker` after ordering edits"),
         "unexpected stderr: {stderr}"
     );

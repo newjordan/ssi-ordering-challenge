@@ -1,6 +1,13 @@
 //! End-to-end: the harness enforces the per-matrix time cap by killing a slow
 //! order() worker, and a normal run over the sample corpus still succeeds.
 //! Drives the release binary the way a contestant does.
+//!
+//! These tests exercise corpus handling, the census redaction, and the time
+//! cap — not the worker sandbox, which has its own coverage (the `sandbox`
+//! unit tests, `--grader --sandbox-*-check`, and the Linux/macOS sandbox CI).
+//! Local runs now sandbox order() by default (issue #47), so each invocation
+//! sets `SSI_ALLOW_UNSANDBOXED_WORKER=1` to run the trusted candidate directly
+//! and stay hermetic on runners without a native sandbox installed.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -75,6 +82,7 @@ fn normal_run_succeeds_on_sample_corpus() {
     // bucket keys are still emitted; only the huge matrices are skipped.
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
+        .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
         .env("SSI_CORPUS_FILE", &corpus)
         .env("SSI_MAX_MATRIX_N", "2000")
         .current_dir(&dir)
@@ -129,6 +137,7 @@ fn hidden_corpus_omits_per_matrix_census() {
 
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
+        .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
         .env("SSI_CORPUS_FILE", &corpus)
         .current_dir(&dir)
         .output()
@@ -180,6 +189,7 @@ fn hidden_corpus_load_failure_omits_raw_name() {
 
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
+        .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
         .env("SSI_CORPUS_FILE", &corpus)
         .current_dir(&dir)
         .output()
@@ -207,6 +217,7 @@ fn slow_ordering_is_killed_and_fails_promptly() {
     let start = Instant::now();
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
+        .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
         .env("SSI_CORPUS_FILE", public_dev_corpus())
         .current_dir(&dir)
         .args(["--test-time-cap", "--note", "time_cap test: slow"])
