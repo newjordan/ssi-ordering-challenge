@@ -29,8 +29,35 @@ pub enum WorkerOutcome {
     Ok,
     /// Child exceeded the time cap and was killed.
     Timeout,
-    /// Child exited non-zero or could not be spawned/waited (reason attached).
-    Crashed(String),
+    /// Child exited non-zero or could not be spawned/waited.
+    Crashed(CrashDetail),
+}
+
+/// Why a supervised worker did not exit cleanly. `kind` is the redaction-safe
+/// classification (OS/harness-determined bucket, safe to surface on the hidden
+/// eval corpus); `detail` is the full human-readable reason and may embed a
+/// worker-controlled exit code, so it is for the PUBLIC dev corpus only.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CrashDetail {
+    pub kind: CrashKind,
+    pub detail: String,
+}
+
+/// Redaction-safe classification of a non-clean worker exit. The bucket itself
+/// is OS/harness-determined; only the numeric exit code (folded into
+/// `CrashDetail::detail`, never here) is worker-controlled.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CrashKind {
+    /// Killed by a signal — e.g. SIGABRT from an allocation failure at the
+    /// memory cap, or SIGSEGV. Signal delivery is OS-driven.
+    Signal,
+    /// Exited with a nonzero code — e.g. a panic in `order()` (code 101) or an
+    /// explicit `std::process::exit(N)`. The code VALUE is worker-controlled,
+    /// so only the fact of a nonzero exit is safe to surface, never the number.
+    NonzeroExit,
+    /// Harness-internal failure spawning or waiting on the worker; carries no
+    /// worker-controlled data (the worker never ran).
+    Harness,
 }
 
 /// Spawn `cmd` and supervise it under `cfg`. Kills the child on time breach.
@@ -48,7 +75,12 @@ pub fn run_capped(cmd: &mut Command, cfg: &CapConfig) -> WorkerOutcome {
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return WorkerOutcome::Crashed(format!("could not spawn worker: {e}")),
+        Err(e) => {
+            return WorkerOutcome::Crashed(CrashDetail {
+                kind: CrashKind::Harness,
+                detail: format!("could not spawn worker: {e}"),
+            })
+        }
     };
     let start = Instant::now();
     loop {
@@ -65,11 +97,16 @@ pub fn run_capped(cmd: &mut Command, cfg: &CapConfig) -> WorkerOutcome {
                 return if status.success() {
                     WorkerOutcome::Ok
                 } else {
-                    WorkerOutcome::Crashed(describe_status(&status))
+                    WorkerOutcome::Crashed(describe_crash(&status))
                 };
             }
             Ok(None) => {}
-            Err(e) => return WorkerOutcome::Crashed(format!("wait failed: {e}")),
+            Err(e) => {
+                return WorkerOutcome::Crashed(CrashDetail {
+                    kind: CrashKind::Harness,
+                    detail: format!("wait failed: {e}"),
+                })
+            }
         }
         if start.elapsed() > cfg.time_cap {
             kill_group(&mut child);
@@ -116,10 +153,7 @@ fn trusted_kill_path() -> Option<&'static std::path::Path> {
 #[cfg(unix)]
 fn kill_group_command(kill: &std::path::Path, pgid: u32) -> Command {
     let mut command = Command::new(kill);
-    command
-        .arg("-KILL")
-        .arg("--")
-        .arg(format!("-{pgid}"));
+    command.arg("-KILL").arg("--").arg(format!("-{pgid}"));
     command
 }
 
@@ -129,20 +163,32 @@ fn kill_group(child: &mut std::process::Child) {
 }
 
 #[cfg(unix)]
-fn describe_status(status: &std::process::ExitStatus) -> String {
+fn describe_crash(status: &std::process::ExitStatus) -> CrashDetail {
     use std::os::unix::process::ExitStatusExt;
     if let Some(sig) = status.signal() {
-        format!("worker killed by signal {sig}")
+        CrashDetail {
+            kind: CrashKind::Signal,
+            detail: format!("worker killed by signal {sig}"),
+        }
     } else if let Some(code) = status.code() {
-        format!("worker exited with code {code}")
+        CrashDetail {
+            kind: CrashKind::NonzeroExit,
+            detail: format!("worker exited with code {code}"),
+        }
     } else {
-        "worker exited abnormally".to_string()
+        CrashDetail {
+            kind: CrashKind::NonzeroExit,
+            detail: "worker exited abnormally".to_string(),
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn describe_status(status: &std::process::ExitStatus) -> String {
-    format!("worker exited: {status}")
+fn describe_crash(status: &std::process::ExitStatus) -> CrashDetail {
+    CrashDetail {
+        kind: CrashKind::NonzeroExit,
+        detail: format!("worker exited: {status}"),
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +229,10 @@ mod tests {
     #[test]
     fn linux_group_kill_uses_trusted_path_and_option_terminator() {
         let kill = trusted_kill_path().expect("Linux runner has /bin/kill or /usr/bin/kill");
-        assert!(kill.is_absolute(), "kill path must not depend on PATH: {kill:?}");
+        assert!(
+            kill.is_absolute(),
+            "kill path must not depend on PATH: {kill:?}"
+        );
 
         let command = kill_group_command(kill, 12345);
         assert_eq!(command.get_program(), kill.as_os_str());
@@ -209,8 +258,10 @@ mod tests {
         let pidfile = std::env::temp_dir().join(format!("ssi-wd-{}.pid", std::process::id()));
         let _ = std::fs::remove_file(&pidfile);
         let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(format!("sleep 30 & echo $! > {}; sleep 30", pidfile.display()));
+        cmd.arg("-c").arg(format!(
+            "sleep 30 & echo $! > {}; sleep 30",
+            pidfile.display()
+        ));
         let cfg = CapConfig {
             time_cap: Duration::from_millis(200),
             poll: Duration::from_millis(5),
@@ -249,7 +300,10 @@ mod tests {
         }
         if alive {
             // Reap the orphan so a red test doesn't leave it lingering.
-            let _ = Command::new("kill").arg("-KILL").arg(gpid.to_string()).status();
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(gpid.to_string())
+                .status();
         }
         assert!(!alive, "grandchild {gpid} survived the time cap (orphaned)");
     }
@@ -263,7 +317,10 @@ mod tests {
         };
         assert!(matches!(
             run_capped(&mut cmd, &cfg),
-            WorkerOutcome::Crashed(_)
+            WorkerOutcome::Crashed(CrashDetail {
+                kind: CrashKind::NonzeroExit,
+                ..
+            })
         ));
     }
 }
