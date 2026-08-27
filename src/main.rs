@@ -74,6 +74,18 @@ pub use ssi_scoring::Pattern;
 const TIME_CAP_PER_MATRIX: Duration = Duration::from_secs(2);
 const CANDIDATE_WORKER_ENV: &str = "SSI_CANDIDATE_WORKER";
 
+/// Parent-only smoke/CI knob (issue #60): when set to a positive integer, the
+/// harness scores only the corpus matrices whose dimension `n` is at most this
+/// bound. It lets a fast regression test exercise the full public-dev output
+/// format over the small matrices WITHOUT depending on `order()` beating the
+/// per-matrix cap on the largest ones (whose wall-clock time is runner-speed
+/// variable). Read from the trusted PARENT's environment only: the grader never
+/// sets it, and contestant worker code cannot reach the parent env, so graded
+/// eval runs always score the whole corpus. It narrows the scored set only —
+/// the score DEFINITION, the census gate, and the hidden-corpus privacy path
+/// are all unchanged.
+const MAX_MATRIX_N_ENV: &str = "SSI_MAX_MATRIX_N";
+
 /// Parent-only regression flag, accepted from the time-cap integration test:
 /// every worker is launched in the candidate binary's harness-owned
 /// `--worker-test-timeout` mode, which sleeps past the cap without ever calling
@@ -176,6 +188,19 @@ fn main() -> ExitCode {
     if !show_matrix_census {
         let _ = std::fs::remove_file(&corpus_file);
     }
+    // Optional parent-only size filter (see MAX_MATRIX_N_ENV). Applied after the
+    // hidden-corpus unlink so it never changes the privacy path — only which of
+    // the already-loaded matrices get scored. Gated on `show_matrix_census`
+    // (the public-dev path) so a leaked env var can NEVER narrow a graded /
+    // hidden-corpus run: the "grader always scores the whole corpus" promise is
+    // enforced in code here, not merely by the grader declining to set the var.
+    let corpus = match (show_matrix_census, max_matrix_n()) {
+        (true, Some(max_n)) => corpus
+            .into_iter()
+            .filter(|(_, pat)| pat.n <= max_n)
+            .collect(),
+        _ => corpus,
+    };
     if corpus.is_empty() {
         let reason = format!(
             "no patterns found at {}. Run from the repo root.",
@@ -680,11 +705,58 @@ fn is_public_dev_corpus(repo_root: &Path, path: &Path) -> bool {
     }
 }
 
+/// Parse the parent-only `SSI_MAX_MATRIX_N` bound (see `MAX_MATRIX_N_ENV`).
+/// Returns `None` — score everything — when the variable is unset, blank,
+/// not a valid `usize`, or `0`, so a mistyped value can never silently score
+/// zero matrices. Graded runs never set it.
+fn max_matrix_n() -> Option<usize> {
+    parse_max_matrix_n(std::env::var(MAX_MATRIX_N_ENV).ok())
+}
+
+/// Pure parser behind [`max_matrix_n`], split out so its fail-open behavior is
+/// unit-testable without mutating the process environment. A bound of `0` would
+/// filter out every matrix (all `n >= 1`) and surface as a misleading "no
+/// patterns found" error, so it is treated as "no limit" like any other
+/// unusable value.
+fn parse_max_matrix_n(raw: Option<String>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
 fn matrix_failure(show_matrix_census: bool, name: &str, detailed: &str, redacted: &str) -> String {
     if show_matrix_census {
         format!("{name}: {detailed}")
     } else {
         format!("hidden matrix: {redacted}")
+    }
+}
+
+#[cfg(test)]
+mod max_matrix_n_tests {
+    use super::parse_max_matrix_n;
+
+    #[test]
+    fn unset_scores_everything() {
+        assert_eq!(parse_max_matrix_n(None), None);
+    }
+
+    #[test]
+    fn blank_or_invalid_fails_open_to_no_limit() {
+        // A mistyped bound must never silently narrow the corpus to nothing.
+        assert_eq!(parse_max_matrix_n(Some(String::new())), None);
+        assert_eq!(parse_max_matrix_n(Some("  ".to_string())), None);
+        assert_eq!(parse_max_matrix_n(Some("2k".to_string())), None);
+        assert_eq!(parse_max_matrix_n(Some("-5".to_string())), None);
+        // 0 would filter out every matrix (all n >= 1); treat it as no limit
+        // rather than fail with a misleading "no patterns found" error.
+        assert_eq!(parse_max_matrix_n(Some("0".to_string())), None);
+        assert_eq!(parse_max_matrix_n(Some(" 0 ".to_string())), None);
+    }
+
+    #[test]
+    fn valid_bound_parses_and_tolerates_whitespace() {
+        assert_eq!(parse_max_matrix_n(Some("2000".to_string())), Some(2000));
+        assert_eq!(parse_max_matrix_n(Some(" 1 ".to_string())), Some(1));
     }
 }
 
