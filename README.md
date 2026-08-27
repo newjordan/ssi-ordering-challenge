@@ -113,6 +113,19 @@ fails on any matrix:
   submission on the server is exactly the cap you see locally.) Annealing and
   learned orderings are welcome; runaways are not — and note that cost scales
   with **density (nnz)**, not just dimension.
+
+  > **Leave headroom — the cap is noisy wall-clock time.** The cap measures
+  > **wall-clock** duration, not CPU time, on **shared CI/grader hardware**. That
+  > measurement is inherently noisy: on a loaded or contended machine the same
+  > `order()` can take meaningfully longer than it does on your fast local box,
+  > and grader hardware may simply be slower than yours. Because `order()` is run
+  > **twice per matrix** (the determinism gate) and *any single* over-the-cap run
+  > FAILs your **entire** submission, a one-off timing spike on the largest matrix
+  > is enough to fail an ordering that looks safe locally. **Do not tune right up
+  > to 2 s.** Aim for your slowest matrix to finish in *well under half the cap*
+  > (≈1 s of local wall time) so that runner variance and slower hardware still
+  > leave you comfortably inside the limit. An ordering that only *just* clears
+  > 2 s locally is likely to fail intermittently when graded.
 - **No panics.**
 
 There are no loopholes: the input is the pattern only (no values, no
