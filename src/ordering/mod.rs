@@ -196,6 +196,15 @@ mod exact_dp;
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
 
+/// NESTED-DISSECTION with QUOTIENT-GRAPH MATCHING REFINEMENT (ND-QGMR) — an
+/// opt-in research knob (env flag `SSI_ND_QGMR`, default OFF) that wraps a
+/// two-step refinement (heavy-vertex matching quotient builder + 2-hop
+/// boundary swap refinement) around the AMD anchor's permutation. See the
+/// module doc for the algorithm and `memory/experiments/0008-nd-qgmr.md`
+/// for the knob rationale. Off by default so the shipped `order()` is
+/// byte-identical to the prior baseline when the flag is unset.
+mod nd_qgmr;
+
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
 use feral::sparse::csc::CscPattern as ScoringPattern;
