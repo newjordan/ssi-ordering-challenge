@@ -422,7 +422,7 @@ impl WorkerSandbox {
                 let candidate_exe = canonical_file(candidate_exe, "candidate executable")?;
                 let input = canonical_file(input, "worker input")?;
                 let output = canonical_file(output, "worker output")?;
-                let profile = seatbelt_profile(&output);
+                let profile = seatbelt_profile(&candidate_exe, &input, &output);
 
                 let mut cmd = Command::new(executable);
                 cmd.arg("-p").arg(&profile).arg(&candidate_exe);
@@ -442,14 +442,98 @@ impl WorkerSandbox {
     }
 }
 
-/// Build the Seatbelt profile for one worker: deny everything, then re-allow
-/// only what a dynamically linked Rust binary needs to run (exec/fork, reading
-/// libraries and the dyld shared cache, sysctl, mach lookups), deny all network,
-/// and permit writes to exactly the one staged output file plus /dev/null.
+/// Home directory subtrees whose reads are denied to the worker (issue #63).
+/// Every credential class the POC exfiltrated — SSH keys, cloud credentials,
+/// GnuPG rings, login/keychain data, browser cookies — lives under a user home
+/// (`/Users/<u>` on macOS, `/home/<u>` on Linux layouts) or root's home
+/// (`/var/root`, canonically `/private/var/root`). Denying these removes the
+/// material there is any incentive to encode into the scored permutation.
+const SEATBELT_DENIED_READ_SUBTREES: &[&str] =
+    &["/Users", "/home", "/var/root", "/private/var/root"];
+
+/// The read-deny subtree list for one worker: the static home prefixes above,
+/// plus the *canonicalized* `$HOME` when it falls outside them.
 ///
-/// `output` MUST already be canonicalized by the caller.
-fn seatbelt_profile(output: &Path) -> String {
+/// Seatbelt matches `subpath` rules on the realpath (symlinks resolved), so a
+/// home relocated onto another volume by symlink (e.g. `/Users/bob` ->
+/// `/Volumes/data/bob`, common for network or oversized homes) would slip past
+/// the bare `/Users` prefix and reopen the issue #63 channel. Resolving `$HOME`
+/// and denying its real location closes that. (Only the home *root* can be
+/// resolved this way; a home whose individual subdirectory is symlinked off-tree
+/// cannot be enumerated here.)
+///
+/// Pure over `canonical_home` so it can be unit-tested without a symlinked home;
+/// the caller resolves `$HOME` to its realpath and passes the result.
+fn seatbelt_denied_read_subtrees(canonical_home: Option<&str>) -> Vec<String> {
+    let mut subtrees: Vec<String> = SEATBELT_DENIED_READ_SUBTREES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Some(home) = canonical_home {
+        let covered = subtrees
+            .iter()
+            .any(|s| home == s || home.starts_with(&format!("{s}/")));
+        if !covered {
+            subtrees.push(home.to_string());
+        }
+    }
+    subtrees
+}
+
+/// Build the Seatbelt profile for one worker: deny everything, re-allow only
+/// what a dynamically linked Rust binary needs to run (exec/fork, sysctl, mach
+/// lookups) plus broad reads, then CARVE OUT the home directories, deny all
+/// network, and permit writes to exactly the one staged output file plus
+/// /dev/null.
+///
+/// The home-directory read carve-out is the fix for issue #63. A blanket
+/// `(allow file-read*)` let a winning submission's `order()` read any host file
+/// (`~/.ssh`, `~/.aws`, the keychain, browser data) and encode what it found
+/// into its returned permutation — an attacker-controlled channel that modulates
+/// the committed `score.json`/`results.tsv`, turning every contestant's local
+/// run into a fleet-scale exfiltration node. Network-deny and write-confinement
+/// alone do NOT close it, because the score itself is a low-bandwidth covert
+/// channel to a public artifact. Denying reads of the home directories removes
+/// the secrets there is any incentive to encode.
+///
+/// Why a deny-list here rather than the Linux side's tight allow-list: on macOS,
+/// dyld's shared-cache discovery reads across a set of version-dependent paths
+/// (the cryptex-split cache under `/System/Volumes/Preboot/Cryptexes/OS/...`,
+/// dyld closures, and fallbacks) that a minimal allow-list cannot pin without
+/// breaking the worker before `order()` runs. This was verified empirically on
+/// macOS 26.x / arm64: a deny-default profile allowing only `/usr/lib`,
+/// `/System`, and `/private/var/db/dyld` aborts in `dyld4::CacheFinder`, and even
+/// allowing every standard system tree while omitting `/Users` still aborts;
+/// keeping broad read while denying the home trees runs cleanly. The
+/// `seatbelt_worker_produces_valid_permutation` e2e test pins the positive
+/// direction (the worker runs) and `seatbelt_denies_home_reads_but_runs` pins the
+/// negative (a `$HOME` read is blocked), so a future macOS release that regresses
+/// either direction fails loudly.
+///
+/// Seatbelt matches the LAST rule that applies, so the exact candidate binary and
+/// input are re-allowed by literal AFTER the home-directory denies: the worker
+/// still loads and reads its pattern even when the clone (hence the binary and
+/// staged input) lives under `$HOME` — the case a bare home-dir deny would
+/// otherwise break. Output writes use `file-write*`, which the read denies do not
+/// touch.
+///
+/// All three paths MUST already be canonicalized by the caller (Seatbelt matches
+/// on canonical paths). `$HOME` is resolved here so that a home symlinked onto
+/// another volume is still denied — see `seatbelt_denied_read_subtrees`.
+fn seatbelt_profile(candidate_exe: &Path, input: &Path, output: &Path) -> String {
+    let candidate_exe = seatbelt_quote(&candidate_exe.to_string_lossy());
+    let input = seatbelt_quote(&input.to_string_lossy());
     let output = seatbelt_quote(&output.to_string_lossy());
+    let canonical_home = std::env::var_os("HOME")
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .map(|home| home.to_string_lossy().into_owned());
+    let deny_home_reads: String = seatbelt_denied_read_subtrees(canonical_home.as_deref())
+        .iter()
+        .map(|subtree| {
+            let subtree = seatbelt_quote(subtree);
+            format!("(deny file-read* (subpath \"{subtree}\"))")
+        })
+        .collect();
     format!(
         "(version 1)\
          (deny default)\
@@ -458,6 +542,9 @@ fn seatbelt_profile(output: &Path) -> String {
          (allow sysctl-read)\
          (allow mach-lookup)\
          (allow file-read*)\
+         {deny_home_reads}\
+         (allow file-read* (literal \"{candidate_exe}\"))\
+         (allow file-read* (literal \"{input}\"))\
          (deny network*)\
          (allow file-write-data (literal \"/dev/null\"))\
          (allow file-write* (literal \"{output}\"))"
@@ -551,6 +638,25 @@ mod tests {
     }
 
     #[test]
+    fn denied_read_subtrees_cover_relocated_home() {
+        // The static prefixes are always present.
+        let base = seatbelt_denied_read_subtrees(None);
+        for subtree in SEATBELT_DENIED_READ_SUBTREES {
+            assert!(base.iter().any(|s| s == subtree));
+        }
+
+        // A home already under a static prefix adds nothing (no duplicate).
+        let under_users = seatbelt_denied_read_subtrees(Some("/Users/alice"));
+        assert_eq!(under_users, base);
+
+        // Issue #63 symlink bypass: a home whose realpath is on another volume
+        // is NOT under any static prefix, so it must get its own deny — Seatbelt
+        // resolves symlinks before matching, so `/Users` alone would miss it.
+        let relocated = seatbelt_denied_read_subtrees(Some("/Volumes/data/bob"));
+        assert!(relocated.iter().any(|s| s == "/Volumes/data/bob"));
+    }
+
+    #[test]
     fn grader_mode_rejects_missing_or_empty_sandbox_selection() {
         // In grader mode the opt-out is irrelevant: a missing/empty selection is
         // always a hard error.
@@ -632,6 +738,21 @@ mod tests {
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(deny network*)"));
 
+        // Issue #63: home directories — where ~/.ssh, ~/.aws, the keychain and
+        // browser data live — must be read-denied so order() has nothing worth
+        // encoding into the scored permutation.
+        for subtree in SEATBELT_DENIED_READ_SUBTREES {
+            assert!(
+                profile.contains(&format!("(deny file-read* (subpath \"{subtree}\"))")),
+                "home read carve-out for {subtree} missing (issue #63): {profile}"
+            );
+        }
+        // The home denies must precede the candidate/input re-allows: Seatbelt
+        // takes the LAST matching rule, so the literal re-allows below only win
+        // (keeping the worker runnable from a clone under $HOME) if they come
+        // after the denies.
+        let first_home_deny = profile.find("(deny file-read* (subpath").unwrap();
+
         // The write-allow literal must be the CANONICAL output path (so the
         // /var -> /private/var symlink does not defeat the match), and the
         // candidate/input/output paths follow the profile, canonicalized.
@@ -644,6 +765,23 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        // The candidate binary and input are re-allowed by their exact canonical
+        // literals AFTER the home denies, so the worker still loads and reads its
+        // input even when the clone (and thus the binary/input) lives under
+        // $HOME — the case a bare `(deny subpath "/Users")` would break.
+        let candidate_allow = format!("(allow file-read* (literal \"{canonical_candidate}\"))");
+        assert!(profile.contains(&candidate_allow));
+        assert!(
+            profile.find(&candidate_allow).unwrap() > first_home_deny,
+            "candidate re-allow must follow the home denies to win last-match: {profile}"
+        );
+        let canonical_input = std::fs::canonicalize(&input)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(profile.contains(&format!(
+            "(allow file-read* (literal \"{canonical_input}\"))"
+        )));
         assert_eq!(args[2], canonical_candidate);
         assert_eq!(args.last().unwrap(), &canonical_output.to_string_lossy());
 
@@ -655,8 +793,84 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_profile_escapes_quotes_in_output_path() {
-        let profile = seatbelt_profile(Path::new("/tmp/we\"ird/out.bin"));
+        let profile = seatbelt_profile(
+            Path::new("/tmp/cand"),
+            Path::new("/tmp/in"),
+            Path::new("/tmp/we\"ird/out.bin"),
+        );
         assert!(profile.contains("/tmp/we\\\"ird/out.bin"));
+    }
+
+    /// End-to-end proof of the issue #63 carve-out: under the real Seatbelt
+    /// profile, a read of a file under `$HOME` is DENIED while a read of a system
+    /// file (dyld/runtime health) still SUCCEEDS. Uses `/bin/cat` as a stand-in
+    /// for a malicious `order()`, so it needs no built candidate — but it writes
+    /// a throwaway probe under the real home directory, so it is ignored during
+    /// routine `cargo test` and run explicitly to re-verify per macOS release.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes a probe under $HOME; run explicitly to re-verify the #63 home-read carve-out"]
+    fn seatbelt_denies_home_reads_but_runs() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+        assert!(
+            home.starts_with("/Users") || home.starts_with("/home") || home.starts_with("/var"),
+            "test assumes HOME lives under a denied subtree: {}",
+            home.display()
+        );
+        let probe_dir = home.join(format!(".ssi63-carveout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        std::fs::create_dir_all(&probe_dir).unwrap();
+        let secret = probe_dir.join("stolen_secret");
+        std::fs::write(&secret, b"top secret\n").unwrap();
+
+        // A system file that must stay readable, and a scratch output file.
+        let system_file = Path::new("/System/Library/CoreServices/SystemVersion.plist");
+        assert!(system_file.exists(), "expected a readable system file");
+        let output = probe_dir.join("out");
+        std::fs::File::create(&output).unwrap();
+
+        // Build the exact production profile. `input` is a SYSTEM file (not the
+        // probe), so the probe is never re-allowed by the literal carve-back.
+        let cat = canonical_file(Path::new("/bin/cat"), "cat").unwrap();
+        let profile = seatbelt_profile(
+            &cat,
+            &canonical_file(system_file, "system file").unwrap(),
+            &canonical_file(&output, "output").unwrap(),
+        );
+
+        let run = |target: &Path| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(&profile)
+                .arg("/bin/cat")
+                .arg(target)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+        };
+
+        // Sanity: unsandboxed, the "secret" is readable — proving the deny below
+        // is what blocks it, not a missing file.
+        assert!(std::process::Command::new("/bin/cat")
+            .arg(&secret)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(
+            !run(&secret).success(),
+            "issue #63: a $HOME read must be blocked under the Seatbelt profile"
+        );
+        assert!(
+            run(system_file).success(),
+            "a system read must still succeed (dyld/runtime health)"
+        );
+
+        std::fs::remove_dir_all(&probe_dir).unwrap();
     }
 
     /// End-to-end proof that the Seatbelt profile does not break a genuine

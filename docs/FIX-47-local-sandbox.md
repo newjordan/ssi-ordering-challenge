@@ -25,7 +25,8 @@ later via Yukon.
 - **Execute phase** (`src/sandbox.rs`): `from_env`/`select` pick the host-native
   sandbox when `SSI_GRADER_SANDBOX` is unset — **bubblewrap** on Linux,
   **`sandbox-exec` (Seatbelt)** on macOS (new `WorkerSandbox::Seatbelt`). The
-  Seatbelt profile is `deny default` re-allowing exec/fork, broad `file-read*`,
+  Seatbelt profile is `deny default` re-allowing exec/fork, broad `file-read*`
+  **with the home directories carved out (issue #63, see below)**,
   `mach-lookup`, `sysctl-read`; **`deny network*`**; and `file-write*` for
   exactly the one canonicalized output file (+ `/dev/null`). No native sandbox →
   **fail closed** with an actionable message. `SSI_ALLOW_UNSANDBOXED_WORKER=1` is
@@ -65,12 +66,55 @@ later via Yukon.
 - **Regression:** `cargo test --release` green (Seatbelt selection/command tests;
   `security_boundary` asserts the default build path routes through the sandbox).
 
+## Home-directory read carve-out (issue #63)
+
+The original Seatbelt profile paired broad `file-read*` with network-deny and
+write-confinement and claimed that left "no exfiltration path." **That was
+false.** The one sanctioned output — the returned permutation — is an
+attacker-controlled, score-modulating channel that reaches a *public* artifact:
+a winning `order()` could read `~/.ssh`, `~/.aws`, the keychain or browser data
+(all allowed by broad `file-read*`) and encode what it found as pre-tuned
+permutation swaps, shifting the committed `score.json` / `results.tsv` by
+distinct, decodable amounts. Since every contestant runs the pushed-back winner
+locally, that is fleet-scale, invisible exfiltration through the score itself —
+network-deny does nothing about it. (The Linux/grader bubblewrap path was never
+affected: it binds in only the runtime-library trees, the binary, the input and
+the output, so there is nothing under `$HOME` to read.)
+
+**Fix:** `seatbelt_profile()` keeps broad `file-read*` but denies reads of the
+home directories (`/Users`, `/home`, `/var/root`, `/private/var/root`) and
+re-allows the exact candidate binary and input by literal *after* the denies
+(Seatbelt takes the last matching rule) so the worker still loads and reads its
+pattern when the clone lives under `$HOME`. Every credential class the POC
+exfiltrated lives under a home directory, so the channel is left with nothing
+worth encoding.
+
+Because Seatbelt resolves symlinks before matching a `subpath`, the static
+prefixes alone would miss a home relocated onto another volume (e.g.
+`/Users/bob` → `/Volumes/data/bob`, common for network or oversized homes):
+`~/.ssh` would canonicalize outside `/Users` and slip past the deny. So the
+profile also resolves `$HOME` to its realpath at build time and denies that when
+it falls outside the static prefixes (`seatbelt_denied_read_subtrees`). A home
+whose individual subdirectory is symlinked off-tree still cannot be enumerated
+this way — only the home root is resolved.
+
+Why deny-list, not the Linux side's tight allow-list: empirically (macOS 26.x /
+arm64), a deny-default profile that allows only `/usr/lib`, `/System` and
+`/private/var/db/dyld` — or even every standard system tree while omitting
+`/Users` — aborts in `dyld4::CacheFinder` before `order()` runs, because dyld's
+shared-cache discovery reads across version-dependent paths (the cryptex-split
+cache, closures, fallbacks) a minimal allow-list cannot pin. Keeping broad read
+while carving out the home trees runs cleanly. The positive direction (worker
+runs) is pinned by `seatbelt_worker_produces_valid_permutation`; the negative
+(a `$HOME` read is blocked, a system read is not) by
+`seatbelt_denies_home_reads_but_runs`.
+
 ## Residual (deferred to Yukon)
 
-- The local Seatbelt profile allows broad `file-read*` (needed for dyld), so a
-  worker can still *read* host files — but with network denied and no writable
-  channel except a bijection-validated output, there is no exfiltration path.
-  Cross-checkout read restriction is part of the later Yukon containment.
+- Non-home host files (e.g. `/etc`, `/Library`, `/private/var`) remain readable,
+  since dyld needs broad read on macOS. The high-value, per-user secrets are all
+  under `$HOME` and are now denied; fully confining the read side to the Linux
+  allow-list model is part of the later Yukon managed sandbox.
 - Seatbelt is namespace/policy isolation, not a VM; kernel bugs remain in scope.
 - `sandbox-exec` is deprecated by Apple but present and functional on current
   macOS; Yukon replaces this local shim with its managed sandbox.
