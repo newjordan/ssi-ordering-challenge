@@ -65,9 +65,18 @@ fn normal_run_succeeds_on_sample_corpus() {
     std::fs::create_dir_all(&dir).unwrap();
     let corpus = public_dev_corpus();
 
+    // This test verifies the successful public-dev OUTPUT FORMAT (per-matrix
+    // census + score.json schema), not order() speed — cap enforcement is
+    // covered deterministically by `slow_ordering_is_killed_and_fails_promptly`.
+    // Bound the scored set to small matrices (SSI_MAX_MATRIX_N) so the format
+    // assertions never depend on the heavy portfolio beating the 2s wall-clock
+    // cap on the largest matrices, which is runner-speed flaky (issue #60). The
+    // run stays on the public-dev path (same corpus file), so the census and
+    // bucket keys are still emitted; only the huge matrices are skipped.
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_CORPUS_FILE", &corpus)
+        .env("SSI_MAX_MATRIX_N", "2000")
         .current_dir(&dir)
         .args(["--note", "time_cap test: normal"])
         .output()

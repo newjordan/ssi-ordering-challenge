@@ -147,6 +147,17 @@ SSI_CORPUS_FILE=/path/to/other.jsonl cargo run --release --offline --locked -- -
 Unset (the default), the harness grades the in-repo corpus. The competition's
 hidden evaluation corpus is never published.
 
+For a quick smoke run, `SSI_MAX_MATRIX_N=N` scores only the corpus matrices
+whose dimension `n` is at most `N`, skipping the largest (and slowest) ones:
+
+```sh
+SSI_MAX_MATRIX_N=2000 cargo run --release --offline --locked -- --note "smoke run"
+```
+
+This narrows the scored set only — the score definition is unchanged, so the
+number it prints is *not* your leaderboard score. The grader never sets it and
+always ranks against the full corpus.
+
 ### Reference numbers
 
 Beating AMD (**score < 1.00**) is the game; the AMD baseline is anchored at
