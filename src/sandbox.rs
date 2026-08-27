@@ -448,12 +448,8 @@ impl WorkerSandbox {
 /// (`/Users/<u>` on macOS, `/home/<u>` on Linux layouts) or root's home
 /// (`/var/root`, canonically `/private/var/root`). Denying these removes the
 /// material there is any incentive to encode into the scored permutation.
-const SEATBELT_DENIED_READ_SUBTREES: &[&str] = &[
-    "/Users",
-    "/home",
-    "/var/root",
-    "/private/var/root",
-];
+const SEATBELT_DENIED_READ_SUBTREES: &[&str] =
+    &["/Users", "/home", "/var/root", "/private/var/root"];
 
 /// Build the Seatbelt profile for one worker: deny everything, re-allow only
 /// what a dynamically linked Rust binary needs to run (exec/fork, sysctl, mach
