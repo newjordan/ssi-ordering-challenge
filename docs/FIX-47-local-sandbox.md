@@ -89,6 +89,15 @@ pattern when the clone lives under `$HOME`. Every credential class the POC
 exfiltrated lives under a home directory, so the channel is left with nothing
 worth encoding.
 
+Because Seatbelt resolves symlinks before matching a `subpath`, the static
+prefixes alone would miss a home relocated onto another volume (e.g.
+`/Users/bob` → `/Volumes/data/bob`, common for network or oversized homes):
+`~/.ssh` would canonicalize outside `/Users` and slip past the deny. So the
+profile also resolves `$HOME` to its realpath at build time and denies that when
+it falls outside the static prefixes (`seatbelt_denied_read_subtrees`). A home
+whose individual subdirectory is symlinked off-tree still cannot be enumerated
+this way — only the home root is resolved.
+
 Why deny-list, not the Linux side's tight allow-list: empirically (macOS 26.x /
 arm64), a deny-default profile that allows only `/usr/lib`, `/System` and
 `/private/var/db/dyld` — or even every standard system tree while omitting

@@ -451,6 +451,35 @@ impl WorkerSandbox {
 const SEATBELT_DENIED_READ_SUBTREES: &[&str] =
     &["/Users", "/home", "/var/root", "/private/var/root"];
 
+/// The read-deny subtree list for one worker: the static home prefixes above,
+/// plus the *canonicalized* `$HOME` when it falls outside them.
+///
+/// Seatbelt matches `subpath` rules on the realpath (symlinks resolved), so a
+/// home relocated onto another volume by symlink (e.g. `/Users/bob` ->
+/// `/Volumes/data/bob`, common for network or oversized homes) would slip past
+/// the bare `/Users` prefix and reopen the issue #63 channel. Resolving `$HOME`
+/// and denying its real location closes that. (Only the home *root* can be
+/// resolved this way; a home whose individual subdirectory is symlinked off-tree
+/// cannot be enumerated here.)
+///
+/// Pure over `canonical_home` so it can be unit-tested without a symlinked home;
+/// the caller resolves `$HOME` to its realpath and passes the result.
+fn seatbelt_denied_read_subtrees(canonical_home: Option<&str>) -> Vec<String> {
+    let mut subtrees: Vec<String> = SEATBELT_DENIED_READ_SUBTREES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Some(home) = canonical_home {
+        let covered = subtrees
+            .iter()
+            .any(|s| home == s || home.starts_with(&format!("{s}/")));
+        if !covered {
+            subtrees.push(home.to_string());
+        }
+    }
+    subtrees
+}
+
 /// Build the Seatbelt profile for one worker: deny everything, re-allow only
 /// what a dynamically linked Rust binary needs to run (exec/fork, sysctl, mach
 /// lookups) plus broad reads, then CARVE OUT the home directories, deny all
@@ -489,14 +518,21 @@ const SEATBELT_DENIED_READ_SUBTREES: &[&str] =
 /// touch.
 ///
 /// All three paths MUST already be canonicalized by the caller (Seatbelt matches
-/// on canonical paths).
+/// on canonical paths). `$HOME` is resolved here so that a home symlinked onto
+/// another volume is still denied — see `seatbelt_denied_read_subtrees`.
 fn seatbelt_profile(candidate_exe: &Path, input: &Path, output: &Path) -> String {
     let candidate_exe = seatbelt_quote(&candidate_exe.to_string_lossy());
     let input = seatbelt_quote(&input.to_string_lossy());
     let output = seatbelt_quote(&output.to_string_lossy());
-    let deny_home_reads: String = SEATBELT_DENIED_READ_SUBTREES
+    let canonical_home = std::env::var_os("HOME")
+        .and_then(|home| std::fs::canonicalize(home).ok())
+        .map(|home| home.to_string_lossy().into_owned());
+    let deny_home_reads: String = seatbelt_denied_read_subtrees(canonical_home.as_deref())
         .iter()
-        .map(|subtree| format!("(deny file-read* (subpath \"{subtree}\"))"))
+        .map(|subtree| {
+            let subtree = seatbelt_quote(subtree);
+            format!("(deny file-read* (subpath \"{subtree}\"))")
+        })
         .collect();
     format!(
         "(version 1)\
@@ -599,6 +635,25 @@ mod tests {
         );
         assert!(cmd.get_envs().all(|(_, value)| value.is_none()));
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/empty")));
+    }
+
+    #[test]
+    fn denied_read_subtrees_cover_relocated_home() {
+        // The static prefixes are always present.
+        let base = seatbelt_denied_read_subtrees(None);
+        for subtree in SEATBELT_DENIED_READ_SUBTREES {
+            assert!(base.iter().any(|s| s == subtree));
+        }
+
+        // A home already under a static prefix adds nothing (no duplicate).
+        let under_users = seatbelt_denied_read_subtrees(Some("/Users/alice"));
+        assert_eq!(under_users, base);
+
+        // Issue #63 symlink bypass: a home whose realpath is on another volume
+        // is NOT under any static prefix, so it must get its own deny — Seatbelt
+        // resolves symlinks before matching, so `/Users` alone would miss it.
+        let relocated = seatbelt_denied_read_subtrees(Some("/Volumes/data/bob"));
+        assert!(relocated.iter().any(|s| s == "/Volumes/data/bob"));
     }
 
     #[test]
