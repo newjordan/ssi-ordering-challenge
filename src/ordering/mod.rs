@@ -1864,6 +1864,15 @@ fn order_with_options(
         consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern))
         });
+        // Same BFS-separator structure, but each base-case leaf and unsplittable
+        // separator is ordered by AMD on its induced subgraph (textbook ND +
+        // minimum-degree hybrid) rather than a plain global-degree sort. Added
+        // as a DISTINCT candidate, so the best-of floor keeps it zero-downside
+        // on score; identical gate; deterministic; extra cost is ≈ one more ND
+        // pass plus O(nnz) induced-graph work, all below the slow tier.
+        consider(&|| {
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order_impl(pattern, true))
+        });
     }
 
     // GREEDY GRAPH-GROWING (GGGP) recursive bisection — a SECOND, algorithmically
@@ -3868,7 +3877,86 @@ fn ndfm_order(pattern: &Pattern) -> Vec<i32> {
 /// Deterministic: fixed min-degree seed, one fixed pseudo-peripheral refinement,
 /// median-level separator, and partition lists built by scanning `nodes` in
 /// ascending order.
+/// Order the subset `nodes` (ascending, deterministic) into `order[lo..lo+m]`
+/// by running feral AMD on the *induced* subgraph, then mapping the result back
+/// to global ids. `g2l` is a length-`n` scratch buffer that is `-1` everywhere
+/// on entry and is restored to `-1` on exit (only `nodes`' slots are touched).
+/// On any failure (degenerate pattern, AMD error, unexpected length) it falls
+/// back to the same ascending-degree fill `deg_fill` uses, so the result is
+/// always a valid, deterministic ordering of exactly `nodes`.
+fn amd_fill_induced(
+    order: &mut [usize],
+    lo: usize,
+    nodes: &[usize],
+    adj: &[Vec<usize>],
+    degree: &[usize],
+    g2l: &mut [i32],
+) {
+    let m = nodes.len();
+    // global -> local (1:1 over `nodes`); `nodes` is ascending so this is
+    // deterministic and induced row lists come out sorted after sort_unstable.
+    for (li, &v) in nodes.iter().enumerate() {
+        g2l[v] = li as i32;
+    }
+    let mut col_ptr = vec![0i32; m + 1];
+    for (li, &v) in nodes.iter().enumerate() {
+        let mut d = 0i32;
+        for &w in &adj[v] {
+            if g2l[w] >= 0 {
+                d += 1;
+            }
+        }
+        col_ptr[li + 1] = col_ptr[li] + d;
+    }
+    let mut row_idx = vec![0i32; col_ptr[m] as usize];
+    for (li, &v) in nodes.iter().enumerate() {
+        let start = col_ptr[li] as usize;
+        let mut t = 0usize;
+        for &w in &adj[v] {
+            let lw = g2l[w];
+            if lw >= 0 {
+                row_idx[start + t] = lw;
+                t += 1;
+            }
+        }
+        row_idx[start..start + t].sort_unstable();
+    }
+    // Restore scratch to all -1 for the next leaf.
+    for &v in nodes {
+        g2l[v] = -1;
+    }
+
+    let perm = feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx)
+        .and_then(|core| feral_amd::amd_order(&core).ok());
+    match perm {
+        Some(p) if p.len() == m => {
+            for (t, &l) in p.iter().enumerate() {
+                order[lo + t] = nodes[l as usize];
+            }
+        }
+        // Fallback: ascending global-degree fill (identical to `deg_fill`).
+        _ => {
+            let mut v = nodes.to_vec();
+            v.sort_by(|&a, &b| degree[a].cmp(&degree[b]).then_with(|| a.cmp(&b)));
+            for (t, u) in v.into_iter().enumerate() {
+                order[lo + t] = u;
+            }
+        }
+    }
+}
+
 fn nd_order(pattern: &Pattern) -> Vec<i32> {
+    nd_order_impl(pattern, false)
+}
+
+/// Nested dissection with a choice of leaf/unsplittable-separator ordering.
+/// `amd_leaves = false` is the shipped behavior (ascending global-degree fill).
+/// `amd_leaves = true` orders each base-case leaf and each unsplittable
+/// separator with AMD on the induced subgraph (the textbook ND + minimum-degree
+/// hybrid). The two are DISTINCT candidates routed through the best-of floor,
+/// so the AMD-leaf variant can only lower a matrix's ratio, never raise it —
+/// only its (bounded) time is at stake.
+fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     let n = pattern.n;
 
     // Symmetric adjacency (exclude self-loops; dedup for accurate degrees).
@@ -3900,6 +3988,10 @@ fn nd_order(pattern: &Pattern) -> Vec<i32> {
     // (e.g. highly disconnected) input can drive quadratic blow-up.
     let mut budget: i64 = 64 * n as i64 + 4096;
 
+    // Scratch global->local map for AMD-on-induced-leaf ordering; -1 everywhere
+    // between leaves. Allocated only when the AMD-leaf variant is requested.
+    let mut g2l: Vec<i32> = if amd_leaves { vec![-1i32; n] } else { Vec::new() };
+
     // Fill `order[lo..lo+v.len()]` with `v` reordered by ascending degree
     // (min-degree-ish leaf ordering), ties broken by index → deterministic.
     let deg_fill = |order: &mut [usize], lo: usize, mut v: Vec<usize>| {
@@ -3918,9 +4010,14 @@ fn nd_order(pattern: &Pattern) -> Vec<i32> {
         let sz = nodes.len();
         let hi = lo + sz;
 
-        // Base case / budget exhausted: order this subset by degree and stop.
+        // Base case / budget exhausted: order this subset by degree (or by AMD
+        // on the induced subgraph, for the AMD-leaf variant) and stop.
         if sz <= ND_LEAF || budget < 0 {
-            deg_fill(&mut order, lo, nodes);
+            if amd_leaves {
+                amd_fill_induced(&mut order, lo, &nodes, &adj, &degree, &mut g2l);
+            } else {
+                deg_fill(&mut order, lo, nodes);
+            }
             continue;
         }
         budget -= sz as i64;
@@ -4040,9 +4137,14 @@ fn nd_order(pattern: &Pattern) -> Vec<i32> {
             mark[u] = false;
         }
 
-        // Unsplittable (separator is the whole subset): degree-order and stop.
+        // Unsplittable (separator is the whole subset): degree-order (or AMD on
+        // the induced subgraph, for the AMD-leaf variant) and stop.
         if left.is_empty() && right.is_empty() {
-            deg_fill(&mut order, lo, sep);
+            if amd_leaves {
+                amd_fill_induced(&mut order, lo, &sep, &adj, &degree, &mut g2l);
+            } else {
+                deg_fill(&mut order, lo, sep);
+            }
             continue;
         }
 
@@ -4589,6 +4691,54 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(nd_order(&pat), nd_order(&pat));
+    }
+
+    /// ND with AMD-ordered leaves must also always be a valid, deterministic
+    /// bijection — exercising the base-case leaf, unsplittable-separator, and
+    /// (via degenerate subsets) the AMD fallback paths — across a disconnected
+    /// graph, an edgeless graph, and a grid large enough to recurse past
+    /// `ND_LEAF` into real AMD leaves.
+    #[test]
+    fn nd_amd_leaves_is_valid_and_deterministic() {
+        let n = 50;
+        let mut edges = Vec::new();
+        for v in 0..20 {
+            edges.push((v, v + 1));
+        }
+        for v in 25..40 {
+            edges.push((v, v + 1));
+        }
+        // nodes 41..50 are isolated
+        let pat = Pattern::from_edges(n, &edges);
+        let perm: Vec<usize> = nd_order_impl(&pat, true)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        assert_bijection(&perm, n);
+
+        let empty = Pattern::from_edges(12, &[]);
+        let perm2: Vec<usize> = nd_order_impl(&empty, true)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        assert_bijection(&perm2, 12);
+
+        let m = 600;
+        let mut e2 = Vec::new();
+        for v in 0..m - 1 {
+            e2.push((v, v + 1));
+        }
+        for v in 0..m - 20 {
+            e2.push((v, v + 20));
+        }
+        let grid = Pattern::from_edges(m, &e2);
+        let perm3: Vec<usize> = nd_order_impl(&grid, true)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        assert_bijection(&perm3, m);
+
+        assert_eq!(nd_order_impl(&grid, true), nd_order_impl(&grid, true));
     }
 
     /// GGGP graph-growing bisection must always return a valid bijection,
