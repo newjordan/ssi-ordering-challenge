@@ -310,15 +310,16 @@ fn main() -> ExitCode {
             )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
-                watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(
-                    &out_perm, pat.n,
-                )
-                .map_err(|e| WorkerFailure {
-                    // The parse error can echo bytes from the worker-written
-                    // output file, so keep it off the hidden path.
-                    detailed: format!("worker produced no readable permutation: {e}"),
-                    redacted: "worker produced no readable permutation".to_string(),
-                }),
+                watchdog::WorkerOutcome::Ok => {
+                    ssi_worker_protocol::read_permutation(&out_perm, pat.n).map_err(|e| {
+                        WorkerFailure {
+                            // The parse error can echo bytes from the worker-written
+                            // output file, so keep it off the hidden path.
+                            detailed: format!("worker produced no readable permutation: {e}"),
+                            redacted: "worker produced no readable permutation".to_string(),
+                        }
+                    })
+                }
                 other => Err(classify_worker_failure(
                     other,
                     t0.elapsed(),
@@ -674,11 +675,7 @@ fn repo_root() -> std::path::PathBuf {
     resolve_repo_root(compiled, executable.as_deref(), cwd.as_deref())
 }
 
-fn resolve_repo_root(
-    compiled: &Path,
-    executable: Option<&Path>,
-    cwd: Option<&Path>,
-) -> PathBuf {
+fn resolve_repo_root(compiled: &Path, executable: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
     find_repo_root(compiled)
         .or_else(|| executable.and_then(find_repo_root))
         .or_else(|| cwd.and_then(find_repo_root))
@@ -688,9 +685,7 @@ fn resolve_repo_root(
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|path| {
-            path.join("deny.toml").is_file() && path.join("src/ordering").is_dir()
-        })
+        .find(|path| path.join("deny.toml").is_file() && path.join("src/ordering").is_dir())
         .map(Path::to_path_buf)
 }
 
@@ -774,14 +769,25 @@ fn classify_worker_failure(
             ),
             redacted: format!("order() exceeded the {cap:.1}s per-matrix cap and was killed"),
         },
-        watchdog::WorkerOutcome::Crashed(why) => {
-            // `why` is describe_status/spawn-error text: harness-generated exit
-            // code or signal, never worker stdio (which is /dev/null). Safe to
-            // surface verbatim on the hidden path.
-            let msg = format!("order() worker exited abnormally: {why}");
+        watchdog::WorkerOutcome::Crashed(crash) => {
+            // The redacted category is keyed off the OS/harness-determined
+            // CrashKind, never off `crash.detail` — a nonzero exit code is
+            // worker-chosen (`std::process::exit(f(n))`), so echoing it on the
+            // hidden path would be a covert channel for the eval matrix. The
+            // signal-vs-exit split is the actionable bit (memory cap / segfault
+            // vs a panic) and leaks at most one OS-determined bit, no number.
+            let redacted = match crash.kind {
+                watchdog::CrashKind::Signal => {
+                    "order() worker was killed by a signal (e.g. it hit the memory cap or segfaulted)"
+                }
+                watchdog::CrashKind::NonzeroExit => {
+                    "order() worker exited nonzero (e.g. order() panicked)"
+                }
+                watchdog::CrashKind::Harness => "order() worker could not be run",
+            };
             WorkerFailure {
-                redacted: msg.clone(),
-                detailed: msg,
+                detailed: format!("order() worker exited abnormally: {}", crash.detail),
+                redacted: redacted.to_string(),
             }
         }
         watchdog::WorkerOutcome::Ok => {
@@ -931,18 +937,56 @@ mod census_tests {
     }
 
     #[test]
-    fn crash_failure_is_distinct_from_timeout_and_carries_exit_status() {
+    fn crash_redacted_never_carries_the_worker_controlled_exit_code() {
+        // A nonzero exit code is worker-chosen (`std::process::exit(f(n))`), so
+        // it must never reach the hidden-corpus log — only the fact of a crash.
         let f = classify_worker_failure(
-            watchdog::WorkerOutcome::Crashed("signal: 9 (SIGKILL)".to_string()),
+            watchdog::WorkerOutcome::Crashed(watchdog::CrashDetail {
+                kind: watchdog::CrashKind::NonzeroExit,
+                detail: "worker exited with code 17".to_string(),
+            }),
+            Duration::ZERO,
+            357,
+            1080,
+        );
+        // Distinct from a time-cap kill, and free of the worker-chosen number.
+        assert!(!f.redacted.contains("cap"), "redacted: {}", f.redacted);
+        assert!(
+            !f.redacted.contains("17"),
+            "redacted leaked code: {}",
+            f.redacted
+        );
+        // The full detail (public dev corpus only) may keep the code.
+        assert!(f.detailed.contains("17"));
+    }
+
+    #[test]
+    fn crash_redacted_distinguishes_signal_from_nonzero_exit() {
+        let signal = classify_worker_failure(
+            watchdog::WorkerOutcome::Crashed(watchdog::CrashDetail {
+                kind: watchdog::CrashKind::Signal,
+                detail: "worker killed by signal 6".to_string(),
+            }),
             Duration::ZERO,
             10,
             20,
         );
-        // A crash/OOM-kill must not masquerade as a time-cap kill.
-        assert!(!f.redacted.contains("cap"), "redacted: {}", f.redacted);
-        // Harness-generated exit status is safe to surface on both paths.
-        assert!(f.redacted.contains("signal: 9"), "redacted: {}", f.redacted);
-        assert!(f.detailed.contains("signal: 9"));
+        let exited = classify_worker_failure(
+            watchdog::WorkerOutcome::Crashed(watchdog::CrashDetail {
+                kind: watchdog::CrashKind::NonzeroExit,
+                detail: "worker exited with code 101".to_string(),
+            }),
+            Duration::ZERO,
+            10,
+            20,
+        );
+        // A signal (memory cap / segfault) reads differently from a nonzero
+        // exit (panic / explicit exit) — the actionable distinction for a
+        // contestant — but neither carries the signal or code NUMBER.
+        assert!(signal.redacted.contains("signal"), "{}", signal.redacted);
+        assert!(!signal.redacted.contains('6'));
+        assert!(!exited.redacted.contains("101"));
+        assert_ne!(signal.redacted, exited.redacted);
     }
 }
 
