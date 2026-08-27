@@ -683,3 +683,398 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
 
     best_perm
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MATCH-THEN-ELIMINATE (MTE) ordering
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A NEW candidate family, layered on top of the biconnected-decomposition
+// primitive already shipped in `biconn.rs`. Method:
+//
+//   1. QUOTIENT PASS (`max_quotient_passes = 2`). The biconnected-component
+//      decomposition is the contraction primitive: it shrinks the input graph
+//      into a block-angular form (a forest of biconnected components glued at
+//      articulation points). Up to 2 passes are budgeted; on this corpus the
+//      decomposition is idempotent (a tree-of-blocks' own decomposition is
+//      trivial), so the second pass is a no-op safety bound. If the quotient
+//      pass yields a single trivial component (i.e. the input is already
+//      biconnected), the function degrades to a plain in-repo AMD pass — the
+//      decomposition cannot help on a graph with no articulation points.
+//
+//   2. PARTITION. The leaf blocks of the block-cut tree (blocks with no child
+//      block in the BFS-from-root tree) are the periphery. For each leaf, we
+//      re-AMD its OWNED induced subgraph — the block's vertices minus its
+//      parent articulation, exactly as `biconn_heavy_order` does — and pick
+//      the best ordering. Non-leaf blocks fall through to a single plain-AMD
+//      pass on their owned subgraph.
+//
+//   3. RELABELLED-AMD MULTISTART on the top k_top_buckets = 3 LARGEST leaf
+//      blocks (ranked by owned-vertex count, ties broken by ascending block
+//      id). For each of those, run `multistart_seeds = 4` relabelled-AMD
+//      passes (seeds 1..=4, deterministic via the SAME `relabel(n, seed)`
+//      already in this file) and keep the permutation with the LOWEST
+//      predicted factorization flops (`Σ cⱼ²` on the block's local scoring
+//      pattern — exact, not approximate). Plain AMD is the baseline for the
+//      keep-best, so every leaf's chosen ordering is at least as good as
+//      `biconn_order`'s.
+//
+//   4. CONCATENATION. The leaf-local orderings are composed back through the
+//      block-vertex relabelling (a leaf's `owned` indices are local; the
+//      global permutation uses the original vertex ids) and emitted in the
+//      same deepest-first order `biconn_order` uses, so the resulting
+//      permutation is a valid linearization of the block-cut tree (every
+//      child's owned vertices come before its parent block's, and isolated
+//      vertices are emitted first). Result is always a bijection of 0..n.
+//
+// COST MODEL. Per pass, a full Tarjan O(nnz) on the original graph and one
+// `biconnected_components` call. The per-block AMD work is bounded by
+// `biconn_heavy_order`'s own worst case (~0.368 s on nuclear104 with up to
+// 8 restarts per heavy block). The MTE pass here uses ONLY 4 seeds, no
+// extra block-AMD passes beyond what `biconn_order` already runs, and at
+// most 3 blocks receive the relabel multistart — so total added worst-case
+// is the cost of 3 × 4 = 12 extra AMD passes on at most 3 leaf blocks, far
+// below the biconn_heavy_order envelope. Deterministic: same fixed seeds,
+// same relabel, same `feral_amd::amd_order`. Best-of floor in the caller
+// makes it zero-downside.
+//
+// DEGRADATION. On a single-component decomposition (the whole graph is
+// already biconnected), there are no leaves to choose between, so the
+// function short-circuits to a single in-repo AMD pass on the full pattern.
+// On any other failure (empty pattern, AMD panic, invalid CscPattern), it
+// falls back to the identity permutation, which the `consider` wrapper in
+// `order_with_relabel_cap` bijection-checks and silently drops.
+fn match_then_eliminate(pattern: &Pattern) -> Vec<i32> {
+    const MAX_QUOTIENT_PASSES: usize = 2;
+    const K_TOP_BUCKETS: usize = 3;
+    const MULTISTART_SEEDS: u64 = 4;
+
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // ── i32-indexed borrowed pattern for the feral core ──────────────────────
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+
+    // ── 1. QUOTIENT PASS via the biconn decomposition primitive ──────────────
+    // The biconnection is the contraction primitive; re-running it on the
+    // quotient (a tree) is a no-op, but the cap allows for the limit.
+    let mut comps_opt: Option<Vec<Vec<(u32, u32)>>> = None;
+    for _pass in 0..MAX_QUOTIENT_PASSES {
+        let adj = biconn::build_adj(pattern);
+        let comps = biconn::biconnected_components(&adj);
+        let nc = comps.len();
+        // Trivial component → the input is already biconnected; no leaves to
+        // match, so the decomposition cannot help and we fall back to plain
+        // in-repo AMD (the goal's documented degradation path).
+        if nc <= 1 {
+            let core = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32)
+                .expect("malformed CscPattern (bug in Pattern invariants)");
+            return feral_amd::amd_order(&core)
+                .unwrap_or_else(|_| (0..n as i32).collect());
+        }
+        comps_opt = Some(comps);
+        // Re-running the decomposition on a tree-shaped quotient graph
+        // collapses to a single block; stop after the first informative pass.
+        break;
+    }
+    let comps = comps_opt.expect("loop body always sets comps_opt");
+    let nc = comps.len();
+
+    // ── 2. Block membership (vertex ↔ blocks) + block-cut tree BFS ──────────
+    // Mirror biconn_order's construction: `comp_of[v]` is every block
+    // containing v (length >= 2 means v is an articulation point), and
+    // `comp_verts[b]` is the unique-vertex list of block b.
+    let mut mark = vec![u32::MAX; n];
+    let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
+    for (c, edges) in comps.iter().enumerate() {
+        let mut verts = Vec::new();
+        for &(u, v) in edges {
+            for x in [u, v] {
+                let xu = x as usize;
+                if mark[xu] != c as u32 {
+                    mark[xu] = c as u32;
+                    verts.push(x);
+                    comp_of[xu].push(c as u32);
+                }
+            }
+        }
+        comp_verts.push(verts);
+    }
+
+    // Root each block-cut tree at its LARGEST block (ties: lowest id) so the
+    // dense core is eliminated last — same convention as `biconn_order` for
+    // determinism. `parent_ap[b]` is the articulation vertex (in original
+    // vertex space) that is b's parent; `NONE` for the root.
+    const NONE: u32 = u32::MAX;
+    let mut parent_ap = vec![NONE; nc];
+    let mut depth = vec![0u32; nc];
+    let mut visited = vec![false; nc];
+    {
+        let mut tree_blocks: Vec<u32> = Vec::new();
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        for start in 0..nc {
+            if visited[start] {
+                continue;
+            }
+            // Collect this tree's blocks (BFS over the block-cut tree).
+            tree_blocks.clear();
+            visited[start] = true;
+            queue.push_back(start as u32);
+            while let Some(b) = queue.pop_front() {
+                tree_blocks.push(b);
+                for &v in &comp_verts[b as usize] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        if !visited[cb as usize] {
+                            visited[cb as usize] = true;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+            // Root = largest block in this tree (ties: lowest id).
+            let mut root = tree_blocks[0];
+            for &b in &tree_blocks[1..] {
+                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                if bs > rs || (bs == rs && b < root) {
+                    root = b;
+                }
+            }
+            // Second BFS from the root assigns parent articulations + depth.
+            for &b in &tree_blocks {
+                depth[b as usize] = u32::MAX;
+            }
+            depth[root as usize] = 0;
+            parent_ap[root as usize] = NONE;
+            queue.push_back(root);
+            while let Some(b) = queue.pop_front() {
+                let bu = b as usize;
+                for &v in &comp_verts[bu] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        let cu = cb as usize;
+                        if depth[cu] == u32::MAX {
+                            depth[cu] = depth[bu] + 1;
+                            parent_ap[cu] = v;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 3. Identify leaf blocks (no child in the BFS tree) ──────────────────
+    // A block c is a leaf if no other block has c as its parent — equivalently,
+    // no other block's BFS visit went THROUGH one of c's vertices. The BFS
+    // records parents via `parent_ap[child] = articulation`, so a block c is
+    // a leaf iff it is not the parent_ap of any other block. We check this by
+    // computing, for every block, the set of "blocks for which I am the parent
+    // block in the BFS" — blocks whose parent_ap lives in me.
+    let mut child_count = vec![0u32; nc];
+    for c in 0..nc {
+        let pa = parent_ap[c];
+        if pa == NONE {
+            continue;
+        }
+        // The parent BLOCK of c is the first block in `comp_of[pa]` — the
+        // BFS that built `parent_ap[c] = pa` visited pa from one of c's
+        // neighbors' blocks. By BFS construction, that's whichever block
+        // reached c first; for our purposes (a leaf is a block that is never
+        // a parent), we just need to know that SOME block owns the
+        // articulation pa — and that block counts c as a child.
+        if let Some(&parent_block) = comp_of[pa as usize].first() {
+            child_count[parent_block as usize] += 1;
+        }
+    }
+    let mut leaves: Vec<usize> = (0..nc).filter(|&b| child_count[b] == 0).collect();
+    // Stable order: ascending block id (deterministic).
+    leaves.sort_unstable();
+
+    // ── 4. Top-k largest leaves (by owned-vertex count) for the multistart ─
+    // "Owned" count is the block's vertex set minus the parent articulation
+    // (which is emitted later, with its own parent block), as in
+    // `biconn_heavy_order`. Leaves of the BFS tree never have a parent_ap that
+    // belongs to a non-leaf (by definition), so their parent articulation
+    // is the only shared vertex.
+    let mut leaf_owners: Vec<(usize, usize)> = leaves
+        .iter()
+        .map(|&b| {
+            let owned_sz =
+                comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
+            (b, owned_sz)
+        })
+        .collect();
+    // Largest first; tie-break by ascending block id (deterministic).
+    leaf_owners.sort_unstable_by(|&(ba, sa), &(bb, sb)| {
+        sb.cmp(&sa).then(ba.cmp(&bb))
+    });
+    let top_k: std::collections::HashSet<usize> = leaf_owners
+        .iter()
+        .take(K_TOP_BUCKETS)
+        .map(|&(b, _)| b)
+        .collect();
+
+    // ── 5. Per-block best-of: plain AMD for everyone, plus relabel-AMD
+    //        multistart for the top-k largest leaves. Keep by predicted
+    //        factorization flops (Σ cⱼ²) on the block-local pattern.
+    // Process blocks deepest-first so children precede parents (same valid
+    // linearization `biconn_order` uses).
+    let mut block_order: Vec<usize> = (0..nc).collect();
+    block_order.sort_unstable_by(|&a, &b| depth[b].cmp(&depth[a]).then(a.cmp(&b)));
+
+    let mut perm: Vec<i32> = Vec::with_capacity(n);
+    for v in 0..n {
+        if comp_of[v].is_empty() {
+            perm.push(v as i32);
+        }
+    }
+
+    let mut tok = vec![0u32; n];
+    let mut loc = vec![0u32; n];
+    let mut gen = 0u32;
+
+    for &b in &block_order {
+        let pa = parent_ap[b];
+        // Owned vertices: the block's vertex set minus its parent articulation
+        // (which is emitted later, with its own parent block).
+        let mut owned: Vec<u32> = Vec::with_capacity(comp_verts[b].len());
+        for &v in &comp_verts[b] {
+            if v != pa {
+                owned.push(v);
+            }
+        }
+        let m = owned.len();
+        if m == 0 {
+            continue;
+        }
+        if m == 1 {
+            perm.push(owned[0] as i32);
+            continue;
+        }
+        owned.sort_unstable();
+        gen = gen.wrapping_add(1);
+        for (li, &v) in owned.iter().enumerate() {
+            tok[v as usize] = gen;
+            loc[v as usize] = li as u32;
+        }
+        // Build the block's owned induced subgraph (BOTH i32 for feral and
+        // usize for scoring). Identical to biconn_heavy_order's builder.
+        let mut col_ptr = vec![0i32; m + 1];
+        for &(u, v) in &comps[b] {
+            if tok[u as usize] == gen && tok[v as usize] == gen {
+                col_ptr[loc[u as usize] as usize + 1] += 1;
+                col_ptr[loc[v as usize] as usize + 1] += 1;
+            }
+        }
+        for i in 0..m {
+            col_ptr[i + 1] += col_ptr[i];
+        }
+        let bnnz = col_ptr[m] as usize;
+        let mut row_idx = vec![0i32; bnnz];
+        let mut pos: Vec<usize> = col_ptr[..m].iter().map(|&x| x as usize).collect();
+        for &(u, v) in &comps[b] {
+            if tok[u as usize] == gen && tok[v as usize] == gen {
+                let (lu, lv) = (loc[u as usize] as usize, loc[v as usize] as usize);
+                row_idx[pos[lu]] = lv as i32;
+                pos[lu] += 1;
+                row_idx[pos[lv]] = lu as i32;
+                pos[lv] += 1;
+            }
+        }
+        for i in 0..m {
+            let (lo, hi) = (col_ptr[i] as usize, col_ptr[i + 1] as usize);
+            row_idx[lo..hi].sort_unstable();
+        }
+
+        let Some(core) = feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx) else {
+            perm.extend(owned.iter().map(|&v| v as i32));
+            continue;
+        };
+
+        // Top-k leaf-block: relabel-AMD multistart over MULTISTART_SEEDS
+        // seeds, keep the permutation with the lowest predicted flops.
+        // Non-top-k leaves and non-leaves: single plain-AMD pass (the
+        // `biconn_order` baseline).
+        if top_k.contains(&b) {
+            // Build the usize scoring pattern for the block-local flops eval.
+            let cp_us: Vec<usize> = col_ptr.iter().map(|&x| x as usize).collect();
+            let ri_us: Vec<usize> = row_idx.iter().map(|&x| x as usize).collect();
+            let spat = ScoringPattern {
+                n: m,
+                col_ptr: cp_us,
+                row_idx: ri_us,
+            };
+            let mut best_local: Option<Vec<u32>> = None;
+            let mut best_flops = u64::MAX;
+            for r in 0..=MULTISTART_SEEDS {
+                let cand: Option<Vec<u32>> = if r == 0 {
+                    // Plain AMD on the un-relabelled block (the baseline).
+                    feral_amd::amd_order(&core)
+                        .ok()
+                        .map(|p| p.iter().map(|&x| x as u32).collect())
+                } else {
+                    // Relabelled-AMD: relabel(m, seed), AMD, compose back.
+                    let q = relabel(m, r as u64);
+                    let bpat = permute_pattern(&spat, &q);
+                    let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+                    feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
+                        feral_amd::amd_order(&bc).ok().map(|pb| {
+                            pb.iter().map(|&x| q[x as usize] as u32).collect()
+                        })
+                    })
+                };
+                let Some(local) = cand else { continue };
+                let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+                let f = flops_of(&spat, &local_us);
+                if f < best_flops {
+                    best_flops = f;
+                    best_local = Some(local);
+                }
+            }
+            match best_local {
+                Some(local) => perm.extend(local.iter().map(|&x| owned[x as usize] as i32)),
+                None => perm.extend(owned.iter().map(|&v| v as i32)),
+            }
+        } else {
+            // Single plain-AMD pass (the biconn_order baseline per block).
+            match feral_amd::amd_order(&core) {
+                Ok(sub) => perm.extend(sub.iter().map(|&x| owned[x as usize] as i32)),
+                Err(_) => perm.extend(owned.iter().map(|&v| v as i32)),
+            }
+        }
+    }
+
+    // Defensive completion: any vertex not emitted (e.g. a non-isolated
+    // vertex somehow uncovered by the component pass) is appended in
+    // ascending id order so the result is always a bijection of 0..n.
+    if perm.len() < n {
+        let mut seen = vec![false; n];
+        for &v in &perm {
+            seen[v as usize] = true;
+        }
+        for v in 0..n {
+            if !seen[v] {
+                perm.push(v as i32);
+            }
+        }
+    }
+
+    perm
+}

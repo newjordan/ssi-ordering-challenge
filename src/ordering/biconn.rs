@@ -47,7 +47,7 @@ use crate::Pattern;
 /// Build symmetric adjacency lists (off-diagonal only), each undirected edge
 /// recorded once via the `i > j` guard, sorted ascending per vertex so the
 /// Tarjan DFS traversal order is deterministic.
-fn build_adj(pattern: &Pattern) -> Vec<Vec<u32>> {
+pub(crate) fn build_adj(pattern: &Pattern) -> Vec<Vec<u32>> {
     let n = pattern.n;
     let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
     for j in 0..n {
@@ -69,7 +69,7 @@ fn build_adj(pattern: &Pattern) -> Vec<Vec<u32>> {
 /// Iterative (explicit stacks) because the corpus reaches n ≈ 340k and a
 /// path graph's block-cut tree is ~n deep — recursion would overflow the
 /// worker's stack. Deterministic given sorted adjacency.
-fn biconnected_components(adj: &[Vec<u32>]) -> Vec<Vec<(u32, u32)>> {
+pub(crate) fn biconnected_components(adj: &[Vec<u32>]) -> Vec<Vec<(u32, u32)>> {
     let n = adj.len();
     const NONE: u32 = u32::MAX;
     // disc == 0 means unvisited; otherwise discovery time (1-based).
