@@ -277,7 +277,7 @@ fn main() -> ExitCode {
         }
 
         // --- contestant ordering: capped subprocess, run twice ---
-        let run_once = |tag: &str| -> Result<Vec<usize>, String> {
+        let run_once = |tag: &str| -> Result<Vec<usize>, WorkerFailure> {
             let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
             let _ = std::fs::remove_file(&out_perm);
             // Pre-create the output so grader mode can bind precisely one
@@ -310,30 +310,21 @@ fn main() -> ExitCode {
             )?;
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
-                watchdog::WorkerOutcome::Ok => {
-                    ssi_worker_protocol::read_permutation(&out_perm, pat.n)
-                        .map_err(|e| format!("worker produced no readable permutation: {e}"))
-                }
-                watchdog::WorkerOutcome::Timeout => {
-                    if show_matrix_census {
-                        Err(format!(
-                            "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
-                             Your ordering must return within {:.0}s on every matrix. This matrix is \
-                             n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
-                             gate expensive paths by BOTH n and nnz.",
-                            TIME_CAP_PER_MATRIX.as_secs_f64(),
-                            t0.elapsed().as_secs_f64(),
-                            TIME_CAP_PER_MATRIX.as_secs_f64(),
-                            pat.n, pat.nnz(), pat.nnz() / pat.n.max(1)
-                        ))
-                    } else {
-                        Err(format!(
-                            "order() exceeded the {:.1}s per-matrix cap and was killed",
-                            TIME_CAP_PER_MATRIX.as_secs_f64()
-                        ))
-                    }
-                }
-                watchdog::WorkerOutcome::Crashed(why) => Err(format!("order() crashed: {why}")),
+                watchdog::WorkerOutcome::Ok => ssi_worker_protocol::read_permutation(
+                    &out_perm, pat.n,
+                )
+                .map_err(|e| WorkerFailure {
+                    // The parse error can echo bytes from the worker-written
+                    // output file, so keep it off the hidden path.
+                    detailed: format!("worker produced no readable permutation: {e}"),
+                    redacted: "worker produced no readable permutation".to_string(),
+                }),
+                other => Err(classify_worker_failure(
+                    other,
+                    t0.elapsed(),
+                    pat.n,
+                    pat.nnz(),
+                )),
             }
         };
 
@@ -343,8 +334,8 @@ fn main() -> ExitCode {
                 failed = Some(matrix_failure(
                     show_matrix_census,
                     name,
-                    &e,
-                    "worker ordering failed",
+                    &e.detailed,
+                    &e.redacted,
                 ));
                 break;
             }
@@ -355,8 +346,8 @@ fn main() -> ExitCode {
                 failed = Some(matrix_failure(
                     show_matrix_census,
                     name,
-                    &e,
-                    "worker ordering failed",
+                    &e.detailed,
+                    &e.redacted,
                 ));
                 break;
             }
@@ -733,6 +724,72 @@ fn parse_max_matrix_n(raw: Option<String>) -> Option<usize> {
         .filter(|&n| n > 0)
 }
 
+/// A worker failure carries two renderings of the same event: `detailed` (for
+/// the PUBLIC dev corpus, includes the matrix census) and `redacted` (for the
+/// HIDDEN eval corpus, names the failure category but never the census). Both
+/// are corpus-neutral — the matrix name and its n/nnz are added/withheld by
+/// [`matrix_failure`], not here.
+struct WorkerFailure {
+    detailed: String,
+    redacted: String,
+}
+
+impl From<String> for WorkerFailure {
+    /// Harness-internal staging/sandbox errors carry no matrix census, so the
+    /// same message is safe on both the public and hidden paths.
+    fn from(msg: String) -> Self {
+        WorkerFailure {
+            redacted: msg.clone(),
+            detailed: msg,
+        }
+    }
+}
+
+/// Classify a non-success worker outcome into a [`WorkerFailure`]. The redacted
+/// rendering distinguishes a time-cap kill from an abnormal exit — the
+/// actionable bit for a contestant — while withholding the n/nnz census that
+/// would fingerprint a hidden eval matrix. `describe_status`-derived crash
+/// detail is harness-generated (exit code/signal), never worker output, so it
+/// is safe on both paths.
+fn classify_worker_failure(
+    outcome: watchdog::WorkerOutcome,
+    elapsed: Duration,
+    n: usize,
+    nnz: usize,
+) -> WorkerFailure {
+    let cap = TIME_CAP_PER_MATRIX.as_secs_f64();
+    match outcome {
+        watchdog::WorkerOutcome::Timeout => WorkerFailure {
+            detailed: format!(
+                "order() exceeded the {:.1}s per-matrix cap and was killed (took ≥ {:.1}s). \
+                 Your ordering must return within {:.0}s on every matrix. This matrix is \
+                 n={}, nnz={}, nnz/n≈{} — if it is dense, the cost is in order() itself; \
+                 gate expensive paths by BOTH n and nnz.",
+                cap,
+                elapsed.as_secs_f64(),
+                cap,
+                n,
+                nnz,
+                nnz / n.max(1)
+            ),
+            redacted: format!("order() exceeded the {cap:.1}s per-matrix cap and was killed"),
+        },
+        watchdog::WorkerOutcome::Crashed(why) => {
+            // `why` is describe_status/spawn-error text: harness-generated exit
+            // code or signal, never worker stdio (which is /dev/null). Safe to
+            // surface verbatim on the hidden path.
+            let msg = format!("order() worker exited abnormally: {why}");
+            WorkerFailure {
+                redacted: msg.clone(),
+                detailed: msg,
+            }
+        }
+        watchdog::WorkerOutcome::Ok => {
+            unreachable!("classify_worker_failure called on a successful worker outcome")
+        }
+    }
+}
+
 fn matrix_failure(show_matrix_census: bool, name: &str, detailed: &str, redacted: &str) -> String {
     if show_matrix_census {
         format!("{name}: {detailed}")
@@ -852,6 +909,40 @@ mod census_tests {
             "ordering timed out",
         );
         assert_eq!(reason, "dev-matrix: timeout at n=12, nnz=34");
+    }
+
+    #[test]
+    fn timeout_failure_names_the_cap_and_withholds_census() {
+        let f = classify_worker_failure(
+            watchdog::WorkerOutcome::Timeout,
+            Duration::from_secs_f64(2.5),
+            1234,
+            5678,
+        );
+        // Shown on the hidden eval corpus: names the time cap, not the old
+        // opaque "worker ordering failed", and never leaks the census.
+        assert_ne!(f.redacted, "worker ordering failed");
+        assert!(f.redacted.contains("cap"), "redacted: {}", f.redacted);
+        assert!(!f.redacted.contains("1234"));
+        assert!(!f.redacted.contains("5678"));
+        // Public dev corpus keeps the actionable n/nnz census.
+        assert!(f.detailed.contains("1234"));
+        assert!(f.detailed.contains("5678"));
+    }
+
+    #[test]
+    fn crash_failure_is_distinct_from_timeout_and_carries_exit_status() {
+        let f = classify_worker_failure(
+            watchdog::WorkerOutcome::Crashed("signal: 9 (SIGKILL)".to_string()),
+            Duration::ZERO,
+            10,
+            20,
+        );
+        // A crash/OOM-kill must not masquerade as a time-cap kill.
+        assert!(!f.redacted.contains("cap"), "redacted: {}", f.redacted);
+        // Harness-generated exit status is safe to surface on both paths.
+        assert!(f.redacted.contains("signal: 9"), "redacted: {}", f.redacted);
+        assert!(f.detailed.contains("signal: 9"));
     }
 }
 
