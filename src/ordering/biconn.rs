@@ -644,6 +644,161 @@ pub fn biconn_heavy_order(
     perm.into_iter().map(|x| x as i32).collect()
 }
 
+/// A biconnected-component decomposition exposed as a clique cover: each
+/// block is the maximal clique of the induced chordal completion on its
+/// owned vertex set, articulation points are the multi-block vertices that
+/// glue the cliques together, and the block-cut tree's edges are the
+/// clique-cover bipartite overlap graph. This is exactly the structural
+/// primitive a clique-cover-guided AMD (CCG-AMD) candidate needs: it can
+/// order each clique (block) locally with AMD on its induced subgraph, then
+/// decide the global interleaving either by tree order (cheap, what
+/// [`biconn_order`] does) or by a richer multi-start that scores composed
+/// flops (what CCG-AMD does on top of it).
+///
+/// Returned fields are pure functions of the pattern: deterministic
+/// (sorted adjacency, ascending DFS, fixed (depth, id) emission) and free of
+/// any ordering decision. `owned[c]` is the block-c-vertex-set minus its
+/// parent articulation (so disjoint across blocks), and `isolated` lists
+/// every degree-0 vertex in ascending id order. `comps[c]` keeps the
+/// per-block edge list so a caller can rebuild the induced subgraph without
+/// re-touching the original pattern.
+pub struct BiconnDecomposition {
+    /// Vertex count of the original pattern.
+    pub n: usize,
+    /// Edge list per biconnected component (block), in pop order off the
+    /// iterative Tarjan stack. Each edge `(u, v)` has `u < v` after the
+    /// `i > j` guard in [`build_adj`].
+    pub comps: Vec<Vec<(u32, u32)>>,
+    /// Distinct vertex set of each component (ascending).
+    pub comp_verts: Vec<Vec<u32>>,
+    /// Per-vertex list of components containing it; `comp_of[v].len() >= 2`
+    /// iff `v` is an articulation point; `comp_of[v].is_empty()` iff `v` is
+    /// isolated (degree 0).
+    pub comp_of: Vec<Vec<u32>>,
+    /// `parent_ap[c]` is the articulation point of block `c` whose removal
+    /// separates `c` from its parent in the block-cut tree, or
+    /// `u32::MAX` for the rooted block of each tree.
+    pub parent_ap: Vec<u32>,
+    /// Tree depth of block `c` (root has depth 0).
+    pub depth: Vec<u32>,
+    /// Isolated vertices (degree 0), in ascending id order.
+    pub isolated: Vec<u32>,
+}
+
+/// Run the iterative Tarjan biconnected-components pass once and return the
+/// full decomposition as a [`BiconnDecomposition`]. The same data the
+/// `biconn_order` and `biconn_heavy_order` entry points build internally;
+/// exposed here so a clique-cover-guided caller (CCG-AMD) can drive a
+/// different global-interleaving policy without paying for a second Tarjan
+/// pass or re-deriving the block-cut tree. Cheap (O(nnz)) and deterministic.
+pub fn biconn_decompose(pattern: &Pattern) -> BiconnDecomposition {
+    let n = pattern.n;
+    const NONE: u32 = u32::MAX;
+    let comps: Vec<Vec<(u32, u32)>> = if n == 0 {
+        Vec::new()
+    } else {
+        let adj = build_adj(pattern);
+        biconnected_components(&adj)
+    };
+    let nc = comps.len();
+
+    let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
+    {
+        let mut mark = vec![u32::MAX; n];
+        for (c, edges) in comps.iter().enumerate() {
+            let mut verts = Vec::new();
+            for &(u, v) in edges {
+                for x in [u, v] {
+                    let xu = x as usize;
+                    if mark[xu] != c as u32 {
+                        mark[xu] = c as u32;
+                        verts.push(x);
+                        comp_of[xu].push(c as u32);
+                    }
+                }
+            }
+            comp_verts.push(verts);
+        }
+    }
+
+    let mut parent_ap = vec![NONE; nc];
+    let mut depth = vec![0u32; nc];
+    let mut visited = vec![false; nc];
+    {
+        let mut tree_blocks: Vec<u32> = Vec::new();
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        for start in 0..nc {
+            if visited[start] {
+                continue;
+            }
+            tree_blocks.clear();
+            visited[start] = true;
+            queue.push_back(start as u32);
+            while let Some(b) = queue.pop_front() {
+                tree_blocks.push(b);
+                for &v in &comp_verts[b as usize] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        if !visited[cb as usize] {
+                            visited[cb as usize] = true;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+            let mut root = tree_blocks[0];
+            for &b in &tree_blocks[1..] {
+                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                if bs > rs || (bs == rs && b < root) {
+                    root = b;
+                }
+            }
+            for &b in &tree_blocks {
+                depth[b as usize] = u32::MAX;
+            }
+            depth[root as usize] = 0;
+            parent_ap[root as usize] = NONE;
+            queue.push_back(root);
+            while let Some(b) = queue.pop_front() {
+                let bu = b as usize;
+                for &v in &comp_verts[bu] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        let cu = cb as usize;
+                        if depth[cu] == u32::MAX {
+                            depth[cu] = depth[bu] + 1;
+                            parent_ap[cu] = v;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut isolated: Vec<u32> = Vec::new();
+    for v in 0..n {
+        if comp_of[v].is_empty() {
+            isolated.push(v as u32);
+        }
+    }
+
+    BiconnDecomposition {
+        n,
+        comps,
+        comp_verts,
+        comp_of,
+        parent_ap,
+        depth,
+        isolated,
+    }
+}
+
 /// Structural summary of the biconnected decomposition, for gating and for
 /// sizing the per-block-heavy variant: `(n_components, n_articulation_points,
 /// largest_block_vertices, n_isolated)`. Cheap (shares the Tarjan pass).
