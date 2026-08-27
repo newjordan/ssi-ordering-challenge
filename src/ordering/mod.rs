@@ -1,5 +1,7 @@
 //! ★ THE SUBMISSION DIRECTORY ★ — the one place you may edit.
 //!
+//! (No-op edit: pipeline grading smoke test, 2026-08-27. Behavior unchanged.)
+//!
 //! Fill-reducing ordering. Contract (frozen):
 //!   `pub fn order(pattern: &Pattern) -> Vec<usize>`
 //! Returns `perm[k]` = the original index eliminated k-th; the result must be a
