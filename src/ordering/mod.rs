@@ -4427,14 +4427,14 @@ fn order_with_options(
     // pockets rather than one deep one.
     const RGSUB_MAX_NNZ: usize = 1_500_000;
     const RGSUB_CFG: rgreedy::SubCfg = rgreedy::SubCfg {
-        min_s: 32,
-        max_s: 700,
-        max_sub: 3_500,
-        max_blocks: 96,
-        budget: 5_000_000,
-        streams: 2,
+        min_s: 24,
+        max_s: 800,
+        max_sub: 4_000,
+        max_blocks: 128,
+        budget: 6_000_000,
+        streams: 3,
     };
-    if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+    if rgreedy_enabled && n >= 400 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
