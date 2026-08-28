@@ -882,7 +882,12 @@ pub(crate) fn search_par_default_seeds(
         0x8543_4123_4A92_BC10,
         0x4F1B_B12D_32C1_59A8,
     ];
-    let specs = SEEDS.map(|rng| (rng, Params::DEFAULT, budget));
+    let mut specs = SEEDS.map(|rng| (rng, Params::DEFAULT, budget));
+    // The varied schedule's fourth trajectory wins in 1k_10k but regresses
+    // lt_1k. Replace only that same-cost slot at the bucket boundary.
+    if n >= 1_000 {
+        specs[3] = (stream_rng(3), stream_params(3), budget);
+    }
     search_par_specs(n, col_ptr, row_idx, seed, seed_flops, specs)
 }
 
@@ -1098,9 +1103,31 @@ pub(crate) fn subtree_refine(
             *c = true;
         }
         blocks.push((a, j));
-        if blocks.len() >= cfg.max_blocks {
+        if !cfg.rank_blocks && blocks.len() >= cfg.max_blocks {
             break;
         }
+    }
+    if cfg.rank_blocks {
+        let mut ranked: Vec<(usize, usize, u64)> = blocks
+            .drain(..)
+            .map(|(a, b)| {
+                let contribution = counts[a..=b]
+                    .iter()
+                    .map(|&c| {
+                        let c = c as u64;
+                        c * c
+                    })
+                    .sum();
+                (a, b, contribution)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+        blocks.extend(
+            ranked
+                .into_iter()
+                .take(cfg.max_blocks)
+                .map(|(a, b, _)| (a, b)),
+        );
     }
     if blocks.is_empty() {
         return 0;
@@ -1246,4 +1273,7 @@ pub(crate) struct SubCfg {
     /// Streams per block (sequential here; the caller parallelises over
     /// blocks, which is the coarser and cheaper axis).
     pub(crate) streams: usize,
+    /// Select blocks by exact incumbent objective contribution instead of
+    /// postorder position before applying `max_blocks`.
+    pub(crate) rank_blocks: bool,
 }
