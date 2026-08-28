@@ -207,5 +207,7 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0021-biconn-additive-amf-restack.md](experiments/0021-biconn-additive-amf-restack.md) — **review candidate, current-frontier controlled win.** Restacks the P4 one-AMF biconn block slot onto official `5141ad0` without replacing any of its new restart floors or any promoted biconn AMD-relabel slot. On the exact 186-matrix `nnz <= 10k` population: `0.906951 -> 0.906481`; timing evidence supports only this narrow gate, not a submission.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

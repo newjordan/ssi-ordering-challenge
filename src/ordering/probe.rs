@@ -3747,7 +3747,7 @@ fn probe_biconn_heavy() {
         ) as f64;
 
         let t0 = Instant::now();
-        let hp = biconn::biconn_heavy_order(pat, 24, 32, 150_000);
+        let hp = biconn::biconn_heavy_order(pat, 24, 0, 32, 150_000);
         let secs = t0.elapsed().as_secs_f64();
         let hp_us: Vec<usize> = hp.iter().map(|&x| x as usize).collect();
         let r = if is_bijection(&hp_us, n) {

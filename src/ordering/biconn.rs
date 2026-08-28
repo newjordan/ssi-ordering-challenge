@@ -377,9 +377,13 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
 /// biggest blocks) under a global cap `total_restarts`, so worst-case added
 /// cost is bounded independent of the (possibly huge) block count: each
 /// restart is one block-local AMD pass plus one `flops_of`, both O(block).
+/// `total_cross_family` is a separate, strictly additive budget: it is spent
+/// only after every promoted relabelled-AMD slot has been retained. This makes
+/// cross-family exploration unable to evict a previously-live AMD restart.
 pub fn biconn_heavy_order(
     pattern: &Pattern,
     total_restarts: usize,
+    total_cross_family: usize,
     min_block: usize,
     block_nnz_cap: usize,
 ) -> Vec<i32> {
@@ -487,6 +491,7 @@ pub fn biconn_heavy_order(
     const EXTRA_CAP: usize = 7;
     let mut budget = total_restarts;
     let mut extra_of: Vec<usize> = vec![0; nc];
+    let mut cross_family_of: Vec<usize> = vec![0; nc];
     {
         let mut by_size: Vec<usize> = (0..nc).collect();
         by_size.sort_unstable_by(|&a, &b| {
@@ -505,6 +510,24 @@ pub fn biconn_heavy_order(
             let give = budget.min(EXTRA_CAP);
             extra_of[b] = give;
             budget -= give;
+        }
+
+        // Allocate the new candidates under an independent, much smaller
+        // whole-matrix budget. The established `extra_of` schedule above is
+        // complete before this starts, so no AMD restart is replaced. Keep at
+        // most two additions on any one block: plain AMF, then no-dense AMD.
+        let mut cross_family_budget = total_cross_family;
+        for &b in &by_size {
+            if cross_family_budget == 0 {
+                break;
+            }
+            let owned_sz = comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
+            if owned_sz < min_block || comps[b].len() > block_nnz_cap {
+                continue;
+            }
+            let give = cross_family_budget.min(2);
+            cross_family_of[b] = give;
+            cross_family_budget -= give;
         }
     }
 
@@ -576,7 +599,8 @@ pub fn biconn_heavy_order(
         };
 
         let extra = extra_of[b];
-        if extra == 0 {
+        let cross_family = cross_family_of[b];
+        if extra == 0 && cross_family == 0 {
             // Plain single AMD pass (identical to biconn_order's per-block path).
             match feral_amd::amd_order(&core) {
                 Ok(sub) => perm.extend(sub.iter().map(|&x| owned[x as usize] as usize)),
@@ -585,8 +609,9 @@ pub fn biconn_heavy_order(
             continue;
         }
 
-        // Heavy path: best-of-(1+extra) relabelled AMD, scored by exact local
-        // flops. Build the usize ScoringPattern once for flops_of.
+        // Heavy path: the promoted best-of-(1+extra) relabelled-AMD schedule,
+        // followed by its separately budgeted additive cross-family candidates,
+        // all scored by exact local flops. Build the usize ScoringPattern once.
         let cp_us: Vec<usize> = col_ptr.iter().map(|&x| x as usize).collect();
         let ri_us: Vec<usize> = row_idx.iter().map(|&x| x as usize).collect();
         let spat = super::ScoringPattern {
@@ -597,8 +622,9 @@ pub fn biconn_heavy_order(
         let mut best_local: Option<Vec<u32>> = None;
         let mut best_flops = u64::MAX;
         // Restart 0 is plain AMD on the un-relabelled block; restarts 1..=extra
-        // are AMD on `relabel(m, seed)` relabellings, composed back. Same seed
-        // stream as the portfolio's multi-start.
+        // are the original AMD-on-`relabel(m, seed)` schedule, composed back.
+        // Do not interleave new families here: their separate loop below is
+        // deliberately additive with respect to the promoted schedule.
         for r in 0..=extra {
             let cand: Option<Vec<u32>> = if r == 0 {
                 feral_amd::amd_order(&core)
@@ -614,6 +640,34 @@ pub fn biconn_heavy_order(
                         pb.iter().map(|&x| q[x as usize] as u32).collect()
                     })
                 })
+            };
+            let Some(local) = cand else { continue };
+            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+            let f = super::flops_of(&spat, &local_us);
+            if f < best_flops {
+                best_flops = f;
+                best_local = Some(local);
+            }
+        }
+        // At most two additional local candidates are permitted by the caller's
+        // whole-matrix budget. Plain AMF is first because it is the less
+        // expensive distinct objective; no-dense AMD is available only if a
+        // second slot is explicitly purchased. Both are compared against every
+        // preserved AMD candidate by the same exact local objective.
+        let amd_nodense = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        let amf_default = feral_amf::AmfOptions::default();
+        for slot in 0..cross_family {
+            let cand: Option<Vec<u32>> = match slot {
+                0 => feral_amf::amf_order_opts(&core, &amf_default)
+                    .ok()
+                    .map(|(p, ..)| p.iter().map(|&x| x as u32).collect()),
+                1 => feral_amd::amd_order_opts(&core, &amd_nodense)
+                    .ok()
+                    .map(|(p, ..)| p.iter().map(|&x| x as u32).collect()),
+                _ => unreachable!("cross-family allocation is capped at two"),
             };
             let Some(local) = cand else { continue };
             let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();

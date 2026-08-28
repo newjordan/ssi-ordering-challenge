@@ -2023,7 +2023,17 @@ fn order_with_options(
         if nnz <= 60_000 {
             consider(&|| {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    // Preserve all 24 promoted relabelled-AMD slots. One
+                    // additional AMF block candidate has its own budget and
+                    // a stricter whole-matrix gate, so it cannot repeat P2's
+                    // rejected replacement schedule or reach the old 30k wall.
+                    biconn::biconn_heavy_order(
+                        pattern,
+                        24,
+                        usize::from(nnz <= 10_000),
+                        32,
+                        150_000,
+                    ),
                 )
             });
         }
