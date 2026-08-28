@@ -918,7 +918,7 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
 const PAIR_DESCENT_MIN_N: usize = 1_000;
 const PAIR_DESCENT_MAX_N: usize = 4_000;
 const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-const PAIR_DESCENT_SWEEPS: usize = 3;
+const PAIR_DESCENT_SWEEPS: usize = 2;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
@@ -4302,7 +4302,7 @@ fn order_with_options(
     const RGREEDY_MAX_NNZ: usize = 250_000;
     const RGREEDY_BUDGET: i64 = 200_000_000;
     const RGREEDY_PEP_MAX_NNZ: usize = 60_000;
-    const RGREEDY_PEP_BUDGET: i64 = 300_000_000;
+    const RGREEDY_PEP_BUDGET: i64 = 600_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
     // ties at 1.0000) and that class is where the portfolio is already slow.
     // Pep's accepted selector did not apply it inside the <=60k envelope.
