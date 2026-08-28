@@ -25,12 +25,19 @@
 //! NEVER edit this file to track future changes in `mod.rs` — once its job
 //! (pinning down the pre-merge behavior) is done, delete it rather than
 //! update it. Not part of the shipped submission (`#[cfg(test)]`).
-
-#![cfg(test)]
+//!
+//! The `recolor_front_swaps` helper below is the ONE exception: it is a
+//! shipped, opt-in post-AMD recoloring primitive (method family
+//! DWL-AMD-2LF) gated by the `ORDERING_DWL_RECOLOR` env var, called from
+//! `order()` in `mod.rs`. It lives here rather than `mod.rs` because the
+//! rest of the file is the test-only frozen pre-merge snapshot and grouping
+//! keeps the diff minimal; the function is `pub(crate)` and its full body
+//! compiles in non-test builds.
 
 use super::*;
 
 /// Return an elimination order for `pattern` (best-of over the ordering family).
+#[cfg(test)]
 pub(crate) fn legacy_order(pattern: &Pattern) -> Vec<usize> {
     legacy_order_with_relabel_cap(pattern, usize::MAX)
 }
@@ -39,6 +46,7 @@ pub(crate) fn legacy_order(pattern: &Pattern) -> Vec<usize> {
 /// `relabel_cap`. `order()` passes `usize::MAX` (no extra cap, shipped
 /// behavior); probes pass `0` to measure the portfolio-minus-multi-start
 /// baseline so restart schedules can be compared at a true equal budget.
+#[cfg(test)]
 fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
 
     let n = pattern.n;
