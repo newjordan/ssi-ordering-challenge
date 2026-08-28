@@ -3778,3 +3778,125 @@ fn probe_biconn_heavy() {
 fn probe_max_deg(pat: &Pattern) -> usize {
     (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
 }
+
+/// Production-tree causal A/B for the hub-heavy relabel-budget deletion.
+/// Both policies execute in this one release test binary. The atomic switch is
+/// test-only: `false` reproduces exact `5141ad0` (300k everywhere), while
+/// `true` exercises the production static gate (150k only on hub-heavy
+/// patterns with nnz <= 150k). Run serially:
+///
+/// `cargo test --release probe_narrow_relabel_budget_ab -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn probe_narrow_relabel_budget_ab() {
+    let corpus = crate::corpus::corpus();
+    let mut base_logs = [0.0f64; 3];
+    let mut cand_logs = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut eligible = 0usize;
+    let mut restart_affected = 0usize;
+    let mut permutation_changes = 0usize;
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    let mut removed_passes = 0usize;
+    let mut base_total_s = 0.0f64;
+    let mut cand_total_s = 0.0f64;
+    let mut base_eligible_s = 0.0f64;
+    let mut cand_eligible_s = 0.0f64;
+    let mut base_worst = (0.0f64, String::new());
+    let mut cand_worst = (0.0f64, String::new());
+
+    println!("matrix\tn\tnnz\tmaxdeg\tbase_r\tcand_r\tbase_flops\tcand_flops\tbase_s\tcand_s\tverdict");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let max_deg = probe_max_deg(pat);
+        let gate = nnz <= 150_000 && max_deg > n / 50;
+        eligible += usize::from(gate);
+
+        let base_r = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg);
+        let cand_budget = if gate { RELABEL_BUDGET_HUB_HEAVY } else { RELABEL_BUDGET };
+        let cand_r = relabel_restarts(cand_budget, RELABEL_MAX_RESTARTS, n, nnz, max_deg);
+        let affected = base_r != cand_r;
+        restart_affected += usize::from(affected);
+        if affected {
+            let families = 1
+                + usize::from(nnz <= 130_000)
+                + usize::from(nnz <= 60_000);
+            removed_passes += (base_r - cand_r) * families;
+        }
+
+        NARROW_RELABEL_BUDGET_ENABLED.store(false, AtomicOrdering::Relaxed);
+        let base_start = Instant::now();
+        let base_perm = order(pat);
+        let base_s = base_start.elapsed().as_secs_f64();
+
+        NARROW_RELABEL_BUDGET_ENABLED.store(true, AtomicOrdering::Relaxed);
+        let cand_start = Instant::now();
+        let cand_perm = order(pat);
+        let cand_s = cand_start.elapsed().as_secs_f64();
+
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let anchor: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let anchor_flops = flops_of(&sp, &anchor) as f64;
+        let base_flops = flops_of(&sp, &base_perm);
+        let cand_flops = flops_of(&sp, &cand_perm);
+        let b = bucket(n);
+        counts[b] += 1;
+        base_logs[b] += (base_flops as f64 / anchor_flops).ln();
+        cand_logs[b] += (cand_flops as f64 / anchor_flops).ln();
+
+        base_total_s += base_s;
+        cand_total_s += cand_s;
+        if gate {
+            base_eligible_s += base_s;
+            cand_eligible_s += cand_s;
+        }
+        if base_s > base_worst.0 {
+            base_worst = (base_s, name.clone());
+        }
+        if cand_s > cand_worst.0 {
+            cand_worst = (cand_s, name.clone());
+        }
+
+        permutation_changes += usize::from(base_perm != cand_perm);
+        let verdict = if cand_flops < base_flops {
+            wins += 1;
+            "WIN"
+        } else if cand_flops > base_flops {
+            losses += 1;
+            "LOSS"
+        } else if base_perm != cand_perm {
+            "PERM_ONLY"
+        } else {
+            "SAME"
+        };
+        if gate || verdict != "SAME" {
+            println!(
+                "{name}\t{n}\t{nnz}\t{max_deg}\t{base_r}\t{cand_r}\t{base_flops}\t{cand_flops}\t{base_s:.6}\t{cand_s:.6}\t{verdict}"
+            );
+        }
+    }
+    NARROW_RELABEL_BUDGET_ENABLED.store(true, AtomicOrdering::Relaxed);
+
+    println!("SUMMARY matrices={}", corpus.len());
+    println!("SUMMARY static_gate_eligible={eligible}");
+    println!("SUMMARY restart_affected={restart_affected}");
+    println!("SUMMARY permutation_changes={permutation_changes}");
+    println!("SUMMARY wins={wins} losses={losses}");
+    println!("SUMMARY candidate_passes_removed={removed_passes}");
+    println!("SUMMARY score_base={:.9}", aggregate(&base_logs, &counts));
+    println!("SUMMARY score_candidate={:.9}", aggregate(&cand_logs, &counts));
+    println!("SUMMARY wall_total_base_s={base_total_s:.6} wall_total_candidate_s={cand_total_s:.6}");
+    println!("SUMMARY wall_eligible_base_s={base_eligible_s:.6} wall_eligible_candidate_s={cand_eligible_s:.6}");
+    println!("SUMMARY worst_base_s={:.6} matrix={} worst_candidate_s={:.6} matrix={}", base_worst.0, base_worst.1, cand_worst.0, cand_worst.1);
+}

@@ -145,6 +145,16 @@
 
 use crate::Pattern;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// Test-only switch used by the paired full-corpus probe. Production builds
+/// always take the statically gated policy below; the switch only lets one
+/// test binary reproduce the exact `5141ad0` path for the baseline half of an
+/// A/B without compiling a second binary.
+#[cfg(test)]
+static NARROW_RELABEL_BUDGET_ENABLED: AtomicBool = AtomicBool::new(true);
+
 /// TEST-ONLY measurement harness (timing headroom, tie lists, candidate
 /// what-if scoring). Not compiled into the shipped binary.
 #[cfg(test)]
@@ -437,6 +447,29 @@ const KAHIP_MAX_NNZ: usize = 50_000;
 /// clear the 2 s cap in the real environment.
 const RELABEL_BUDGET: usize = 300_000;
 const RELABEL_MAX_RESTARTS: usize = 24;
+
+/// Cost-deletion budget for the complementary, hub-heavy side of the existing
+/// mid-band restart-floor gate. A large hub makes quotient-graph restart passes
+/// disproportionately expensive; unlike the low-hub side, this population is
+/// deliberately excluded from the promoted floor that adds restarts.
+const RELABEL_BUDGET_HUB_HEAVY: usize = 150_000;
+
+/// Choose the relabel-family budget from structural features only. The
+/// `nnz <= 150k` boundary matches the measured mid-band ceiling, while
+/// `max_deg > n/50` is its complementary hub discriminator. This is not a
+/// matrix-identity exception and applies uniformly to unseen patterns.
+fn relabel_budget_for(n: usize, nnz: usize, max_deg: usize) -> usize {
+    #[cfg(test)]
+    if !NARROW_RELABEL_BUDGET_ENABLED.load(AtomicOrdering::Relaxed) {
+        return RELABEL_BUDGET;
+    }
+
+    if nnz <= 150_000 && max_deg > n / 50 {
+        RELABEL_BUDGET_HUB_HEAVY
+    } else {
+        RELABEL_BUDGET
+    }
+}
 
 /// BUCKET-WEIGHTED budget for `n >= 10_000` (win C): `gt_10k` carries weight
 /// 0.40 over only 45 dev matrices — ~4.4x the per-matrix leverage of
@@ -2368,7 +2401,8 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
+    let (relabel_budget, relabel_cap_bucket) =
+        (relabel_budget_for(n, nnz, max_deg), RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
@@ -2415,8 +2449,14 @@ fn order_with_options(
             dense_alpha: 5.0,
             ..Default::default()
         };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+        let amf_restarts = relabel_restarts(
+            relabel_budget,
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            max_deg,
+        )
+        .min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             consider(&|| {
@@ -2466,8 +2506,14 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: -1.0,
         };
-        let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+        let amdnd_restarts = relabel_restarts(
+            relabel_budget,
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            max_deg,
+        )
+        .min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
             consider(&|| {
