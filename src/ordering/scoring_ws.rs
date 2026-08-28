@@ -367,6 +367,32 @@ impl ScoreWorkspace {
         self.build_postorder_and_first();
         self.column_counts_gnp_flops()
     }
+
+    /// Score `perm` and expose the resulting column count by original vertex.
+    /// This reuses the same buffers as [`Self::flops`] and fails closed on a
+    /// malformed permutation or output slice.
+    pub(crate) fn flops_and_counts_by_vertex(
+        &mut self,
+        pat: &ScoringPattern,
+        perm: &[usize],
+        counts: &mut [usize],
+    ) -> Option<u64> {
+        if perm.len() != self.n || counts.len() != self.n {
+            return None;
+        }
+        self.inv_perm.fill(usize::MAX);
+        for &v in perm {
+            if v >= self.n || self.inv_perm[v] != usize::MAX {
+                return None;
+            }
+            self.inv_perm[v] = 0;
+        }
+        let flops = self.flops(pat, perm);
+        for (pos, &v) in perm.iter().enumerate() {
+            counts[v] = usize::try_from(self.delta[pos]).ok()?;
+        }
+        Some(flops)
+    }
 }
 
 #[cfg(test)]

@@ -187,6 +187,9 @@ mod metric_sweep;
 mod scoring_ws;
 use scoring_ws::ScoreWorkspace;
 
+/// Final-stage componentwise fusion of the AMD anchor and final incumbent.
+mod component_fusion;
+
 /// Incremental nested-induced-subgraph builder — merged in specifically for
 /// the STRIP TRANSFORM (win A), which independently rebuilds 6 induced
 /// subgraphs per matrix from scratch today. See its module doc for the
@@ -1171,6 +1174,13 @@ const HEAVY_RELABEL_AMF_DENSE_MIN_NNZ: usize = 400_000;
 const HEAVY_RELABEL_AMF_DENSE_MAX_NNZ: usize = 1_000_000;
 const HEAVY_RELABEL_AMF_BUDGET: usize = 1_500_000;
 const HEAVY_RELABEL_AMF_MAX_PASSES: usize = 4;
+
+// One final symbolic count pass is admitted only in the already-safe medium
+// envelope, and only after the AMD etree proves at least two choice-bearing
+// disconnected components. A fused candidate adds one more exact score only
+// when its componentwise sum predicts a strict win.
+const COMPONENT_FUSION_MAX_N: usize = 60_000;
+const COMPONENT_FUSION_MAX_NNZ: usize = 150_000;
 
 /// TEST-ONLY A/B switch for the heavy-tier relabelled-AMF block, so one probe
 /// run can measure the variant and the unchanged frontier back to back on the
@@ -4031,6 +4041,42 @@ fn order_with_options(
         }
     }
 
+    // Final independent sibling: disconnected components contribute
+    // additively, so retain the better of AMD and the fully downstream final
+    // incumbent in each component. It deliberately runs after final TELOS;
+    // nothing consumes this result as a seed.
+    if n <= COMPONENT_FUSION_MAX_N && nnz <= COMPONENT_FUSION_MAX_NNZ {
+        if let Some(components) = component_fusion::Components::from_amd_forest(
+            &amd_perm,
+            &amd_etree.parent,
+        ) {
+            #[cfg(test)]
+            component_fusion::mark_default_reach();
+            let mut final_counts = vec![0usize; n];
+            if let Some(rescored) =
+                ws.flops_and_counts_by_vertex(scoring_pat, &best_perm, &mut final_counts)
+            {
+                if rescored == best_flops {
+                    if let Some(fused) = components.fuse(
+                        &amd_perm,
+                        &amd_counts,
+                        &best_perm,
+                        &final_counts,
+                        best_flops,
+                    ) {
+                        if is_bijection(&fused.perm, n) {
+                            let actual = ws.flops(scoring_pat, &fused.perm);
+                            if actual == fused.predicted_flops && actual < best_flops {
+                                best_flops = actual;
+                                best_perm = fused.perm;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _ = best_flops;
 
     best_perm
@@ -5928,5 +5974,16 @@ mod tests {
         let amd_flops = flops_of(&scoring_pat, &amd);
         let ours_flops = flops_of(&scoring_pat, &order(&pat));
         assert!(ours_flops <= amd_flops, "ours {ours_flops} > amd {amd_flops}");
+    }
+    #[test]
+    fn component_fusion_is_reached_by_default_and_remains_deterministic() {
+        let pat = Pattern::from_edges(6, &[(0, 1), (1, 2), (3, 4), (4, 5)]);
+        component_fusion::take_default_reach();
+        let a = order(&pat);
+        assert!(component_fusion::take_default_reach() > 0);
+        let b = order(&pat);
+        assert!(component_fusion::take_default_reach() > 0);
+        assert_eq!(a, b);
+        assert!(is_bijection(&a, pat.n));
     }
 }
