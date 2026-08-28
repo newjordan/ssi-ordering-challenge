@@ -149,6 +149,9 @@ pub(crate) struct Game<'a> {
     /// Deterministic work counter, in word-operations. The ONLY budget signal —
     /// no wall-clock anywhere in this module.
     pub(crate) ops: i64,
+    /// `adj` starts as an exact copy of `adj0`, so the first reset can skip a
+    /// redundant full-bitset copy while retaining the identical op charge.
+    adj_pristine: bool,
 }
 
 impl<'a> Game<'a> {
@@ -173,7 +176,10 @@ impl<'a> Game<'a> {
                 if r >= n {
                     return None;
                 }
-                if r != v {
+                // `Pattern` is the full symmetric graph, so exactly one of
+                // the two CSC directions has `r > v`. Materialize both bitset
+                // entries from that direction and avoid two redundant ORs.
+                if r > v {
                     adj0[v * w + (r >> 6)] |= 1u64 << (r & 63);
                     adj0[r * w + (v >> 6)] |= 1u64 << (v & 63);
                 }
@@ -231,22 +237,32 @@ impl<'a> Game<'a> {
             cand: Vec::with_capacity(n),
             tmp: vec![0u64; w],
             ops: 0,
+            adj_pristine: true,
         })
     }
 
     fn reset(&mut self) {
-        self.adj.copy_from_slice(&self.adj0[..self.n * self.w]);
+        if self.adj_pristine {
+            self.adj_pristine = false;
+        } else {
+            self.adj.copy_from_slice(&self.adj0[..self.n * self.w]);
+        }
         self.bhead.fill(-1);
         self.livelist.clear();
         for v in 0..self.n {
+            // A partial subtree game never chooses a boundary vertex as a
+            // pivot. Its adjacency still receives fill, but its degree is not
+            // consulted by selection, scoring, or deficiency, so avoid a full
+            // row popcount for every boundary vertex on every reset.
+            if v >= self.nelim {
+                self.deg[v] = 0;
+                continue;
+            }
             let mut d = 0u32;
             for k in 0..self.w {
                 d += self.adj[v * self.w + k].count_ones();
             }
             self.deg[v] = d;
-            if v >= self.nelim {
-                continue; // permanently live: never a pivot, never bucketed
-            }
             if self.use_buckets {
                 self.blink(v, d as usize);
             } else {
@@ -325,28 +341,33 @@ impl<'a> Game<'a> {
         for i in 0..self.nlist.len() {
             let u = self.nlist[i] as usize;
             let base = u * w;
+            let track_degree = u < self.nelim;
             let mut d = 0u32;
             for k in 0..w {
                 let nv = self.adj[base + k] | self.tmp[k];
                 self.adj[base + k] = nv;
-                d += nv.count_ones();
+                if track_degree {
+                    d += nv.count_ones();
+                }
             }
             // `tmp` contains u (u ∈ N(v)) and `adj[u]` contained v; both are
             // now set and both must go — hence the `-2`.
             self.adj[base + (u >> 6)] &= !(1u64 << (u & 63));
             self.adj[base + vw] &= !vbit;
-            let nd = d - 2;
-            if self.use_buckets && u < self.nelim {
-                let od = self.deg[u];
-                if nd != od {
-                    self.bunlink(u, od as usize);
-                    self.blink(u, nd as usize);
-                    if (nd as usize) < self.mind {
-                        self.mind = nd as usize;
+            if track_degree {
+                let nd = d - 2;
+                if self.use_buckets {
+                    let od = self.deg[u];
+                    if nd != od {
+                        self.bunlink(u, od as usize);
+                        self.blink(u, nd as usize);
+                        if (nd as usize) < self.mind {
+                            self.mind = nd as usize;
+                        }
                     }
                 }
+                self.deg[u] = nd;
             }
-            self.deg[u] = nd;
         }
         self.ops += ((self.nlist.len() + 1) * (3 * w + 6) + 24) as i64;
         for k in 0..w {
@@ -1194,6 +1215,13 @@ pub(crate) fn subtree_refine(
                     let mut local: Vec<u32> = vec![u32::MAX; n];
                     let mut touched: Vec<usize> = Vec::new();
                     let mut verts: Vec<usize> = Vec::new();
+                    // Reuse the largest per-block buffers owned by this worker.
+                    // A sparse-large matrix can visit dozens of blocks, and
+                    // repeatedly allocating/page-zeroing their bitsets was a
+                    // material part of RGSUB wall time despite producing the
+                    // same graph each time.
+                    let mut adj0: Vec<u64> = Vec::new();
+                    let mut seed: Vec<usize> = Vec::new();
                     let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
                     let mut bi = t;
                     while bi < blocks_ro.len() {
@@ -1231,17 +1259,25 @@ pub(crate) fn subtree_refine(
 
                         // Induced adjacency over S u boundary, as bitsets.
                         let w = m.div_ceil(64);
-                        let mut adj0 = vec![0u64; m * w];
+                        adj0.clear();
+                        adj0.resize(m * w, 0);
                         for (li, &v) in verts.iter().enumerate() {
                             for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
                                 if u >= n {
                                     continue;
                                 }
                                 let lu = local[u];
-                                if lu == u32::MAX || lu as usize == li {
+                                if lu == u32::MAX {
                                     continue;
                                 }
                                 let lu = lu as usize;
+                                // Pattern's contract is the full symmetric
+                                // graph. Visit each undirected edge once rather
+                                // than processing both CSC directions and
+                                // redundantly writing both bitset entries twice.
+                                if lu <= li {
+                                    continue;
+                                }
                                 adj0[li * w + (lu >> 6)] |= 1u64 << (lu & 63);
                                 adj0[lu * w + (li >> 6)] |= 1u64 << (li & 63);
                             }
@@ -1255,14 +1291,16 @@ pub(crate) fn subtree_refine(
                                 c * c
                             })
                             .sum();
-                        let seed: Vec<usize> = (0..ssz).collect();
+                        seed.clear();
+                        seed.extend(0..ssz);
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         let first_stream =
                             usize::from(split_ranked_streams && block_rank >= 32);
                         for k in first_stream..cfg.streams.max(1) {
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
-                            // seed to sample an independent subtree basin.
+                            // seed to sample an independent subtree basin only
+                            // on the large tier with measured headroom.
                             let rng_seed = if n >= 10_000 && k == 1 {
                                 0xD1B5_4A32_D192_ED03
                             } else {
