@@ -1187,14 +1187,30 @@ pub(crate) fn subtree_refine(
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         for k in 0..cfg.streams.max(1) {
+                            // The transferred seed wins only in the large
+                            // bucket. Keep smaller matrices byte-identical to
+                            // the promoted parent, and trim the new large-only
+                            // trajectory below the incumbent stream's work so
+                            // an unseen fill path cannot expand the cap tail.
+                            let transferred = n > 10_000 && k == 1;
+                            let rng_seed = if transferred {
+                                0xD1B5_4A32_D192_ED03
+                            } else {
+                                stream_rng(k)
+                            };
+                            let budget = if transferred {
+                                cfg.budget.min(3_000_000)
+                            } else {
+                                cfg.budget
+                            };
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
                                 ssz,
                                 &seed,
                                 seed_flops,
-                                cfg.budget,
-                                stream_rng(k),
+                                budget,
+                                rng_seed,
                                 stream_params(k),
                             );
                             if let Some((o, f)) = r {

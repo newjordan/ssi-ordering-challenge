@@ -20,6 +20,11 @@ these to the next scoring win, at zero extra measurement cost:
   have a second, pool-shaped consequence.
 
 ## Current best
+- Current race tree: dev **0.818950**, fill **0.934962**, worst isolated
+  `order()` **0.765 s** — accepted Top-K main `4270fd7` + separately accepted
+  narrow MID800 + the one-round large RGSUB seed transfer that passed its own
+  official 500-matrix benchmark. See
+  [0024](experiments/0024-current-main-cap-safe-composition.md).
 - Best score: dev **0.840107** ([0022](experiments/0022-topk-telos-seeding.md) rev3,
   top-K TELOS seeding with LIGHT extra descents: descend from the incumbent + up to 2
   retained `consider` seeds in three gated regimes, extras on the Tier-B grid; plus
@@ -108,6 +113,10 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0024-current-main-cap-safe-composition.md](experiments/0024-current-main-cap-safe-composition.md)
+  — **WIN, current-main dev 0.819376→0.818950**, fill 0.934962, buckets
+  `0.8925 / 0.8619 / 0.7316`, isolated worst 0.765 s. Composes accepted Top-K,
+  accepted narrow MID800, and the hidden-valid one-round large RGSUB brake.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:

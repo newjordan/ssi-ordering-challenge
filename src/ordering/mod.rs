@@ -4657,10 +4657,17 @@ fn order_with_options(
     const RGREEDY_SLACK_MIN_N: usize = 64;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
+    const RGREEDY_SLACK_MID_NARROW: i64 = 800_000_000;
+    let narrow_mid_pep = nnz <= RGREEDY_PEP_MAX_NNZ
+        && (nnz <= n.saturating_mul(2)
+            || (n.saturating_mul(4) <= nnz
+                && nnz.saturating_mul(2) <= n.saturating_mul(9)));
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
+    } else if narrow_mid_pep {
+        RGREEDY_SLACK_MID_NARROW
     } else {
         RGREEDY_SLACK_MID
     };
@@ -4830,7 +4837,11 @@ fn order_with_options(
         streams: 2,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
-        for _round in 0..2 {
+        // Large matrices get one bounded pass. Besides limiting search work to
+        // 5M + 3M, this prevents a changed first-pass basin from unlocking an
+        // extra unbudgeted permute/etree/counts/refinement pass.
+        let rounds = if n > 10_000 { 1 } else { 2 };
+        for _round in 0..rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
