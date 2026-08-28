@@ -207,5 +207,7 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0024-isolated-biconn-amf-true-path.md](experiments/0024-isolated-biconn-amf-true-path.md) - **local positive, false path isolated.** Restores exact `5141ad0` `biconn_heavy_order` and dispatches to a separate AMF-specialized clone only under `n<=192 && nnz<=1200 && max_deg<=64`. Full 300 A/B: `0.842222684 -> 0.841958705`, one strict win / zero losses, and 0 permutation mismatches on all 214 false-gate rows. No submission.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

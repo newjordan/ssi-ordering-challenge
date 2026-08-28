@@ -689,6 +689,330 @@ pub fn biconn_stats(pattern: &Pattern) -> (usize, usize, usize, usize) {
     (comps.len(), nart, max_block, niso)
 }
 
+/// Strict-gate specialization of [`biconn_heavy_order`]. The original
+/// function above is intentionally left byte-for-byte unchanged and remains
+/// the only false-gate call target. This separate body adds one plain-AMF
+/// candidate after all 24 promoted relabelled-AMD slots have been allocated.
+pub fn biconn_heavy_order_with_amf(
+    pattern: &Pattern,
+    total_restarts: usize,
+    min_block: usize,
+    block_nnz_cap: usize,
+) -> Vec<i32> {
+    // The caller's strict whole-pattern gate is the cost boundary. This
+    // specialized true-path buys exactly one additive plain-AMF block slot.
+    let total_cross_family = 1usize;
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    let adj = build_adj(pattern);
+    let comps = biconnected_components(&adj);
+    let nc = comps.len();
+
+    let mut mark = vec![u32::MAX; n];
+    let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
+    for (c, edges) in comps.iter().enumerate() {
+        let mut verts = Vec::new();
+        for &(u, v) in edges {
+            for x in [u, v] {
+                let xu = x as usize;
+                if mark[xu] != c as u32 {
+                    mark[xu] = c as u32;
+                    verts.push(x);
+                    comp_of[xu].push(c as u32);
+                }
+            }
+        }
+        comp_verts.push(verts);
+    }
+
+    const NONE: u32 = u32::MAX;
+    let mut parent_ap = vec![NONE; nc];
+    let mut depth = vec![0u32; nc];
+    let mut visited = vec![false; nc];
+    {
+        let mut tree_blocks: Vec<u32> = Vec::new();
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        for start in 0..nc {
+            if visited[start] {
+                continue;
+            }
+            tree_blocks.clear();
+            visited[start] = true;
+            queue.push_back(start as u32);
+            while let Some(b) = queue.pop_front() {
+                tree_blocks.push(b);
+                for &v in &comp_verts[b as usize] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        if !visited[cb as usize] {
+                            visited[cb as usize] = true;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+            let mut root = tree_blocks[0];
+            for &b in &tree_blocks[1..] {
+                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                if bs > rs || (bs == rs && b < root) {
+                    root = b;
+                }
+            }
+            for &b in &tree_blocks {
+                depth[b as usize] = u32::MAX;
+            }
+            depth[root as usize] = 0;
+            parent_ap[root as usize] = NONE;
+            queue.push_back(root);
+            while let Some(b) = queue.pop_front() {
+                let bu = b as usize;
+                for &v in &comp_verts[bu] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        let cu = cb as usize;
+                        if depth[cu] == u32::MAX {
+                            depth[cu] = depth[bu] + 1;
+                            parent_ap[cu] = v;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut block_order: Vec<usize> = (0..nc).collect();
+    block_order.sort_unstable_by(|&a, &b| depth[b].cmp(&depth[a]).then(a.cmp(&b)));
+
+    // Restart allocation, largest-block-first: block "size" for budget purposes
+    // is its owned-vertex count (the part that gets ordered here). Each block
+    // with size >= min_block draws `1 + extra` passes (the base AMD plus
+    // `extra` relabelled restarts) until the global restart budget is spent.
+    // `extra` per block is capped so one huge block cannot eat the whole budget.
+    //
+    // COST SAFETY: a restart on a block costs ~O(block_nnz) (one block-local
+    // AMD pass + one flops_of). Blocks whose edge count exceeds
+    // `block_nnz_cap` are capped at the single base AMD pass (no restarts) --
+    // this is what keeps the huge dominant-block matrices (faclay75, largest
+    // block ~700k nnz) cheap: without it the biggest block alone would draw
+    // EXTRA_CAP expensive restarts for no measured win.
+    const EXTRA_CAP: usize = 7;
+    let mut budget = total_restarts;
+    let mut extra_of: Vec<usize> = vec![0; nc];
+    let mut cross_family_of: Vec<usize> = vec![0; nc];
+    {
+        let mut by_size: Vec<usize> = (0..nc).collect();
+        by_size.sort_unstable_by(|&a, &b| {
+            let sa = comp_verts[a].len() - usize::from(parent_ap[a] != NONE);
+            let sb = comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
+            sb.cmp(&sa).then(a.cmp(&b))
+        });
+        for &b in &by_size {
+            if budget == 0 {
+                break;
+            }
+            let owned_sz = comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
+            if owned_sz < min_block || comps[b].len() > block_nnz_cap {
+                continue;
+            }
+            let give = budget.min(EXTRA_CAP);
+            extra_of[b] = give;
+            budget -= give;
+        }
+
+        // Allocate the new candidates under an independent, much smaller
+        // whole-matrix budget. The established `extra_of` schedule above is
+        // complete before this starts, so no AMD restart is replaced. Keep at
+        // most two additions on any one block: plain AMF, then no-dense AMD.
+        let mut cross_family_budget = total_cross_family;
+        for &b in &by_size {
+            if cross_family_budget == 0 {
+                break;
+            }
+            let owned_sz = comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
+            if owned_sz < min_block || comps[b].len() > block_nnz_cap {
+                continue;
+            }
+            let give = cross_family_budget.min(2);
+            cross_family_of[b] = give;
+            cross_family_budget -= give;
+        }
+    }
+
+    let mut perm: Vec<usize> = Vec::with_capacity(n);
+    for v in 0..n {
+        if comp_of[v].is_empty() {
+            perm.push(v);
+        }
+    }
+
+    let mut tok = vec![0u32; n];
+    let mut loc = vec![0u32; n];
+    let mut gen = 0u32;
+
+    for &b in &block_order {
+        let pa = parent_ap[b];
+        let mut owned: Vec<u32> = Vec::with_capacity(comp_verts[b].len());
+        for &v in &comp_verts[b] {
+            if v != pa {
+                owned.push(v);
+            }
+        }
+        let m = owned.len();
+        if m == 0 {
+            continue;
+        }
+        if m == 1 {
+            perm.push(owned[0] as usize);
+            continue;
+        }
+        owned.sort_unstable();
+        gen = gen.wrapping_add(1);
+        for (li, &v) in owned.iter().enumerate() {
+            tok[v as usize] = gen;
+            loc[v as usize] = li as u32;
+        }
+        // Induced subgraph on `owned`, built in BOTH index widths: i32 for the
+        // feral core, usize for the exact `flops_of` scoring used to pick the
+        // best restart.
+        let mut col_ptr = vec![0i32; m + 1];
+        for &(u, v) in &comps[b] {
+            if tok[u as usize] == gen && tok[v as usize] == gen {
+                col_ptr[loc[u as usize] as usize + 1] += 1;
+                col_ptr[loc[v as usize] as usize + 1] += 1;
+            }
+        }
+        for i in 0..m {
+            col_ptr[i + 1] += col_ptr[i];
+        }
+        let bnnz = col_ptr[m] as usize;
+        let mut row_idx = vec![0i32; bnnz];
+        let mut pos: Vec<usize> = col_ptr[..m].iter().map(|&x| x as usize).collect();
+        for &(u, v) in &comps[b] {
+            if tok[u as usize] == gen && tok[v as usize] == gen {
+                let (lu, lv) = (loc[u as usize] as usize, loc[v as usize] as usize);
+                row_idx[pos[lu]] = lv as i32;
+                pos[lu] += 1;
+                row_idx[pos[lv]] = lu as i32;
+                pos[lv] += 1;
+            }
+        }
+        for i in 0..m {
+            let (lo, hi) = (col_ptr[i] as usize, col_ptr[i + 1] as usize);
+            row_idx[lo..hi].sort_unstable();
+        }
+        let Some(core) = feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx) else {
+            perm.extend(owned.iter().map(|&v| v as usize));
+            continue;
+        };
+
+        let extra = extra_of[b];
+        let cross_family = cross_family_of[b];
+        if extra == 0 && cross_family == 0 {
+            // Plain single AMD pass (identical to biconn_order's per-block path).
+            match feral_amd::amd_order(&core) {
+                Ok(sub) => perm.extend(sub.iter().map(|&x| owned[x as usize] as usize)),
+                Err(_) => perm.extend(owned.iter().map(|&v| v as usize)),
+            }
+            continue;
+        }
+
+        // Heavy path: the promoted best-of-(1+extra) relabelled-AMD schedule,
+        // followed by its separately budgeted additive cross-family candidates,
+        // all scored by exact local flops. Build the usize ScoringPattern once.
+        let cp_us: Vec<usize> = col_ptr.iter().map(|&x| x as usize).collect();
+        let ri_us: Vec<usize> = row_idx.iter().map(|&x| x as usize).collect();
+        let spat = super::ScoringPattern {
+            n: m,
+            col_ptr: cp_us,
+            row_idx: ri_us,
+        };
+        let mut best_local: Option<Vec<u32>> = None;
+        let mut best_flops = u64::MAX;
+        // Restart 0 is plain AMD on the un-relabelled block; restarts 1..=extra
+        // are the original AMD-on-`relabel(m, seed)` schedule, composed back.
+        // Do not interleave new families here: their separate loop below is
+        // deliberately additive with respect to the promoted schedule.
+        for r in 0..=extra {
+            let cand: Option<Vec<u32>> = if r == 0 {
+                feral_amd::amd_order(&core)
+                    .ok()
+                    .map(|p| p.iter().map(|&x| x as u32).collect())
+            } else {
+                let q = super::relabel(m, r as u64);
+                let bpat = feral::ordering::amd::permute_pattern(&spat, &q);
+                let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+                feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
+                    feral_amd::amd_order(&bc).ok().map(|pb| {
+                        pb.iter().map(|&x| q[x as usize] as u32).collect()
+                    })
+                })
+            };
+            let Some(local) = cand else { continue };
+            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+            let f = super::flops_of(&spat, &local_us);
+            if f < best_flops {
+                best_flops = f;
+                best_local = Some(local);
+            }
+        }
+        // At most two additional local candidates are permitted by the caller's
+        // whole-matrix budget. Plain AMF is first because it is the less
+        // expensive distinct objective; no-dense AMD is available only if a
+        // second slot is explicitly purchased. Both are compared against every
+        // preserved AMD candidate by the same exact local objective.
+        let amd_nodense = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        let amf_default = feral_amf::AmfOptions::default();
+        for slot in 0..cross_family {
+            let cand: Option<Vec<u32>> = match slot {
+                0 => feral_amf::amf_order_opts(&core, &amf_default)
+                    .ok()
+                    .map(|(p, ..)| p.iter().map(|&x| x as u32).collect()),
+                1 => feral_amd::amd_order_opts(&core, &amd_nodense)
+                    .ok()
+                    .map(|(p, ..)| p.iter().map(|&x| x as u32).collect()),
+                _ => unreachable!("cross-family allocation is capped at two"),
+            };
+            let Some(local) = cand else { continue };
+            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+            let f = super::flops_of(&spat, &local_us);
+            if f < best_flops {
+                best_flops = f;
+                best_local = Some(local);
+            }
+        }
+        match best_local {
+            Some(local) => perm.extend(local.iter().map(|&x| owned[x as usize] as usize)),
+            None => perm.extend(owned.iter().map(|&v| v as usize)),
+        }
+    }
+
+    if perm.len() < n {
+        let mut seen = vec![false; n];
+        for &v in &perm {
+            seen[v] = true;
+        }
+        for v in 0..n {
+            if !seen[v] {
+                perm.push(v);
+            }
+        }
+    }
+
+    perm.into_iter().map(|x| x as i32).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

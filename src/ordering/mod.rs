@@ -2021,11 +2021,22 @@ fn order_with_options(
         // and per-block relabel restarts on the hot 100k+ gate-wall class
         // (ringpack_30_2) added +0.14 s to the portfolio's worst case.
         if nnz <= 60_000 {
-            consider(&|| {
-                Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
-                )
-            });
+            // The false arm intentionally retains the exact official-frontier
+            // call. The additive AMF machinery lives in a separate function
+            // and is unreachable unless all three direct size bounds pass.
+            if n <= 192 && nnz <= 1_200 && max_deg <= 64 {
+                consider(&|| {
+                    Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                        biconn::biconn_heavy_order_with_amf(pattern, 24, 32, 150_000),
+                    )
+                });
+            } else {
+                consider(&|| {
+                    Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                        biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    )
+                });
+            }
         }
     }
 
