@@ -207,5 +207,12 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0025-p29-slot3-on-promoted-pep600.md](experiments/0025-p29-slot3-on-promoted-pep600.md) —
+  **READY on promoted `28652c6`; exact PEP600 A/B 0.819884→0.819790
+  (−0.000094).** P27 officially promoted at FLOPS 0.821800 / fill 0.931791 and
+  proved the 600M envelope clears hidden cap. Restack only the same-cost slot-3
+  varied policy. Production `mod.rs` and `rgreedy.rs` blobs exactly match the
+  tested P29 objects; 38/38 tests and network-denied build evidence transfer.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

@@ -865,9 +865,10 @@ pub(crate) fn search_par(
     search_par_specs(n, col_ptr, row_idx, seed, seed_flops, specs)
 }
 
-/// Four default-policy trajectories with the fixed seeds proven by pep's
-/// accepted hidden run. The production selector uses a 300M budget only in
-/// pep's original `nnz <= 60k` envelope.
+/// Four fixed-seed trajectories in pep's original `nnz <= 60k` envelope.
+/// Three keep the accepted default policy; slot 3 uses the varied schedule's
+/// narrowed policy mask. Exact-5e PEP600 A/B: 0.819884 -> 0.819790 at the same
+/// four-stream deterministic operation cap.
 pub(crate) fn search_par_default_seeds(
     n: usize,
     col_ptr: &[usize],
@@ -882,7 +883,9 @@ pub(crate) fn search_par_default_seeds(
         0x8543_4123_4A92_BC10,
         0x4F1B_B12D_32C1_59A8,
     ];
-    let specs = SEEDS.map(|rng| (rng, Params::DEFAULT, budget));
+    let mut specs = SEEDS.map(|rng| (rng, Params::DEFAULT, budget));
+    // Same-cost portfolio replacement, not a fifth stream.
+    specs[3] = (stream_rng(3), stream_params(3), budget);
     search_par_specs(n, col_ptr, row_idx, seed, seed_flops, specs)
 }
 
