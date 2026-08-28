@@ -202,6 +202,12 @@ mod nested_subgraph;
 /// portfolio currently costs well under a millisecond and the 2 s cap is
 /// effectively unbounded.
 mod exact_dp;
+/// Shipped call-site gate matching [`exact_dp::STRUCTURAL_MAX_N`]. The DP is
+/// never launched ungated — n=24 is ~1.5 s vs the 2 s cap.
+const EXACT_DP_MAX_N: usize = exact_dp::STRUCTURAL_MAX_N;
+/// Skip `exact_min_flops_order` unless the cheap predicted Σc² is strictly
+/// below the live incumbent.
+const PREDICTED_FLOP_DELTA_GATE: bool = true;
 /// BICONNECTED-DECOMPOSITION ordering — a NEW candidate family that
 /// DECOMPOSES the graph into biconnected components (Tarjan) and orders each
 /// with AMD, articulation points deferred to their parent block. No other
@@ -467,6 +473,11 @@ const KAHIP_MAX_NNZ: usize = 50_000;
 /// the grader. So this ships a worst case no larger than one already known to
 /// clear the 2 s cap in the real environment.
 const RELABEL_BUDGET: usize = 300_000;
+/// Fraction of [`RELABEL_BUDGET`] fed to `relabel_restarts` at the live
+/// `order_with_options` call sites. 0.15 × 300_000 = 45_000 — shrinks
+/// per-matrix restart work after the Benchmark-timeout fail; `splitmix64` /
+/// `relabel` themselves are unchanged.
+const RELABEL_BUDGET_FRACTION: f64 = 0.15;
 const RELABEL_MAX_RESTARTS: usize = 24;
 
 /// BUCKET-WEIGHTED budget for `n >= 10_000` (win C): `gt_10k` carries weight
@@ -777,6 +788,14 @@ const STRIPV2_DENSE_SPLIT_AVG_DEG: f64 = 35.0;
 /// submission.
 const TELOS_MAX_NNZ: usize = 400_000;
 const TELOS_TIER_A_MAX_NNZ: usize = 150_000;
+/// Compile-time descent depth: `telos_schedule` still returns 2 on
+/// nnz < [`TELOS_TIER_A_MAX_NNZ`] (1 on tier B); `telos_descend` consumes
+/// at most this many rounds.
+const TELOS_COMPILE_DEPTH: usize = 1;
+/// Compile-time prio/peel prefix consumed by `telos_descend` (crown
+/// [`TELOS_PRIO`]=16, [`TELOS_PEEL_A`]=15, [`TELOS_B_PRIO`]=2). Not a new
+/// descent family — the same schedule, truncated.
+const TELOS_COMPILE_WINDOW: usize = 4;
 /// Tier-A sub-orderer pass budget per round: passes = clamp(this/nnz,
 /// TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A). 700k (vs the probe's 1M) leans
 /// cap-safe at the top of tier A; the cap of 16 (not 12) is deliberate —
@@ -1864,6 +1883,10 @@ fn telos_descend(
     let n = sp.n;
     let mut cur_perm: Vec<usize> = start_perm.to_vec();
     let mut cur_flops = start_flops;
+    let max_rounds = max_rounds.min(TELOS_COMPILE_DEPTH);
+    let prio = &prio[..prio.len().min(TELOS_COMPILE_WINDOW)];
+    let peel_grid = &peel_grid[..peel_grid.len().min(TELOS_COMPILE_WINDOW)];
+    let passes = passes.min(TELOS_COMPILE_WINDOW);
 
     for _round in 0..max_rounds {
         let permuted = permute_pattern(sp, &cur_perm);
@@ -2016,6 +2039,42 @@ fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static
         // the `TELOS_*` constants.
         (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
     }
+}
+
+/// Cheap fill-game min-degree Σc² — a feasible upper bound on the exact min.
+/// O(n²) bitset walk, only ever called for n ≤ [`EXACT_DP_MAX_N`]. Used as
+/// the predicted-delta gate so `exact_min_flops_order` is never launched
+/// ungated.
+fn predicted_exact_flops(adj: &[u32], n: usize) -> u64 {
+    let mut adj = adj[..n].to_vec();
+    let mut alive: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    let mut cost = 0u64;
+    for _ in 0..n {
+        let mut best_v = 0usize;
+        let mut best_d = u32::MAX;
+        let mut rem = alive;
+        while rem != 0 {
+            let v = rem.trailing_zeros() as usize;
+            rem &= rem.wrapping_sub(1);
+            let d = (adj[v] & alive).count_ones();
+            if d < best_d || (d == best_d && v < best_v) {
+                best_d = d;
+                best_v = v;
+            }
+        }
+        let c = (best_d + 1) as u64;
+        cost += c * c;
+        let vb = 1u32 << best_v;
+        let nbrs = adj[best_v] & alive & !vb;
+        let mut r = nbrs;
+        while r != 0 {
+            let u = r.trailing_zeros() as usize;
+            r &= r.wrapping_sub(1);
+            adj[u] |= nbrs;
+        }
+        alive &= !vb;
+    }
+    cost
 }
 
 /// Return an elimination order for `pattern` (best-of over the ordering family).
@@ -3091,7 +3150,10 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
+    let (relabel_budget, relabel_cap_bucket) = (
+        (RELABEL_BUDGET as f64 * RELABEL_BUDGET_FRACTION) as usize,
+        RELABEL_MAX_RESTARTS,
+    );
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
@@ -3139,7 +3201,7 @@ fn order_with_options(
             ..Default::default()
         };
         let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+            relabel_restarts(relabel_budget, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             // Cloned per restart: each queued closure is a `move` closure and
@@ -3283,7 +3345,7 @@ fn order_with_options(
             dense_alpha: -1.0,
         };
         let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+            relabel_restarts(relabel_budget, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
             // Cloned per restart — see the relabelled-AMF loop above.
@@ -3515,7 +3577,7 @@ fn order_with_options(
         for j in 0..wave {
             let rr = r + j;
             let seed = (rr as u64 + 1).wrapping_mul(0x9E37);
-            let swaps = if rr % 2 == 0 { n / 16 } else { n / 4 };
+            let swaps = 1;
             htasks.push(Box::new(move || {
                 let q = perturb(base, seed, swaps);
                 let b = permute_pattern(scoring_pat, &q);
@@ -3840,15 +3902,16 @@ fn order_with_options(
         && max_deg <= n / 50
         && (n <= 3_600 || nnz >= 15_000);
     if nnz > 0 && nnz < TELOS_MAX_NNZ {
-        let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
+        let (_sched_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
         // The AMD anchor exposes a different TELOS basin on this measured
         // sparse, low-hub band. Replace, rather than add to, the established
         // descent: the gated path runs exactly one round and keeps the current
-        // pre-TELOS incumbent as a strict fallback.
+        // pre-TELOS incumbent as a strict fallback. Compile depth=1 always
+        // (crown `telos_schedule` returns 2 on nnz<TELOS_TIER_A_MAX_NNZ).
         let (seed_perm, seed_flops, rounds) = if amd_seed_one_round {
             (&amd_perm[..], anchor_flops, 1)
         } else {
-            (&best_perm[..], best_flops, max_rounds)
+            (&best_perm[..], best_flops, TELOS_COMPILE_DEPTH)
         };
         let (p, f) = telos_descend(
             scoring_pat,
@@ -4409,6 +4472,7 @@ fn order_with_options(
     let telos_ms = telos_ms_count(telos_ms, n, nnz, max_deg);
     if telos_ms > 0 {
         let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
+        let max_rounds = max_rounds.min(TELOS_COMPILE_DEPTH);
         // Seed slots, in `TELOS_MS_PLAN`'s numbering.
         // Snapshot the incumbent: the queued descents borrow their seed for as
         // long as the batch lives, and the acceptance below writes
@@ -4576,6 +4640,27 @@ fn order_with_options(
                 if f < best_flops {
                     best_flops = f;
                     best_perm = cand;
+                }
+            }
+        }
+    }
+
+    // EXACT min-Σc² DP. Call-site gate (never ungated): n ≤ STRUCTURAL_MAX_N
+    // AND the cheap fill-game min-degree prediction is strictly below the
+    // incumbent. n=24 is ~1.5 s against the 2 s cap; the predicted-delta
+    // check is the insurance that skips the table when it cannot win.
+    if PREDICTED_FLOP_DELTA_GATE && n <= EXACT_DP_MAX_N && n <= exact_dp::STRUCTURAL_MAX_N {
+        if let Some(adj) = exact_dp::adjacency(n, &pattern.col_ptr, &pattern.row_idx) {
+            let predicted = predicted_exact_flops(&adj, n);
+            if predicted < best_flops {
+                if let Some((perm, dp_flops)) = exact_dp::exact_min_flops_order(n, &adj) {
+                    if dp_flops < best_flops && is_bijection(&perm, n) {
+                        let f = ws.flops(&scoring_pat, &perm);
+                        if f < best_flops {
+                            best_flops = f;
+                            best_perm = perm;
+                        }
+                    }
                 }
             }
         }
