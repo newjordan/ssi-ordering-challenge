@@ -1107,7 +1107,9 @@ pub(crate) fn subtree_refine(
     cfg: SubCfg,
 ) -> usize {
     // Spend the ranked large-matrix budget on more D1 basins without adding
-    // trajectories: 32 blocks get both streams and the next 64 get D1 only.
+    // trajectories: 40 blocks get both streams and the next 56 get D1 only.
+    // This is a finer fixed-work interpolation around the promoted 32/64
+    // split. It remains well below the formerly accepted 96-by-two ceiling.
     let split_ranked_streams =
         n >= 10_000 && cfg.rank_blocks && cfg.max_blocks == 64 && cfg.streams == 2;
 
@@ -1258,7 +1260,7 @@ pub(crate) fn subtree_refine(
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         let first_stream =
-                            usize::from(split_ranked_streams && block_rank >= 32);
+                            usize::from(split_ranked_streams && block_rank >= 40);
                         for k in first_stream..cfg.streams.max(1) {
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
