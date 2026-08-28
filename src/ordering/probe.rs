@@ -5484,7 +5484,7 @@ fn probe_rank_modes() {
         for m in 0..4u8 {
             let t = Instant::now();
             let (_p, f) =
-                telos_descend(&sp, nnz, &inc, inc_f, rounds, prio, passes, peel, m);
+                telos_descend(&sp, nnz, &inc, inc_f, rounds, prio, passes, peel, m, None);
             let s = t.elapsed().as_secs_f64();
             secs[m as usize] += s;
             if s > worst[m as usize] {
@@ -5563,6 +5563,7 @@ fn probe_heavy_descent() {
                 prio.len(),
                 peel,
                 0,
+                None,
             );
             let s = t.elapsed().as_secs_f64();
             println!(
