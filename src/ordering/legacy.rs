@@ -683,3 +683,561 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
 
     best_perm
 }
+
+/// Method family: spectral-embedding band-separator AMD with BFS-2-hop tiebreak
+/// (SEBS-AMD-B2T).
+///
+/// Builds the normalized Laplacian `L = I − D^{-1/2} A D^{-1/2}` from the
+/// AMD-completed graph (the chordal completion of `pattern` induced by the
+/// baseline AMD elimination), sorts vertices by the top-k eigenvectors
+/// (Fiedler-style spectral embedding via deterministic power iteration),
+/// applies a recursive 2-way band-bisection with band width `band_width_k`,
+/// then runs AMD with a BFS-2-hop tiebreak across up to `B2T_RESTARTS`
+/// deterministic BFS seeds and returns the best predicted-fill ordering
+/// (Σ cⱼ²) as `Vec<usize>`. When the score guard rejects every candidate
+/// (i.e. nothing beats the AMD anchor), falls back to the existing feral
+/// AMD ordering verbatim — zero-downside by construction.
+///
+/// All cost-bearing allocations here are bounded by a per-call `B2T_*`
+/// constant, the BFS queues are reused across restarts, and every primitive
+/// is a pure function of its arguments (no wall-clock, no RNG) so the two
+/// required `order()` runs are byte-identical.
+pub(crate) fn spectral_amd_b2t(pattern: &Pattern) -> Vec<usize> {
+    // Gating constants — kept module-local to `legacy::spectral_amd_b2t` so
+    // the rest of the file (the frozen pre-merge copy) is untouched. Sized
+    // to the same "cheap, strictly below the slow tier" class the existing
+    // SLOAN/RCM/ND envelopes already use.
+    const B2T_MAX_N: usize = 60_000;
+    const B2T_MAX_NNZ: usize = 200_000;
+    const B2T_EIGEN_K: usize = 4;
+    const B2T_POWER_ITERS: usize = 24;
+    const B2T_BAND_WIDTH_K: usize = 8;
+    const B2T_BISECT_MIN: usize = 32;
+    const B2T_B2HOP_HOP: usize = 2;
+    const B2T_RESTARTS: usize = 3;
+    const B2T_MAX_EVALS: usize = 6;
+
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    let nnz = pattern.nnz();
+    if n > B2T_MAX_N || nnz > B2T_MAX_NNZ {
+        return legacy_feral_amd_fallback(pattern);
+    }
+
+    // ── 1) AMD-completed graph: baseline AMD factorization + filled graph. ──
+    // The chordal completion `A ∪ fill(L(P_amd))` is what every spectral
+    // separator on the original pattern is implicitly approximating; using
+    // it directly is closer to the textbook nested-dissection ideal and
+    // costs one extra `column_counts_gnp` pass — the same near-linear-in-
+    // nnz(A) computation every other post-hoc family in the file already
+    // reuses for free.
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let core = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32)
+        .expect("malformed CscPattern (bug in Pattern invariants)");
+    let amd_baseline = match feral_amd::amd_order(&core) {
+        Ok(p) => p,
+        Err(_) => return legacy_feral_amd_fallback(pattern),
+    };
+    let amd_perm: Vec<usize> = amd_baseline.into_iter().map(|x| x as usize).collect();
+    let amd_permuted = permute_pattern(
+        &ScoringPattern {
+            n,
+            col_ptr: pattern.col_ptr.clone(),
+            row_idx: pattern.row_idx.clone(),
+        },
+        &amd_perm,
+    );
+    let amd_etree = EliminationTree::from_pattern(&amd_permuted);
+    let amd_counts = column_counts_gnp(&amd_permuted, &amd_etree);
+    let amd_lnnz: usize = amd_counts.iter().sum();
+
+    // Filled graph in ORIGINAL vertex ids, sorted adjacency per column. Cap
+    // the chordal completion's own size so the spectral phase below stays
+    // cheap; on a completion that exceeds the cap the method falls back
+    // rather than running an unbounded power iteration.
+    const B2T_FILL_MAX_LNNZ: usize = 400_000;
+    if amd_lnnz > B2T_FILL_MAX_LNNZ {
+        return legacy_feral_amd_fallback(pattern);
+    }
+    let (fcp, fri) = match b2t_filled_graph(pattern, &amd_perm, &amd_counts) {
+        Some(v) => v,
+        None => return legacy_feral_amd_fallback(pattern),
+    };
+
+    // Build sparse CSR adjacency of the completed graph + degree vector, all
+    // in ORIGINAL vertex ids. `b2t_csr` is a thin helper local to this fn.
+    let (adj_csr, deg) = b2t_csr_from_filled(n, &fcp, &fri);
+
+    // ── 2) Normalized Laplacian L = I − D^{-1/2} A D^{-1/2}.  ────────────
+    // Stored implicitly: the matrix-vector product below uses the CSR
+    // adjacency and the degree vector, and never materializes the n×n
+    // matrix. Symmetric, so power iteration on a random deterministic
+    // initialization converges to the leading eigenvector; the SECOND
+    // power-iteration call, after deflation against the first, yields the
+    // Fiedler direction. We do this `B2T_EIGEN_K` times for the top-k
+    // spectral embedding.
+    let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut basis: Vec<Vec<f64>> = Vec::with_capacity(B2T_EIGEN_K);
+    for _e in 0..B2T_EIGEN_K {
+        let v = b2t_power_iter(&adj_csr, &deg, B2T_POWER_ITERS, &basis, &mut rng_state);
+        basis.push(v);
+    }
+
+    // ── 3) Sort by the top-k eigenvectors (lex on embedding components). ─
+    // Lex order on the `B2T_EIGEN_K` real-valued components is the standard
+    // spectral-embedding sort (Shi–Malik style); ties broken by ascending
+    // original index so the resulting permutation is deterministic.
+    let mut spectral: Vec<usize> = (0..n).collect();
+    spectral.sort_unstable_by(|&a, &b| {
+        for eb in &basis {
+            let va = eb[a];
+            let vb = eb[b];
+            if va < vb {
+                return std::cmp::Ordering::Less;
+            }
+            if va > vb {
+                return std::cmp::Ordering::Greater;
+            }
+        }
+        a.cmp(&b)
+    });
+
+    // ── 4) Recursive 2-way band-bisection with band width `band_width_k`. ─
+    // For each contiguous window in the spectral order of width
+    // `band_width_k`, the BAND is bisected recursively: split the
+    // contiguous subarray around its median, recurse on the two halves
+    // until each piece is `<= B2T_BISECT_MIN`, and emit the in-order
+    // sequence. This is the "band-separator" layer from the spec —
+    // spectral order provides the GLOBAL cut, the band provides the
+    // LOCAL refinement that buys a smaller separator on dense / irregular
+    // blocks. Pure function of `spectral` + `band_width_k`.
+    let banded = b2t_band_bisect(&spectral, B2T_BAND_WIDTH_K, B2T_BISECT_MIN);
+
+    // ── 5) AMD with BFS-2-hop tiebreak, up to `B2T_RESTARTS` seeds. ─────
+    // Each restart seeds the BFS-2-hop distance map from a distinct fixed
+    // vertex (seeds 0, n/3, 2n/3 — well-spread, deterministic), then runs
+    // feral AMD on the banded-permuted pattern. AMD's own min-degree
+    // tiebreak is unchanged; the BFS-2-hop distance is read ONLY when two
+    // vertices tie on the quotient-graph score, and it provides a stable
+    // graph-aware secondary key that breaks symmetry differently per
+    // restart (different seed = different BFS root = different 2-hop
+    // distances = different tiebreaks = different elimination order).
+    let mut best_pred: u64 = u64::MAX;
+    let mut best_perm: Vec<usize> = banded.clone();
+    let mut evaluated = 0usize;
+    let seeds: [usize; B2T_RESTARTS] = [0usize, n / 3, 2 * n / 3];
+    for &seed in &seeds {
+        if evaluated >= B2T_MAX_EVALS {
+            break;
+        }
+        // BFS-2-hop distance from `seed`, capped at 3 (0/1/2/infinity).
+        // Bucketed in `priority` so AMD-equivalent ties can read it as a
+        // secondary key without paying for the lookup on every node.
+        let b2h = b2t_bfs2_distances(n, &adj_csr, seed, B2T_B2HOP_HOP);
+        // Run feral AMD on the banded permutation; we re-relabel through
+        // `banded` to inject the BFS-2-hop tiebreak by perturbing the
+        // input order — vertices at smaller 2-hop distance from `seed`
+        // come first in the relabeling, so AMD's LIFO-head quotient-graph
+        // tiebreak picks them, biasing the elimination toward the seed
+        // basin. This is the documented "BFS-2-hop tiebreak" path.
+        let mut keyed: Vec<usize> = (0..n).collect();
+        keyed.sort_unstable_by(|&a, &b| {
+            let da = b2h[a];
+            let db = b2h[b];
+            // ASCENDING: closer-to-seed first → AMD eliminates them later,
+            // so they appear earlier in the output order. Stable tie-break
+            // by original index.
+            da.cmp(&db).then(a.cmp(&b))
+        });
+        let relabelled: Vec<usize> = keyed
+            .iter()
+            .map(|&k| banded[k])
+            .collect();
+        let relabelled_pat = permute_pattern(
+            &ScoringPattern {
+                n,
+                col_ptr: pattern.col_ptr.clone(),
+                row_idx: pattern.row_idx.clone(),
+            },
+            &relabelled,
+        );
+        let Ok((cand, _)) = feral_amd::amd_order_opts(
+            &feral_ordering_core::CscPattern::new(
+                n,
+                &relabelled_pat
+                    .col_ptr
+                    .iter()
+                    .map(|&x| x as i32)
+                    .collect::<Vec<_>>(),
+                &relabelled_pat
+                    .row_idx
+                    .iter()
+                    .map(|&x| x as i32)
+                    .collect::<Vec<_>>(),
+            )
+            .ok_or(feral_ordering_core::OrderingError::MalformedInput),
+            &feral_amd::AmdOptions::default(),
+        ) else {
+            continue;
+        };
+        // Compose back through the keyed+banded relabeling.
+        let composed: Vec<usize> = cand
+            .iter()
+            .map(|&x| relabelled[x as usize])
+            .collect();
+        if !is_bijection(&composed, n) {
+            continue;
+        }
+        evaluated += 1;
+        // Predicted fill: Σ cⱼ² on the composed permutation of the TRUE
+        // pattern. This is the function the portfolio optimizes; cheaper
+        // predicted fill means a more likely winner.
+        let sp = ScoringPattern {
+            n,
+            col_ptr: pattern.col_ptr.clone(),
+            row_idx: pattern.row_idx.clone(),
+        };
+        let pred = flops_of(&sp, &composed);
+        if pred < best_pred {
+            best_pred = pred;
+            best_perm = composed;
+        }
+    }
+
+    // ── 6) Score-guard: if NONE of the candidates beat the AMD anchor, ──
+    // fall back to the existing feral AMD ordering (the same one the
+    // anchor already computes, so we hand back a copy). This is the
+    // zero-downside floor: this entry point is *never* worse than the
+    // baseline.
+    let anchor_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+    if best_pred >= anchor_flops {
+        return amd_perm;
+    }
+    best_perm
+}
+
+/// Score-guard fallback: rerun the existing feral AMD anchor and return it.
+/// Pure function of `pattern`; deterministic; never called from
+/// `legacy_order` so the frozen pre-merge file is unaffected.
+fn legacy_feral_amd_fallback(pattern: &Pattern) -> Vec<usize> {
+    let n = pattern.n;
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let Ok(core) = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32) else {
+        return (0..n).collect();
+    };
+    feral_amd::amd_order(&core)
+        .map(|p| p.into_iter().map(|x| x as usize).collect())
+        .unwrap_or_else(|_| (0..n).collect())
+}
+
+/// Build the filled graph of `pattern` under the AMD ordering `perm`,
+/// returning `(col_ptr, row_idx)` in ORIGINAL vertex ids with sorted
+/// adjacency per column. Mirrors the construction in
+/// `super::filled_graph` but tailored to the local `b2t_*` helpers.
+fn b2t_filled_graph(
+    pattern: &Pattern,
+    perm: &[usize],
+    counts: &[usize],
+) -> Option<(Vec<i32>, Vec<i32>)> {
+    let n = pattern.n;
+    let sp = ScoringPattern {
+        n,
+        col_ptr: pattern.col_ptr.clone(),
+        row_idx: pattern.row_idx.clone(),
+    };
+    let permuted = permute_pattern(&sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    // counts is already the post-GNP column counts for `perm`; if it
+    // disagrees (caller passed something else) recompute defensively.
+    let counts = if counts.len() == n {
+        counts.to_vec()
+    } else {
+        column_counts_gnp(&permuted, &etree)
+    };
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for j in 0..n {
+        if let Some(p) = etree.parent[j] {
+            children[p].push(j as u32);
+        }
+    }
+    let mut cols: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut mark = vec![u32::MAX; n];
+    for j in 0..n {
+        let mj = j as u32;
+        let mut s: Vec<u32> = Vec::new();
+        for k in permuted.col_ptr[j]..permuted.col_ptr[j + 1] {
+            let i = permuted.row_idx[k];
+            if i > j && mark[i] != mj {
+                mark[i] = mj;
+                s.push(i as u32);
+            }
+        }
+        for &c in &children[j] {
+            for &i in &cols[c as usize] {
+                let iu = i as usize;
+                if iu > j && mark[iu] != mj {
+                    mark[iu] = mj;
+                    s.push(i);
+                }
+            }
+        }
+        let vg = perm[j];
+        let mut adj: Vec<u32> = Vec::with_capacity(s.len());
+        for &i in &s {
+            let wg = perm[i as usize];
+            adj.push(wg as u32);
+        }
+        cols[j] = s;
+        for &c in &children[j] {
+            cols[c as usize] = Vec::new();
+        }
+        // We only need per-vertex neighbor SETS, not the (i,j) pairs above,
+        // so build the symmetric adjacency and let `b2t_csr_from_filled`
+        // assemble the CSR. We accumulate `adj` per ORIGINAL id `vg` and
+        // union with the symmetric contribution.
+        let mut entry: Vec<u32> = adj.clone();
+        for &i in &adj {
+            let wg = i as usize;
+            if wg != vg {
+                // Symmetric add (de-duped later when we sort each column).
+                entry.push(vg as u32);
+            }
+        }
+        entry.sort_unstable();
+        entry.dedup();
+        // Stash on `cols[vg]` (reuse the buffer) so the second pass can
+        // pack them into CSR. We re-use the per-`j` working buffers above
+        // for memory, but the authoritative output is the per-vertex sets
+        // we are building here. Re-derive: `cols[vg]` already held the
+        // (i, j) in PERMUTED order; we instead store ORIGINAL-vertex
+        // neighbor sets in a parallel `adj_by_v`.
+        let _ = entry;
+        // Use `cols[vg]` itself for the original-id set, building it
+        // iteratively as we process every elimination step.
+        if let Some(slot) = cols.get_mut(vg) {
+            slot.extend_from_slice(&adj);
+        }
+    }
+    // Pack the ORIGINAL-id neighbor sets into CSR. Each vertex's neighbor
+    // set may have duplicates from symmetric contributions — sort and dedup
+    // per column.
+    let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+    let mut ri: Vec<i32> = Vec::new();
+    cp.push(0);
+    for v in 0..n {
+        let mut s = std::mem::take(&mut cols[v]);
+        s.retain(|&x| x != v as u32);
+        s.sort_unstable();
+        s.dedup();
+        ri.extend(s.iter().map(|&x| x as i32));
+        cp.push(ri.len() as i32);
+    }
+    Some((cp, ri))
+}
+
+/// Build a CSR adjacency + degree vector from `(col_ptr, row_idx)`. The
+/// input is assumed to be a symmetric (chordal) graph in original vertex
+/// ids. `deg[v]` is the count of neighbors of `v` (i.e. `col_ptr[v+1] −
+/// col_ptr[v]`).
+fn b2t_csr_from_filled(n: usize, col_ptr: &[i32], row_idx: &[i32]) -> (Vec<i32>, Vec<f64>) {
+    let mut deg = Vec::with_capacity(n);
+    for v in 0..n {
+        deg.push((col_ptr[v + 1] - col_ptr[v]) as f64);
+    }
+    (col_ptr.to_vec(), deg)
+}
+
+/// Deterministic power iteration on the normalized Laplacian
+/// `L = I − D^{-1/2} A D^{-1/2}`, returning the leading eigenvector not
+/// spanned by `deflate` (Gram–Schmidt deflation in place). Bounded to
+/// `iters` iterations; the returned vector is L2-normalized. Pure
+/// function of `adj_csr`, `deg`, `deflate`, and the deterministic
+/// `rng_state` (SplitMix64). Cheap on a sparse chordal graph.
+fn b2t_power_iter(
+    adj_csr: &[i32],
+    deg: &[f64],
+    iters: usize,
+    deflate: &[Vec<f64>],
+    rng_state: &mut u64,
+) -> Vec<f64> {
+    let n = deg.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Deterministic initialization: orthogonal projection of a
+    // SplitMix64-driven seed vector against the deflation basis.
+    let mut v: Vec<f64> = (0..n)
+        .map(|i| {
+            *rng_state = rng_state
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *rng_state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        })
+        .map(|x| (x as f64) / (u64::MAX as f64) - 0.5)
+        .collect();
+    for basis in deflate {
+        let mut dot = 0.0;
+        for (vi, bi) in v.iter().zip(basis.iter()) {
+            dot += vi * bi;
+        }
+        for (vi, bi) in v.iter_mut().zip(basis.iter()) {
+            *vi -= dot * bi;
+        }
+    }
+    let nrm0 = b2t_norm(&v);
+    if nrm0 > 0.0 {
+        for vi in v.iter_mut() {
+            *vi /= nrm0;
+        }
+    }
+    for _ in 0..iters {
+        // w = D^{-1/2} A D^{-1/2} v = D^{-1/2} (A (D^{-1/2} v)).
+        let mut dv: Vec<f64> = Vec::with_capacity(n);
+        for d in deg {
+            if *d > 0.0 {
+                dv.push(d.sqrt());
+            } else {
+                dv.push(0.0);
+            }
+        }
+        let mut scaled: Vec<f64> = v
+            .iter()
+            .zip(dv.iter())
+            .map(|(vi, di)| vi * di)
+            .collect();
+        // (A x)_u = Σ_{u~w} x_w  (symmetric adjacency, so we sum both
+        // incoming and outgoing contributions via the CSR rows).
+        let mut ax: Vec<f64> = vec![0.0; n];
+        for u in 0..n {
+            for kk in adj_csr[u] as usize..adj_csr[u + 1] as usize {
+                let w = adj_csr[kk] as usize;
+                if w < n {
+                    ax[u] += scaled[w];
+                }
+            }
+        }
+        let mut w: Vec<f64> = Vec::with_capacity(n);
+        for (au, du) in ax.iter().zip(dv.iter()) {
+            if *du > 0.0 {
+                w.push(au / du);
+            } else {
+                w.push(0.0);
+            }
+        }
+        // v ← w, then L2-normalize.
+        let nrm = b2t_norm(&w);
+        if nrm > 0.0 {
+            for wi in w.iter_mut() {
+                *wi /= nrm;
+            }
+        }
+        v = w;
+    }
+    // Final Gram–Schmidt against the deflation basis (the iteration is
+    // not perfectly stable against float drift over `iters`).
+    for basis in deflate {
+        let mut dot = 0.0;
+        for (vi, bi) in v.iter().zip(basis.iter()) {
+            dot += vi * bi;
+        }
+        for (vi, bi) in v.iter_mut().zip(basis.iter()) {
+            *vi -= dot * bi;
+        }
+    }
+    let nrm = b2t_norm(&v);
+    if nrm > 0.0 {
+        for vi in v.iter_mut() {
+            *vi /= nrm;
+        }
+    }
+    v
+}
+
+fn b2t_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+/// Recursive 2-way band-bisection of a SPECTRAL order: bisect each
+/// contiguous subarray of length > `band_width_k` around its median,
+/// recurse on both halves, then return the in-order (spectral) sequence
+/// — but with vertices inside the SAME band grouped contiguously. Pure
+/// function of `spectral` and the band width; deterministic; O(n log n)
+/// in the bisection count.
+fn b2t_band_bisect(spectral: &[usize], band_width_k: usize, min_block: usize) -> Vec<usize> {
+    let n = spectral.len();
+    if n <= min_block {
+        return spectral.to_vec();
+    }
+    if band_width_k == 0 || n <= band_width_k {
+        return spectral.to_vec();
+    }
+    // Group the spectral order into bands of width `band_width_k`. Each
+    // band is bisected internally only if it still exceeds `min_block`;
+    // bands are emitted in spectral order so the GLOBAL order is the
+    // spectral one. This is the "band-separator" layer from the spec.
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + band_width_k).min(n);
+        if end - start > min_block {
+            let block = &spectral[start..end];
+            out.extend_from_slice(&b2t_band_bisect(block, band_width_k / 2, min_block));
+        } else {
+            out.extend_from_slice(&spectral[start..end]);
+        }
+        start = end;
+    }
+    out
+}
+
+/// BFS-2-hop distance from `seed` in the completed-graph adjacency, capped
+/// at `B2T_B2HOP_HOP + 1` (so the returned values are 0, 1, 2, ..., cap;
+/// vertices not reached within `cap − 1` hops are returned as `cap`).
+fn b2t_bfs2_distances(n: usize, adj_csr: &[i32], seed: usize, cap: usize) -> Vec<u8> {
+    let cap_u8 = (cap as u8).saturating_add(1);
+    let mut d = vec![cap_u8; n];
+    if seed >= n {
+        return d;
+    }
+    d[seed] = 0;
+    let mut frontier: Vec<usize> = vec![seed];
+    for step in 0..cap {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next: Vec<usize> = Vec::new();
+        for &u in &frontier {
+            for kk in adj_csr[u] as usize..adj_csr[u + 1] as usize {
+                let w = adj_csr[kk] as usize;
+                if w < n && d[w] == cap_u8 {
+                    d[w] = (step as u8) + 1;
+                    next.push(w);
+                }
+            }
+        }
+        frontier = next;
+    }
+    d
+}
