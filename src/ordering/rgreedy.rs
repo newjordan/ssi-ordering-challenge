@@ -44,11 +44,13 @@
 /// lower and is chosen for TIME, not memory.
 pub(crate) const MAX_N: usize = 12_000;
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static ADJACENT_PAIR_DESCENT_CALLS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
+/// Pivot selection switches from a linear scan over the live set to degree
+/// buckets above this `n`. Swept on the full small tier at the shipped budget:
+/// scan-always -0.002359, crossover 700 -0.002406, **crossover 1500
+/// -0.002413 (66 matrices improved)**, buckets-always -0.002251. See
+/// `Game::use_buckets` for why the asymptotically-worse scan wins at the
+/// bottom.
+const SCAN_MAX_N: usize = 1_500;
 
 #[inline]
 fn xs64(s: &mut u64) -> u64 {
@@ -77,8 +79,32 @@ pub(crate) struct Game<'a> {
     adj0: &'a [u64],
     adj: Vec<u64>,
     deg: Vec<u32>,
+    /// Live set as a dense array with position index (the linear-scan path).
     livelist: Vec<u32>,
     pos: Vec<u32>,
+    // ── degree buckets ──────────────────────────────────────────────────────
+    // `bhead[d]` heads a doubly-linked list of the live vertices of degree `d`
+    // (`-1` = empty), `mind` is a running LOWER bound on the minimum live
+    // degree, advanced lazily. This replaces an O(n) scan over the live set at
+    // every one of the n elimination steps — the `2n²` term that dominated a
+    // run's cost on sparse patterns and made `n > 3000` unaffordable.
+    bhead: Vec<i32>,
+    bnext: Vec<i32>,
+    bprev: Vec<i32>,
+    mind: usize,
+    nlive: usize,
+    /// Only vertices `< nelim` may be eliminated (see `new_partial`). Equal to
+    /// `n` for a whole-matrix game.
+    nelim: usize,
+    /// Which pivot-selection structure this game uses. MEASURED, not assumed:
+    /// the linear scan is a tight, cache-friendly sweep over two dense arrays,
+    /// and below n≈3000 it beats the buckets outright despite being O(n) per
+    /// step — the buckets' per-degree-change unlink/relink is pointer chasing
+    /// through three n-sized arrays, and at that size the `2n²` scan term is
+    /// simply not the bottleneck. Above n≈3000 it is: with buckets the
+    /// 3000<n<=10000 band costs 0.094 s worst instead of 0.408 s AND scores
+    /// better (-0.000285 vs -0.000216).
+    use_buckets: bool,
     nlist: Vec<u32>,
     cand: Vec<u32>,
     tmp: Vec<u64>,
@@ -118,6 +144,27 @@ impl<'a> Game<'a> {
         Some(adj0)
     }
 
+    /// A working game over a shared pristine adjacency, in which only the
+    /// FIRST `nelim` vertices may be eliminated. The remaining `n - nelim` are
+    /// permanently live: they still receive fill and still count toward every
+    /// eliminated vertex's column count, but are never chosen as a pivot.
+    ///
+    /// That is exactly the subproblem an elimination-tree SUBTREE poses. If
+    /// `S` is a subtree of the etree of the incumbent ordering, then no vertex
+    /// outside `S` eliminated before `S`'s block can create fill touching `S`
+    /// — every vertex's fill goes to its own etree ancestors, and a
+    /// non-descendant of `S`'s root has no `S` vertex among its ancestors. So
+    /// the elimination of `S` sees exactly the ORIGINAL graph induced on
+    /// `S ∪ N_A(S)`, reordering inside `S` changes only `Σ_{v∈S} c_v²` (the
+    /// fill graph after eliminating a SET is order-independent, so everything
+    /// above the subtree root is untouched), and any local improvement is a
+    /// global improvement of the same amount.
+    pub(crate) fn new_partial(n: usize, adj0: &'a [u64], nelim: usize) -> Option<Game<'a>> {
+        let mut g = Game::new(n, adj0)?;
+        g.nelim = nelim.min(n);
+        Some(g)
+    }
+
     /// A working game over a shared pristine adjacency.
     pub(crate) fn new(n: usize, adj0: &'a [u64]) -> Option<Game<'a>> {
         if n == 0 || n > MAX_N {
@@ -135,6 +182,13 @@ impl<'a> Game<'a> {
             deg: vec![0; n],
             livelist: Vec::with_capacity(n),
             pos: vec![0; n],
+            use_buckets: n > SCAN_MAX_N,
+            bhead: vec![-1; n + 1],
+            bnext: vec![-1; n],
+            bprev: vec![-1; n],
+            mind: 0,
+            nlive: 0,
+            nelim: n,
             nlist: Vec::with_capacity(n),
             cand: Vec::with_capacity(n),
             tmp: vec![0u64; w],
@@ -144,6 +198,7 @@ impl<'a> Game<'a> {
 
     fn reset(&mut self) {
         self.adj.copy_from_slice(&self.adj0[..self.n * self.w]);
+        self.bhead.fill(-1);
         self.livelist.clear();
         for v in 0..self.n {
             let mut d = 0u32;
@@ -151,24 +206,62 @@ impl<'a> Game<'a> {
                 d += self.adj[v * self.w + k].count_ones();
             }
             self.deg[v] = d;
-            self.pos[v] = self.livelist.len() as u32;
-            self.livelist.push(v as u32);
+            if v >= self.nelim {
+                continue; // permanently live: never a pivot, never bucketed
+            }
+            if self.use_buckets {
+                self.blink(v, d as usize);
+            } else {
+                self.pos[v] = self.livelist.len() as u32;
+                self.livelist.push(v as u32);
+            }
         }
+        self.mind = 0;
+        self.nlive = self.nelim;
         // Charged to match measured cost: the bitset copy and the per-vertex
         // popcount pass are both `n·w`, plus a fixed per-vertex bookkeeping term
-        // (livelist/pos). Without the linear term the budget massively
+        // (bucket insertion). Without the linear term the budget massively
         // undercharges tiny `n` (where `w == 1`), and a constant ops budget
         // then costs 3x more wall time at n=64 than at n=800.
         self.ops += (2 * self.n * self.w + 8 * self.n) as i64;
     }
 
     #[inline]
-    fn drop_live(&mut self, v: usize) {
-        let p = self.pos[v] as usize;
-        let last = *self.livelist.last().unwrap();
-        self.livelist[p] = last;
-        self.pos[last as usize] = p as u32;
-        self.livelist.pop();
+    fn blink(&mut self, v: usize, d: usize) {
+        let h = self.bhead[d];
+        self.bnext[v] = h;
+        self.bprev[v] = -1;
+        if h >= 0 {
+            self.bprev[h as usize] = v as i32;
+        }
+        self.bhead[d] = v as i32;
+    }
+
+    #[inline]
+    fn bunlink(&mut self, v: usize, d: usize) {
+        let p = self.bprev[v];
+        let nx = self.bnext[v];
+        if p >= 0 {
+            self.bnext[p as usize] = nx;
+        } else {
+            self.bhead[d] = nx;
+        }
+        if nx >= 0 {
+            self.bprev[nx as usize] = p;
+        }
+    }
+
+    /// Advance `mind` to the smallest non-empty bucket. Amortized O(1) per
+    /// elimination over a whole run: `mind` only ever moves up here, and only
+    /// ever moves down by the explicit `min` in `eliminate`.
+    #[inline]
+    fn advance_mind(&mut self) {
+        let mut d = self.mind;
+        while d < self.n && self.bhead[d] < 0 {
+            d += 1;
+        }
+        self.ops += (d - self.mind) as i64 + 2;
+        self.mind = d;
     }
 
     /// Eliminate `v`, returning its column count `c = 1 + |N(v)|`.
@@ -187,6 +280,8 @@ impl<'a> Game<'a> {
         }
         let c = self.nlist.len() as u64 + 1;
         let vw = v >> 6;
+        // `v` leaves the live set first: it is never in `N(v)`, so the
+        // neighbour loop below cannot touch its bucket links.
         let vbit = 1u64 << (v & 63);
         // Clique N(v): each u in N(v) absorbs N(v), minus itself and minus v.
         for i in 0..self.nlist.len() {
@@ -202,14 +297,34 @@ impl<'a> Game<'a> {
             // now set and both must go — hence the `-2`.
             self.adj[base + (u >> 6)] &= !(1u64 << (u & 63));
             self.adj[base + vw] &= !vbit;
-            self.deg[u] = d - 2;
+            let nd = d - 2;
+            if self.use_buckets && u < self.nelim {
+                let od = self.deg[u];
+                if nd != od {
+                    self.bunlink(u, od as usize);
+                    self.blink(u, nd as usize);
+                    if (nd as usize) < self.mind {
+                        self.mind = nd as usize;
+                    }
+                }
+            }
+            self.deg[u] = nd;
         }
         self.ops += ((self.nlist.len() + 1) * (3 * w + 6) + 24) as i64;
         for k in 0..w {
             self.adj[v * w + k] = 0;
         }
+        if self.use_buckets {
+            self.bunlink(v, self.deg[v] as usize);
+        } else {
+            let p = self.pos[v] as usize;
+            let last = *self.livelist.last().unwrap();
+            self.livelist[p] = last;
+            self.pos[last as usize] = p as u32;
+            self.livelist.pop();
+        }
         self.deg[v] = 0;
-        self.drop_live(v);
+        self.nlive -= 1;
         c
     }
 
@@ -288,7 +403,7 @@ impl Game<'_> {
                 return None;
             }
         }
-        while !self.livelist.is_empty() {
+        while self.nlive > 0 {
             // HARD STOP. `last_run` bounds the budget using the PREVIOUS run's
             // cost, which is only a prediction: a randomized pivot sequence can
             // generate far more fill than the incumbent's, and on an unseen
@@ -301,38 +416,70 @@ impl Game<'_> {
             if self.ops > hard_cap {
                 return None;
             }
-            let m = self.livelist.len();
-            self.ops += 4 * m as i64;
-            let mut dmin = u32::MAX;
-            for i in 0..m {
-                let d = self.deg[self.livelist[i] as usize];
-                if d < dmin {
-                    dmin = d;
+            let dmin;
+            if self.use_buckets {
+                self.advance_mind();
+                dmin = self.mind;
+            } else {
+                let m = self.nlive;
+                self.ops += 4 * m as i64;
+                let mut d0 = u32::MAX;
+                for i in 0..m {
+                    let d = self.deg[self.livelist[i] as usize];
+                    if d < d0 {
+                        d0 = d;
+                    }
                 }
+                dmin = d0 as usize;
             }
-            let cut = dmin.saturating_add(pol.slack);
+            let cut = (dmin + pol.slack as usize).min(self.n - 1);
             let pick;
             if pol.slack == 0 && !pol.fill_tb {
-                // Uniform among the argmin set, via reservoir sampling (no
-                // allocation, no index bias).
+                // Uniform over the argmin bucket, via reservoir sampling (no
+                // allocation, no index bias, and no dependence on the list's
+                // internal order beyond the sampling itself).
                 let mut cnt = 0u32;
-                let mut sel = 0u32;
-                for i in 0..m {
-                    let v = self.livelist[i];
-                    if self.deg[v as usize] == dmin {
+                let mut sel = 0i32;
+                if self.use_buckets {
+                    sel = self.bhead[dmin];
+                    let mut x = self.bhead[dmin];
+                    while x >= 0 {
                         cnt += 1;
                         if below(rng, cnt) == 0 {
-                            sel = v;
+                            sel = x;
+                        }
+                        x = self.bnext[x as usize];
+                    }
+                    self.ops += cnt as i64 * 2 + 4;
+                } else {
+                    for i in 0..self.nlive {
+                        let v = self.livelist[i];
+                        if self.deg[v as usize] as usize == dmin {
+                            cnt += 1;
+                            if below(rng, cnt) == 0 {
+                                sel = v as i32;
+                            }
                         }
                     }
                 }
                 pick = sel as usize;
             } else {
                 self.cand.clear();
-                for i in 0..m {
-                    let v = self.livelist[i];
-                    if self.deg[v as usize] <= cut {
-                        self.cand.push(v);
+                if self.use_buckets {
+                    for d in dmin..=cut {
+                        let mut x = self.bhead[d];
+                        while x >= 0 {
+                            self.cand.push(x as u32);
+                            x = self.bnext[x as usize];
+                        }
+                    }
+                    self.ops += self.cand.len() as i64 * 2 + 4;
+                } else {
+                    for i in 0..self.nlive {
+                        let v = self.livelist[i];
+                        if (self.deg[v as usize] as usize) <= cut {
+                            self.cand.push(v);
+                        }
                     }
                 }
                 if pol.fill_tb && self.cand.len() > 1 {
@@ -470,7 +617,24 @@ pub(crate) fn search_with(
     rng_seed: u64,
     par: Params,
 ) -> Option<(Vec<usize>, u64)> {
-    let mut g = Game::new(n, adj0)?;
+    search_with_nelim(n, adj0, n, seed, seed_flops, budget, rng_seed, par)
+}
+
+/// [`search_with`] on a game where only the first `nelim` vertices may be
+/// eliminated — the elimination-tree-subtree subproblem. See
+/// [`Game::new_partial`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_with_nelim(
+    n: usize,
+    adj0: &[u64],
+    nelim: usize,
+    seed: &[usize],
+    seed_flops: u64,
+    budget: i64,
+    rng_seed: u64,
+    par: Params,
+) -> Option<(Vec<usize>, u64)> {
+    let mut g = Game::new_partial(n, adj0, nelim)?;
     let mut rng = rng_seed | 1;
     let mut best = seed_flops;
     let mut best_ord: Vec<usize> = Vec::new();
@@ -548,23 +712,26 @@ pub(crate) fn search_with(
         best_ord.clone()
     };
     let nwalk = par.walks.max(1);
+    let nelim = g.nelim;
+    let _ = nelim;
     let mut cur: Vec<Vec<usize>> = vec![start; nwalk];
     let mut cur_f: Vec<u64> = vec![best; nwalk];
     let mut stall = 0usize;
     let mut kick: Vec<usize> = Vec::new();
     while par.lns && g.ops + last_run <= budget {
         let before = g.ops;
+        let ne = nelim.max(1);
         let p = match par.prefix_mode {
-            0 => below(&mut rng, n as u32) as usize,
-            3 => below(&mut rng, (n as u32).div_ceil(2)) as usize,
-            4 => below(&mut rng, (n as u32).div_ceil(4)) as usize,
-            2 if it % 2 == 0 => below(&mut rng, n as u32) as usize,
+            0 => below(&mut rng, ne as u32) as usize,
+            3 => below(&mut rng, (ne as u32).div_ceil(2)) as usize,
+            4 => below(&mut rng, (ne as u32).div_ceil(4)) as usize,
+            2 if it % 2 == 0 => below(&mut rng, ne as u32) as usize,
             _ => {
                 // Log-uniform tail: pick an exponent, then a length inside it.
-                let bits = usize::BITS - n.leading_zeros();
+                let bits = usize::BITS - ne.leading_zeros();
                 let e = below(&mut rng, bits);
                 let k = 1 + below(&mut rng, 1u32 << e) as usize;
-                n.saturating_sub(k.min(n))
+                ne.saturating_sub(k.min(ne))
             }
         };
         let pol = pols[it % pols.len()];
@@ -728,239 +895,228 @@ pub(crate) fn search_par(
     best
 }
 
-/// Exact adjacent-transposition descent around a completed ordering.
+// ════════════════════════════════════════════════════════════════════════════
+// SUBTREE REFINEMENT — the exact elimination game on gt_10k, one etree subtree
+// at a time.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Re-order the inside of elimination-tree SUBTREES of a postordered incumbent.
 ///
-/// At an elimination state, consider consecutive pivots `a, b`. If they are
-/// non-adjacent, their eliminations commute and swapping them is score-neutral.
-/// If they are adjacent, after either first pivot is eliminated the survivor's
-/// live neighbourhood is the same union
-/// `(N(a) union N(b)) - {a, b}`. The residual graph after both pivots is also
-/// identical. Consequently only the first column count differs, and placing
-/// the lower-current-degree endpoint first is the exact better choice for the
-/// pair. Disjoint pair choices in one sweep are independent because each pair
-/// leaves the same eliminated set at the next boundary.
+/// ## Why a subtree is an exactly-separable subproblem
 ///
-/// Sweeps alternate pair parity, so two sweeps examine every adjacent boundary.
-/// The operation budget is deterministic and cumulative. Exhaustion discards
-/// the whole candidate instead of returning a partially explored result.
-pub(crate) fn adjacent_pair_descent(
+/// Let `S` be the vertex set of a subtree of the elimination tree of `perm`.
+/// Two standard facts make the inside of `S` independently optimizable:
+///
+/// 1. `col_F(v)` — hence `c_v` — depends only on `v`'s DESCENDANTS in the etree
+///    (Liu's reachable-set characterisation: `w ∈ col_F(v)` iff `w` is reachable
+///    from `v` through vertices eliminated earlier, and those are exactly `v`'s
+///    descendants). A subtree is closed under descendants, so for `v ∈ S` the
+///    whole computation lives inside `S ∪ N_A(S)` and no vertex eliminated
+///    before `S`'s block can touch it.
+/// 2. The fill graph after eliminating a SET does not depend on the order
+///    within the set. So everything ABOVE the subtree root — every `c_w` for
+///    `w ∉ S` — is unchanged by any internal reordering.
+///
+/// Therefore `Σ_j c_j²` splits as `(fixed part) + Σ_{v∈S} c_v²`, and any
+/// improvement found inside `S` is a global improvement of exactly the same
+/// size. That is what makes this affordable on `gt_10k`: the search never sees
+/// the whole matrix, only a block of a few hundred to a few thousand vertices
+/// plus its boundary.
+///
+/// `perm` MUST be postordered with respect to its own elimination tree (which
+/// leaves `Σ c_j²` unchanged), so that each subtree occupies a CONTIGUOUS range
+/// of positions `[j - size(j) + 1, j]` — otherwise reordering inside `S` would
+/// also move non-`S` vertices across `S`'s members and fact 1 would not apply.
+///
+/// Returns the number of blocks improved; `perm` is edited in place. The caller
+/// must still re-score `perm` through the trusted scorer and keep it only on a
+/// strict improvement.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subtree_refine(
     n: usize,
     col_ptr: &[usize],
     row_idx: &[usize],
-    seed: &[usize],
-    sweeps: usize,
-    budget: i64,
-) -> Option<Vec<usize>> {
-    #[cfg(test)]
-    ADJACENT_PAIR_DESCENT_CALLS.with(|calls| calls.set(calls.get() + 1));
-
-    if n < 2 || seed.len() != n || sweeps == 0 || budget <= 0 {
-        return None;
-    }
-    let mut seen = vec![false; n];
-    for &v in seed {
-        if v >= n || seen[v] {
-            return None;
-        }
-        seen[v] = true;
-    }
-
-    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
-    let mut game = Game::new(n, &adj0)?;
-    let mut cur = seed.to_vec();
-    let mut next = Vec::with_capacity(n);
-    let mut changed_any = false;
-
-    for sweep in 0..sweeps {
-        game.reset();
-        if game.ops > budget {
-            return None;
-        }
-        next.clear();
-
-        let mut k = 0usize;
-        if sweep & 1 == 1 {
-            let v = cur[0];
-            next.push(v);
-            game.eliminate(v);
-            if game.ops > budget {
-                return None;
-            }
-            k = 1;
-        }
-
-        let mut changed = false;
-        while k + 1 < n {
-            let a = cur[k];
-            let b = cur[k + 1];
-            let adjacent = game.adj[a * game.w + (b >> 6)] & (1u64 << (b & 63)) != 0;
-            let swap = adjacent && game.deg[b] < game.deg[a];
-            let (first, second) = if swap { (b, a) } else { (a, b) };
-            changed |= swap;
-            next.push(first);
-            next.push(second);
-            game.eliminate(first);
-            if game.ops > budget {
-                return None;
-            }
-            game.eliminate(second);
-            if game.ops > budget {
-                return None;
-            }
-            k += 2;
-        }
-        if k < n {
-            let v = cur[k];
-            next.push(v);
-            game.eliminate(v);
-            if game.ops > budget {
-                return None;
-            }
-        }
-
-        if changed {
-            changed_any = true;
-            std::mem::swap(&mut cur, &mut next);
+    perm: &mut [usize],
+    counts: &[u32],
+    parent: &[i32],
+    cfg: SubCfg,
+) -> usize {
+    // ── subtree sizes and their contiguous postorder blocks ─────────────────
+    // Postorder ⇒ every child precedes its parent, so one ascending sweep
+    // accumulates sizes.
+    let mut size: Vec<u32> = vec![1; n];
+    for j in 0..n {
+        let p = parent[j];
+        if p >= 0 {
+            size[p as usize] += size[j];
         }
     }
 
-    changed_any.then_some(cur)
+    // ── pick disjoint blocks, topmost-eligible first ────────────────────────
+    // Descending position order visits ancestors before descendants, so the
+    // first eligible node on any root-to-leaf path wins and everything below it
+    // is marked covered. Deterministic: a plain descending scan, no tie-breaks.
+    let mut covered = vec![false; n];
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for j in (0..n).rev() {
+        if covered[j] {
+            continue;
+        }
+        let sz = size[j] as usize;
+        if sz < cfg.min_s || sz > cfg.max_s {
+            continue;
+        }
+        let a = j + 1 - sz;
+        for c in covered.iter_mut().take(j + 1).skip(a) {
+            *c = true;
+        }
+        blocks.push((a, j));
+        if blocks.len() >= cfg.max_blocks {
+            break;
+        }
+    }
+    if blocks.is_empty() {
+        return 0;
+    }
+
+    // ── search the blocks, in parallel over BLOCKS ──────────────────────────
+    // Blocks are disjoint position ranges and each builds its own local
+    // subgraph from the ORIGINAL pattern, so there is no shared mutable state:
+    // the threads only READ `perm` and return `(start, new order)` pairs that
+    // are applied afterwards to disjoint ranges. Completion order therefore
+    // cannot affect the result. Parallelising over blocks rather than over
+    // search streams is the cheaper axis — a block's search is short, and this
+    // way all four vCPUs stay busy even on a matrix with one big block set.
+    let nthreads = super::parallel::PAR_MAX_THREADS.max(1).min(blocks.len());
+    let perm_ro: &[usize] = perm;
+    let blocks_ro: &[(usize, usize)] = &blocks;
+    let parts: Vec<Vec<(usize, Vec<usize>)>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|t| {
+                sc.spawn(move || {
+                    let mut local: Vec<u32> = vec![u32::MAX; n];
+                    let mut touched: Vec<usize> = Vec::new();
+                    let mut verts: Vec<usize> = Vec::new();
+                    let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
+                    let mut bi = t;
+                    while bi < blocks_ro.len() {
+                        let (a, b) = blocks_ro[bi];
+                        bi += nthreads;
+                        let ssz = b + 1 - a;
+                        verts.clear();
+                        for &c in touched.iter() {
+                            local[c] = u32::MAX;
+                        }
+                        touched.clear();
+                        // S first, in incumbent block order: the seed order is
+                        // then the identity, and local id i is position a + i.
+                        for &v in &perm_ro[a..=b] {
+                            local[v] = verts.len() as u32;
+                            touched.push(v);
+                            verts.push(v);
+                        }
+                        // Boundary: original-graph neighbours of S outside S.
+                        for i in 0..ssz {
+                            let v = verts[i];
+                            for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
+                                if u < n && local[u] == u32::MAX {
+                                    local[u] = verts.len() as u32;
+                                    touched.push(u);
+                                    verts.push(u);
+                                }
+                            }
+                        }
+                        let m = verts.len();
+                        if m > cfg.max_sub || m > MAX_N {
+                            continue;
+                        }
+
+                        // Induced adjacency over S u boundary, as bitsets.
+                        let w = m.div_ceil(64);
+                        let mut adj0 = vec![0u64; m * w];
+                        for (li, &v) in verts.iter().enumerate() {
+                            for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
+                                if u >= n {
+                                    continue;
+                                }
+                                let lu = local[u];
+                                if lu == u32::MAX || lu as usize == li {
+                                    continue;
+                                }
+                                let lu = lu as usize;
+                                adj0[li * w + (lu >> 6)] |= 1u64 << (lu & 63);
+                                adj0[lu * w + (li >> 6)] |= 1u64 << (li & 63);
+                            }
+                        }
+
+                        // The block's exact contribution to the global objective.
+                        let seed_flops: u64 = counts[a..=b]
+                            .iter()
+                            .map(|&c| {
+                                let c = c as u64;
+                                c * c
+                            })
+                            .sum();
+                        let seed: Vec<usize> = (0..ssz).collect();
+                        let mut best: Option<(Vec<usize>, u64)> = None;
+                        for k in 0..cfg.streams.max(1) {
+                            let r = search_with_nelim(
+                                m,
+                                &adj0,
+                                ssz,
+                                &seed,
+                                seed_flops,
+                                cfg.budget,
+                                stream_rng(k),
+                                stream_params(k),
+                            );
+                            if let Some((o, f)) = r {
+                                if best.as_ref().is_none_or(|(_, bf)| f < *bf) {
+                                    best = Some((o, f));
+                                }
+                            }
+                        }
+                        if let Some((ord, _)) = best {
+                            if ord.len() == ssz {
+                                got.push((a, ord.iter().map(|&li| verts[li]).collect()));
+                            }
+                        }
+                    }
+                    got
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+
+    let mut improved = 0usize;
+    for part in parts {
+        for (a, ord) in part {
+            perm[a..a + ord.len()].copy_from_slice(&ord);
+            improved += 1;
+        }
+    }
+    improved
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Pattern;
-
-    fn trusted_flops(pattern: &Pattern, perm: &[usize]) -> u64 {
-        let scoring = super::super::ScoringPattern {
-            n: pattern.n,
-            col_ptr: pattern.col_ptr.clone(),
-            row_idx: pattern.row_idx.clone(),
-        };
-        super::super::flops_of(&scoring, perm)
-    }
-
-    #[test]
-    fn adjacent_pair_descent_improves_star_exactly_and_deterministically() {
-        let pattern = Pattern::from_edges(4, &[(0, 1), (0, 2), (0, 3)]);
-        let seed = vec![0, 1, 2, 3];
-        let first = adjacent_pair_descent(
-            pattern.n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &seed,
-            2,
-            1_000_000,
-        )
-        .expect("the center-first star contains strict adjacent inversions");
-        let second = adjacent_pair_descent(
-            pattern.n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &seed,
-            2,
-            1_000_000,
-        )
-        .expect("the deterministic replay must find the same inversions");
-
-        assert_eq!(first, second);
-        assert_eq!(first.len(), pattern.n);
-        let mut sorted = first.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..pattern.n).collect::<Vec<_>>());
-        assert!(trusted_flops(&pattern, &first) < trusted_flops(&pattern, &seed));
-    }
-
-    #[test]
-    fn adjacent_pair_descent_matches_trusted_score_on_small_graphs() {
-        let mut state = 0xD1B5_4A32_D192_ED03u64;
-        let mut improved = 0usize;
-        for case in 0..96 {
-            let n = 3 + case % 9;
-            let mut edges = Vec::new();
-            for u in 0..n {
-                for v in u + 1..n {
-                    if xs64(&mut state) % 5 <= 1 {
-                        edges.push((u, v));
-                    }
-                }
-            }
-            let pattern = Pattern::from_edges(n, &edges);
-            let mut seed: Vec<usize> = (0..n).collect();
-            for i in (1..n).rev() {
-                let j = xs64(&mut state) as usize % (i + 1);
-                seed.swap(i, j);
-            }
-
-            if let Some(cand) = adjacent_pair_descent(
-                n,
-                &pattern.col_ptr,
-                &pattern.row_idx,
-                &seed,
-                2,
-                2_000_000,
-            ) {
-                improved += 1;
-                let mut sorted = cand.clone();
-                sorted.sort_unstable();
-                assert_eq!(sorted, (0..n).collect::<Vec<_>>());
-                assert!(
-                    trusted_flops(&pattern, &cand) < trusted_flops(&pattern, &seed),
-                    "case {case} returned a non-improving exchange"
-                );
-            }
-        }
-        assert!(improved > 0, "property sweep did not exercise any exchange");
-    }
-
-    #[test]
-    fn adjacent_pair_descent_fails_closed_on_edge_cases() {
-        let singleton = Pattern::from_edges(1, &[]);
-        assert!(adjacent_pair_descent(
-            singleton.n,
-            &singleton.col_ptr,
-            &singleton.row_idx,
-            &[0],
-            2,
-            1_000_000,
-        )
-        .is_none());
-
-        let edge = Pattern::from_edges(2, &[(0, 1)]);
-        assert!(adjacent_pair_descent(
-            edge.n,
-            &edge.col_ptr,
-            &edge.row_idx,
-            &[0, 0],
-            2,
-            1_000_000,
-        )
-        .is_none());
-        assert!(adjacent_pair_descent(
-            edge.n,
-            &edge.col_ptr,
-            &edge.row_idx,
-            &[0, 1],
-            2,
-            1,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn adjacent_pair_descent_is_reached_from_default_order() {
-        let n = 1_000;
-        let edges: Vec<(usize, usize)> = (0..n - 1).map(|v| (v, v + 1)).collect();
-        let pattern = Pattern::from_edges(n, &edges);
-        ADJACENT_PAIR_DESCENT_CALLS.with(|calls| calls.set(0));
-
-        let perm = super::super::order(&pattern);
-
-        ADJACENT_PAIR_DESCENT_CALLS.with(|calls| assert_eq!(calls.get(), 1));
-        assert_eq!(perm.len(), n);
-        let mut sorted = perm;
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..n).collect::<Vec<_>>());
-    }
+/// Gating and budget for [`subtree_refine`].
+#[derive(Clone, Copy)]
+pub(crate) struct SubCfg {
+    /// Smallest subtree worth searching (below this the block is a chain or a
+    /// clique and there is nothing to reorder).
+    pub(crate) min_s: usize,
+    /// Largest subtree accepted as one block.
+    pub(crate) max_s: usize,
+    /// Ceiling on `|S| + |boundary(S)|` — the bitset game's actual size.
+    pub(crate) max_sub: usize,
+    /// Cap on how many blocks are searched per matrix.
+    pub(crate) max_blocks: usize,
+    /// Per-stream word-op budget for ONE block.
+    pub(crate) budget: i64,
+    /// Streams per block (sequential here; the caller parallelises over
+    /// blocks, which is the coarser and cheaper axis).
+    pub(crate) streams: usize,
 }
