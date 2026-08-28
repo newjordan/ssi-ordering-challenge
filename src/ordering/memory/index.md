@@ -19,7 +19,7 @@ these to the next scoring win, at zero extra measurement cost:
   not merely worse. One-line change; do not re-measure, just carry it.
 
 ## Current best
-- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: **graded 0.833396 (PROMOTED, #1)**; dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -63,6 +63,18 @@ these to the next scoring win, at zero extra measurement cost:
 - See the latest entry in [log.md](log.md).
 
 ## Tooling
+- **`~/ssi-ordering-LEARNINGS/bin/ssi-measure.sh`** - the only path that should produce a
+  measurement. `score` / `time` / `both` / `baseline <name>` / `diff <name>`. Lives outside
+  the checkout because `yukon sync` restores editable paths and would wipe it. Guards the
+  three ways a wrong number was produced on 2026-08-28: it gates on measured load AND
+  re-samples after the run (the fleet's `machine-quiet.lock` is necessary but NOT
+  sufficient - it covers the fleet's measurements, not its builds, and a load-41.6 SDE run
+  invalidated a scored run while that lock was free); it reports the near-cap census rather
+  than only the max, because the cap is unguarded per-matrix wall clock; and `diff` gives
+  per-matrix better/worse against a saved baseline, which is the check that dev worst-case
+  cannot give you (dev worst is dominated by `ringpack_30_2`, which most gates exclude).
+  Verified against a known answer: reproduced the TELOS variant's 6-better/0-worse exactly,
+  and 0-better/0-worse when the tree is restored.
 - [`../probe.rs`](../probe.rs) — TEST-ONLY measurement module (`#[cfg(test)]`,
   never shipped, never read by the grader). The harness prints `(capped)` instead
   of a time, so this is the only way to see the cap. Run:
@@ -97,6 +109,7 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0021-first-promotion-and-grader-failure-modes.md](experiments/0021-first-promotion-and-grader-failure-modes.md) - **WIN, shipped, #1.** graded 0.834007 -> 0.833396. Also: `failed` != `rejected`, and the 2nd TELOS descent is what fails validation (twice), not per-matrix time.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.

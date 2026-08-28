@@ -77,6 +77,27 @@ is one extra descent per retained seed, against a 2.0 s per-matrix cap where the
 matrix currently sits at 1.784 s - so it must be gated by measured per-family time, the
 calibration warning from 0007/0019 applies.
 
+## Closed: the scorer is not stateful (checked at candidate level)
+
+A reviewer raised the one premise the phase-gating did not test: that `ws.flops` returns a
+correct value on *every* call, given that the buffer-reuse test in `scoring_ws.rs` covers
+benign sequences rather than this exact call history. A corrupted too-high score on a
+candidate that then gets REJECTED is invisible to a check on the returned permutation, and
+would be systematically lost score.
+
+Tested directly rather than argued: re-scored **every** `consider` candidate with the
+workspace-free `flops_of` path and compared, across all 300 matrices.
+
+**Zero mismatches.** Combined with the returned-permutation check (in-run `2104445` /
+`1975321` both matching a fresh re-score exactly) and `flops_cache` being per-call
+(`mod.rs:1574`, a local `HashMap`, so no cross-matrix contamination), the scorer is sound
+on accepted and rejected candidates alike. Do not re-open this.
+
+Note also that ONE cause covers both "impossible" observations, so no second mechanism is
+needed: the post-hoc PEEL/CNTREL family sits at line 2556, **before** TELOS at 2811, so
+post-hoc improving the incumbent hands TELOS a different seed. "Enabling a phase that only
+accepts improvements made the result worse" is the same seed-sensitivity, one phase upstream.
+
 ## Method note
 
 The four "explanations" were separated only because each phase could be switched off
