@@ -10,16 +10,53 @@ their own (a submission must *strictly* beat the frontier — a 0.00% diff is re
 which is exactly the frontier holder's own recent streak). Attach the next one of
 these to the next scoring win, at zero extra measurement cost:
 
-- **`RELABEL_BUDGET` 300_000 → 150_000.** Score **identical** (0.842722, every bucket
-  unchanged) and worst-case `order()` **1.858 s → 1.832 s**, i.e. +0.026 s of margin
-  against the 2.0 s SIGKILL. Measured in the 8-policy sweep in
-  [0017](experiments/0017-relabel-budget-saturation.md). Matters because the shipped
-  frontier config runs at **93% of the cap** while local run-to-run variance is
-  recorded at ~1.6× and grader timing is invisible — a FAIL scores nothing at all,
-  not merely worse. One-line change; do not re-measure, just carry it.
+- ~~**`RELABEL_BUDGET` 300_000 → 150_000.**~~ **RETIRED 2026-08-29 — STALE, DO NOT
+  CARRY.** 0017 measured it score-identical (0.842722) *before* the 0019 restart
+  floors; re-measured on top of them in
+  [0021](experiments/0021-permute-i32-wiring.md) it scores **0.842457 vs 0.842223**
+  (1k_10k +0.0003, gt_10k +0.0004) — the floors leave the 20k–30k nnz band and
+  hub-gated mid-band uncovered, where the halving now cuts winning seeds. 0017's
+  "do not re-measure, just carry it" was wrong; 0019's "re-measure before riding"
+  was right. A warning paragraph now sits on the constant itself.
+- **`permute_i32_into` wiring ([0021](experiments/0021-permute-i32-wiring.md)).**
+  Score **EXACTLY** 0.842223/0.948942 (byte-identical permutations, vendor-match
+  tested) and candidate ≤ incumbent on every interleaved A/B pair — `ringpack_30_2`
+  reclaims ~0.2–0.4 s on the cap-critical path. Already merged; listed here as the
+  cap-margin funding for the next scoring win.
 
 ## Current best
-- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- **FRONTIER MOVED mid-session (2026-08-29 02:04): mellowcroc's watcher-MINL
+  promoted at official 0.832843** (submission c56744e / repo commit d020def;
+  new `minl_watch.rs`, an event-driven four-cycle-witness completion
+  minimalizer post-TELOS, plus a fused seed-major relabel loop that is
+  selection-identical to the old family-major order; shipped with NO memory
+  note by its author). Worktree-measured dev baseline **0.841526** (fill
+  0.948713). Everything below this line predates that promotion.
+- **0027** ([0027](experiments/0027-flops-ceiling-second-descent.md)): the
+  deterministic re-gate 0026 called for, shipped — the 0025 second descent
+  additionally requires incumbent `best_flops ≤ 20_000_000` at TELOS entry
+  (per-eval cost ∝ nnz(L); Σc² is in hand, pattern-pure, and maximal on the
+  dense hidden class). Census on the rebased tree: excludes exactly one dev
+  matrix (`crudeoil_lee2_06`, 23.0e6, measured zero-move in a 1.643 s
+  order()); all five 0025 winners keep their second descent (movers ≤
+  13.1e6). NOTE 0026's sketch (`nnz/n≤10 OR n≤500`) was NOT used: it deletes
+  the langford mover and admits sparse-but-deep-fill hidden matrices (nnz/n
+  small, Σc² ~1e9) that are exactly as cap-dangerous as the dense class.
+- ⚠️ **0025 (dev 0.841594) grader-FAILED on the 2.0 s cap** ("hidden matrix:
+  order() exceeded the 2.0s per-matrix cap and was killed") — its `nnz≤100k`
+  gate is a cost PROXY, not a time bound, and a DENSE hidden matrix (0005: eval
+  nnz/n up to 497, a class dev lacks) ran the second descent and blew the cap.
+  The submittable frontier is therefore still the pre-0025 **0.842223**.
+  **0026** ([0026](experiments/0026-cap-guard-second-descent.md)) is the
+  cap-safety response — a 600 ms wall-clock guard on the second descent —
+  IMPLEMENTED, builds, 35/35 green, cap-mechanism verified; but measurement
+  says **DO NOT SUBMIT the wall-clock version**: it (a) erases the main win
+  (`procurement1large` hits the gate at ~1.08 s ≫ 600 ms even clean, so gt_10k
+  reverts to baseline; on-box score 0.842177) and (b) breaks the two-run
+  **determinism gate** (`main.rs:369`) on winning matrices straddling 600 ms
+  (`nuclear25a`). ORD-0027 must use a DETERMINISTIC `(n, nnz)` covariate gate
+  instead (see the rule below and 0026's recommendation).
+- Best score: dev **0.841594** ([0025](experiments/0025-distinct-runner-up-descent.md), distinct-runner-up second TELOS descent, gap>0.1% + nnz≤100k; 5 matrices improved, nothing regressed by strict-keep; +0.16 s on the one paying gt_10k matrix, cap wall untouched). **NOTE: this score grader-FAILED — see the warning above.** Previous: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -41,6 +78,20 @@ these to the next scoring win, at zero extra measurement cost:
   is strong. No candidate can make the score worse (verified: zero of 500 graded
   matrices exceed 1.000) but one breach fails the whole run — **the risk is
   asymmetric, so ship less when in doubt.**
+- ⚠️⚠️ **A COST HAZARD MUST BE GATED BY A *DETERMINISTIC* COVARIATE, NOT BY
+  WALL-CLOCK** (0026). The grader runs `order()` **twice** per matrix and FAILs
+  on `perm1 != perm2` (`main.rs:369`, "nondeterministic ordering (two runs
+  differ)"). So any gate whose decision changes the OUTPUT must be a pure
+  function of the matrix. A wall-clock guard (elapsed < 600 ms) is timing-
+  dependent: any *winning* matrix straddling the threshold flips run-to-run →
+  determinism FAIL (0026 measured `nuclear25a` at 527→924 ms). It ALSO couples
+  the gate to box speed, erasing wins on a slow box (0026: `procurement1large`
+  hits the gate at ~1.08 s even clean). The hidden corpus DOES have a denser
+  cost class than dev (0005), so the cost hazard is real — but bound it by
+  **`n` AND `nnz` (density), deterministically** (0005's "gate a hazard by its
+  own covariate" + the grader's own message "gate expensive paths by BOTH n and
+  nnz"), never by wall-clock. Time-based EARLY-EXITs are fine only where they
+  cannot change the output (e.g. a deterministic op-count budget).
 - Per bucket: lt_1k 0.9073 (147) · 1k_10k 0.9069 (108) · gt_10k 0.8306 (45).
 - **99** matrices still tied at exactly 1.000 (58 lt_1k · 24 1k_10k · 17 gt_10k);
   re-run `probe_ties` rather than trusting that number.
@@ -98,6 +149,11 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
 
 ## Experiments
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
+- [0022-telos-topk-runner-up.md](experiments/0022-telos-topk-runner-up.md) - **NEGATIVE on the named target, reverted** — TELOS top-K (K=2) from the runner-up-by-flops does NOT recover `chp_shorttermplan2d` (runner-up = the demoted previous best on the SAME improvement path — same basin, descent finds zero moves; 0020's second basin needs a between-CONFIG seed, not rank-2). **Quantified unclaimed lead:** the same implementation descends across a basin on `procurement1large` 0.6343 → 0.5814 (est. weighted ≈ −0.0006, zero score downside by construction; +0.1–0.25 s in the 40–90k nnz band, >100k gate keeps the cap wall untouched) — worth its own candidate with full-run + timing protocol.
+- [0023-ultrasmall-band-floor.md](experiments/0023-ultrasmall-band-floor.md) - **NEGATIVE, killed at a 15 s probe; RETIRES the 0019 census as a target list.** The ultra-small-band floor (nnz≤8k, budget 1.5M, "claim `chimera_lga-01`'s 0.0621") is void: the winning seeds sit at 91/7/32 — INSIDE the ~94 passes 0019's shipped 600k floor already buys — and the current final (0.8034) is already below the census target (0.8085). Next lga improvement is at seed **781** (≈5M budget, cap-suicidal); only live residual is `hydroenergy2` ≈ −0.00004 dev at seed 376, not worth a floor. Cost model reconfirmed at ~4.7e-7 s/nnz·seed. **Rule: re-run any census against the CURRENT incumbent before building on it** — third consecutive stage where a recorded "unclaimed/ready" claim died on re-measurement. Probe kept: `probe_ultrasmall_census`.
+- [0024-strip-amf-sparse-core.md](experiments/0024-strip-amf-sparse-core.md) - **NEGATIVE, killed at a ~2 min flops-only probe; mod.rs never touched.** AMF-α5 sub-ordering of the SPARSE-class stripped core (the dense-class `sub_amf5` split's "coverage hole", k=64 deg/lcnt-ranked, nnz<120k): **205 matrices in gate, 0 wins, 0 near-misses** — never beats the shipped incumbent at all (3 exact ties, otherwise 1.1–7x worse, tails to 29x). Mechanism: the strip itself removes the fat columns that make min-fill pay in the dense class; the remaining low-degree core is where min-DEGREE is near-optimal (0012/0018), so the dense precedent cannot transfer by construction. Third diversity zero after 0014/0016. Do not retry AMF parameter variants on sparse cores. Probe kept: `probe_strip_amf`.
+- [0026-cap-guard-second-descent.md](experiments/0026-cap-guard-second-descent.md) - **CAUTION/PARTIAL: cap-safety guard implemented, but measurement says DO NOT SUBMIT as-is.** 0025 grader-FAILed the 2.0 s cap on a dense hidden matrix (nnz≤100k is a cost proxy, not a time bound; 0005's dense class). Added a **600 ms wall-clock guard** (`SECOND_DESCENT_TIME_GUARD` = 0.30 × the grader's 2.0 s cap, referenced literally not from the local patched main.rs; `order_start` captured at `order_with_options` entry) as a 4th conjunct on the runner-up `seed_count`, on top of the nnz+gap gates. Builds, 35/35 green, and the **cap mechanism works** (census: every dense/large gate-passer — chp_shorttermplan2d 1260 ms, crudeoil_lee2_06 1268 ms, faclay30 632 ms — skips; a dense hidden matrix skips harder). **Two measured blockers kill it as a submission:** (1) it **erases the main win** — `procurement1large` reaches the gate at ~1.08 s even CLEAN (the whole multistart/HC/ORBIT/PHARMAKOS pipeline runs before the gate), ≫ 600 ms, so its second descent skips and gt_10k reverts to 0.7745≈baseline; on-box flops score 0.842177 (vs 0025's 0.841594), and raising the guard can't help (1.08 s > the 1000 ms ceiling); the win survives only if the grader is materially faster than this box. (2) it **breaks the two-run determinism gate** (`main.rs:369` "nondeterministic ordering (two runs differ)") — a wall-clock decision is timing-dependent, so any WINNING matrix straddling 600 ms yields different perms across the grader's two runs → whole-run FAIL; `nuclear25a` (527→924 ms across probe runs) is the dev exemplar and its decision flipped between my passes. Box too loaded (68 % CPU) for a clean scored run (full harness spuriously cap-failed on non-gate-passer `crudeoil_lee4_06`). **Recommendation → ORD-0027: a DETERMINISTIC `(n,nnz)` gate** (`nnz/n≤10 OR n≤500`) — deterministic (passes the gate), cap-safe (excludes dense-large), AND preserves procurement1large (sparse, nnz/n=2.8). Probe: `probe_telos_topk` now prints `GUARD` elapsed-margin lines.
+- [0025-distinct-runner-up-descent.md](experiments/0025-distinct-runner-up-descent.md) - **WIN, shipped: 0.842223 → 0.841594** (first scoring win since 0019) — **but grader-FAILED the 2.0 s cap on a dense hidden matrix; see [0026](experiments/0026-cap-guard-second-descent.md).** 0022's top-K=2 TELOS mechanism re-applied behind a DISTINCTNESS GATE (`TELOS_TOPK_GAP_MIN=0.001` on the runner-up's relative flops gap at TELOS entry, still nnz≤100k): 53/272 second descents admitted, 5 strict wins across all three buckets — `procurement1large` 0.6343→0.5814 as 0022 measured plus four unpredicted (`st_e31`, `graphpart_clique-20`, `maxcsp-langford-3-11`, `nuclear25a`); nothing can regress (strict-keep). Cost: +0.16 s on the winner, ≤0.06 s per zero-move descent (41 remain), cap wall untouched. **Transferable finding: gap size ≠ basin difference** — chp_shorttermplan2d's runner-up is 1.45% away yet same-basin (zero moves), langford crosses at 0.12%; the gate is necessary-not-sufficient cost control. Census instrument kept: `probe_telos_topk` `ALL` mode.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
 - [0001-amd-quotient-graph.md](experiments/0001-amd-quotient-graph.md) — AMD port; matched the baseline. **Superseded**: that hand-rolled `amd.rs` is no longer in the tree.
