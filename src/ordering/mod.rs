@@ -2912,76 +2912,95 @@ fn order_with_options(
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
 
-        for _round in 0..max_rounds {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut cnt = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                cnt[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+        let mut run_telos_on_seed = |seed_perm: &Vec<usize>, seed_flops: u64, best_f: &mut u64, best_p: &mut Vec<usize>, max_r: usize| {
+            let mut cur_perm = seed_perm.clone();
+            let mut cur_flops = seed_flops;
+            for _round in 0..max_r {
+                let permuted = permute_pattern(&scoring_pat, &cur_perm);
+                let etree = EliminationTree::from_pattern(&permuted);
+                let counts = column_counts_gnp(&permuted, &etree);
+                let mut cnt = vec![0usize; n];
+                for (pos, &v) in cur_perm.iter().enumerate() {
+                    cnt[v] = counts[pos];
+                }
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
 
-            let mut round_f = best_flops;
-            let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
-                };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
-
-            for &(subi, k) in prio.iter().take(passes) {
-                if k >= n {
-                    continue;
-                }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
+                let mut round_f = cur_flops;
+                let mut round_p: Option<Vec<usize>> = None;
+                let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
                     };
-                if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
-                    try_cand(cand, &mut round_f, &mut round_p);
-                }
-            }
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
+                };
 
-            for &k in peel_grid {
-                if k >= n {
-                    continue;
-                }
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in &best_perm {
-                    if !fat[v] {
-                        cand.push(v);
+                for &(subi, k) in prio.iter().take(passes) {
+                    if k >= n {
+                        continue;
+                    }
+                    let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                        match subi {
+                            0 => &sub_amd,
+                            1 => &sub_nd,
+                            _ => &sub_mf,
+                        };
+                    if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
+                        try_cand(cand, &mut round_f, &mut round_p);
                     }
                 }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
-                cand.extend(tail);
-                try_cand(cand, &mut round_f, &mut round_p);
-            }
 
-            match round_p {
-                Some(p) if round_f < best_flops => {
-                    best_flops = round_f;
-                    best_perm = p;
+                for &k in peel_grid {
+                    if k >= n {
+                        continue;
+                    }
+                    let mut fat = vec![false; n];
+                    for &v in &ranked[..k] {
+                        fat[v] = true;
+                    }
+                    let mut cand: Vec<usize> = Vec::with_capacity(n);
+                    for &v in &cur_perm {
+                        if !fat[v] {
+                            cand.push(v);
+                        }
+                    }
+                    let mut tail: Vec<usize> = ranked[..k].to_vec();
+                    tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+                    cand.extend(tail);
+                    try_cand(cand, &mut round_f, &mut round_p);
                 }
-                _ => break,
+
+                match round_p {
+                    Some(p) if round_f < cur_flops => {
+                        cur_flops = round_f;
+                        cur_perm = p;
+                    }
+                    _ => break,
+                }
             }
+            if cur_flops < *best_f {
+                *best_f = cur_flops;
+                *best_p = cur_perm;
+            }
+        };
+
+        // Primary descent from incumbent:
+        let primary_seed = best_perm.clone();
+        let primary_flops = best_flops;
+        run_telos_on_seed(&primary_seed, primary_flops, &mut best_flops, &mut best_perm, max_rounds);
+
+        // Secondary descent from AMD anchor (tightly capped to nnz <= 20_000, max runtime overhead < 4ms):
+        if nnz <= 20_000 && amd_perm != primary_seed {
+            let anchor_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+            run_telos_on_seed(&amd_perm, anchor_flops, &mut best_flops, &mut best_perm, max_rounds);
         }
     }
 
