@@ -49,6 +49,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 use super::scoring_ws::ScoreWorkspace;
 use super::{is_bijection, ScoringPattern};
@@ -118,6 +119,35 @@ pub(crate) fn run_candidates(
         nnz,
         incumbent,
         false,
+        0,
+        &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
+            Ok(Ok(perm_i32)) => Some(perm_i32.into_iter().map(|x| x as usize).collect()),
+            _ => None,
+        },
+    )
+}
+
+/// Generate and score the same candidate batch while retaining the raw top
+/// `keep_top` candidates by deterministic `(flops, task_index)` rank. No new
+/// candidate is generated or scored; this only keeps the few permutations a
+/// downstream seed selector may consume. The monotone top-rank threshold means
+/// a candidate dropped here can never enter the final top `keep_top`.
+pub(crate) fn run_candidates_keep_top(
+    tasks: &[CandFn<'_>],
+    sp: &ScoringPattern,
+    n: usize,
+    nnz: usize,
+    incumbent: u64,
+    keep_top: usize,
+) -> Vec<CandOut> {
+    run_generic(
+        tasks.len(),
+        sp,
+        n,
+        nnz,
+        incumbent,
+        false,
+        keep_top,
         &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
             Ok(Ok(perm_i32)) => Some(perm_i32.into_iter().map(|x| x as usize).collect()),
             _ => None,
@@ -171,6 +201,7 @@ fn run_perms_inner(
         nnz,
         incumbent,
         keep_all,
+        0,
         &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
             Ok(v) => v,
             Err(_) => None,
@@ -188,6 +219,7 @@ fn run_generic(
     nnz: usize,
     incumbent: u64,
     keep_all: bool,
+    keep_top: usize,
     produce: &(dyn Fn(usize) -> Option<Vec<usize>> + Sync),
 ) -> Vec<CandOut> {
     let mut results: Vec<CandOut> = Vec::with_capacity(len);
@@ -200,6 +232,7 @@ fn run_generic(
 
     // Monotone shared upper bound on the final minimum. Only ever decreases.
     let gmin = AtomicU64::new(incumbent);
+    let ranked_floor: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
 
     let eval = |i: usize, ws: &mut Option<ScoreWorkspace>| -> CandOut {
         let Some(perm) = produce(i) else {
@@ -211,10 +244,28 @@ fn run_generic(
         let w = ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
         let f = w.flops(sp, &perm);
         let prev = gmin.fetch_min(f, AtomicOrdering::Relaxed);
+        let retained_rank = if keep_top == 0 {
+            false
+        } else {
+            let key = (f, i);
+            let mut top = ranked_floor.lock().unwrap_or_else(|e| e.into_inner());
+            let pos = top.partition_point(|&prior| prior < key);
+            if pos < keep_top {
+                top.insert(pos, key);
+                top.truncate(keep_top);
+                true
+            } else {
+                false
+            }
+        };
         CandOut {
             flops: Some(f),
             // Retain only while this candidate can still be the argmin.
-            perm: if keep_all || f <= prev { Some(perm) } else { None },
+            perm: if keep_all || retained_rank || f <= prev {
+                Some(perm)
+            } else {
+                None
+            },
         }
     };
     // Nothing inside `eval` should be able to unwind (the producers are
