@@ -110,26 +110,13 @@ pub(crate) fn run_candidates(
     n: usize,
     nnz: usize,
     incumbent: u64,
-    // `true` disables the drop-early memory optimization so EVERY valid
-    // candidate keeps its permutation — required by the TELOS seed pool
-    // (0022), which needs the top-8 by value, not just the argmin. Retaining
-    // more can never change the argmin `accept` picks, so this is
-    // output-neutral; callers pass `true` only under the pool's small-matrix
-    // gates, where the retained permutations total a few MB.
-    keep_all: bool,
 ) -> Vec<CandOut> {
-    run_generic(
-        tasks.len(),
-        sp,
-        n,
-        nnz,
-        incumbent,
-        keep_all,
-        &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
+    run_generic(tasks.len(), sp, n, nnz, incumbent, false, &|i: usize| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
             Ok(Ok(perm_i32)) => Some(perm_i32.into_iter().map(|x| x as usize).collect()),
             _ => None,
-        },
-    )
+        }
+    })
 }
 
 /// Same as [`run_candidates`] for producers that already speak `Vec<usize>`.
@@ -171,18 +158,12 @@ fn run_perms_inner(
     incumbent: u64,
     keep_all: bool,
 ) -> Vec<CandOut> {
-    run_generic(
-        tasks.len(),
-        sp,
-        n,
-        nnz,
-        incumbent,
-        keep_all,
-        &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
+    run_generic(tasks.len(), sp, n, nnz, incumbent, keep_all, &|i: usize| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
             Ok(v) => v,
             Err(_) => None,
-        },
-    )
+        }
+    })
 }
 
 /// The shared engine: a lock-free `AtomicUsize` work queue over `len` tasks,
@@ -221,7 +202,11 @@ fn run_generic(
         CandOut {
             flops: Some(f),
             // Retain only while this candidate can still be the argmin.
-            perm: if keep_all || f <= prev { Some(perm) } else { None },
+            perm: if keep_all || f <= prev {
+                Some(perm)
+            } else {
+                None
+            },
         }
     };
     // Nothing inside `eval` should be able to unwind (the producers are
