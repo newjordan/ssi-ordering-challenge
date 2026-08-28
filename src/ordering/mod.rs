@@ -1469,7 +1469,12 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // `lt_1k` 0.90702 -> 0.90642 — and dismissed as small; at this stage of diminishing
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
-    let small_multi = if nnz <= 20_000 {
+    // On the composed iterative-RGSUB + pair + TELOS frontier, the 3M floor
+    // improves `1k_10k` but regresses `lt_1k` (0.893263 -> 0.893392). Keep the
+    // extra search in the measured winning bucket and retain the normal capped
+    // restart policy below n=1000, where downstream seeded phases can otherwise
+    // turn a better intermediate incumbent into a worse final basin (0020).
+    let small_multi = if n >= 1_000 && nnz <= 20_000 {
         (3_000_000 / nnz).clamp(1, 800)
     } else {
         0
