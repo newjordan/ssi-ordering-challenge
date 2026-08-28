@@ -135,6 +135,95 @@ fn probe_timing_and_score() {
     println!("WORST order() = {:.3} s", rows[0].0);
 }
 
+/// Stable full-corpus fingerprint for exact before/after equivalence checks.
+/// The FNV-style fold is deliberately independent of `DefaultHasher`, whose
+/// implementation is not a stable artifact format.  We print both the exact
+/// permutation fingerprint and the exact symbolic flop count so a runtime-only
+/// change has to preserve both on every public matrix.
+#[test]
+#[ignore]
+fn probe_output_fingerprints() {
+    let corpus = crate::corpus::corpus();
+    println!("FINGERPRINT\tmatrix\tn\tnnz\tperm_hash\tflops");
+    for (name, pat) in &corpus {
+        let perm = order(pat);
+        let mut hash = 0xcbf29ce484222325u64;
+        for &v in &perm {
+            hash ^= v as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let flops = flops_of(&scoring_pattern(pat), &perm);
+        println!(
+            "FINGERPRINT\t{name}\t{}\t{}\t{hash:016x}\t{flops}",
+            pat.n,
+            pat.nnz()
+        );
+    }
+}
+
+/// Isolated A/B for the runtime-only change: the old restart preparation
+/// allocated a vendor `usize` pattern plus fresh i32 casts on every seed; the
+/// candidate reuses the already-vendor-equivalent workspace and output Vecs.
+#[test]
+#[ignore]
+fn probe_relabel_buffer_reuse() {
+    let wanted = [
+        "crudeoil_lee1_07",
+        "ringpack_30_2",
+        "squfl030-150",
+        "nuclear10a",
+    ];
+    println!("REUSE\tmatrix\trestarts\told_ms\tnew_ms\tspeedup");
+    for (name, pat) in crate::corpus::corpus() {
+        if !wanted.contains(&name.as_str()) {
+            continue;
+        }
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let max_deg = probe_max_deg(&pat);
+        let restarts = relabel_restarts(
+            RELABEL_BUDGET,
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            max_deg,
+        );
+        let sp = scoring_pattern(&pat);
+
+        let mut best_old = f64::INFINITY;
+        let mut best_new = f64::INFINITY;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for r in 0..restarts {
+                let q = relabel(n, r as u64 + 1);
+                let b = permute_pattern(&sp, &q);
+                let cp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let ri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                std::hint::black_box((&cp, &ri));
+            }
+            best_old = best_old.min(t0.elapsed().as_secs_f64());
+
+            let mut ws = ScoreWorkspace::new(n, nnz);
+            let mut q = Vec::with_capacity(n);
+            let mut cp = Vec::with_capacity(n + 1);
+            let mut ri = Vec::with_capacity(nnz);
+            let t0 = Instant::now();
+            for r in 0..restarts {
+                relabel_into(&mut q, n, r as u64 + 1);
+                ws.permute_i32_into(&sp, &q, &mut cp, &mut ri);
+                std::hint::black_box((&cp, &ri));
+            }
+            best_new = best_new.min(t0.elapsed().as_secs_f64());
+        }
+        println!(
+            "REUSE\t{name}\t{restarts}\t{:.3}\t{:.3}\t{:.3}",
+            1000.0 * best_old,
+            1000.0 * best_new,
+            best_old / best_new
+        );
+    }
+}
+
 /// List the matrices where the current `order()` is still tied at (or above)
 /// the AMD baseline. Every tie is pure upside for a new candidate, so this is
 /// the target list for the next experiment.
