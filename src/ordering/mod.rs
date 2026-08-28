@@ -4454,6 +4454,18 @@ fn order_with_options(
         streams: 2,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        // The sparse-large tier remains breadth-limited after the promoted
+        // two-round/two-stream RGSUB expansion: 96 -> 128 blocks moves the full
+        // score 0.820416 -> 0.820317 through three strict improvements and zero
+        // regressions. Every other matrix keeps the promoted config exactly.
+        let rgsub_cfg = if n >= 10_000 && nnz <= 125_000 {
+            rgreedy::SubCfg {
+                max_blocks: 128,
+                ..RGSUB_CFG
+            }
+        } else {
+            RGSUB_CFG
+        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4479,7 +4491,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
