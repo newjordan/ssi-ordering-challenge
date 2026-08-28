@@ -3778,3 +3778,116 @@ fn probe_biconn_heavy() {
 fn probe_max_deg(pat: &Pattern) -> usize {
     (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
 }
+
+/// TOP-K TELOS SWEEP (experiment 0021, from 0020's seed-sensitivity finding).
+/// For every matrix inside the TELOS nnz gate, run the WHOLE `order()` at
+/// several extra-seed counts K (via the `TELOS_EXTRA_OVERRIDE` test hook; the
+/// shipped gate stays untouched) and report the final flops ratio and wall
+/// time at each K. The ratio columns are exact and load-independent; the
+/// SECONDS columns carry the recorded ~1.6x run-to-run variance plus any
+/// concurrent load — size the shipped gate from an isolated re-measurement of
+/// the chosen config, never from a contended sweep (0004/0019 rule).
+///
+/// Env: `SSI_TOPK_KS=0,1,3,7` (default) picks the K grid;
+/// `SSI_PROBE_SHARD=i/m` shards the corpus; `SSI_MAX_PROBE_NNZ` caps nnz.
+#[test]
+#[ignore]
+fn probe_topk_telos() {
+    let shard = std::env::var("SSI_PROBE_SHARD")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('/')?;
+            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+        })
+        .unwrap_or((0, 1));
+    let ks: Vec<usize> = std::env::var("SSI_TOPK_KS")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|| vec![0, 1, 3, 7]);
+    let max_nnz: usize = std::env::var("SSI_MAX_PROBE_NNZ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TELOS_MAX_NNZ);
+    let corpus = crate::corpus::corpus();
+
+    let mut hdr = String::from("TOPK\tmatrix\tn\tnnz\tmaxdeg");
+    for k in &ks {
+        hdr.push_str(&format!("\tr@{k}"));
+    }
+    for k in &ks {
+        hdr.push_str(&format!("\ts@{k}"));
+    }
+    println!("{hdr}");
+
+    // Per-K aggregate vs the K=0 column: matrices strictly improved / worsened
+    // and the summed ln-ratio delta (negative = better), per bucket.
+    let mut better = vec![[0usize; 3]; ks.len()];
+    let mut worse = vec![[0usize; 3]; ks.len()];
+    let mut dln = vec![[0.0f64; 3]; ks.len()];
+
+    for (idx, (name, pat)) in corpus.iter().enumerate() {
+        if idx % shard.1 != shard.0 {
+            continue;
+        }
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if nnz == 0 || nnz >= TELOS_MAX_NNZ || nnz >= max_nnz {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let max_deg = probe_max_deg(pat);
+
+        let mut ratios: Vec<f64> = Vec::with_capacity(ks.len());
+        let mut secs: Vec<f64> = Vec::with_capacity(ks.len());
+        for &k in &ks {
+            TELOS_EXTRA_OVERRIDE.with(|c| c.set(Some(k)));
+            let t0 = Instant::now();
+            let perm = order(pat);
+            secs.push(t0.elapsed().as_secs_f64());
+            ratios.push(flops_of(&sp, &perm) as f64 / base);
+        }
+        TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
+
+        let b = bucket(n);
+        for (i, &r) in ratios.iter().enumerate() {
+            if r < ratios[0] - 1e-15 {
+                better[i][b] += 1;
+            } else if r > ratios[0] + 1e-15 {
+                worse[i][b] += 1;
+            }
+            dln[i][b] += (r / ratios[0]).ln();
+        }
+
+        let mut row = format!("TOPK\t{name}\t{n}\t{nnz}\t{max_deg}");
+        for r in &ratios {
+            row.push_str(&format!("\t{r:.6}"));
+        }
+        for s in &secs {
+            row.push_str(&format!("\t{s:.4}"));
+        }
+        println!("{row}");
+    }
+
+    println!("\n--- aggregate vs K=0 (per bucket: better/worse, sum dln) ---");
+    for (i, &k) in ks.iter().enumerate() {
+        for b in 0..3 {
+            println!(
+                "K={k}\t{}\tbetter={}\tworse={}\tsum_dln={:+.6}",
+                BUCKET_NAMES[b], better[i][b], worse[i][b], dln[i][b]
+            );
+        }
+    }
+}

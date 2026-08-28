@@ -10,16 +10,24 @@ their own (a submission must *strictly* beat the frontier — a 0.00% diff is re
 which is exactly the frontier holder's own recent streak). Attach the next one of
 these to the next scoring win, at zero extra measurement cost:
 
-- **`RELABEL_BUDGET` 300_000 → 150_000.** Score **identical** (0.842722, every bucket
-  unchanged) and worst-case `order()` **1.858 s → 1.832 s**, i.e. +0.026 s of margin
-  against the 2.0 s SIGKILL. Measured in the 8-policy sweep in
-  [0017](experiments/0017-relabel-budget-saturation.md). Matters because the shipped
-  frontier config runs at **93% of the cap** while local run-to-run variance is
-  recorded at ~1.6× and grader timing is invisible — a FAIL scores nothing at all,
-  not merely worse. One-line change; do not re-measure, just carry it.
+- ~~**`RELABEL_BUDGET` 300_000 → 150_000.**~~ **DEAD as of
+  [0021](experiments/0021-topk-telos-seeding.md)** — on the top-K-TELOS tree this
+  change costs **+0.002051** (all in gt_10k): the restart pool is now the TELOS seed
+  NURSERY, and halving it deletes the seeds (nuclear10a's among them) the new phase
+  feeds on. 0017's score-neutrality was real on the pre-0021 tree and is refuted on
+  this one. General rule: re-measure every pre-0021 "score-neutral" claim about
+  anything upstream of `consider` before carrying it — candidate-pool changes now
+  have a second, pool-shaped consequence.
 
 ## Current best
-- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.840107** ([0021](experiments/0021-topk-telos-seeding.md), top-K
+  TELOS seeding with LIGHT extra descents: descend from the incumbent + up to 3
+  retained `consider` seeds in three gated regimes, extras on the Tier-B grid; worst
+  order() **1.208 s** vs the untouched frontier's 1.254 s on the same box — NOTE that
+  box is ~1.45× faster than the one older pages' timings were recorded on, so compare
+  timings only within one box. The full-grid variant scored dev 0.839362 but FAILED
+  the grader's cap on a hidden matrix — read 0021's postscript before widening). Previous: dev
+  **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -97,6 +105,18 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0021-topk-telos-seeding.md](experiments/0021-topk-telos-seeding.md) — **WIN, dev
+  0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
+  FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:
+  TELOS descends from the incumbent + up to 3 retained top-8 `consider` seeds
+  (seed-local descents, strict-`<` merge, AMD floor intact; extras on the light Tier-B
+  grid), gated `nnz<=20k` / `20k–55k` hub-gated / `150k–200k` hub-gated. nuclear10a
+  0.996→0.758 survives light extras; chp_shorttermplan2d's 0.515→0.484 needs full-grid
+  extras and is sacrificed for cap safety. Worst order() 1.254→1.208 s (same box);
+  light extras: 8 better / 0 worse corpus-wide.
+  ⚠️ kills the 0017 free rider (+0.002051 on this tree) — the restart pool is now the
+  TELOS seed nursery. Opens: top-K for MINL/ORBIT/PHARMAKOS; a cheap/expensive-descent
+  discriminator to reopen full-grid extras where affordable.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
