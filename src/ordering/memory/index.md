@@ -1,5 +1,7 @@
 # Index
 
+- [2026-08-29-campaign-ledger.md](2026-08-29-campaign-ledger.md) - authoritative 10-UUID campaign ledger, in-flight state, frontier, and exact resume action.
+
 The map of the knowledge base. One line per page, grouped by type. Read this
 first; keep it current whenever you add, rename, or retire a page.
 
@@ -97,7 +99,8 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
-- [0024-adjacent-pair-descent.md](experiments/0024-adjacent-pair-descent.md) - **READY_FOR_SLOT.** Final post-TELOS exact adjacent-pair descent uses a two-pivot residual-graph identity, bounded deterministic replay, trusted strict adoption, focused 4/4 tests, and sandboxed worker verification on `70a7701`.
+- [0025-simplicial-promotion.md](experiments/0025-simplicial-promotion.md) - **READY_FOR_SLOT.** Final non-adjacent simplicial promotion crosses an adjacent-swap plateau with a proved zero-fill move; fixed `30->23` witness, 96 property cases, focused 4/4 plus adjacent-pair regression 4/4, and sandbox worker pass on `33034d6`.
+- [0024-adjacent-pair-descent.md](experiments/0024-adjacent-pair-descent.md) - **TERMINAL promoted** as `a6439d59-5067-42cd-ad7c-5c1640414ba6`: official `0.827559`, fill `0.936716`, diff `-0.000114`, promoted source `33034d6`. Final post-TELOS exact adjacent-pair descent transferred to hidden matrices and passed the cap.
 - [0023-disconnected-component-fusion.md](experiments/0023-disconnected-component-fusion.md) - **TERMINAL rejected / CLOSED** as `aa9439ab-b9f5-4fff-af9a-7a51a76ce730`, official `0.828335` versus advanced frontier `0.827815`. Final-stage AMD/incumbent fusion was displayed score-neutral to its `26b1103` base and did not transfer sufficient hidden gain; do not redraw.
 - [0022-articulation-aware-child-block-amd.md](experiments/0022-articulation-aware-child-block-amd.md) - **TERMINAL failed before CI/no score; exact retry declined.** Plain biconnected child blocks retain their parent articulation during local AMD and project it out afterward; default-path causal reach and worker safety verified, representative local cohort flat/inconclusive. The UUID created no public branch or workflow, so this is not performance evidence.
 - [0021-dual-telos-hidden-timeout.md](experiments/0021-dual-telos-hidden-timeout.md) - **CLOSED, OFFICIAL-TERMINAL failed/no score.** Bounded pre-floor dual-TELOS improved the paired 21-pattern dev cohort but exceeded the hidden 2-second cap; do not redraw this axis.

@@ -66,6 +66,15 @@ fn below(s: &mut u64, m: u32) -> u32 {
     ((xs64(s) >> 32) * (m as u64) >> 32) as u32
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Proves that the shipped `order()` path reaches the final promotion
+    /// phase without exposing a production-global mutable counter.
+    pub(crate) static SIMPLICIAL_PROMOTION_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// The elimination game on a bitset fill graph.
 ///
 /// Invariant: `adj[u]` holds exactly `u`'s neighbours in the CURRENT fill graph
@@ -250,6 +259,133 @@ impl<'a> Game<'a> {
         }
         f
     }
+}
+
+/// Promote a provably zero-fill future pivot across a bounded prefix of the
+/// incumbent ordering.
+///
+/// At prefix `k`, a live vertex with deficiency zero is simplicial in the
+/// current fill graph: eliminating it now creates no edges.  We promote it only
+/// when it is adjacent to the planned pivot and has strictly smaller live
+/// degree.  Bubble the simplicial vertex left across the intervening block:
+/// non-edge crossings are neutral, edge crossings are non-increasing, and the
+/// final crossing over the planned pivot is strictly improving.  The relative
+/// order of every other pivot is kept intact.  Ties use
+/// `(degree, future position, vertex id)`.
+///
+/// This is deliberately a candidate builder, not an admission oracle.  The
+/// caller must still validate the bijection and re-score the completed order
+/// through the trusted symbolic path, accepting only a strict improvement.
+/// Every bitset operation after construction is covered by `ops_budget`; if
+/// the next atomic deficiency/elimination step would cross it, the WHOLE
+/// candidate fails closed.
+pub(crate) fn simplicial_promotion(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    lookahead: usize,
+    promotion_cap: usize,
+    ops_budget: i64,
+) -> Option<Vec<usize>> {
+    #[cfg(test)]
+    SIMPLICIAL_PROMOTION_CALLS.with(|c| c.set(c.get() + 1));
+
+    if n < 3
+        || seed.len() != n
+        || col_ptr.len() != n + 1
+        || lookahead < 2
+        || promotion_cap == 0
+        || ops_budget <= 0
+    {
+        return None;
+    }
+    if col_ptr[0] != 0 || col_ptr[n] != row_idx.len() || col_ptr.windows(2).any(|w| w[0] > w[1]) {
+        return None;
+    }
+    let mut seen = vec![false; n];
+    for &v in seed {
+        if v >= n || seen[v] {
+            return None;
+        }
+        seen[v] = true;
+    }
+
+    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
+    let mut game = Game::new(n, &adj0)?;
+    game.reset();
+    if game.ops > ops_budget {
+        return None;
+    }
+
+    let mut order = seed.to_vec();
+    let mut changed = false;
+    let mut promotions = 0usize;
+    for k in 0..n {
+        let current = order[k];
+        let current_degree = game.deg[current];
+        let end = k
+            .saturating_add(1)
+            .saturating_add(lookahead)
+            .min(n);
+        let mut best: Option<(u32, usize, usize)> = None;
+
+        // Distance one is intentionally excluded: this phase is a batch move
+        // across an adjacent-swap plateau, never a duplicate adjacent-pair
+        // descent step.
+        for j in k.saturating_add(2)..end {
+            let v = order[j];
+            let degree = game.deg[v];
+            if degree >= current_degree {
+                continue;
+            }
+
+            // The adjacency to the current pivot is the strict certificate;
+            // charge the one-word membership probe before performing it.
+            if game.ops.saturating_add(1) > ops_budget {
+                return None;
+            }
+            game.ops += 1;
+            let adjacent = game.adj[v * game.w + (current >> 6)]
+                & (1u64 << (current & 63))
+                != 0;
+            if !adjacent {
+                continue;
+            }
+
+            // `deficiency`'s charged work is exact and depends only on the
+            // current degree and bitset width, so reserve it before entering
+            // the atomic operation instead of detecting an overshoot after it.
+            let charge = (degree as i64 + 1) * (2 * game.w as i64 + 4);
+            if game.ops.saturating_add(charge) > ops_budget {
+                return None;
+            }
+            if game.deficiency(v) == 0 {
+                let key = (degree, j, v);
+                if best.is_none_or(|old| key < old) {
+                    best = Some(key);
+                }
+            }
+        }
+
+        if let Some((_, j, _)) = best {
+            order[k..=j].rotate_right(1);
+            changed = true;
+            promotions += 1;
+            if promotions == promotion_cap {
+                return Some(order);
+            }
+        }
+
+        let pivot = order[k];
+        let charge = (game.deg[pivot] as i64 + 1) * (3 * game.w as i64 + 6) + 24;
+        if game.ops.saturating_add(charge) > ops_budget {
+            return None;
+        }
+        game.eliminate(pivot);
+    }
+
+    changed.then_some(order)
 }
 
 /// A pivot policy: pick uniformly among the live vertices whose degree is

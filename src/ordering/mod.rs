@@ -926,6 +926,27 @@ const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 const PAIR_DESCENT_SWEEPS: usize = 2;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
 
+/// Final simplicial-promotion sibling.  The `n` cap bounds the two bitset
+/// adjacency copies to ~4 MiB, while the sparse-ratio/`nnz` gates keep both
+/// construction and the final trusted scoring pass away from the frontier's
+/// dense slow cases.  Inside the phase, every dynamic-fill word operation is
+/// separately bounded by `SIMPLICIAL_PROMOTION_OPS_BUDGET`.
+const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
+const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ_PER_VERTEX: usize = 24;
+const SIMPLICIAL_PROMOTION_LOOKAHEAD: usize = 16;
+const SIMPLICIAL_PROMOTION_MAX_PROMOTIONS: usize = 256;
+const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
+
+#[inline]
+fn simplicial_promotion_reachable(n: usize, nnz: usize) -> bool {
+    (SIMPLICIAL_PROMOTION_MIN_N..=SIMPLICIAL_PROMOTION_MAX_N).contains(&n)
+        && nnz > 0
+        && nnz <= SIMPLICIAL_PROMOTION_MAX_NNZ
+        && nnz <= n.saturating_mul(SIMPLICIAL_PROMOTION_MAX_NNZ_PER_VERTEX)
+}
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -4333,7 +4354,8 @@ fn order_with_options(
     // The theorem and internal accumulator are not trusted for admission:
     // malformed input, a hard-op-budget exit, or no swap returns None; any
     // candidate must still be a bijection and beat the existing FINAL score
-    // through the shared exact scorer. No downstream phase consumes it.
+    // through the shared exact scorer. Only the final strict sibling below
+    // consumes its accepted incumbent; no earlier frontier phase is changed.
     if n >= PAIR_DESCENT_MIN_N
         && n <= PAIR_DESCENT_MAX_N
         && nnz > 0
@@ -4359,6 +4381,47 @@ fn order_with_options(
 
     #[cfg(test)]
     parallel::phase_mark("10.pair_descent", _tp10);
+
+    #[cfg(test)]
+    let _tp11 = std::time::Instant::now();
+    // ── FINAL SIMPLICIAL PROMOTION (proof-directed strict sibling) ─────
+    // Replay the post-adjacent-pair FINAL incumbent in the exact elimination
+    // game. Within a 16-pivot lookahead (distance >= 2), promote only a live
+    // vertex whose neighbourhood is already a clique (`deficiency == 0`),
+    // which is adjacent to the planned pivot, and whose live degree is strictly
+    // smaller. The non-local move can cross a plateau of individually
+    // non-improving adjacent swaps while preserving every other pivot's
+    // relative order, so it is not another adjacent-pair descent step or a
+    // from-scratch min-fill/RGreedy search.
+    //
+    // It is intentionally LAST: watcher, parallel RGreedy, final TELOS and the
+    // promoted adjacent-pair phase all keep their existing inputs and behavior.
+    // The exact-game proof only proposes a candidate; safety comes from the
+    // same bijection guard and trusted symbolic scorer used by the rest of this
+    // file, with STRICT `<` acceptance. Any malformed input or operation-budget
+    // exhaustion returns `None` and leaves the adjacent-pair incumbent intact.
+    if simplicial_promotion_reachable(n, nnz) {
+        if let Some(cand) = rgreedy::simplicial_promotion(
+            n,
+            &pattern.col_ptr,
+            &pattern.row_idx,
+            &best_perm,
+            SIMPLICIAL_PROMOTION_LOOKAHEAD,
+            SIMPLICIAL_PROMOTION_MAX_PROMOTIONS,
+            SIMPLICIAL_PROMOTION_OPS_BUDGET,
+        ) {
+            if is_bijection(&cand, n) {
+                let f = ws.flops(scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    parallel::phase_mark("11.simplicial_promotion", _tp11);
     let _ = best_flops;
 
     best_perm
@@ -5818,6 +5881,177 @@ mod tests {
             assert!(v < n && !seen[v], "not a bijection of 0..{n}");
             seen[v] = true;
         }
+    }
+
+    #[test]
+    fn simplicial_promotion_crosses_an_adjacent_swap_plateau_and_strictly_improves() {
+        // Biconnected witness: K4 minus edge (2,3).  Seed [0,1,2,3] costs 30;
+        // each of its three one-position swaps also costs 30, so strict
+        // adjacent-pair descent is stuck.  Vertex 2 is simplicial, adjacent to
+        // pivot 0 and has degree 2 < 3; promoting it across vertex 1 reaches
+        // [2,0,1,3], which costs 23.
+        let pat = Pattern::from_edges(4, &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3)]);
+        let seed = vec![0, 1, 2, 3];
+        let cand = rgreedy::simplicial_promotion(
+            pat.n,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            4,
+            8,
+            1_000_000,
+        )
+        .expect("biconnected witness must expose a strict zero-fill promotion");
+
+        assert_eq!(cand, vec![2, 0, 1, 3]);
+        assert_bijection(&cand, pat.n);
+        let scoring = ScoringPattern {
+            n: pat.n,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        };
+        let seed_flops = flops_of(&scoring, &seed);
+        assert_eq!(seed_flops, 30);
+        for i in 0..seed.len() - 1 {
+            let mut adjacent = seed.clone();
+            adjacent.swap(i, i + 1);
+            assert_eq!(
+                flops_of(&scoring, &adjacent),
+                seed_flops,
+                "single adjacent swap {i} unexpectedly escapes the plateau"
+            );
+        }
+        assert_eq!(flops_of(&scoring, &cand), 23);
+        assert_eq!(
+            Some(cand),
+            rgreedy::simplicial_promotion(
+                pat.n,
+                &pat.col_ptr,
+                &pat.row_idx,
+                &seed,
+                4,
+                8,
+                1_000_000,
+            ),
+            "the candidate builder must be deterministic"
+        );
+    }
+
+    #[test]
+    fn simplicial_promotion_is_score_safe_on_small_graphs() {
+        // Property-style exact check over varied connected/disconnected sparse
+        // graphs and arbitrary seed permutations.  Every emitted candidate has
+        // an adjacency + degree-gap certificate, so even the helper must be
+        // strictly better; the production caller independently re-proves `<`.
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        let mut produced = 0usize;
+        for case in 0..96 {
+            let n = 4 + case % 9;
+            let mut edges = Vec::new();
+            for u in 0..n {
+                for v in u + 1..n {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    if rng & 7 == 0 {
+                        edges.push((u, v));
+                    }
+                }
+            }
+            let pat = Pattern::from_edges(n, &edges);
+            let mut seed: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                seed.swap(i, (rng as usize) % (i + 1));
+            }
+            let Some(cand) = rgreedy::simplicial_promotion(
+                n,
+                &pat.col_ptr,
+                &pat.row_idx,
+                &seed,
+                8,
+                32,
+                5_000_000,
+            ) else {
+                continue;
+            };
+            produced += 1;
+            assert_bijection(&cand, n);
+            let scoring = ScoringPattern {
+                n,
+                col_ptr: pat.col_ptr.clone(),
+                row_idx: pat.row_idx.clone(),
+            };
+            assert!(
+                flops_of(&scoring, &cand) < flops_of(&scoring, &seed),
+                "certified zero-fill promotion was not strict in case {case}"
+            );
+        }
+        assert!(produced > 0, "property sweep must exercise the candidate path");
+    }
+
+    #[test]
+    fn simplicial_promotion_fails_closed_on_edge_inputs() {
+        let singleton = Pattern::from_edges(1, &[]);
+        assert!(rgreedy::simplicial_promotion(
+            1,
+            &singleton.col_ptr,
+            &singleton.row_idx,
+            &[0],
+            4,
+            8,
+            10_000,
+        )
+        .is_none());
+
+        let path = Pattern::from_edges(3, &[(0, 1), (1, 2)]);
+        assert!(rgreedy::simplicial_promotion(
+            3,
+            &path.col_ptr,
+            &path.row_idx,
+            &[0, 0, 2],
+            4,
+            8,
+            10_000,
+        )
+        .is_none());
+        assert!(rgreedy::simplicial_promotion(
+            3,
+            &path.col_ptr,
+            &path.row_idx,
+            &[1, 0, 2],
+            4,
+            8,
+            1,
+        )
+        .is_none());
+        assert!(rgreedy::simplicial_promotion(
+            3,
+            &[0, 2, 1, path.row_idx.len()],
+            &path.row_idx,
+            &[1, 0, 2],
+            4,
+            8,
+            10_000,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn simplicial_promotion_is_reached_by_default_order_path() {
+        let n = SIMPLICIAL_PROMOTION_MIN_N;
+        let edges: Vec<(usize, usize)> = (0..n - 1).map(|v| (v, v + 1)).collect();
+        let pat = Pattern::from_edges(n, &edges);
+        assert!(simplicial_promotion_reachable(n, pat.nnz()));
+
+        rgreedy::SIMPLICIAL_PROMOTION_CALLS.with(|c| c.set(0));
+        let got = order(&pat);
+        assert_bijection(&got, n);
+        rgreedy::SIMPLICIAL_PROMOTION_CALLS.with(|c| {
+            assert_eq!(c.get(), 1, "default order() must invoke the final phase")
+        });
     }
 
     /// PROOF OF OUTPUT NEUTRALITY for the cap-safety merge's cost-reduction

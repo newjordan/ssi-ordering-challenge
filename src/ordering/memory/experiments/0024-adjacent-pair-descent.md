@@ -3,8 +3,11 @@
 - **Date:** 2026-08-29
 - **Base:** `70a7701`
 - **Candidate:** `865903f`
-- **Funnel state:** **READY_FOR_SLOT**
-- **Evidence state:** verified-correct and worker-verified; performance is a hypothesis
+- **Funnel state:** **TERMINAL promoted — LEARNED**
+- **Yukon UUID:** `a6439d59-5067-42cd-ad7c-5c1640414ba6`
+- **Official score:** `0.827559`, fill `0.936716`, official diff `-0.000114`
+- **Promoted source:** `33034d6`
+- **Evidence state:** verified-correct, worker-verified, and official-terminal positive
 
 ## Mechanism
 
@@ -72,3 +75,11 @@ Numerical non-regression for completed calls is structural because the phase is
 last and uses trusted strict adoption. Hidden activation frequency and benefit
 remain a **HYPOTHESIS**; no public aggregate is claimed. Yukon terminal is the
 official performance and hidden-cap authority.
+
+## Official terminal result
+
+Yukon promoted UUID `a6439d59-5067-42cd-ad7c-5c1640414ba6` at FLOPS score
+`0.827559` and fill tiebreak `0.936716`, an official improvement of `0.000114`
+over the immediately preceding live frontier. The exact adjacent-pair identity
+therefore transferred to hidden matrices and completed inside the hidden cap.
+Promoted source `33034d6` is now the campaign base.
