@@ -1187,6 +1187,16 @@ pub(crate) fn subtree_refine(
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         for k in 0..cfg.streams.max(1) {
+                            // Preserve the two-stream, same-budget envelope but
+                            // give the second subtree search the independent seed
+                            // that transferred in the promoted whole-matrix PEP
+                            // selector. Keep `stream_params(k)`: this experiment
+                            // changes trajectory only, not the prefix policy.
+                            let rng_seed = if k == 1 {
+                                0xD1B5_4A32_D192_ED03
+                            } else {
+                                stream_rng(k)
+                            };
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1194,7 +1204,7 @@ pub(crate) fn subtree_refine(
                                 &seed,
                                 seed_flops,
                                 cfg.budget,
-                                stream_rng(k),
+                                rng_seed,
                                 stream_params(k),
                             );
                             if let Some((o, f)) = r {
