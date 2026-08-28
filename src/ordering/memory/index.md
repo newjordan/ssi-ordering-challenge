@@ -97,6 +97,10 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0024-adjacent-pair-descent.md](experiments/0024-adjacent-pair-descent.md) - **READY_FOR_SLOT.** Final post-TELOS exact adjacent-pair descent uses a two-pivot residual-graph identity, bounded deterministic replay, trusted strict adoption, focused 4/4 tests, and sandboxed worker verification on `70a7701`.
+- [0023-disconnected-component-fusion.md](experiments/0023-disconnected-component-fusion.md) - **TERMINAL rejected / CLOSED** as `aa9439ab-b9f5-4fff-af9a-7a51a76ce730`, official `0.828335` versus advanced frontier `0.827815`. Final-stage AMD/incumbent fusion was displayed score-neutral to its `26b1103` base and did not transfer sufficient hidden gain; do not redraw.
+- [0022-articulation-aware-child-block-amd.md](experiments/0022-articulation-aware-child-block-amd.md) - **TERMINAL failed before CI/no score; exact retry declined.** Plain biconnected child blocks retain their parent articulation during local AMD and project it out afterward; default-path causal reach and worker safety verified, representative local cohort flat/inconclusive. The UUID created no public branch or workflow, so this is not performance evidence.
+- [0021-dual-telos-hidden-timeout.md](experiments/0021-dual-telos-hidden-timeout.md) - **CLOSED, OFFICIAL-TERMINAL failed/no score.** Bounded pre-floor dual-TELOS improved the paired 21-pattern dev cohort but exceeded the hidden 2-second cap; do not redraw this axis.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
