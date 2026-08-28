@@ -38,6 +38,44 @@
 
 #![allow(dead_code)]
 
+fn rank_product(value: u64, value_power: usize, len: usize, len_power: usize) -> [u64; 6] {
+    fn mul(words: &mut [u64; 6], factor: u64) {
+        let mut carry = 0u128;
+        for word in words.iter_mut() {
+            let product = *word as u128 * factor as u128 + carry;
+            *word = product as u64;
+            carry = product >> 64;
+        }
+        debug_assert_eq!(carry, 0);
+    }
+
+    let mut product = [0u64; 6];
+    product[0] = 1;
+    for _ in 0..value_power {
+        mul(&mut product, value);
+    }
+    for _ in 0..len_power {
+        mul(&mut product, len as u64);
+    }
+    product
+}
+
+fn rank_alpha_three_quarters_cmp(
+    a: &(usize, usize, u64),
+    b: &(usize, usize, u64),
+) -> std::cmp::Ordering {
+    let len_a = a.1 + 1 - a.0;
+    let len_b = b.1 + 1 - b.0;
+    let b_cross = rank_product(b.2, 4, len_a, 3);
+    let a_cross = rank_product(a.2, 4, len_b, 3);
+    b_cross
+        .iter()
+        .rev()
+        .cmp(a_cross.iter().rev())
+        .then_with(|| b.2.cmp(&a.2))
+        .then_with(|| b.1.cmp(&a.1))
+}
+
 /// Largest `n` this module will allocate for. Memory is `2 · n · ⌈n/64⌉ · 8`
 /// bytes (two bitset adjacency copies) = ~`n²/4` bytes; at 4000 that is 4 MB,
 /// far inside the 4 GiB worker cap. The SHIPPED gate at the call site is much
@@ -1068,6 +1106,11 @@ pub(crate) fn subtree_refine(
     parent: &[i32],
     cfg: SubCfg,
 ) -> usize {
+    // Spend the ranked large-matrix budget on more D1 basins without adding
+    // trajectories: 32 blocks get both streams and the next 64 get D1 only.
+    let split_ranked_streams =
+        n >= 10_000 && cfg.rank_blocks && cfg.max_blocks == 64 && cfg.streams == 2;
+
     // ── subtree sizes and their contiguous postorder blocks ─────────────────
     // Postorder ⇒ every child precedes its parent, so one ascending sweep
     // accumulates sizes.
@@ -1098,9 +1141,36 @@ pub(crate) fn subtree_refine(
             *c = true;
         }
         blocks.push((a, j));
-        if blocks.len() >= cfg.max_blocks {
+        if !cfg.rank_blocks && blocks.len() >= cfg.max_blocks {
             break;
         }
+    }
+    if cfg.rank_blocks {
+        let mut ranked: Vec<(usize, usize, u64)> = blocks
+            .drain(..)
+            .map(|(a, b)| {
+                let contribution = counts[a..=b]
+                    .iter()
+                    .map(|&c| {
+                        let c = c as u64;
+                        c * c
+                    })
+                    .sum();
+                (a, b, contribution)
+            })
+            .collect();
+        ranked.sort_by(rank_alpha_three_quarters_cmp);
+        let ranked_limit = if split_ranked_streams {
+            96
+        } else {
+            cfg.max_blocks
+        };
+        blocks.extend(
+            ranked
+                .into_iter()
+                .take(ranked_limit)
+                .map(|(a, b, _)| (a, b)),
+        );
     }
     if blocks.is_empty() {
         return 0;
@@ -1127,6 +1197,7 @@ pub(crate) fn subtree_refine(
                     let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
                     let mut bi = t;
                     while bi < blocks_ro.len() {
+                        let block_rank = bi;
                         let (a, b) = blocks_ro[bi];
                         bi += nthreads;
                         let ssz = b + 1 - a;
@@ -1186,7 +1257,17 @@ pub(crate) fn subtree_refine(
                             .sum();
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
-                        for k in 0..cfg.streams.max(1) {
+                        let first_stream =
+                            usize::from(split_ranked_streams && block_rank >= 32);
+                        for k in first_stream..cfg.streams.max(1) {
+                            // Keep the same two searches and uniform-prefix
+                            // stream-1 policy, but use PEP's promoted second
+                            // seed to sample an independent subtree basin.
+                            let rng_seed = if n >= 10_000 && k == 1 {
+                                0xD1B5_4A32_D192_ED03
+                            } else {
+                                stream_rng(k)
+                            };
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1194,7 +1275,7 @@ pub(crate) fn subtree_refine(
                                 &seed,
                                 seed_flops,
                                 cfg.budget,
-                                stream_rng(k),
+                                rng_seed,
                                 stream_params(k),
                             );
                             if let Some((o, f)) = r {
@@ -1246,4 +1327,7 @@ pub(crate) struct SubCfg {
     /// Streams per block (sequential here; the caller parallelises over
     /// blocks, which is the coarser and cheaper axis).
     pub(crate) streams: usize,
+    /// Select blocks by exact incumbent objective contribution divided by
+    /// subtree size to the three-quarter power.
+    pub(crate) rank_blocks: bool,
 }

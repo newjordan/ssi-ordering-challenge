@@ -4671,27 +4671,14 @@ fn order_with_options(
         && nnz <= RGREEDY_MAX_NNZ
         && nnz <= RGREEDY_MAX_AVG_DEG * n;
     if rgreedy_enabled && n <= RGREEDY_MAX_N && (rgreedy_pep_gate || rgreedy_rgs_gate) {
-        // Policy information is concentrated in the graph's mean degree. On
-        // the local corpus, Rényi-2 degree/signature collisions and a GF(2)
-        // neighborhood-sketch rank add no out-of-sample predictive value, but
-        // this one-threshold rule survives both leave-one-out and five-fold
-        // validation. Keep the incumbent varied policy above the PEP tier;
-        // inside it, sparse graphs get its broader mix of search policies.
-        let sparse_policy = nnz.saturating_mul(40) <= n.saturating_mul(207);
-        let use_default = rgreedy_pep_gate && !sparse_policy;
-        let budget = if rgreedy_pep_gate {
-            RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor)
-        } else {
-            RGREEDY_BUDGET.max(rgreedy_slack_floor)
-        };
-        let found = if use_default {
+        let found = if rgreedy_pep_gate {
             rgreedy::search_par_default_seeds(
                 n,
                 &pattern.col_ptr,
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                budget,
+                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
             )
         } else {
             rgreedy::search_par(
@@ -4700,7 +4687,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                budget,
+                RGREEDY_BUDGET.max(rgreedy_slack_floor),
                 0x9E37_79B9_7F4A_7C15,
             )
         };
@@ -4841,8 +4828,23 @@ fn order_with_options(
         max_blocks: 96,
         budget: 5_000_000,
         streams: 2,
+        rank_blocks: false,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        // Sparse-large RGSUB is breadth-limited, but postorder position is an
+        // arbitrary way to spend that breadth. Rank eligible disjoint blocks
+        // by exact incumbent contribution divided by subtree size^(3/4). This
+        // preserves the fixed trajectory count while balancing total block
+        // value against search breadth.
+        let rgsub_cfg = if n >= 10_000 && nnz <= RGSUB_MAX_NNZ {
+            rgreedy::SubCfg {
+                max_blocks: 64,
+                rank_blocks: true,
+                ..RGSUB_CFG
+            }
+        } else {
+            RGSUB_CFG
+        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4868,7 +4870,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
