@@ -367,6 +367,107 @@ impl ScoreWorkspace {
         self.build_postorder_and_first();
         self.column_counts_gnp_flops()
     }
+
+    /// Per-position predicted-flop signal `c_j²` for `perm` on `pat`, plus
+    /// the total `Σ c_j²` — the WORKSPACE-EQUIVALENT of `flops_of`, with one
+    /// extra O(n) buffer the caller can read for per-vertex tiebreak signals.
+    ///
+    /// Reuses the same three-stage pipeline (`permute → etree → GNP`); the
+    /// only difference from [`flops`] is that the per-vertex `c_j²` is
+    /// written into `out_pos_sq` (a length-`n` `Vec<u64>`) BEFORE the
+    /// total is summed, so the caller sees the per-bucket deltas the
+    /// quotient-graph AMD tiebreak in `mod.rs` reads to bias the relabel
+    /// toward lower-flop positions.
+    ///
+    /// Deterministic: every input is a pure function of `(pat, perm)`, every
+    /// buffer is fully overwritten (see [`flops`]), so the per-position
+    /// signal is byte-identical to a hypothetical `let c = counts; let
+    /// out = c.iter().map(|x| (x as u64).pow(2)).collect();` invocation.
+    /// The output `out_pos_sq` is cleared and resized to `n`.
+    pub(crate) fn flops_per_position(
+        &mut self,
+        pat: &ScoringPattern,
+        perm: &[usize],
+        out_pos_sq: &mut Vec<u64>,
+    ) -> u64 {
+        self.permute_into(pat, perm);
+        self.build_etree();
+        self.build_postorder_and_first();
+        // Need the per-position `c_j` to compute `c_j²`; reuse the
+        // pre-allocated buffers and a dedicated O(n) pass. The two paths
+        // share everything up to (and including) the `delta` write-back,
+        // then diverge: this method reads `delta[j] = c_j` directly to
+        // populate `out_pos_sq`, while [`column_counts_gnp_flops`] folds
+        // `delta[j]²` into a scalar.
+        let n = self.n;
+        // Reset accumulators exactly as `column_counts_gnp_flops` does.
+        for i in 0..n {
+            self.delta[i] = if self.children[i].is_empty() { 1 } else { 0 };
+        }
+        self.maxfirst.fill(-1);
+        self.prevleaf.fill(-1);
+        for i in 0..n {
+            self.dsu_ancestor[i] = i;
+        }
+        // Pass-1 / Pass-2 of GNP — verbatim from the scalar path; we need
+        // the post-order write-back of `delta[i] += delta[child]` below.
+        for idx in 0..n {
+            let i = self.post[idx];
+            if let Some(p) = self.parent[i] {
+                self.delta[p] -= 1;
+            }
+            let fi = self.first[i] as i64;
+            let row_start = self.pcol_ptr[i];
+            let row_end = self.pcol_ptr[i + 1];
+            for k in row_start..row_end {
+                let partner = self.prow_idx[k];
+                if partner <= i {
+                    continue;
+                }
+                if fi > self.maxfirst[partner] {
+                    self.delta[i] += 1;
+                    let pl = self.prevleaf[partner];
+                    if pl != -1 {
+                        let mut q = pl as usize;
+                        while self.dsu_ancestor[q] != q {
+                            q = self.dsu_ancestor[q];
+                        }
+                        let root = q;
+                        let mut cur = pl as usize;
+                        while cur != root {
+                            let next = self.dsu_ancestor[cur];
+                            self.dsu_ancestor[cur] = root;
+                            cur = next;
+                        }
+                        self.delta[root] -= 1;
+                    }
+                    self.prevleaf[partner] = i as i64;
+                    self.maxfirst[partner] = fi;
+                }
+            }
+            if let Some(p) = self.parent[i] {
+                self.dsu_ancestor[i] = p;
+            }
+        }
+        for idx in 0..n {
+            let i = self.post[idx];
+            if let Some(p) = self.parent[i] {
+                let di = self.delta[i];
+                self.delta[p] += di;
+            }
+        }
+        // Emit per-position signal and total in one pass.
+        out_pos_sq.clear();
+        out_pos_sq.resize(n, 0);
+        let mut flops: u64 = 0;
+        for j in 0..n {
+            let c = self.delta[j] as u64;
+            let s = c * c;
+            out_pos_sq[j] = s;
+            flops += s;
+        }
+        flops
+    }
 }
 
 #[cfg(test)]
