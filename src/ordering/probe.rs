@@ -4507,6 +4507,281 @@ fn probe_rgreedy_identity() {
     println!("elimination-game identity verified on {checked} matrices x 3 permutations");
 }
 
+/// RGREEDY-SPARSE headroom probe — the quotient-graph exact game on the mid
+/// band (`RGS_MIN_N < n <= RGS_MAX_N`). Incumbent is the full shipped
+/// `order()` with BOTH rgreedy tiers disabled (`rgreedy_enabled = false`), so
+/// the sparse phase is measured against exactly what precedes it and is not
+/// double-run. Scored on flops only (deterministic, load-independent) but the
+/// per-matrix `secs` column is the isolated cost of the sparse search itself —
+/// use it to calibrate `RGS_BUDGET` via the printed ops/sec.
+///
+/// ```sh
+/// RGS_MAX_N=30000 RGS_BUDGET=120000000 cargo test --release -p ssi-candidate-worker \
+///   -- --ignored --nocapture probe_rgreedy_sparse
+/// ```
+#[test]
+#[ignore]
+fn probe_rgreedy_sparse() {
+    let corpus = crate::corpus::corpus();
+    let min_n: usize = envu("RGS_MIN_N", 3_000);
+    let max_n: usize = envu("RGS_MAX_N", 30_000);
+    let max_nnz: usize = envu("RGS_MAX_NNZ", 150_000);
+    let hub_div: usize = envu("RGS_HUB", 50);
+    let budget: i64 = envu("RGS_BUDGET", 120_000_000) as i64;
+    let nthreads: usize = envu("RGS_THREADS", 8);
+
+    let targets: Vec<usize> = (0..corpus.len())
+        .filter(|&i| {
+            let p = &corpus[i].1;
+            let n = p.n;
+            if n <= min_n || n > max_n || p.nnz() > max_nnz || p.nnz() == 0 {
+                return false;
+            }
+            let max_deg = (0..n)
+                .map(|v| p.col_ptr[v + 1] - p.col_ptr[v])
+                .max()
+                .unwrap_or(0);
+            hub_div == 0 || max_deg * hub_div <= n
+        })
+        .collect();
+    eprintln!(
+        "rgreedy-sparse probe: {} matrices ({min_n} < n <= {max_n}, nnz <= {max_nnz}, hub_div {hub_div}), budget {budget} ops, {nthreads} threads",
+        targets.len()
+    );
+
+    struct Row {
+        name: String,
+        n: usize,
+        nnz: usize,
+        amd: u64,
+        port: u64,
+        rg: u64,
+        secs: f64,
+        port_secs: f64,
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::<Row>::new());
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if k >= targets.len() {
+                    break;
+                }
+                let (name, pat) = &corpus[targets[k]];
+                let n = pat.n;
+                let sp = scoring_pattern(pat);
+                let (cp, ri) = core_of(pat);
+                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+                let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+                    .unwrap()
+                    .into_iter()
+                    .map(|x| x as usize)
+                    .collect();
+                let amd = flops_of(&sp, &amd_perm);
+                let tp = Instant::now();
+                let pperm = order_with_options(pat, usize::MAX, true, true, true, false, 0);
+                let port_secs = tp.elapsed().as_secs_f64();
+                let port = flops_of(&sp, &pperm);
+
+                // RGS_SCALED=1 reproduces the SHIPPED per-matrix budget
+                // formula instead of the flat RGS_BUDGET.
+                let eff_budget = if envu("RGS_SCALED", 0) != 0 {
+                    (160_000_000i64 - 1_300 * pat.nnz() as i64).clamp(80_000_000, 160_000_000)
+                } else {
+                    budget
+                };
+                let t0 = Instant::now();
+                let found = crate::ordering::rgreedy_sparse::search(
+                    n, &pat.col_ptr, &pat.row_idx, &pperm, port, eff_budget,
+                    0x9E3779B97F4A7C15,
+                );
+                let secs = t0.elapsed().as_secs_f64();
+                let rg = match found {
+                    Some((ord, f)) => {
+                        assert!(super::is_bijection(&ord, n), "{name}: rgreedy-sparse non-bijection");
+                        let trusted = flops_of(&sp, &ord);
+                        assert_eq!(
+                            trusted, f,
+                            "{name}: sparse accumulator {f} disagrees with trusted scorer {trusted}"
+                        );
+                        trusted
+                    }
+                    None => port,
+                };
+                out.lock().unwrap().push(Row {
+                    name: name.clone(),
+                    n,
+                    nnz: pat.nnz(),
+                    amd,
+                    port,
+                    rg,
+                    secs,
+                    port_secs,
+                });
+            });
+        }
+    });
+
+    let mut rows = out.into_inner().unwrap();
+    rows.sort_by(|a, b| {
+        let ka = (a.rg as f64) / (a.port as f64);
+        let kb = (b.rg as f64) / (b.port as f64);
+        ka.partial_cmp(&kb).unwrap().then(a.name.cmp(&b.name))
+    });
+
+    println!(
+        "{:<32} {:>6} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
+        "matrix", "n", "nnz", "r_amd", "r_port", "r_rg", "rg_s", "port_s"
+    );
+    let mut improved = 0usize;
+    let mut ln_delta = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut worst_secs = 0.0f64;
+    let mut worst_name = String::new();
+    let mut rate_lo = f64::MAX;
+    let mut rate_hi = 0.0f64;
+    for r in &rows {
+        let b = bucket(r.n);
+        if r.secs > 0.0 {
+            let rate = budget as f64 / r.secs;
+            rate_lo = rate_lo.min(rate);
+            rate_hi = rate_hi.max(rate);
+        }
+        if r.secs > worst_secs {
+            worst_secs = r.secs;
+            worst_name = r.name.clone();
+        }
+        counts[b] += 1;
+        let rp = r.port as f64 / r.amd as f64;
+        let rr = r.rg as f64 / r.amd as f64;
+        println!(
+            "{:<32} {:>6} {:>8} {:>8.4} {:>8.4} {:>8.4} {:>7.3} {:>7.3}{}",
+            r.name, r.n, r.nnz,
+            1.0, rp, rr, r.secs, r.port_secs,
+            if r.rg < r.port { "  <-- WIN" } else { "" }
+        );
+        if r.rg < r.port {
+            improved += 1;
+            ln_delta[b] += (r.rg as f64 / r.port as f64).ln();
+        }
+    }
+    println!("\n--- rgreedy-sparse headroom ({min_n} < n <= {max_n}, budget {budget}) ---");
+    println!("matrices              : {}", rows.len());
+    println!("strictly improved     : {improved}");
+    println!("worst sparse secs     : {worst_secs:.4}  ({worst_name})");
+    println!("ops/sec spread        : {:.0}M .. {:.0}M", rate_lo / 1e6, rate_hi / 1e6);
+    const GEOMEAN: [f64; 3] = [0.8958, 0.8726, 0.7704];
+    const BUCKET_N: [f64; 3] = [147.0, 108.0, 45.0];
+    let mut gain = 0.0;
+    for b in 0..3 {
+        if counts[b] == 0 {
+            continue;
+        }
+        let lev = BUCKET_WEIGHTS[b] * GEOMEAN[b] / BUCKET_N[b];
+        println!(
+            "bucket {:<7} n={:<4} sum_ln_delta={:+.5}  -> score {:+.6}",
+            BUCKET_NAMES[b], counts[b], ln_delta[b], ln_delta[b] * lev
+        );
+        gain += ln_delta[b] * lev;
+    }
+    println!("predicted dev score delta: {gain:+.6}");
+}
+
+/// Cross-check: the SPARSE elimination-game accumulator must reproduce the
+/// trusted `column_counts_gnp`-based `Σ c_j²` exactly, on real mid-band corpus
+/// patterns and several permutations each, AND agree with the bitset game
+/// where both representations apply.
+#[test]
+#[ignore]
+fn probe_rgreedy_sparse_identity() {
+    let corpus = crate::corpus::corpus();
+    let mut checked = 0usize;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n > 9_000 || pat.nnz() > 120_000 || checked >= 40 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let mut g =
+            crate::ordering::rgreedy_sparse::SparseGame::new(n, &pat.col_ptr, &pat.row_idx)
+                .unwrap();
+        for perm in [amd_perm, (0..n).collect::<Vec<_>>(), (0..n).rev().collect::<Vec<_>>()] {
+            let a = g.replay_flops(&perm);
+            let b = flops_of(&sp, &perm);
+            assert_eq!(a, b, "{name}: sparse elimination-game {a} != trusted {b}");
+        }
+        checked += 1;
+    }
+    println!("sparse elimination-game identity verified on {checked} matrices x 3 permutations");
+}
+
+/// Edge-case validity for the sparse game: bijection, determinism, and
+/// accumulator identity on degenerate synthetic patterns (edgeless,
+/// disconnected, complete, star hub, path). Fast, NOT ignored — runs in the
+/// ordinary test suite.
+#[test]
+fn rgreedy_sparse_edge_cases() {
+    let complete: Vec<(usize, usize)> = (0..12usize)
+        .flat_map(|i| (i + 1..12).map(move |j| (i, j)))
+        .collect();
+    let cases: Vec<(&str, Pattern)> = vec![
+        ("edgeless", Pattern::from_edges(6, &[])),
+        (
+            "disconnected",
+            Pattern::from_edges(7, &[(0, 1), (1, 2), (0, 2), (4, 5), (5, 6)]),
+        ),
+        ("complete12", Pattern::from_edges(12, &complete)),
+        (
+            "star",
+            Pattern::from_edges(10, &(1..10).map(|i| (0, i)).collect::<Vec<_>>()),
+        ),
+        (
+            "path",
+            Pattern::from_edges(9, &(0..8).map(|i| (i, i + 1)).collect::<Vec<_>>()),
+        ),
+    ];
+    for (name, pat) in &cases {
+        let n = pat.n;
+        let sp = scoring_pattern(pat);
+        let ident: Vec<usize> = (0..n).collect();
+        let ident_f = flops_of(&sp, &ident);
+        let mut g =
+            crate::ordering::rgreedy_sparse::SparseGame::new(n, &pat.col_ptr, &pat.row_idx)
+                .unwrap();
+        // Accumulator identity on two replays.
+        assert_eq!(g.replay_flops(&ident), ident_f, "{name}: identity replay");
+        let rev: Vec<usize> = (0..n).rev().collect();
+        assert_eq!(g.replay_flops(&rev), flops_of(&sp, &rev), "{name}: reverse replay");
+        // Search: bijection + strict improvement + determinism across two runs.
+        let r1 = crate::ordering::rgreedy_sparse::search(
+            n, &pat.col_ptr, &pat.row_idx, &ident, ident_f, 200_000, 0x9E3779B97F4A7C15,
+        );
+        let r2 = crate::ordering::rgreedy_sparse::search(
+            n, &pat.col_ptr, &pat.row_idx, &ident, ident_f, 200_000, 0x9E3779B97F4A7C15,
+        );
+        match (&r1, &r2) {
+            (Some((o1, f1)), Some((o2, f2))) => {
+                assert_eq!(o1, o2, "{name}: non-deterministic order");
+                assert_eq!(f1, f2, "{name}: non-deterministic flops");
+                assert!(super::is_bijection(o1, n), "{name}: non-bijection");
+                assert!(*f1 < ident_f, "{name}: returned non-improvement");
+                assert_eq!(flops_of(&sp, o1), *f1, "{name}: accumulator mismatch");
+            }
+            (None, None) => {}
+            _ => panic!("{name}: determinism violated (Some vs None)"),
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // HEAVY-TIER ARM (arm/heavy). Probes for the gt_10k matrices with nnz >= 250k
 // or n >= 100k, which the frontier's (n, nnz) gates exclude from almost every

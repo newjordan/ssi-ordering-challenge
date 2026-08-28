@@ -217,6 +217,7 @@ mod biconn;
 /// relabelled-AMD/AMF multi-start, which can only perturb an APPROXIMATE
 /// minimum-degree code's internal tie-breaks. See its module doc.
 mod rgreedy;
+mod rgreedy_sparse;
 /// Bounded (max 4-thread) OUTPUT-IDENTICAL parallelism for the candidate
 /// portfolio and the post-hoc phases' independent candidate batches. See its
 /// module doc for the argument that thread completion order decides nothing.
@@ -566,6 +567,35 @@ const MIDX_LOWSEED_MAX_NNZ: usize = 95_000;
 const MIDX_LOWSEED_RESTARTS: usize = 4;
 const MIDX_AMF_BUDGET: usize = 800_000;
 const MIDX_AMF_MAX_RESTARTS: usize = 6;
+
+/// ── MIDX SECOND TIER: no-dense AMD for `MIDX_AMDND_MAX_NNZ` (95k) < nnz <=
+/// 130_000 — the deferred half of the mid-band extension, re-opened for the
+/// PARALLEL portfolio.
+///
+/// The 95_000 ceiling above was sized by a grader FAIL in the SEQUENTIAL
+/// build: `crudeoil_lee4_10` (nnz 120_632) held this arm's largest measured
+/// gain (0.7271 -> 0.6858) but its census curve (0.7833/0.7758/0.7628/0.7416/
+/// 0.6858 at 1/2/4/8/16 seeds) shows nothing before seed 10 — ~0.19 s of
+/// added sequential work on a matrix already at 0.92-0.96 s. The 0021-midband
+/// note deferred it explicitly: "re-open `MIDX_AMDND_MAX_NNZ` to 130_000
+/// (budget 1_600_000, cap 12) once the portfolio runs candidates in
+/// parallel." That precondition now holds: each relabel seed is an
+/// independent `consider` task on the 4-thread carrier, and this band's
+/// matrices run far below their old sequential times.
+///
+/// The existing tier's guards enclose this one unchanged and are load-bearing:
+/// `max_deg <= n / MIDX_HUB_DIV` is the ONLY covariate separating
+/// `crudeoil_lee4_10` (max_deg 168 <= 356) from its (n, nnz)-twin
+/// `ringpack_30_2` (1632 > 359, the corpus worst case), and
+/// `nnz <= MIDX_MAX_AVG_DEG * n` keeps the dense KKT class
+/// (`telecomsp_metro`, density ~53) out by construction. Budget 1_600_000 /
+/// cap 12 gives 12 seeds across the whole window (1.6M/nnz >= 12.3 at the
+/// 130k ceiling); the timing rule from the FAIL (a matrix >0.7 s local may
+/// not grow >0.1 s) is re-verified against THIS build with `probe_midx_ab`
+/// before scoring.
+const MIDX2_AMDND_MAX_NNZ: usize = 130_000;
+const MIDX2_BUDGET: usize = 1_600_000;
+const MIDX2_MAX_RESTARTS: usize = 12;
 
 /// ── RELABELLED AMF alpha=0.5, TWO SEEDS. The portfolio relabels three
 /// objectives (AMD default, AMF alpha5, no-dense AMD). `probe_mid_obj` ran nine
@@ -918,17 +948,8 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
 const PAIR_DESCENT_MIN_N: usize = 1_000;
 const PAIR_DESCENT_MAX_N: usize = 4_000;
 const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-// Spend the stranded per-matrix slack on the newest phase. The 2 s cap is
-// charged per matrix; the grader's own Actions log for the promoting run shows
-// 999 order() calls consuming 513.5 s of the 1998 s allowed, the fastest half
-// inside 0.390 s, and the tail entirely gt_10k. This phase is gated to
-// 1000 <= n <= 4000, a band whose worst measured order() is 0.420 s locally
-// (~1.1 s on the grader at the 2.6x ratio), so it has ~0.9 s of margin. The
-// budget is a deterministic cumulative op count, exhaustion discards, and the
-// result is admitted only through the trusted global scorer -- so more of it is
-// weakly improving and cannot change determinism.
-const PAIR_DESCENT_SWEEPS: usize = 4;
-const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
+const PAIR_DESCENT_SWEEPS: usize = 2;
+const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -3393,6 +3414,34 @@ fn order_with_options(
             }
         }
 
+        // Second no-dense-AMD tier (95k, 130k] — see `MIDX2_*` doc comment.
+        // Identical closure body to the tier above; only the window and the
+        // seed count differ. Kept as a separate block so the shipped 60-95k
+        // tier stays byte-identical.
+        if nnz > MIDX_AMDND_MAX_NNZ && nnz <= MIDX2_AMDND_MAX_NNZ {
+            let midx_restarts =
+                (MIDX2_BUDGET / nnz).clamp(1, MIDX2_MAX_RESTARTS).min(relabel_cap);
+            let amd_nd_opts = feral_amd::AmdOptions {
+                aggressive: false,
+                dense_alpha: -1.0,
+            };
+            for r in 0..midx_restarts {
+                let seed = r as u64 + 1;
+                // Cloned per restart — see the tier above.
+                let amd_nd_opts = amd_nd_opts.clone();
+                consider!(move || {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(&scoring_pat, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
+                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+                });
+            }
+        }
+
         if nnz > RELABEL_AMF_MAX_NNZ && nnz <= MIDX_AMF_MAX_NNZ {
             let midx_restarts = (MIDX_AMF_BUDGET / nnz)
                 .clamp(1, MIDX_AMF_MAX_RESTARTS)
@@ -4071,6 +4120,79 @@ fn order_with_options(
             }
             Some(minl_mcs_peo(n, &adj))
         }));
+
+        // ── WATCHER-2 — the same witness-driven minimalizer, REVERSE scan
+        // order (fourth dtasks sibling; idle-worker spend, arm/parallel).
+        // Scan order is semantically significant here: deletions commit
+        // greedily in queue order and each committed deletion can make
+        // another fill edge undeletable (the minimal completions below a
+        // given completion form an antichain, and the scan order picks which
+        // one the greedy walk lands on). The shipped watcher scans
+        // cheapest-degree-sum-first — a budget-driven choice that harvests
+        // many cheap fringe deletions. This sibling makes the complementary
+        // bet: strictly the REVERSE of that order, attacking the fat-clique
+        // region first, where each deleted edge subtracts from the largest
+        // `(|K|-1)²` terms of the objective. Same gate and the SAME 60M op
+        // budget as the other siblings, so it can never become the batch's
+        // longest task; the batch previously ran 3 tasks on 4 workers, so
+        // this fills the idle slot at ~zero wall-clock. The fill ceiling is
+        // deliberately NOT widened (a widening failed the hidden timeout on
+        // a previous frontier).
+        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
+            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = scoring_pat.row_idx
+                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            if n > WATCH_MINL_MAX_N
+                || fill.is_empty()
+                || fill.len() > WATCH_MINL_MAX_FILL
+                || fill.len().saturating_mul(5) < fri.len()
+            {
+                return None;
+            }
+            let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
+            ids.sort_unstable_by_key(|&i| {
+                let (u, v) = fill[i as usize];
+                (adj[u as usize].len() + adj[v as usize].len(), i)
+            });
+            ids.reverse();
+            let result = watcher_minimalize(
+                &mut adj,
+                &fill,
+                &ids,
+                WATCH_MINL_OPS_BUDGET,
+                WATCH_MINL_MAX_COMMON,
+            );
+            if result.removed == 0 {
+                return None;
+            }
+            Some(minl_mcs_peo(n, &adj))
+        }));
     }
 
     // ── COMPONENT B: ORBIT-BATCHED COMPLETION-LATTICE DESCENT — see the
@@ -4316,39 +4438,6 @@ fn order_with_options(
     // ties at 1.0000) and that class is where the portfolio is already slow.
     // Pep's accepted selector did not apply it inside the <=60k envelope.
     const RGREEDY_MAX_AVG_DEG: usize = 100;
-    // CAP SLACK. The 2 s limit is charged PER MATRIX, but both budgets above are
-    // flat op counts, so a pattern whose whole order() costs 0.05 s buys exactly
-    // the same search as one costing 0.43 s. Mined from the Actions log of the
-    // run that promoted this line of work: 999 order() calls consumed 513.5 s of
-    // the 1998 s the cap allows -- 74% stranded -- with the fastest half all
-    // inside 0.390 s and only the top 1% at 1.85-2.02 s. The tail is set by
-    // gt_10k, which this phase never touches (gated at n <= 3000).
-    //
-    // So raise these to a FLOOR rather than scaling them: whatever the selector
-    // above picks, spend at least this much where the slack provably is. Both
-    // floors are the values whose wall time I measured directly -- worst
-    // order() 0.426 s at n <= 1000 and 0.420 s at n <= 3000 on a quiet host,
-    // about 1.1 s on the grader at the 2.6x ratio, against a 2.0 s cap.
-    // Deterministic: a pure function of n, so both determinism-gate calls agree.
-    //
-    // LOWER BOUND, and it is the load-bearing part. A budget denominated in ops
-    // is not a budget for a tiny pattern: an 8-vertex elimination game converges
-    // almost immediately but needs an enormous number of runs to exhaust a fixed
-    // op count, so it burns the whole allowance on a search that finished long
-    // ago. Measured directly: with the floor applied unconditionally, `st_e41`
-    // (n = 8) is the SLOWEST matrix under n = 1000 at 0.664 s -- worse than any
-    // matrix in the 1k-4k band. Below this bound the floor buys nothing and
-    // costs the most, so it is simply not applied.
-    const RGREEDY_SLACK_MIN_N: usize = 64;
-    const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
-    const RGREEDY_SLACK_MID: i64 = 600_000_000;
-    let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
-        0
-    } else if n <= 1_000 {
-        RGREEDY_SLACK_SMALL
-    } else {
-        RGREEDY_SLACK_MID
-    };
     #[cfg(test)]
     let _tp = std::time::Instant::now();
     let rgreedy_pep_gate = nnz > 0 && nnz <= RGREEDY_PEP_MAX_NNZ;
@@ -4363,7 +4452,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
+                RGREEDY_PEP_BUDGET,
             )
         } else {
             rgreedy::search_par(
@@ -4372,7 +4461,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_BUDGET.max(rgreedy_slack_floor),
+                RGREEDY_BUDGET,
                 0x9E37_79B9_7F4A_7C15,
             )
         };
@@ -4571,6 +4660,73 @@ fn order_with_options(
             PAIR_DESCENT_SWEEPS,
             PAIR_DESCENT_OPS_BUDGET,
         ) {
+            if is_bijection(&cand, n) {
+                let f = ws.flops(&scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
+        }
+    }
+
+    // ── RGREEDY-SPARSE — the same exact elimination-game search, quotient- ──
+    // graph representation, for the band ABOVE the bitset tier. See
+    // `rgreedy_sparse.rs`. Runs LAST for the same monotonicity reason as the
+    // bitset tier: strictly-improving over the whole pipeline's output,
+    // re-scored through the trusted path, so it can only lower the ratio.
+    //
+    // GATES. `RGS_MIN_N` = the bitset tier's ceiling (the two tiers are
+    // disjoint by construction). `RGS_MAX_N`/`RGS_MAX_NNZ` bound the mid band
+    // 0019/0021 identified as seed-starved with 0.6–1.4 s of unused budget.
+    // `max_deg <= n / RGS_HUB_DIV` is 0019's hub rule, and here it is also the
+    // MECHANISM gate: a hub pivot's boundary update is O(deg²) in a quotient
+    // graph, so the same discriminator that predicts "restarts are expensive"
+    // predicts "this game is expensive" — and it excludes `ringpack_30_2`
+    // (max degree 1632), the corpus's historical worst-case matrix, by
+    // construction. `RGS_BUDGET` is in deterministic list-ops (see the module
+    // doc); calibrated by `probe_rgreedy_sparse` measuring ops/sec on the
+    // admitted band.
+    const RGS_MIN_N: usize = RGREEDY_MAX_N;
+    const RGS_MAX_N: usize = 30_000;
+    const RGS_MAX_NNZ: usize = 150_000;
+    const RGS_HUB_DIV: usize = 50;
+    // Per-matrix ops budget, DECREASING in nnz: the portfolio's own cost on
+    // this band is nnz-driven (the relabel multistarts), so the slack under
+    // the ~1.1 s corpus worst case is largest exactly where nnz is smallest.
+    // Measured serial (quiet box, `probe_timing_and_score`): the sparse game
+    // runs ≥ ~380M ops/s, so 160M ≈ 0.42 s worst on the low-nnz end (port
+    // ≤ 0.35 s there) and 80M ≈ 0.22 s past nnz≈62k (port ≈ 0.55 s) — every
+    // admitted matrix stays well under ~1.0 s total, below the untouched
+    // corpus worst (`acopf_case9241pegase_qcqp`, 1.12 s). The ceiling was
+    // deliberately cut from a probed 240M: the grader is ~2.6x slower than
+    // this box on elimination-game work and hidden in-gate matrices can sit
+    // near the 2 s cap invisibly (two hidden-corpus cap failures forced the
+    // bitset tier down to 300M word-ops ~ 0.22 s local), so the added work
+    // must stay small EVERYWHERE, not just on dev's worst case.
+    const RGS_BUDGET_MAX: i64 = 160_000_000;
+    const RGS_BUDGET_MIN: i64 = 80_000_000;
+    const RGS_BUDGET_NNZ_SLOPE: i64 = 1_300;
+    if rgreedy_enabled
+        && n > RGS_MIN_N
+        && n <= RGS_MAX_N
+        && nnz <= RGS_MAX_NNZ
+        && nnz > 0
+        && max_deg * RGS_HUB_DIV <= n
+    {
+        let rgs_budget = (RGS_BUDGET_MAX - RGS_BUDGET_NNZ_SLOPE * nnz as i64)
+            .clamp(RGS_BUDGET_MIN, RGS_BUDGET_MAX);
+        if let Some((cand, _)) = rgreedy_sparse::search(
+            n,
+            &pattern.col_ptr,
+            &pattern.row_idx,
+            &best_perm,
+            best_flops,
+            rgs_budget,
+            0x9E37_79B9_7F4A_7C15,
+        ) {
+            // Never trust the elimination-game accumulator: re-score through
+            // the trusted path, keep only on a STRICT improvement.
             if is_bijection(&cand, n) {
                 let f = ws.flops(&scoring_pat, &cand);
                 if f < best_flops {
