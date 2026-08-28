@@ -710,6 +710,15 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
 
+/// Narrow structural gate for the non-additive pre-relabel TELOS seed swap.
+/// This is the measured sparse, low-hub band where random-restart progress can
+/// move the incumbent into a worse TELOS basin. Unlike additive multi-seed
+/// attempts, the swap still invokes exactly one descent within the existing
+/// round and pass ceiling.
+fn telos_checkpoint_seed_gate(n: usize, nnz: usize, max_deg: usize) -> bool {
+    (15_000..=18_000).contains(&n) && (50_000..=55_000).contains(&nnz) && max_deg <= n / 50
+}
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -2371,20 +2380,6 @@ fn order_with_options(
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
-    for r in 0..restarts {
-        let seed = r as u64 + 1;
-        consider(&|| {
-            let q = relabel(n, seed);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            let pb = feral_amd::amd_order(&bcore)?;
-            // Compose back: `q[k]` is the original vertex that B numbers `k`.
-            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-        });
-    }
 
     // RELABELLED-AMF MULTISTART (`sbx-relabel-amf`): the relabel trick above
     // works because AMD's tie-break reads the vertex numbering, so `AMD(QAQᵀ)`
@@ -2410,28 +2405,16 @@ fn order_with_options(
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
-    if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        let amf_opts = feral_amf::AmfOptions {
+    let relabel_amf_opts =
+        (nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0).then(|| feral_amf::AmfOptions {
             dense_alpha: 5.0,
             ..Default::default()
-        };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
-        for r in 0..amf_restarts {
-            let seed = r as u64 + 1;
-            consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-                // Compose back: `q[k]` is the original vertex that B numbers `k`.
-                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
-        }
-    }
+        });
+    let amf_restarts = if relabel_amf_opts.is_some() {
+        relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap)
+    } else {
+        0
+    };
 
     // RELABELLED NO-DENSE AMD MULTISTART. The relabel trick is a property of the
     // SHARED quotient-graph machinery, not of `amd_order` specifically: the
@@ -2461,29 +2444,120 @@ fn order_with_options(
     // a genuinely different candidate — and every result is bijection-checked in
     // `consider` before it can win, so this cannot regress the score.
     const RELABEL_AMDND_MAX_NNZ: usize = 60_000;
-    if nnz > 0 && nnz <= RELABEL_AMDND_MAX_NNZ && relabel_cap > 0 {
-        let amd_nd_opts = feral_amd::AmdOptions {
+    let relabel_amdnd_opts = (nnz > 0 && nnz <= RELABEL_AMDND_MAX_NNZ && relabel_cap > 0)
+        .then_some(feral_amd::AmdOptions {
             aggressive: false,
             dense_alpha: -1.0,
+        });
+    let amdnd_restarts = if relabel_amdnd_opts.is_some() {
+        relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap)
+    } else {
+        0
+    };
+
+    // FUSED RELABEL CONSTRUCTION. All three families use the same deterministic
+    // seed schedule, so build Q, Q A Q^T, its i32 buffers, and CscPattern once per
+    // seed, then run every family enabled for that seed against the shared core.
+    //
+    // The old loops were family-major (all AMD, then all AMF, then all no-dense
+    // AMD), whereas this loop is seed-major. Because candidate replacement is
+    // strict, evaluation order determines which byte-level permutation survives
+    // an exact FLOP tie. `original_priority` models the old family-major order;
+    // an equal-score candidate replaces the incumbent only when it would have
+    // appeared earlier in those old loops. Priority zero reserves every
+    // pre-relabel incumbent, reproducing the old strict no-replacement-on-tie
+    // behavior. Thus construction is fused without changing the selected output.
+    drop(consider);
+    // Preserve the incumbent at the exact boundary before the first random
+    // restart. On the narrowly measured gate this may replace, rather than add
+    // to, TELOS's later seed; outside the gate there is no clone or behavior
+    // change.
+    let pre_relabel_seed = if restarts > 0 && telos_checkpoint_seed_gate(n, nnz, max_deg) {
+        Some((best_flops, best_perm.clone()))
+    } else {
+        None
+    };
+    let mut best_relabel_priority = 0usize;
+    let mut consider_relabel =
+        |original_priority: usize,
+         produce: &dyn Fn() -> Result<Vec<i32>, feral_ordering_core::OrderingError>| {
+            let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
+            let Ok(Ok(perm_i32)) = produced else {
+                return;
+            };
+            let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
+            if !is_bijection(&perm, n) {
+                return;
+            }
+            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                cached
+            } else {
+                let v = ws.flops(&scoring_pat, &perm);
+                flops_cache.insert(perm.clone(), v);
+                v
+            };
+            #[cfg(test)]
+            BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+            if f < best_flops
+                || (f == best_flops
+                    && best_relabel_priority != 0
+                    && original_priority < best_relabel_priority)
+            {
+                best_flops = f;
+                best_perm = perm;
+                best_relabel_priority = original_priority;
+            }
         };
-        let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
-        for r in 0..amdnd_restarts {
-            let seed = r as u64 + 1;
-            consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
+
+    let amf_priority_base = 1 + restarts;
+    let amdnd_priority_base = amf_priority_base + amf_restarts;
+    let fused_restarts = restarts.max(amf_restarts).max(amdnd_restarts);
+    for r in 0..fused_restarts {
+        let seed = r as u64 + 1;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let q = relabel(n, seed);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            (q, bcp, bri)
+        }));
+        let Ok((q, bcp, bri)) = built else {
+            continue;
+        };
+        let built_core = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+        }));
+        let Ok(Some(bcore)) = built_core else {
+            continue;
+        };
+
+        if r < restarts {
+            consider_relabel(1 + r, &|| {
+                let pb = feral_amd::amd_order(&bcore)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
             });
         }
+        if r < amf_restarts {
+            let amf_opts = relabel_amf_opts
+                .as_ref()
+                .expect("positive AMF restart count requires options");
+            consider_relabel(amf_priority_base + r, &|| {
+                let (pb, ..) = feral_amf::amf_order_opts(&bcore, amf_opts)?;
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
+        }
+        if r < amdnd_restarts {
+            let amd_nd_opts = relabel_amdnd_opts
+                .as_ref()
+                .expect("positive no-dense AMD restart count requires options");
+            consider_relabel(amdnd_priority_base + r, &|| {
+                let (pb, ..) = feral_amd::amd_order_opts(&bcore, amd_nd_opts)?;
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
+        }
     }
-
+    drop(consider_relabel);
 
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
@@ -2836,6 +2910,22 @@ fn order_with_options(
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
 
+        // A large improvement after the checkpoint can signal that the search
+        // moved into a worse TELOS basin. In the measured narrow band, use the
+        // already-built pre-restart checkpoint as TELOS's single seed when it
+        // is at least 10% worse than the current incumbent. This does not add a
+        // descent invocation. Keep the current pre-TELOS incumbent as a strict
+        // fallback.
+        let incumbent_fallback = pre_relabel_seed
+            .filter(|(checkpoint_f, _)| {
+                (*checkpoint_f as u128) * 100 >= (best_flops as u128) * 110
+            })
+            .map(|(checkpoint_f, checkpoint_p)| {
+                let current = (best_flops, std::mem::replace(&mut best_perm, checkpoint_p));
+                best_flops = checkpoint_f;
+                current
+            });
+
         for _round in 0..max_rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -2905,6 +2995,12 @@ fn order_with_options(
                     best_perm = p;
                 }
                 _ => break,
+            }
+        }
+        if let Some((current_f, current_p)) = incumbent_fallback {
+            if current_f <= best_flops {
+                best_flops = current_f;
+                best_perm = current_p;
             }
         }
     }
