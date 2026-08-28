@@ -168,6 +168,12 @@ mod alloc_probe;
 /// best-of floor.
 mod custom_metrics;
 
+/// Event-driven sibling of the round-based completion minimalizer.  It keeps
+/// an explicit four-cycle witness for every blocked fill edge and wakes that
+/// edge only when a witness support is deleted.
+mod minl_watch;
+use minl_watch::watcher_minimalize;
+
 /// Generic quotient-graph pivot-score family (shot C) — SHIPPED, not
 /// test-gated. `order_generic` drives a parameterized MetricSpec through
 /// `feral_ordering_core::quotient_graph`'s near-linear machinery, and
@@ -847,6 +853,12 @@ const MINL_MAX_LNNZ: usize = 2_400_000;
 const MINL_OPS_BUDGET: i64 = 60_000_000;
 const MINL_MAX_ROUNDS: usize = 8;
 const MINL_MAX_COMMON: usize = 2_000;
+
+/// Witness-driven sibling of MINL.
+const WATCH_MINL_MAX_N: usize = 30_000;
+const WATCH_MINL_MAX_FILL: usize = 145_000;
+const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
+const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 
 /// COMPONENT B — ORBIT-BATCHED COMPLETION-LATTICE DESCENT (Noether priming
 /// round 4, `noether.md` §2.2 "Component B"; source doc:
@@ -3502,6 +3514,79 @@ fn order_with_options(
             // Steps 1-3 (orbit-index, prioritize, batched delete).
             let removed_total = orbit_batched_delete(&mut adj, &fill, &class);
             if removed_total == 0 {
+                return None;
+            }
+            Some(minl_mcs_peo(n, &adj))
+        }));
+    }
+
+    if n <= WATCH_MINL_MAX_N && nnz > 0 {
+        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
+            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = scoring_pat.row_idx
+                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            if fill.is_empty()
+                || fill.len() > WATCH_MINL_MAX_FILL
+                || fill.len().saturating_mul(5) < fri.len()
+            {
+                return None;
+            }
+            let scan_order: Vec<u32> = {
+                let mut keys: Vec<usize> = Vec::with_capacity(fill.len());
+                let mut maxk = 0usize;
+                for &(u, v) in &fill {
+                    let k = adj[u as usize].len() + adj[v as usize].len();
+                    maxk = maxk.max(k);
+                    keys.push(k);
+                }
+                let mut cnt = vec![0u32; maxk + 2];
+                for &k in &keys {
+                    cnt[k + 1] += 1;
+                }
+                for i in 1..cnt.len() {
+                    cnt[i] += cnt[i - 1];
+                }
+                let mut out = vec![0u32; fill.len()];
+                for (ei, &k) in keys.iter().enumerate() {
+                    out[cnt[k] as usize] = ei as u32;
+                    cnt[k] += 1;
+                }
+                out
+            };
+            let result = watcher_minimalize(
+                &mut adj,
+                &fill,
+                &scan_order,
+                WATCH_MINL_OPS_BUDGET,
+                WATCH_MINL_MAX_COMMON,
+            );
+            if result.removed == 0 {
                 return None;
             }
             Some(minl_mcs_peo(n, &adj))
