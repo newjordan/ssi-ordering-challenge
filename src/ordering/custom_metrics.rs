@@ -67,11 +67,32 @@
 //! (`n < AMF_SWEEP_MAX_N && nnz < 130_000`, see `mod.rs`) — no new envelope,
 //! per the measurement that motivated this win.
 
+use feral::ordering::amd::permute_pattern;
+use feral::ordering::elimination_tree::EliminationTree;
+use feral::symbolic::column_counts_gnp;
 use feral_ordering_core::quotient_graph::{
     clear_flag, create_element_amf, finalize_permutation, flip, select_pivot_amf, StepFlops,
     Workspace, WorkspaceOptions, NONE,
 };
 use feral_ordering_core::{CscPattern, OrderingError};
+
+/// Thin wrapper over feral's trusted symbolic scoring path
+/// (`permute_pattern` → `EliminationTree::from_pattern` → `column_counts_gnp`)
+/// returning the predicted factorization flops `Σ_j c_j²` for `perm` on
+/// `core` — the exact quantity the grader ranks, exposed here as the
+/// "emit predicted flop count" primitive the local-search candidate
+/// families in this crate (e.g. `bfg_lahc_reorder` in `legacy.rs`) share.
+///
+/// Pure function of `(core, perm)` — no wall-clock, no RNG. The reference
+/// `flops_of` in `mod.rs` does the same computation via direct calls to
+/// the same vendor symbols, so byte-identical input gives byte-identical
+/// `u64` here.
+pub fn emit_predicted_flops(core: &CscPattern<'_>, perm: &[usize]) -> u64 {
+    let permuted = permute_pattern(core, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    counts.iter().map(|&c| (c as u64) * (c as u64)).sum()
+}
 
 /// Which score formula `finalize_step_variant` computes at re-insertion. See
 /// the module doc for what each one estimates and why it was kept.
