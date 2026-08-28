@@ -4897,7 +4897,13 @@ fn order_with_options(
             // promoted config untouched.)
             RGSUB_CFG
         };
-        let rgsub_rounds = if n >= 10_000 && nnz <= 100_000 { 3 } else { 2 };
+        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
+            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
+        {
+            3
+        } else {
+            2
+        };
         for _round in 0..rgsub_rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
