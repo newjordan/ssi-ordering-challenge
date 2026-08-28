@@ -779,10 +779,11 @@ const MINL_MAX_COMMON: usize = 2_000;
 /// ringpack timing walls before the adjacency clone.  `fri` stores both arcs
 /// of every undirected completion edge, whereas `fill` stores each added edge
 /// once, so `5 * fill >= fri.len()` means fill is at least 40% of the
-/// undirected completion.  Together with the n/fill caps this bounds watcher
-/// storage near 12 MiB rather than the broad gate's 40+ MiB added peak.
+/// undirected completion. The widened ceiling recovers the two measured
+/// low-hub responders excluded by the promoted gate; `max_deg <= n/100`
+/// independently rejects hub-driven timing walls before the adjacency clone.
 const WATCH_MINL_MAX_N: usize = 30_000;
-const WATCH_MINL_MAX_FILL: usize = 145_000;
+const WATCH_MINL_MAX_FILL: usize = 155_000;
 const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
 const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 
@@ -3071,6 +3072,7 @@ fn order_with_options(
                 && !fill.is_empty()
                 && fill.len() <= WATCH_MINL_MAX_FILL
                 && fill.len().saturating_mul(5) >= fri.len()
+                && max_deg <= n / 100
             {
                 Some(adj.clone())
             } else {
