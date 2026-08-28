@@ -5952,3 +5952,61 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+/// Probe the unshipped half-open tail of adjacent-pair descent. The shipped
+/// phase stops at n=4000; this measures four exact sweeps on the sparse,
+/// hub-safe 4000<n<10000 band without changing `order()`.
+#[test]
+#[ignore]
+fn probe_pair_descent_mid_tail() {
+    let corpus = crate::corpus::corpus();
+    let mut wins = 0usize;
+    let mut log_gain = 0.0f64;
+    let mut total_secs = 0.0f64;
+    let mut worst = (0.0f64, String::new());
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if !(4_000 < n && n < 10_000 && nnz <= 60_000) {
+            continue;
+        }
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        if max_deg.saturating_mul(50) > n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let seed = order(pat);
+        let before = flops_of(&sp, &seed);
+        let t0 = Instant::now();
+        let found = rgreedy::adjacent_pair_descent(
+            n,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            4,
+            128_000_000,
+        );
+        let secs = t0.elapsed().as_secs_f64();
+        total_secs += secs;
+        if secs > worst.0 {
+            worst = (secs, name.clone());
+        }
+        let after = found
+            .as_ref()
+            .map(|p| flops_of(&sp, p))
+            .unwrap_or(before)
+            .min(before);
+        if after < before {
+            wins += 1;
+            log_gain += (after as f64 / before as f64).ln();
+            println!("WIN\t{name}\tn={n}\tnnz={nnz}\t{before}->{after}\t{secs:.4}s");
+        }
+    }
+    println!(
+        "PAIR_MID\twins={wins}\tsum_ln={log_gain:.9}\ttotal_s={total_secs:.3}\tworst_s={:.3}({})",
+        worst.0, worst.1
+    );
+}

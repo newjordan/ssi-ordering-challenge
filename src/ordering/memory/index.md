@@ -20,7 +20,15 @@ these to the next scoring win, at zero extra measurement cost:
   have a second, pool-shaped consequence.
 
 ## Current best
-- Best score: dev **0.840107** ([0022](experiments/0022-topk-telos-seeding.md) rev3,
+- Best score: dev **0.818256**, combining
+  [0026](experiments/0026-sparse-mid-pair-descent.md),
+  [0024](experiments/0024-detour-metaflip-shoulder.md), and accepted commit
+  `c7d5a8b` (official **0.820722**). The 0025 mid-band rgreedy arm was removed
+  after its official hidden-cap failure.
+  A same-corpus small-tier control confirms the shoulders remain marginal over
+  the accepted top-K pool: geomean 0.892504581→0.892462058, exactly two changed
+  matrices. The accepted top-K tree's pre-rebaseline notes recorded dev
+  **0.840107** ([0022](experiments/0022-topk-telos-seeding.md) rev3,
   top-K TELOS seeding with LIGHT extra descents: descend from the incumbent + up to 2
   retained `consider` seeds in three gated regimes, extras on the Tier-B grid; plus
   the `hub_gatewall` trim (multistart+hill-climb measured-zero on ringpack_30_2 /
@@ -29,8 +37,9 @@ these to the next scoring win, at zero extra measurement cost:
   ~1.45× faster than the one older pages' timings were recorded on, so compare
   timings only within one box. The full-grid variant scored dev 0.839362 but FAILED
   the grader's cap on a hidden matrix, and rev2 (K=3 light) failed the same way in a
-  grader-wide failure window — read 0022's postscript + REV3 sections first). Previous: dev
-  **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+  grader-wide failure window — read 0022's postscript + REV3 sections first).
+  Older dev scores below may predate later merges or corpus rebaselines and are
+  not directly comparable.
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -108,6 +117,9 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0026-sparse-mid-pair-descent.md](experiments/0026-sparse-mid-pair-descent.md) — **WIN, combined dev 0.818322→0.818256.** Extends the exact terminal adjacent-pair descent only to `4000<n<10000`, `nnz<=60k`, hub-safe matrices. Four sweeps improve 15 matrices with no losses, 0.039 s worst isolated addition, and recover both rsyn regressions from the withdrawn rgreedy lane. Full merged accepted-leader harness passed at 0.818256.
+- [0025-rgreedy-mid-band.md](experiments/0025-rgreedy-mid-band.md) — **LOCAL WIN, OFFICIAL CAP FAIL, WITHDRAWN.** The `3000<n<=10000`, `nnz<=60k`, hub-safe rgreedy pep band improved dev 0.819363→0.819232 but submission `37c36f1` exceeded the hidden 2-second per-matrix cap. The arm has been removed; 0026 replaces it with a cheaper terminal move.
+- [0024-detour-metaflip-shoulder.md](experiments/0024-detour-metaflip-shoulder.md) — **WIN, dev 0.819962→0.819949; first official attempt FAILED the cap.** A MetaFlip-style bounded near-elite archive preserves two max-min terminally different portfolio orderings as appended TELOS seeds, while DETOUR's proposal/certification boundary keeps exact flops as the only acceptance rule. Official failure showed that retaining losers on matrices unable to reach a shoulder slot was not free; the rescue decides eligibility before the portfolio and confines the measured win to `n<1000`.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:
