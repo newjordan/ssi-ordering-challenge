@@ -449,23 +449,25 @@ mod tests {
         let mut col_ptr_i32 = Vec::new();
         let mut row_idx_i32 = Vec::new();
 
-        let perms: Vec<Vec<usize>> = vec![
-            (0..n).collect(),
-            (0..n).rev().collect(),
-            {
-                let mut p: Vec<usize> = (0..n).collect();
-                p.swap(0, 7);
-                p.swap(3, 12);
-                p
-            },
-        ];
+        let perms: Vec<Vec<usize>> = vec![(0..n).collect(), (0..n).rev().collect(), {
+            let mut p: Vec<usize> = (0..n).collect();
+            p.swap(0, 7);
+            p.swap(3, 12);
+            p
+        }];
         for perm in &perms {
             ws.permute_i32_into(&sp, perm, &mut col_ptr_i32, &mut row_idx_i32);
             let expected = feral::ordering::amd::permute_pattern(&sp, perm);
             let expected_cp: Vec<i32> = expected.col_ptr.iter().map(|&x| x as i32).collect();
             let expected_ri: Vec<i32> = expected.row_idx.iter().map(|&x| x as i32).collect();
-            assert_eq!(col_ptr_i32, expected_cp, "col_ptr mismatch for perm {perm:?}");
-            assert_eq!(row_idx_i32, expected_ri, "row_idx mismatch for perm {perm:?}");
+            assert_eq!(
+                col_ptr_i32, expected_cp,
+                "col_ptr mismatch for perm {perm:?}"
+            );
+            assert_eq!(
+                row_idx_i32, expected_ri,
+                "row_idx mismatch for perm {perm:?}"
+            );
         }
     }
 }

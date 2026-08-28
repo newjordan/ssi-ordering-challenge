@@ -178,10 +178,7 @@ fn probe_ties() {
         println!("{name:<28} {n:>8} {nnz:>10} {ratio:>8.4}");
     }
     for b in 0..3 {
-        println!(
-            "{:<8} tied {}/{}",
-            BUCKET_NAMES[b], per_bucket[b], total[b]
-        );
+        println!("{:<8} tied {}/{}", BUCKET_NAMES[b], per_bucket[b], total[b]);
     }
 }
 
@@ -246,8 +243,7 @@ fn probe_relabel_amd() {
                 let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
                 if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
                     if let Ok(pb) = feral_amd::amd_order(&bcore) {
-                        let perm: Vec<usize> =
-                            pb.iter().map(|&x| q[x as usize]).collect();
+                        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
                         if is_bijection(&perm, n) {
                             best = best.min(flops_of(&sp, &perm) as f64);
                         }
@@ -278,7 +274,9 @@ fn probe_relabel_amd() {
     let mut imp: Vec<_> = rows.iter().filter(|r| r.5 < r.4 - 1e-9).collect();
     imp.sort_by(|a, b| (a.5 / a.4).partial_cmp(&(b.5 / b.4)).unwrap());
     for (secs, name, n, nnz, rc, rn) in imp.iter().take(40) {
-        println!("{name:<30} n={n:<7} nnz={nnz:<8} {rc:.4} -> {rn:.4}  ({secs:.3}s for {RESTARTS})");
+        println!(
+            "{name:<30} n={n:<7} nnz={nnz:<8} {rc:.4} -> {rn:.4}  ({secs:.3}s for {RESTARTS})"
+        );
     }
     println!("improved {} of {}", imp.len(), rows.len());
 
@@ -289,7 +287,10 @@ fn probe_relabel_amd() {
 
     println!("\nSCORE cur          = {:.6}", aggregate(&cur.0, &cur.1));
     for (si, &s) in stops.iter().enumerate() {
-        println!("SCORE {s:>2} restarts  = {:.6}", aggregate(&at[si].0, &at[si].1));
+        println!(
+            "SCORE {s:>2} restarts  = {:.6}",
+            aggregate(&at[si].0, &at[si].1)
+        );
     }
 }
 
@@ -380,63 +381,111 @@ fn family_perm(idx: usize, core: &feral_ordering_core::CscPattern<'_>) -> Option
     use feral_kahip::{KahipMode, KahipOptions};
     use feral_metis::MetisOptions;
     match idx {
-        0 => feral_kahip::kahip_order_full(core, &KahipOptions { seed: 2, ..Default::default() })
-            .ok()
-            .map(|(p, _, _)| p),
-        1 => feral_kahip::kahip_order_full(core, &KahipOptions { seed: 3, ..Default::default() })
-            .ok()
-            .map(|(p, _, _)| p),
+        0 => feral_kahip::kahip_order_full(
+            core,
+            &KahipOptions {
+                seed: 2,
+                ..Default::default()
+            },
+        )
+        .ok()
+        .map(|(p, _, _)| p),
+        1 => feral_kahip::kahip_order_full(
+            core,
+            &KahipOptions {
+                seed: 3,
+                ..Default::default()
+            },
+        )
+        .ok()
+        .map(|(p, _, _)| p),
         2 => feral_kahip::kahip_order_full(
             core,
-            &KahipOptions { mode: KahipMode::Eco, ..Default::default() },
+            &KahipOptions {
+                mode: KahipMode::Eco,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
         3 => feral_kahip::kahip_order_full(
             core,
-            &KahipOptions { mode: KahipMode::Strong, ..Default::default() },
+            &KahipOptions {
+                mode: KahipMode::Strong,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
-        4 => feral_metis::metis_order_full(core, &MetisOptions { seed: 21, ..Default::default() })
-            .ok()
-            .map(|(p, _, _)| p),
-        5 => feral_metis::metis_order_full(core, &MetisOptions { seed: 2, ..Default::default() })
-            .ok()
-            .map(|(p, _, _)| p),
+        4 => feral_metis::metis_order_full(
+            core,
+            &MetisOptions {
+                seed: 21,
+                ..Default::default()
+            },
+        )
+        .ok()
+        .map(|(p, _, _)| p),
+        5 => feral_metis::metis_order_full(
+            core,
+            &MetisOptions {
+                seed: 2,
+                ..Default::default()
+            },
+        )
+        .ok()
+        .map(|(p, _, _)| p),
         6 => feral_metis::metis_order_full(
             core,
-            &MetisOptions { max_imbalance: 0.10, ..Default::default() },
+            &MetisOptions {
+                max_imbalance: 0.10,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
         7 => feral_metis::metis_order_full(
             core,
-            &MetisOptions { max_imbalance: 0.05, ..Default::default() },
+            &MetisOptions {
+                max_imbalance: 0.05,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
         8 => feral_metis::metis_order_full(
             core,
-            &MetisOptions { nd_to_amd_switch: 100, ..Default::default() },
+            &MetisOptions {
+                nd_to_amd_switch: 100,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
         9 => feral_metis::metis_order_full(
             core,
-            &MetisOptions { nd_to_amd_switch: 400, ..Default::default() },
+            &MetisOptions {
+                nd_to_amd_switch: 400,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
         10 => feral_metis::metis_order_full(
             core,
-            &MetisOptions { dense_quotient_enabled: true, ..Default::default() },
+            &MetisOptions {
+                dense_quotient_enabled: true,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
         11 => feral_scotch::scotch_order_full(
             core,
-            &feral_scotch::ScotchOptions { seed: 2, ..Default::default() },
+            &feral_scotch::ScotchOptions {
+                seed: 2,
+                ..Default::default()
+            },
         )
         .ok()
         .map(|(p, _, _)| p),
@@ -526,12 +575,19 @@ fn probe_large() {
         }
 
         // AMD with dense deferral disabled and aggressive absorption off.
-        let amd_nd = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let amd_nd = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
         let t = Instant::now();
         let ar = match feral_amd::amd_order_opts(&core, &amd_nd) {
             Ok((p, ..)) => {
                 let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
+                if is_bijection(&p, n) {
+                    flops_of(&sp, &p) as f64 / base
+                } else {
+                    f64::NAN
+                }
             }
             Err(_) => f64::NAN,
         };
@@ -540,12 +596,19 @@ fn probe_large() {
         // One AMF pass at dense_alpha 5, and one with dense detection disabled.
         let mut out = Vec::new();
         for da in [5.0f64, -1.0] {
-            let o = feral_amf::AmfOptions { dense_alpha: da, ..Default::default() };
+            let o = feral_amf::AmfOptions {
+                dense_alpha: da,
+                ..Default::default()
+            };
             let t = Instant::now();
             let r = match feral_amf::amf_order_opts(&core, &o) {
                 Ok((p, ..)) => {
                     let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                    if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
+                    if is_bijection(&p, n) {
+                        flops_of(&sp, &p) as f64 / base
+                    } else {
+                        f64::NAN
+                    }
                 }
                 Err(_) => f64::NAN,
             };
@@ -554,14 +617,18 @@ fn probe_large() {
         // One default METIS pass, only where it is cheap enough to be worth timing.
         let (ms, mr) = if nnz < METIS_PROBE_MAX_NNZ {
             let t = Instant::now();
-            let r = match feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default())
-            {
-                Ok((p, _, _)) => {
-                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                    if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
-                }
-                Err(_) => f64::NAN,
-            };
+            let r =
+                match feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default()) {
+                    Ok((p, _, _)) => {
+                        let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                        if is_bijection(&p, n) {
+                            flops_of(&sp, &p) as f64 / base
+                        } else {
+                            f64::NAN
+                        }
+                    }
+                    Err(_) => f64::NAN,
+                };
             (t.elapsed().as_secs_f64(), r)
         } else {
             (f64::NAN, f64::NAN)
@@ -636,7 +703,10 @@ fn probe_multiseed() {
             // (a) METIS seed restarts — each seed is a different coarsening
             //     matching and a different set of initial bisections.
             for seed in [2u64, 3, 5, 8, 13, 21, 34] {
-                let o = feral_metis::MetisOptions { seed, ..Default::default() };
+                let o = feral_metis::MetisOptions {
+                    seed,
+                    ..Default::default()
+                };
                 if let Ok((p, _, _)) = feral_metis::metis_order_full(&core, &o) {
                     try_perm(format!("metis.seed{seed}"), p);
                 }
@@ -644,7 +714,10 @@ fn probe_multiseed() {
             // (b) METIS imbalance variants — a looser/tighter balance constraint
             //     changes every separator on the recursion.
             for imb in [0.05f64, 0.10, 0.40] {
-                let o = feral_metis::MetisOptions { max_imbalance: imb, ..Default::default() };
+                let o = feral_metis::MetisOptions {
+                    max_imbalance: imb,
+                    ..Default::default()
+                };
                 if let Ok((p, _, _)) = feral_metis::metis_order_full(&core, &o) {
                     try_perm(format!("metis.imb{imb}"), p);
                 }
@@ -652,7 +725,10 @@ fn probe_multiseed() {
             // (c) METIS ND→AMD switch point — how much of the tail is handed to
             //     minimum degree instead of further dissection.
             for sw in [40u32, 100, 400] {
-                let o = feral_metis::MetisOptions { nd_to_amd_switch: sw, ..Default::default() };
+                let o = feral_metis::MetisOptions {
+                    nd_to_amd_switch: sw,
+                    ..Default::default()
+                };
                 if let Ok((p, _, _)) = feral_metis::metis_order_full(&core, &o) {
                     try_perm(format!("metis.sw{sw}"), p);
                 }
@@ -670,20 +746,32 @@ fn probe_multiseed() {
             }
             // (e) Scotch seed restarts.
             for seed in [1u64, 2, 3, 7] {
-                let o = feral_scotch::ScotchOptions { seed, ..Default::default() };
+                let o = feral_scotch::ScotchOptions {
+                    seed,
+                    ..Default::default()
+                };
                 if let Ok((p, _, _)) = feral_scotch::scotch_order_full(&core, &o) {
                     try_perm(format!("scotch.seed{seed}"), p);
                 }
             }
             // (f) KaHIP seeds and the two stronger modes.
             for seed in [2u64, 3, 5] {
-                let o = feral_kahip::KahipOptions { seed, ..Default::default() };
+                let o = feral_kahip::KahipOptions {
+                    seed,
+                    ..Default::default()
+                };
                 if let Ok((p, _, _)) = feral_kahip::kahip_order_full(&core, &o) {
                     try_perm(format!("kahip.seed{seed}"), p);
                 }
             }
-            for (tag, mode) in [("eco", feral_kahip::KahipMode::Eco), ("strong", feral_kahip::KahipMode::Strong)] {
-                let o = feral_kahip::KahipOptions { mode, ..Default::default() };
+            for (tag, mode) in [
+                ("eco", feral_kahip::KahipMode::Eco),
+                ("strong", feral_kahip::KahipMode::Strong),
+            ] {
+                let o = feral_kahip::KahipOptions {
+                    mode,
+                    ..Default::default()
+                };
                 if let Ok((p, _, _)) = feral_kahip::kahip_order_full(&core, &o) {
                     try_perm(format!("kahip.{tag}"), p);
                 }
@@ -728,7 +816,10 @@ fn probe_multiseed() {
     }
     println!("SCORE cur = {:.6}", aggregate(&cur.0, &cur.1));
     println!("SCORE new = {:.6}", aggregate(&new.0, &new.1));
-    println!("worst EXTRA sweep time = {:.3} s on {}", rows[0].0, rows[0].1);
+    println!(
+        "worst EXTRA sweep time = {:.3} s on {}",
+        rows[0].0, rows[0].1
+    );
 }
 
 /// Score the BUDGETED relabelled-AMD multi-start and measure its true combined
@@ -949,7 +1040,10 @@ fn probe_heavy_cost() {
         }
 
         // AMD, dense deferral off + aggressive absorption off: min-of-REPS.
-        let amd_nd = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let amd_nd = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
         let mut amdnd_s = f64::INFINITY;
         let mut amdnd_r = f64::NAN;
         for _ in 0..REPS {
@@ -957,7 +1051,11 @@ fn probe_heavy_cost() {
             let r = match feral_amd::amd_order_opts(&core, &amd_nd) {
                 Ok((p, ..)) => {
                     let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                    if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN }
+                    if is_bijection(&p, n) {
+                        flops_of(&sp, &p) as f64 / base
+                    } else {
+                        f64::NAN
+                    }
                 }
                 Err(_) => f64::NAN,
             };
@@ -1031,7 +1129,13 @@ fn probe_relabel_structured() {
 
         let start_perm = order(pat);
         let cur_flops = flops_of(&sp, &start_perm) as f64;
-        let rmax = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, probe_max_deg(pat));
+        let rmax = relabel_restarts(
+            RELABEL_BUDGET,
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            probe_max_deg(pat),
+        );
 
         // One AMD pass on relabeling q; returns (flops, perm) if valid.
         let try_q = |q: &[usize]| -> Option<(f64, Vec<usize>)> {
@@ -1102,7 +1206,10 @@ fn probe_relabel_structured() {
         }
     }
 
-    println!("\nSCORE cur (no restarts beyond shipped order()) = {:.6}", aggregate(&cur.0, &cur.1));
+    println!(
+        "\nSCORE cur (no restarts beyond shipped order()) = {:.6}",
+        aggregate(&cur.0, &cur.1)
+    );
     for si in 0..NS {
         println!(
             "{:>5}: score={:.6} improved_vs_cur={} beats_rand={}",
@@ -1114,7 +1221,11 @@ fn probe_relabel_structured() {
         print!("       ");
         for b in 0..3 {
             if strat[si].1[b] > 0 {
-                print!(" {}={:.4}", BUCKET_NAMES[b], (strat[si].0[b] / strat[si].1[b] as f64).exp());
+                print!(
+                    " {}={:.4}",
+                    BUCKET_NAMES[b],
+                    (strat[si].0[b] / strat[si].1[b] as f64).exp()
+                );
             }
         }
         println!();
@@ -1174,7 +1285,13 @@ fn probe_relabel_schedule() {
 
         let start_perm = order_with_relabel_cap(pat, 0);
         let start_flops = flops_of(&sp, &start_perm) as f64;
-        let rmax = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, probe_max_deg(pat));
+        let rmax = relabel_restarts(
+            RELABEL_BUDGET,
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            probe_max_deg(pat),
+        );
 
         let try_q = |q: &[usize]| -> Option<(f64, Vec<usize>)> {
             let b = permute_pattern(&sp, q);
@@ -1237,7 +1354,11 @@ fn probe_relabel_schedule() {
         print!("       ");
         for b in 0..3 {
             if strat[si].1[b] > 0 {
-                print!(" {}={:.4}", BUCKET_NAMES[b], (strat[si].0[b] / strat[si].1[b] as f64).exp());
+                print!(
+                    " {}={:.4}",
+                    BUCKET_NAMES[b],
+                    (strat[si].0[b] / strat[si].1[b] as f64).exp()
+                );
             }
         }
         println!();
@@ -1369,7 +1490,12 @@ fn probe_hc_phase() {
             if best < cur_flops - 1e-9 {
                 improved[si] += 1;
                 if si == 0 || si == 1 {
-                    println!("  {name} n={n} nnz={nnz} {}={:.4} cur={:.4}", NAMES[si], best / base, cur_flops / base);
+                    println!(
+                        "  {name} n={n} nnz={nnz} {}={:.4} cur={:.4}",
+                        NAMES[si],
+                        best / base,
+                        cur_flops / base
+                    );
                 }
             }
         }
@@ -1388,7 +1514,11 @@ fn probe_hc_phase() {
         print!("      ");
         for b in 0..3 {
             if strat[si].1[b] > 0 {
-                print!(" {}={:.4}", BUCKET_NAMES[b], (strat[si].0[b] / strat[si].1[b] as f64).exp());
+                print!(
+                    " {}={:.4}",
+                    BUCKET_NAMES[b],
+                    (strat[si].0[b] / strat[si].1[b] as f64).exp()
+                );
             }
         }
         println!();
@@ -1498,7 +1628,10 @@ fn probe_hc_bucket_budget() {
             let hc_secs = t1.elapsed().as_secs_f64();
             let combined = ord_secs + hc_secs;
             if hc_r > 0 && combined > worst[pi].0 {
-                worst[pi] = (combined, format!("{name} (ord={ord_secs:.3} hc={hc_secs:.3})"));
+                worst[pi] = (
+                    combined,
+                    format!("{name} (ord={ord_secs:.3} hc={hc_secs:.3})"),
+                );
             }
             strat[pi].0[bkt] += (best / base).ln();
             strat[pi].1[bkt] += 1;
@@ -1521,7 +1654,11 @@ fn probe_hc_bucket_budget() {
         print!("      ");
         for b in 0..3 {
             if strat[pi].1[b] > 0 {
-                print!(" {}={:.4}", BUCKET_NAMES[b], (strat[pi].0[b] / strat[pi].1[b] as f64).exp());
+                print!(
+                    " {}={:.4}",
+                    BUCKET_NAMES[b],
+                    (strat[pi].0[b] / strat[pi].1[b] as f64).exp()
+                );
             }
         }
         println!();
@@ -1638,16 +1775,32 @@ fn probe_tie_margins() {
         ties.push((margin, name.clone(), n, pat.nnz()));
     }
     ties.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    println!("\n{} ties; margin = best_non_anchor / amd (1.0 = razor thin):", ties.len());
+    println!(
+        "\n{} ties; margin = best_non_anchor / amd (1.0 = razor thin):",
+        ties.len()
+    );
     let mut b = [0usize; 5]; // <1.02, <1.10, <1.5, <inf, inf
     for (m, name, n, nnz) in &ties {
-        let bi = if *m < 1.02 { 0 } else if *m < 1.10 { 1 } else if *m < 1.5 { 2 } else if m.is_finite() { 3 } else { 4 };
+        let bi = if *m < 1.02 {
+            0
+        } else if *m < 1.10 {
+            1
+        } else if *m < 1.5 {
+            2
+        } else if m.is_finite() {
+            3
+        } else {
+            4
+        };
         b[bi] += 1;
         if *m < 1.10 || !m.is_finite() {
             println!("  {name}\tn={n}\tnnz={nnz}\tmargin={m:.4}");
         }
     }
-    println!("\nhistogram: <1.02: {}  1.02-1.10: {}  1.10-1.5: {}  >=1.5: {}  no-candidate: {}", b[0], b[1], b[2], b[3], b[4]);
+    println!(
+        "\nhistogram: <1.02: {}  1.02-1.10: {}  1.10-1.5: {}  >=1.5: {}  no-candidate: {}",
+        b[0], b[1], b[2], b[3], b[4]
+    );
 }
 
 /// VERY-HEAVY TIER (700k < nnz <= 1.5M, sparse): two unmeasured leads.
@@ -1684,7 +1837,10 @@ fn probe_vheavy() {
         ) as f64;
 
         // (a) no-dense AMD, isolated
-        let amd_nodense = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let amd_nodense = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
         let mut nd_cost = f64::INFINITY;
         let mut nd_ratio = f64::NAN;
         for _ in 0..2 {
@@ -1717,7 +1873,10 @@ fn probe_vheavy() {
                 }
             }
             best = best.min(ratio);
-            println!("  seed {seed}: ratio={ratio:.4} best={best:.4} cost={:.3}s", t.elapsed().as_secs_f64());
+            println!(
+                "  seed {seed}: ratio={ratio:.4} best={best:.4} cost={:.3}s",
+                t.elapsed().as_secs_f64()
+            );
         }
     }
 }
@@ -1929,7 +2088,10 @@ fn probe_winc_cap_sweep() {
         bases.push(base);
     }
 
-    println!("\n{:>6} {:>12} {:>10} {:>10} {:>10}", "cap", "score", "lt_1k", "1k_10k", "gt_10k");
+    println!(
+        "\n{:>6} {:>12} {:>10} {:>10} {:>10}",
+        "cap", "score", "lt_1k", "1k_10k", "gt_10k"
+    );
     for &cap in &CAPS {
         let mut ls = [0.0f64; 3];
         let mut ct = [0usize; 3];
@@ -1954,7 +2116,9 @@ fn probe_winc_cap_sweep() {
         println!(
             "{cap:>6} {:>12.6} {:>10.4} {:>10.4} {:>10.4}",
             aggregate(&ls, &ct),
-            per_bucket[0], per_bucket[1], per_bucket[2]
+            per_bucket[0],
+            per_bucket[1],
+            per_bucket[2]
         );
     }
 }
@@ -2013,8 +2177,14 @@ fn probe_win_d_map() {
 
         // D's two candidates, isolated, UN-gated (run regardless of nnz).
         // min-of-3 for both value stability (panics/degenerate runs) and cost.
-        let opts_25 = feral_amf::AmfOptions { dense_alpha: 2.5, ..Default::default() };
-        let opts_05 = feral_amf::AmfOptions { dense_alpha: 0.5, ..Default::default() };
+        let opts_25 = feral_amf::AmfOptions {
+            dense_alpha: 2.5,
+            ..Default::default()
+        };
+        let opts_05 = feral_amf::AmfOptions {
+            dense_alpha: 0.5,
+            ..Default::default()
+        };
         let mut d_best = f64::INFINITY;
         let mut d_cost = f64::INFINITY;
         for _ in 0..3 {
@@ -2036,7 +2206,11 @@ fn probe_win_d_map() {
             d_best = d_best.min(local_best);
         }
         let d_ratio = d_best / base;
-        let verdict = if d_best < actual_flops - 1e-6 { "WIN" } else { "tie" };
+        let verdict = if d_best < actual_flops - 1e-6 {
+            "WIN"
+        } else {
+            "tie"
+        };
         let density = nnz as f64 / n as f64;
         println!(
             "{name:<28} {n:>10} {nnz:>10} {density:>9.2} {actual_ratio:>10.4} {d_ratio:>10.4} {d_cost:>9.3} {verdict:>6} {:>7}",
@@ -2080,7 +2254,10 @@ fn probe_winf_gatewall() {
     ];
     for tname in &targets {
         let Some((_, pat)) = corpus.iter().find(|(n, _)| n == tname) else {
-            println!("{tname}: NOT FOUND in corpus (SSI_CORPUS_FILE={:?})", std::env::var("SSI_CORPUS_FILE").ok());
+            println!(
+                "{tname}: NOT FOUND in corpus (SSI_CORPUS_FILE={:?})",
+                std::env::var("SSI_CORPUS_FILE").ok()
+            );
             continue;
         };
         let n = pat.n;
@@ -2094,14 +2271,22 @@ fn probe_winf_gatewall() {
         let port_perm = crate::ordering::order(pat);
         let port_flops = flops_of(&sp, &port_perm) as f64;
 
-        println!("\n{tname} n={n} nnz={nnz} density={:.2} (gate nnz<130000: {})", nnz as f64 / n as f64, nnz < 130_000);
+        println!(
+            "\n{tname} n={n} nnz={nnz} density={:.2} (gate nnz<130000: {})",
+            nnz as f64 / n as f64,
+            nnz < 130_000
+        );
         for (variant, vname) in variants.iter().zip(names.iter()) {
             match crate::ordering::custom_metrics::order_variant(&core, 10.0, true, *variant) {
                 Ok(p) => {
                     let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
                     if is_bijection(&p, n) {
                         let f = flops_of(&sp, &p) as f64;
-                        let verdict = if f < port_flops - 1e-6 { "WIN" } else { "no-win" };
+                        let verdict = if f < port_flops - 1e-6 {
+                            "WIN"
+                        } else {
+                            "no-win"
+                        };
                         println!("  {vname:<22} flops={f:>14.0} vs portfolio={port_flops:>14.0}  {verdict}");
                     } else {
                         println!("  {vname:<22} NOT A BIJECTION");
@@ -2126,14 +2311,19 @@ fn probe_winf_gatewall() {
 fn probe_shot3_attrib() {
     let corpus = crate::corpus::corpus();
     for tname in ["pooling_sppb5tp", "telecomsp_njlata"] {
-        let Some((_, pat)) = corpus.iter().find(|(n, _)| n == tname) else { continue; };
+        let Some((_, pat)) = corpus.iter().find(|(n, _)| n == tname) else {
+            continue;
+        };
         let n = pat.n;
         let nnz = pat.nnz();
         let sp = scoring_pattern(pat);
         let cp: Vec<i32> = pat.col_ptr.iter().map(|&x| x as i32).collect();
         let ri: Vec<i32> = pat.row_idx.iter().map(|&x| x as i32).collect();
         let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        println!("\n{tname} n={n} nnz={nnz} density={:.1}", nnz as f64 / n as f64);
+        println!(
+            "\n{tname} n={n} nnz={nnz} density={:.1}",
+            nnz as f64 / n as f64
+        );
 
         // shot2-level incumbent (everything through PEEL/CNTREL) as the seed
         let t0 = Instant::now();
@@ -2158,14 +2348,22 @@ fn probe_shot3_attrib() {
             let mut ranked: Vec<usize> = (0..n).collect();
             ranked.sort_unstable_by(|&a, &b| cnt_by_v[b].cmp(&cnt_by_v[a]).then(a.cmp(&b)));
             for &k in &[6usize, 24, 64, 96] {
-                if k >= n { break; }
+                if k >= n {
+                    break;
+                }
                 let _ = crate::ordering::strip_candidate(&sp, &ranked, k);
             }
         }
-        println!("  sv2inc (4x sub-AMD)      = {:.3}s", t0.elapsed().as_secs_f64());
+        println!(
+            "  sv2inc (4x sub-AMD)      = {:.3}s",
+            t0.elapsed().as_secs_f64()
+        );
 
         let dense_class = nnz >= 25 * n || nnz >= 130_000;
-        println!("  dense_class = {dense_class}, nnz/n = {:.2}", nnz as f64 / n as f64);
+        println!(
+            "  dense_class = {dense_class}, nnz/n = {:.2}",
+            nnz as f64 / n as f64
+        );
         if dense_class {
             let mut deg_ranked: Vec<usize> = (0..n).collect();
             deg_ranked.sort_unstable_by(|&a, &b| {
@@ -2175,32 +2373,53 @@ fn probe_shot3_attrib() {
             });
             let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
             let sub_amd_nd = |c: &feral_ordering_core::CscPattern| {
-                let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                let o = feral_amd::AmdOptions {
+                    aggressive: false,
+                    dense_alpha: -1.0,
+                };
                 feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
             };
             let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
-                let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+                let o = feral_amf::AmfOptions {
+                    dense_alpha: 5.0,
+                    ..Default::default()
+                };
                 feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
             };
             let t0 = Instant::now();
             for &k in &[8usize, 32, 64] {
-                if k >= n { break; }
+                if k >= n {
+                    break;
+                }
                 let _ = crate::ordering::strip_general_v2(&sp, &deg_ranked, k, &sub_amd);
             }
-            println!("  sv2damd (3x sub-AMD)     = {:.3}s", t0.elapsed().as_secs_f64());
+            println!(
+                "  sv2damd (3x sub-AMD)     = {:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
             let t0 = Instant::now();
             for &k in &[8usize, 32, 64] {
-                if k >= n { break; }
+                if k >= n {
+                    break;
+                }
                 let _ = crate::ordering::strip_general_v2(&sp, &deg_ranked, k, &sub_amf5);
             }
-            println!("  sv2damf (3x sub-AMF5)    = {:.3}s", t0.elapsed().as_secs_f64());
+            println!(
+                "  sv2damf (3x sub-AMF5)    = {:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
             if nnz > 45 * n {
                 let t0 = Instant::now();
                 for &k in &[8usize, 32, 64] {
-                    if k >= n { break; }
+                    if k >= n {
+                        break;
+                    }
                     let _ = crate::ordering::strip_general_v2(&sp, &deg_ranked, k, &sub_amd_nd);
                 }
-                println!("  sv2dnd (3x sub-AMD-nd)   = {:.3}s", t0.elapsed().as_secs_f64());
+                println!(
+                    "  sv2dnd (3x sub-AMD-nd)   = {:.3}s",
+                    t0.elapsed().as_secs_f64()
+                );
             } else {
                 println!("  sv2dnd: excluded (nnz/n <= 45)");
             }
@@ -2214,7 +2433,10 @@ fn probe_shot3_attrib() {
                 Some((fcp, fri)) => {
                     if let Some(fcore) = feral_ordering_core::CscPattern::new(n, &fcp, &fri) {
                         let _ = feral_amd::amd_order(&fcore);
-                        let ndo = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                        let ndo = feral_amd::AmdOptions {
+                            aggressive: false,
+                            dense_alpha: -1.0,
+                        };
                         let _ = feral_amd::amd_order_opts(&fcore, &ndo);
                     }
                     seed = port_perm.clone();
@@ -2222,7 +2444,11 @@ fn probe_shot3_attrib() {
                 None => break,
             }
         }
-        println!("  fillg (<=2 rounds, gated)= {:.3}s (lnnz={lnnz}, gate 3_000_000, admitted={})", t0.elapsed().as_secs_f64(), lnnz <= 3_000_000);
+        println!(
+            "  fillg (<=2 rounds, gated)= {:.3}s (lnnz={lnnz}, gate 3_000_000, admitted={})",
+            t0.elapsed().as_secs_f64(),
+            lnnz <= 3_000_000
+        );
     }
 }
 
@@ -2256,7 +2482,10 @@ fn probe_telos() {
 
     let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
     let sub_nd = |c: &feral_ordering_core::CscPattern| {
-        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let o = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
         feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
     };
 
@@ -2286,7 +2515,11 @@ fn probe_telos() {
 
         // Tiered budget by nnz.
         let (kgrid, max_rounds, use_nd): (&[usize], usize, bool) = if nnz < 150_000 {
-            (&[1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192], 4, true)
+            (
+                &[1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192],
+                4,
+                true,
+            )
         } else if nnz < 700_000 {
             (&[4, 8, 16, 24, 48, 96, 192], 3, true)
         } else {
@@ -2312,7 +2545,11 @@ fn probe_telos() {
             let mut best_f = f_cur;
             let mut best_p: Option<Vec<usize>> = None;
             let mut best_l = String::new();
-            let mut eval = |cand: Vec<usize>, label: String, best_f: &mut u64, best_p: &mut Option<Vec<usize>>, best_l: &mut String| {
+            let mut eval = |cand: Vec<usize>,
+                            label: String,
+                            best_f: &mut u64,
+                            best_p: &mut Option<Vec<usize>>,
+                            best_l: &mut String| {
                 if !is_bijection(&cand, n) {
                     return;
                 }
@@ -2328,12 +2565,14 @@ fn probe_telos() {
                 if k >= n {
                     break;
                 }
-                let subs: &[(&str, &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>)] =
-                    if use_nd {
-                        &[("amd", &sub_amd), ("nd", &sub_nd)]
-                    } else {
-                        &[("amd", &sub_amd)]
-                    };
+                let subs: &[(
+                    &str,
+                    &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>,
+                )] = if use_nd {
+                    &[("amd", &sub_amd), ("nd", &sub_nd)]
+                } else {
+                    &[("amd", &sub_amd)]
+                };
                 for (sl, sub) in subs {
                     if let Some(cand) = strip_general_v2(&sp, &ranked, k, sub) {
                         // tail-by-count variant derived from the same candidate:
@@ -2343,9 +2582,21 @@ fn probe_telos() {
                             let tail = &mut cand2[n - k..];
                             tail.sort_unstable_by_key(|&v| (cnt[v], v));
                         }
-                        eval(cand, format!("s:{sl}:k{k}"), &mut best_f, &mut best_p, &mut best_l);
+                        eval(
+                            cand,
+                            format!("s:{sl}:k{k}"),
+                            &mut best_f,
+                            &mut best_p,
+                            &mut best_l,
+                        );
                         if cand2 != cur {
-                            eval(cand2, format!("s:{sl}:k{k}c"), &mut best_f, &mut best_p, &mut best_l);
+                            eval(
+                                cand2,
+                                format!("s:{sl}:k{k}c"),
+                                &mut best_f,
+                                &mut best_p,
+                                &mut best_l,
+                            );
                         }
                     }
                 }
@@ -2369,7 +2620,11 @@ fn probe_telos() {
                     }
                     let mut cand = head.clone();
                     cand.extend(tail);
-                    let lbl = if tail_by_deg { format!("p:k{k}d") } else { format!("p:k{k}c") };
+                    let lbl = if tail_by_deg {
+                        format!("p:k{k}d")
+                    } else {
+                        format!("p:k{k}c")
+                    };
                     eval(cand, lbl, &mut best_f, &mut best_p, &mut best_l);
                 }
             }
@@ -2414,7 +2669,9 @@ fn probe_peo_invariance() {
         }
         let sp = scoring_pattern(pat);
         let inc = order(pat);
-        let Some((fcp, fri)) = filled_graph(&sp, &inc, 500_000) else { continue };
+        let Some((fcp, fri)) = filled_graph(&sp, &inc, 500_000) else {
+            continue;
+        };
         let fsp = ScoringPattern {
             n,
             col_ptr: fcp.iter().map(|&x| x as usize).collect(),
@@ -2435,9 +2692,16 @@ fn probe_peo_invariance() {
                     if numbered[v] {
                         continue;
                     }
-                    let h = (v as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(seed).rotate_left(17).wrapping_mul(seed | 1);
+                    let h = (v as u64)
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(seed)
+                        .rotate_left(17)
+                        .wrapping_mul(seed | 1);
                     // max weight, tie by hash
-                    if best_v == usize::MAX || weight[v] > best_key.0 || (weight[v] == best_key.0 && h < best_key.1) {
+                    if best_v == usize::MAX
+                        || weight[v] > best_key.0
+                        || (weight[v] == best_key.0 && h < best_key.1)
+                    {
                         best_v = v;
                         best_key = (weight[v], h);
                     }
@@ -2488,11 +2752,17 @@ fn probe_telos2() {
 
     let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
     let sub_nd = |c: &feral_ordering_core::CscPattern| {
-        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let o = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
         feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
     };
     let sub_mf = |c: &feral_ordering_core::CscPattern| {
-        let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+        let o = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
         feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
     };
 
@@ -2548,7 +2818,11 @@ fn probe_telos2() {
             let mut best_f = f_cur;
             let mut best_p: Option<Vec<usize>> = None;
             let mut best_l = String::new();
-            let mut eval = |cand: Vec<usize>, label: String, best_f: &mut u64, best_p: &mut Option<Vec<usize>>, best_l: &mut String| {
+            let mut eval = |cand: Vec<usize>,
+                            label: String,
+                            best_f: &mut u64,
+                            best_p: &mut Option<Vec<usize>>,
+                            best_l: &mut String| {
                 if !is_bijection(&cand, n) {
                     return;
                 }
@@ -2564,8 +2838,10 @@ fn probe_telos2() {
                 if k >= n {
                     break;
                 }
-                let mut subs: Vec<(&str, &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>)> =
-                    vec![("amd", &sub_amd), ("nd", &sub_nd)];
+                let mut subs: Vec<(
+                    &str,
+                    &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>,
+                )> = vec![("amd", &sub_amd), ("nd", &sub_nd)];
                 if use_mf {
                     subs.push(("mf", &sub_mf));
                 }
@@ -2576,9 +2852,21 @@ fn probe_telos2() {
                             let tail = &mut cand2[n - k..];
                             tail.sort_unstable_by_key(|&v| (cnt[v], v));
                         }
-                        eval(cand, format!("s:{sl}:k{k}"), &mut best_f, &mut best_p, &mut best_l);
+                        eval(
+                            cand,
+                            format!("s:{sl}:k{k}"),
+                            &mut best_f,
+                            &mut best_p,
+                            &mut best_l,
+                        );
                         if cand2 != cur {
-                            eval(cand2, format!("s:{sl}:k{k}c"), &mut best_f, &mut best_p, &mut best_l);
+                            eval(
+                                cand2,
+                                format!("s:{sl}:k{k}c"),
+                                &mut best_f,
+                                &mut best_p,
+                                &mut best_l,
+                            );
                         }
                     }
                 }
@@ -2601,7 +2889,11 @@ fn probe_telos2() {
                     }
                     let mut cand = head.clone();
                     cand.extend(tail);
-                    let lbl = if tail_by_deg { format!("p:k{k}d") } else { format!("p:k{k}c") };
+                    let lbl = if tail_by_deg {
+                        format!("p:k{k}d")
+                    } else {
+                        format!("p:k{k}c")
+                    };
                     eval(cand, lbl, &mut best_f, &mut best_p, &mut best_l);
                 }
             }
@@ -2672,18 +2964,38 @@ fn probe_telos3() {
 
     let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
     let sub_nd = |c: &feral_ordering_core::CscPattern| {
-        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        let o = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
         feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
     };
     let sub_mf = |c: &feral_ordering_core::CscPattern| {
-        let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+        let o = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
         feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
     };
 
     // Priority list from wave-2 winner histogram (label, k). 0=amd 1=nd 2=mf.
     const PRIO: [(u8, usize); 16] = [
-        (2, 1), (1, 2), (2, 4), (0, 1), (2, 12), (1, 6), (2, 24), (0, 4),
-        (1, 12), (2, 2), (0, 16), (1, 8), (2, 32), (0, 96), (2, 6), (2, 16),
+        (2, 1),
+        (1, 2),
+        (2, 4),
+        (0, 1),
+        (2, 12),
+        (1, 6),
+        (2, 24),
+        (0, 4),
+        (1, 12),
+        (2, 2),
+        (0, 16),
+        (1, 8),
+        (2, 32),
+        (0, 96),
+        (2, 6),
+        (2, 16),
     ];
     const HEAVY_PRIO: [(u8, usize); 4] = [(1, 2), (0, 8), (1, 192), (0, 96)];
     const TELOS3_BUDGET: usize = 1_000_000;
@@ -2745,7 +3057,11 @@ fn probe_telos3() {
             let mut best_f = f_cur;
             let mut best_p: Option<Vec<usize>> = None;
             let mut best_l = String::new();
-            let mut eval = |cand: Vec<usize>, label: String, best_f: &mut u64, best_p: &mut Option<Vec<usize>>, best_l: &mut String| {
+            let mut eval = |cand: Vec<usize>,
+                            label: String,
+                            best_f: &mut u64,
+                            best_p: &mut Option<Vec<usize>>,
+                            best_l: &mut String| {
                 if !is_bijection(&cand, n) {
                     return;
                 }
@@ -2762,15 +3078,23 @@ fn probe_telos3() {
                 if k >= n {
                     continue;
                 }
-                let (sl, sub): (&str, &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>) =
-                    match subi {
-                        0 => ("amd", &sub_amd),
-                        1 => ("nd", &sub_nd),
-                        _ => ("mf", &sub_mf),
-                    };
+                let (sl, sub): (
+                    &str,
+                    &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>,
+                ) = match subi {
+                    0 => ("amd", &sub_amd),
+                    1 => ("nd", &sub_nd),
+                    _ => ("mf", &sub_mf),
+                };
                 total_passes += 1;
                 if let Some(cand) = strip_general_v2(&sp, &ranked, k, sub) {
-                    eval(cand, format!("s:{sl}:k{k}"), &mut best_f, &mut best_p, &mut best_l);
+                    eval(
+                        cand,
+                        format!("s:{sl}:k{k}"),
+                        &mut best_f,
+                        &mut best_p,
+                        &mut best_l,
+                    );
                 }
             }
             for &k in peel_grid {
@@ -2790,7 +3114,13 @@ fn probe_telos3() {
                 let mut tail: Vec<usize> = ranked[..k].to_vec();
                 tail.sort_unstable_by_key(|&v| (sp.col_ptr[v + 1] - sp.col_ptr[v], v));
                 cand.extend(tail);
-                eval(cand, format!("p:k{k}d"), &mut best_f, &mut best_p, &mut best_l);
+                eval(
+                    cand,
+                    format!("p:k{k}d"),
+                    &mut best_f,
+                    &mut best_p,
+                    &mut best_l,
+                );
             }
 
             match best_p {
@@ -3246,55 +3576,55 @@ fn probe_orbit() {
         let (mut wl_ms, mut fg_ms, mut scan_ms) = (0u128, 0u128, 0u128);
         let t_fg = Instant::now();
         if n <= ORBIT_MAX_N {
-        if let Some((fcp, fri)) = filled_graph(&sp, &amd_perm, ORBIT_MAX_LNNZ) {
-            fg_ms = t_fg.elapsed().as_millis();
-            let mut adj: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    fri[fcp[v] as usize..fcp[v + 1] as usize]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .collect()
-                })
-                .collect();
-            let asort: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .filter(|&x| x as usize != v)
-                        .collect();
-                    c.sort_unstable();
-                    c
-                })
-                .collect();
-            let mut fill: Vec<(u32, u32)> = Vec::new();
-            for u in 0..n {
-                for &wv in &adj[u] {
-                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
-                        fill.push((u as u32, wv));
+            if let Some((fcp, fri)) = filled_graph(&sp, &amd_perm, ORBIT_MAX_LNNZ) {
+                fg_ms = t_fg.elapsed().as_millis();
+                let mut adj: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        fri[fcp[v] as usize..fcp[v + 1] as usize]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .collect()
+                    })
+                    .collect();
+                let asort: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .filter(|&x| x as usize != v)
+                            .collect();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect();
+                let mut fill: Vec<(u32, u32)> = Vec::new();
+                for u in 0..n {
+                    for &wv in &adj[u] {
+                        if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                            fill.push((u as u32, wv));
+                        }
                     }
                 }
-            }
-            fill_ct = fill.len();
-            if !fill.is_empty() {
-                let t_wl = Instant::now();
-                let (class, k) = orbit_wl_classes(n, &asort, ORBIT_WL_MAX_ROUNDS);
-                wl_ms = t_wl.elapsed().as_millis();
-                classes_ct = k;
-                let t_scan = Instant::now();
-                b_removed = orbit_batched_delete(&mut adj, &fill, &class);
-                scan_ms = t_scan.elapsed().as_millis();
-                if b_removed > 0 {
-                    let cand = minl_mcs_peo(n, &adj);
-                    if is_bijection(&cand, n) {
-                        let f = flops_of(&sp, &cand);
-                        if (f as f64) < base {
-                            b_beats_amd = true;
+                fill_ct = fill.len();
+                if !fill.is_empty() {
+                    let t_wl = Instant::now();
+                    let (class, k) = orbit_wl_classes(n, &asort, ORBIT_WL_MAX_ROUNDS);
+                    wl_ms = t_wl.elapsed().as_millis();
+                    classes_ct = k;
+                    let t_scan = Instant::now();
+                    b_removed = orbit_batched_delete(&mut adj, &fill, &class);
+                    scan_ms = t_scan.elapsed().as_millis();
+                    if b_removed > 0 {
+                        let cand = minl_mcs_peo(n, &adj);
+                        if is_bijection(&cand, n) {
+                            let f = flops_of(&sp, &cand);
+                            if (f as f64) < base {
+                                b_beats_amd = true;
+                            }
                         }
                     }
                 }
             }
-        }
         }
         if classes_ct < n {
             wl_fire += 1;
@@ -3421,13 +3751,13 @@ fn probe_stack() {
         let full = order(pat);
         let f_full = flops_of(&sp, &full) as f64;
 
-        let no_orbit = order_with_options(pat, usize::MAX, false, true, true, true);
+        let no_orbit = order_with_options(pat, usize::MAX, false, true);
         let f_no_orbit = flops_of(&sp, &no_orbit) as f64;
 
-        let no_pharmakos = order_with_options(pat, usize::MAX, true, false, true, true);
+        let no_pharmakos = order_with_options(pat, usize::MAX, true, false);
         let f_no_pharmakos = flops_of(&sp, &no_pharmakos) as f64;
 
-        let neither = order_with_options(pat, usize::MAX, false, false, true, true);
+        let neither = order_with_options(pat, usize::MAX, false, false);
         let f_neither = flops_of(&sp, &neither) as f64;
 
         let this_orbit_fired = f_full < f_no_orbit - 0.5;
@@ -3495,9 +3825,18 @@ fn probe_stack() {
     let score = aggregate(&log_sums, &counts);
     let total: usize = counts.iter().sum();
     println!("\nRECON SCORE = {score:.6}");
-    println!("baseline to beat = 0.834343  (delta = {:+.6})", score - 0.834343);
-    println!("orbit-regate alone = 0.834286  (delta = {:+.6})", score - 0.834286);
-    println!("pharmakos alone    = 0.834320  (delta = {:+.6})", score - 0.834320);
+    println!(
+        "baseline to beat = 0.834343  (delta = {:+.6})",
+        score - 0.834343
+    );
+    println!(
+        "orbit-regate alone = 0.834286  (delta = {:+.6})",
+        score - 0.834286
+    );
+    println!(
+        "pharmakos alone    = 0.834320  (delta = {:+.6})",
+        score - 0.834320
+    );
     println!("ORBIT fired on {orbit_fired}/{total} matrices");
     println!("PHARMAKOS fired on {pharmakos_fired}/{total} matrices");
     println!("BOTH fired on the same matrix (should be 0, disjoint claim): {both_fired}");
@@ -3679,7 +4018,8 @@ fn probe_biconn() {
             worst_s = secs;
             worst_name = name.clone();
         }
-        println!("{name}\t{n}\t{nnz}\t.\t.\t.\t{secs:.4}\t{r:.4}");    }
+        println!("{name}\t{n}\t{nnz}\t.\t.\t.\t{secs:.4}\t{r:.4}");
+    }
     println!("\nbiconn beats AMD on {wins}/{total} matrices");
     println!("worst isolated biconn time: {worst_s:.4}s on {worst_name}");
     win_rows.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
@@ -3776,1453 +4116,8 @@ fn probe_biconn_heavy() {
 }
 
 fn probe_max_deg(pat: &Pattern) -> usize {
-    (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MID-BAND ARM (arm/midband). The 1k_10k bucket plus the light end of gt_10k
-// (n < 100k, nnz < 250k). Per PROBE_TIMING these matrices run at 0.07-0.85 s
-// against a 2.0 s cap, so there is real budget; and the gate constants shut
-// almost every partitioner variant off above n ≈ 5k-12k (METIS_VAR_MAX_N=5000,
-// SCOTCH_MAX_N=12000, KAHIP_MAX_N=6000, METIS_TUNED_MAX_N=21000), which is
-// exactly where the surviving ratio ≥ 0.95 families live (squfl*, emfl*,
-// supplychainr*, gasprod_*, faclay*, popdynm*, nd_netgen*, powerflow*, syn*,
-// rsyn*, p_ball*).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Labels for [`mid_perm`], in index order.
-const MID_LABELS: [&str; 58] = [
-    // AMF dense_alpha grid
-    "amf0.5", "amf1", "amf2", "amf2.5", "amf5", "amf10", "amf20", "amf-1",
-    // AMD option grid
-    "amdNoAgg", "amdA1", "amdA2.5", "amdA5", "amdA20", "amdA-1", "amdA-1NoAgg",
-    // METIS
-    "mtDef", "mtS2", "mtS3", "mtS5", "mtS21", "mtS97", "mtI02", "mtI05", "mtI10",
-    "mtI30", "mtI45", "mtW50", "mtW100", "mtW400", "mtW800", "mtP16", "mtP32",
-    "mtP64", "mtC40", "mtC300", "mtH50", "mtH95", "mtDQ",
-    // SCOTCH
-    "scDef", "scS2", "scS3", "scT10", "scT20", "scA40", "scA300", "scC40",
-    "scC300", "scI02", "scI15", "scNoCmp", "scFM",
-    // KaHIP
-    "khS1", "khS2", "khS3", "khS5", "khEco", "khStrong",
-    // MinFill
-    "minfill",
-];
-
-/// The variant at `idx`. `pat` is only needed by the MinFill index.
-fn mid_perm(
-    idx: usize,
-    core: &feral_ordering_core::CscPattern<'_>,
-    pat: &Pattern,
-) -> Option<Vec<i32>> {
-    use feral_amd::AmdOptions;
-    use feral_amf::AmfOptions;
-    use feral_kahip::{KahipMode, KahipOptions};
-    use feral_metis::MetisOptions;
-    use feral_scotch::ScotchOptions;
-    let amf = |a: f64| {
-        feral_amf::amf_order_opts(core, &AmfOptions { dense_alpha: a })
-            .ok()
-            .map(|(p, _)| p)
-    };
-    let amd = |agg: bool, a: f64| {
-        feral_amd::amd_order_opts(core, &AmdOptions { aggressive: agg, dense_alpha: a })
-            .ok()
-            .map(|(p, _)| p)
-    };
-    let mt = |o: MetisOptions| feral_metis::metis_order_full(core, &o).ok().map(|(p, _, _)| p);
-    let sc = |o: ScotchOptions| feral_scotch::scotch_order_full(core, &o).ok().map(|(p, _, _)| p);
-    let kh = |o: KahipOptions| feral_kahip::kahip_order_full(core, &o).ok().map(|(p, _, _)| p);
-    match idx {
-        0 => amf(0.5),
-        1 => amf(1.0),
-        2 => amf(2.0),
-        3 => amf(2.5),
-        4 => amf(5.0),
-        5 => amf(10.0),
-        6 => amf(20.0),
-        7 => amf(-1.0),
-        8 => amd(false, 10.0),
-        9 => amd(true, 1.0),
-        10 => amd(true, 2.5),
-        11 => amd(true, 5.0),
-        12 => amd(true, 20.0),
-        13 => amd(true, -1.0),
-        14 => amd(false, -1.0),
-        15 => mt(MetisOptions::default()),
-        16 => mt(MetisOptions { seed: 2, ..Default::default() }),
-        17 => mt(MetisOptions { seed: 3, ..Default::default() }),
-        18 => mt(MetisOptions { seed: 5, ..Default::default() }),
-        19 => mt(MetisOptions { seed: 21, ..Default::default() }),
-        20 => mt(MetisOptions { seed: 97, ..Default::default() }),
-        21 => mt(MetisOptions { max_imbalance: 0.02, ..Default::default() }),
-        22 => mt(MetisOptions { max_imbalance: 0.05, ..Default::default() }),
-        23 => mt(MetisOptions { max_imbalance: 0.10, ..Default::default() }),
-        24 => mt(MetisOptions { max_imbalance: 0.30, ..Default::default() }),
-        25 => mt(MetisOptions { max_imbalance: 0.45, ..Default::default() }),
-        26 => mt(MetisOptions { nd_to_amd_switch: 50, ..Default::default() }),
-        27 => mt(MetisOptions { nd_to_amd_switch: 100, ..Default::default() }),
-        28 => mt(MetisOptions { nd_to_amd_switch: 400, ..Default::default() }),
-        29 => mt(MetisOptions { nd_to_amd_switch: 800, ..Default::default() }),
-        30 => mt(MetisOptions { niparts: 16, fm_passes: 20, ..Default::default() }),
-        31 => mt(MetisOptions { niparts: 32, fm_passes: 30, ..Default::default() }),
-        32 => mt(MetisOptions { niparts: 64, fm_passes: 40, ..Default::default() }),
-        33 => mt(MetisOptions { coarsen_floor: 40, ..Default::default() }),
-        34 => mt(MetisOptions { coarsen_floor: 300, ..Default::default() }),
-        35 => mt(MetisOptions { two_hop_ratio_threshold: 0.50, ..Default::default() }),
-        36 => mt(MetisOptions { two_hop_ratio_threshold: 0.95, ..Default::default() }),
-        37 => mt(MetisOptions { dense_quotient_enabled: true, ..Default::default() }),
-        38 => sc(ScotchOptions::default()),
-        39 => sc(ScotchOptions { seed: 2, ..Default::default() }),
-        40 => sc(ScotchOptions { seed: 3, ..Default::default() }),
-        41 => sc(ScotchOptions { n_sep_trials: 10, ..Default::default() }),
-        42 => sc(ScotchOptions { n_sep_trials: 20, ..Default::default() }),
-        43 => sc(ScotchOptions { amd_switch: 40, ..Default::default() }),
-        44 => sc(ScotchOptions { amd_switch: 300, ..Default::default() }),
-        45 => sc(ScotchOptions { coarsen_floor: 40, ..Default::default() }),
-        46 => sc(ScotchOptions { coarsen_floor: 300, ..Default::default() }),
-        47 => sc(ScotchOptions { max_imbalance: 0.02, ..Default::default() }),
-        48 => sc(ScotchOptions { max_imbalance: 0.15, ..Default::default() }),
-        49 => sc(ScotchOptions { compress: false, ..Default::default() }),
-        50 => sc(ScotchOptions { fm_pass_cap: 64, fm_move_cap: 600, ..Default::default() }),
-        51 => kh(KahipOptions::default()),
-        52 => kh(KahipOptions { seed: 2, ..Default::default() }),
-        53 => kh(KahipOptions { seed: 3, ..Default::default() }),
-        54 => kh(KahipOptions { seed: 5, ..Default::default() }),
-        55 => kh(KahipOptions { mode: KahipMode::Eco, ..Default::default() }),
-        56 => kh(KahipOptions { mode: KahipMode::Strong, ..Default::default() }),
-        57 => Some(minfill_order(pat)),
-        _ => None,
-    }
-}
-
-/// Mid-band scope: the 1k_10k bucket plus light gt_10k.
-fn mid_in_scope(n: usize, nnz: usize) -> bool {
-    (1_000..10_000).contains(&n) || (n >= 10_000 && n < 100_000 && nnz < 250_000)
-}
-
-/// WIDE SWEEP. For every in-scope matrix whose CURRENT `order()` ratio is
-/// ≥ `MID_RATIO_FLOOR`, run every [`MID_LABELS`] candidate and print its ratio
-/// and seconds. Two TSV sections: `SWEEP` (per matrix × candidate) and `COST`
-/// (per candidate total seconds). Set `SSI_MID_FLOOR` to change the floor.
-#[test]
-#[ignore]
-fn probe_mid_sweep() {
-    let floor: f64 = std::env::var("SSI_MID_FLOOR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.94);
-    let only: Option<String> = std::env::var("SSI_MID_ONLY").ok();
-    let corpus = crate::corpus::corpus();
-    let mut cost = vec![0.0f64; MID_LABELS.len()];
-    println!("\nSWEEP\tmatrix\tn\tnnz\tcur_r\tcur_s\tcand\tr\ts");
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        let nnz = pat.nnz();
-        if n == 0 || !mid_in_scope(n, nnz) {
-            continue;
-        }
-        if let Some(o) = &only {
-            if !name.contains(o.as_str()) {
-                continue;
-            }
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
-        ) as f64;
-        let t0 = Instant::now();
-        let cur = flops_of(&sp, &order(pat)) as f64 / base;
-        let cur_s = t0.elapsed().as_secs_f64();
-        if cur < floor {
-            continue;
-        }
-        for (i, lab) in MID_LABELS.iter().enumerate() {
-            let t = Instant::now();
-            let p = mid_perm(i, &core, pat);
-            let s = t.elapsed().as_secs_f64();
-            cost[i] += s;
-            let r = match p {
-                Some(p) => {
-                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                    if is_bijection(&p, n) {
-                        flops_of(&sp, &p) as f64 / base
-                    } else {
-                        f64::NAN
-                    }
-                }
-                None => f64::NAN,
-            };
-            println!("SWEEP\t{name}\t{n}\t{nnz}\t{cur:.5}\t{cur_s:.4}\t{lab}\t{r:.5}\t{s:.4}");
-        }
-    }
-    println!("\nCOST\tcand\ttotal_s");
-    for (i, lab) in MID_LABELS.iter().enumerate() {
-        println!("COST\t{lab}\t{:.3}", cost[i]);
-    }
-}
-
-/// MINFILL GATE WALL. `MINFILL_MAX_N=3000` / `MINFILL_MAX_NNZ=12000` are the
-/// tightest gates in the portfolio, and the mid-band sweep found MinFill
-/// beating the whole shipped portfolio on `rsyn0815m02hfsg` (n=3054 — 18 nodes
-/// past the wall). This measures MinFill's ratio AND cost on every matrix up to
-/// `SSI_MF_MAX_N` (default 40000), against the current `order()` ratio, so the
-/// gate can be sized from data. Memory: `minfill_order` allocates `n*n` bytes,
-/// so n=40000 is 1.6 GB — do not raise the default without switching the
-/// membership matrix to a bitset.
-#[test]
-#[ignore]
-fn probe_minfill_wall() {
-    let max_n: usize = std::env::var("SSI_MF_MAX_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(40_000);
-    let corpus = crate::corpus::corpus();
-    println!("\nMF\tmatrix\tn\tnnz\tmaxdeg\tcur_r\tmf_r\tmf_s\tgain");
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        let nnz = pat.nnz();
-        if n == 0 || n > max_n {
-            continue;
-        }
-        let max_deg = (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0);
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
-        ) as f64;
-        let cur = flops_of(&sp, &order(pat)) as f64 / base;
-        let t = Instant::now();
-        let p = minfill_order(pat);
-        let s = t.elapsed().as_secs_f64();
-        let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-        let r = if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN };
-        println!(
-            "MF\t{name}\t{n}\t{nnz}\t{max_deg}\t{cur:.5}\t{r:.5}\t{s:.4}\t{:.5}",
-            cur - r
-        );
-    }
-}
-
-/// Seed-count grid at which [`probe_mid_census`] reports the running best.
-const MID_K_GRID: [usize; 13] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 200, 300];
-
-/// MID-BAND LEVERAGE CENSUS. Flops-only (no wall-clock in the measurement), so
-/// it is deterministic and safe to run on a loaded box. For every in-scope
-/// matrix it spends FAR more relabel restarts than the 2 s cap permits, across
-/// all three shipped relabel objectives (AMD, AMF α5, no-dense AMD), and
-/// reports the best it finds and the seed at which it was found — the 0019
-/// method applied to the mid band. A gain found at seed ≤ ~50 is reachable by a
-/// gate change; one found at seed 500 is not.
-///
-/// Columns: `cur_r` (shipped `order()`), then per objective the best ratio and
-/// its seed, then the overall best and the shipped restart count.
-#[test]
-#[ignore]
-fn probe_mid_census() {
-    let seeds: u64 = std::env::var("SSI_MID_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300);
-    let threads: usize = std::env::var("SSI_MID_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
-    let corpus = crate::corpus::corpus();
-    let jobs: Vec<&(String, Pattern)> = corpus
-        .iter()
-        .filter(|(_, p)| p.n > 0 && mid_in_scope(p.n, p.nnz()))
-        .collect();
-    println!(
-        "\nCEN\tmatrix\tn\tnnz\tmaxdeg\tcur_r\tamd_r\tamd_seed\tamf_r\tamf_seed\tnd_r\tnd_seed\tbest_r\tgain\tshipped_restarts"
-    );
-    println!("\nPFX\tmatrix\tobj\t{}", MID_K_GRID.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("\t"));
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let out = std::sync::Mutex::new(Vec::<String>::new());
-    std::thread::scope(|sc| {
-        for _ in 0..threads {
-            sc.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i >= jobs.len() {
-                    return;
-                }
-                let (name, pat) = jobs[i];
-                let n = pat.n;
-                let nnz = pat.nnz();
-                let max_deg =
-                    (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0);
-                let sp = scoring_pattern(pat);
-                let (cp, ri) = core_of(pat);
-                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-                let base = flops_of(
-                    &sp,
-                    &feral_amd::amd_order(&core)
-                        .unwrap()
-                        .into_iter()
-                        .map(|x| x as usize)
-                        .collect::<Vec<_>>(),
-                ) as f64;
-                let cur = flops_of(&sp, &order(pat)) as f64 / base;
-                // seed budget scaled so huge patterns do not dominate the run
-                let s_max = (3_000_000u64 / nnz.max(1) as u64).clamp(40, seeds);
-                let amf_opts = feral_amf::AmfOptions { dense_alpha: 5.0 };
-                let nd_opts =
-                    feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
-                let mut best = [f64::INFINITY; 3];
-                let mut bseed = [0u64; 3];
-                let mut pfx = [[f64::INFINITY; MID_K_GRID.len()]; 3];
-                for s in 1..=s_max {
-                    let q = relabel(n, s);
-                    let b = permute_pattern(&sp, &q);
-                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                    let bcore =
-                        match feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-                    let mut eval = |k: usize, pb: Vec<i32>| {
-                        let p: Vec<usize> =
-                            pb.iter().map(|&x| q[x as usize]).collect();
-                        if is_bijection(&p, n) {
-                            let r = flops_of(&sp, &p) as f64 / base;
-                            if r < best[k] {
-                                best[k] = r;
-                                bseed[k] = s;
-                            }
-                            for (gi, &g) in MID_K_GRID.iter().enumerate() {
-                                if (s as usize) <= g && best[k] < pfx[k][gi] {
-                                    pfx[k][gi] = best[k];
-                                }
-                            }
-                        }
-                    };
-                    if let Ok(p) = feral_amd::amd_order(&bcore) {
-                        eval(0, p);
-                    }
-                    if let Ok((p, _)) = feral_amf::amf_order_opts(&bcore, &amf_opts) {
-                        eval(1, p);
-                    }
-                    if let Ok((p, _)) = feral_amd::amd_order_opts(&bcore, &nd_opts) {
-                        eval(2, p);
-                    }
-                }
-                let ov = best[0].min(best[1]).min(best[2]);
-                let ship =
-                    relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg);
-                let line = format!(
-                    "CEN\t{name}\t{n}\t{nnz}\t{max_deg}\t{cur:.5}\t{:.5}\t{}\t{:.5}\t{}\t{:.5}\t{}\t{ov:.5}\t{:.5}\t{ship}",
-                    best[0], bseed[0], best[1], bseed[1], best[2], bseed[2], cur - ov
-                );
-                let mut lines = vec![line];
-                for (k, obj) in ["amd", "amf", "nd"].iter().enumerate() {
-                    let cells: Vec<String> =
-                        pfx[k].iter().map(|v| format!("{v:.5}")).collect();
-                    lines.push(format!("PFX\t{name}\t{obj}\t{}", cells.join("\t")));
-                }
-                out.lock().unwrap().extend(lines);
-            });
-        }
-    });
-    let mut v = out.into_inner().unwrap();
-    v.sort();
-    for l in v {
-        println!("{l}");
-    }
-}
-
-/// A/B FOR THE MID-BAND RELABEL EXTENSION. Runs the FULL portfolio twice per
-/// matrix in the SAME probe run — `midx_enabled = false` (the unchanged
-/// frontier) and `midx_enabled = true` — reporting ratio and seconds for each,
-/// interleaved so a drifting machine load hits both arms equally. Covers every
-/// matrix in the extension's window plus (with `SSI_AB_ALL=1`) the corpus-wide
-/// worst-case matrices, so the global worst can be checked against the
-/// frontier's own worst measured in the same run.
-#[test]
-#[ignore]
-fn probe_midx_ab() {
-    let all = std::env::var("SSI_AB_ALL").is_ok();
-    let corpus = crate::corpus::corpus();
-    println!("\nAB\tmatrix\tn\tnnz\tmaxdeg\toff_r\toff_s\ton_r\ton_s\tdr\tds");
-    let mut worst_off = (0.0f64, String::new());
-    let mut worst_on = (0.0f64, String::new());
-    let mut log_off = 0.0f64;
-    let mut log_on = 0.0f64;
-    let mut cnt = 0usize;
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        let nnz = pat.nnz();
-        if n == 0 {
-            continue;
-        }
-        let max_deg = (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0);
-        let in_window = nnz > 60_000
-            && nnz <= MIDX_AMF_MAX_NNZ
-            && nnz <= MIDX_MAX_AVG_DEG * n
-            && max_deg <= n / MIDX_HUB_DIV;
-        if !all && !in_window {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
-        ) as f64;
-        let reps: usize = std::env::var("SSI_AB_REPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let mut off_s = f64::INFINITY;
-        let mut on_s = f64::INFINITY;
-        let mut off = Vec::new();
-        let mut on = Vec::new();
-        for _ in 0..reps.max(1) {
-            let t0 = Instant::now();
-            off = order_with_options(pat, usize::MAX, true, true, false, true);
-            off_s = off_s.min(t0.elapsed().as_secs_f64());
-            let t1 = Instant::now();
-            on = order_with_options(pat, usize::MAX, true, true, true, true);
-            on_s = on_s.min(t1.elapsed().as_secs_f64());
-        }
-        let off_r = flops_of(&sp, &off) as f64 / base;
-        let on_r = flops_of(&sp, &on) as f64 / base;
-        if off_s > worst_off.0 {
-            worst_off = (off_s, name.clone());
-        }
-        if on_s > worst_on.0 {
-            worst_on = (on_s, name.clone());
-        }
-        log_off += off_r.ln();
-        log_on += on_r.ln();
-        cnt += 1;
-        println!(
-            "AB\t{name}\t{n}\t{nnz}\t{max_deg}\t{off_r:.5}\t{off_s:.4}\t{on_r:.5}\t{on_s:.4}\t{:.5}\t{:.4}",
-            on_r - off_r,
-            on_s - off_s
-        );
-    }
-    println!(
-        "\nAB_SUMMARY\tn={cnt}\tgeomean_off={:.6}\tgeomean_on={:.6}\tworst_off={:.4}({})\tworst_on={:.4}({})",
-        (log_off / cnt as f64).exp(),
-        (log_on / cnt as f64).exp(),
-        worst_off.0,
-        worst_off.1,
-        worst_on.0,
-        worst_on.1
-    );
-}
-
-/// RGREEDY headroom probe — does the exact randomized elimination-game family
-/// find anything the shipped portfolio misses on the small tier?
-///
-/// For every corpus matrix with `n <= RG_MAX_N`, this runs the FULL shipped
-/// `order()` (so the comparison is against the real incumbent, not against
-/// AMD), then hands that incumbent to `rgreedy::search` with `RG_BUDGET`
-/// word-operations and reports what it recovers. Scored on flops only —
-/// deterministic and load-independent — so it is safe to run with the box
-/// saturated, and it is parallelised across `RG_THREADS` threads.
-///
-/// ```sh
-/// RG_MAX_N=1000 RG_BUDGET=20000000 cargo test --release -p ssi-candidate-worker \
-///   -- --ignored --nocapture probe_rgreedy
-/// ```
-#[test]
-#[ignore]
-fn probe_rgreedy() {
-    let corpus = crate::corpus::corpus();
-    let max_n: usize = envu("RG_MAX_N", 1_000);
-    let budget: i64 = envu("RG_BUDGET", 20_000_000) as i64;
-    let nthreads: usize = envu("RG_THREADS", 8);
-
-    let targets: Vec<usize> = (0..corpus.len())
-        .filter(|&i| corpus[i].1.n > 0 && corpus[i].1.n <= max_n)
-        .collect();
-    eprintln!("rgreedy probe: {} matrices, budget {budget} ops, {nthreads} threads",
-              targets.len());
-
-    struct Row {
-        name: String,
-        n: usize,
-        nnz: usize,
-        amd: u64,
-        port: u64,
-        rg: u64,
-        secs: f64,
-    }
-
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let out = std::sync::Mutex::new(Vec::<Row>::new());
-    std::thread::scope(|s| {
-        for _ in 0..nthreads {
-            s.spawn(|| loop {
-                let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if k >= targets.len() {
-                    break;
-                }
-                let (name, pat) = &corpus[targets[k]];
-                let n = pat.n;
-                let sp = scoring_pattern(pat);
-                let (cp, ri) = core_of(pat);
-                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-                let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
-                    .unwrap()
-                    .into_iter()
-                    .map(|x| x as usize)
-                    .collect();
-                let amd = flops_of(&sp, &amd_perm);
-                let pperm = order(pat);
-                let port = flops_of(&sp, &pperm);
-
-                let t0 = Instant::now();
-                let par = crate::ordering::rgreedy::Params {
-                    phase_a_num: envu("RG_PHA_NUM", 1) as i64,
-                    phase_a_den: envu("RG_PHA_DEN", 16) as i64,
-                    pol_mask: envu("RG_POL", 0b1111_1111) as u8,
-                    lns: envu("RG_LNS", 1) != 0,
-                    prefix_mode: envu("RG_PFX", 2) as u8,
-                    ..crate::ordering::rgreedy::Params::DEFAULT
-                };
-                let found = crate::ordering::rgreedy::search_with(
-                    n, &pat.col_ptr, &pat.row_idx, &pperm, port, budget,
-                    0x9E3779B97F4A7C15, par,
-                );
-                let secs = t0.elapsed().as_secs_f64();
-                let rg = match found {
-                    Some((ord, f)) => {
-                        assert!(super::is_bijection(&ord, n), "{name}: rgreedy non-bijection");
-                        let trusted = flops_of(&sp, &ord);
-                        assert_eq!(
-                            trusted, f,
-                            "{name}: rgreedy accumulator {f} disagrees with trusted scorer {trusted}"
-                        );
-                        trusted
-                    }
-                    None => port,
-                };
-                out.lock().unwrap().push(Row {
-                    name: name.clone(),
-                    n,
-                    nnz: pat.nnz(),
-                    amd,
-                    port,
-                    rg,
-                    secs,
-                });
-            });
-        }
-    });
-
-    let mut rows = out.into_inner().unwrap();
-    rows.sort_by(|a, b| {
-        let ka = (a.rg as f64) / (a.port as f64);
-        let kb = (b.rg as f64) / (b.port as f64);
-        ka.partial_cmp(&kb).unwrap().then(a.name.cmp(&b.name))
-    });
-
-    println!(
-        "{:<30} {:>5} {:>8} {:>8} {:>8} {:>8} {:>7}",
-        "matrix", "n", "nnz", "r_amd", "r_port", "r_rg", "secs"
-    );
-    let mut improved = 0usize;
-    let mut ln_delta = [0.0f64; 3];
-    let mut counts = [0usize; 3];
-    let mut worst_secs = 0.0f64;
-    let mut worst_name = String::new();
-    let mut rate_lo = f64::MAX;
-    let mut rate_hi = 0.0f64;
-    for r in &rows {
-        let b = bucket(r.n);
-        if r.secs > 0.0 {
-            let rate = budget as f64 / r.secs;
-            rate_lo = rate_lo.min(rate);
-            rate_hi = rate_hi.max(rate);
-        }
-        if r.secs > worst_secs {
-            worst_name = r.name.clone();
-        }
-        counts[b] += 1;
-        let rp = r.port as f64 / r.amd as f64;
-        let rr = r.rg as f64 / r.amd as f64;
-        worst_secs = worst_secs.max(r.secs);
-        if envu("RG_ALL", 0) != 0 {
-            println!(
-                "ALL {:<30} {:>5} {:>8} {:>8.4} {:>8.4} {:>7.3} rate={:.0}M",
-                r.name, r.n, r.nnz, rp, rr, r.secs,
-                budget as f64 / r.secs.max(1e-9) / 1e6
-            );
-        }
-        if r.rg < r.port {
-            improved += 1;
-            ln_delta[b] += (r.rg as f64 / r.port as f64).ln();
-            println!(
-                "{:<30} {:>5} {:>8} {:>8.4} {:>8.4} {:>8.4} {:>7.3}  <-- WIN",
-                r.name, r.n, r.nnz, r.amd as f64 / r.amd as f64, rp, rr, r.secs
-            );
-        }
-    }
-    println!("\n--- rgreedy headroom (n <= {max_n}, budget {budget}) ---");
-    println!("matrices              : {}", rows.len());
-    println!("strictly improved     : {improved}");
-    println!("worst rgreedy secs    : {worst_secs:.4}  ({worst_name})");
-    println!("ops/sec spread        : {:.0}M .. {:.0}M", rate_lo / 1e6, rate_hi / 1e6);
-    const GEOMEAN: [f64; 3] = [0.899432, 0.875342, 0.774477];
-    const BUCKET_N: [f64; 3] = [147.0, 108.0, 45.0];
-    let mut gain = 0.0;
-    for b in 0..3 {
-        if counts[b] == 0 {
-            continue;
-        }
-        let lev = BUCKET_WEIGHTS[b] * GEOMEAN[b] / BUCKET_N[b];
-        println!(
-            "bucket {:<7} n={:<4} sum_ln_delta={:+.5}  -> score {:+.6}",
-            BUCKET_NAMES[b], counts[b], ln_delta[b], ln_delta[b] * lev
-        );
-        gain += ln_delta[b] * lev;
-    }
-    println!("predicted dev score delta: {gain:+.6}");
-}
-
-fn envu(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
-}
-
-/// Cross-check: the elimination-game accumulator must reproduce the trusted
-/// `column_counts_gnp`-based `Σ c_j²` exactly, on real corpus patterns and on
-/// several different permutations each.
-#[test]
-#[ignore]
-fn probe_rgreedy_identity() {
-    let corpus = crate::corpus::corpus();
-    let mut checked = 0usize;
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        if n == 0 || n > 1_500 {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
-            .unwrap()
-            .into_iter()
-            .map(|x| x as usize)
-            .collect();
-        let mut g = crate::ordering::rgreedy::Game::new(n, &pat.col_ptr, &pat.row_idx).unwrap();
-        for perm in [amd_perm, (0..n).collect::<Vec<_>>(), (0..n).rev().collect::<Vec<_>>()] {
-            let a = g.replay_flops(&perm);
-            let b = flops_of(&sp, &perm);
-            assert_eq!(a, b, "{name}: elimination-game {a} != trusted {b}");
-        }
-        checked += 1;
-    }
-    println!("elimination-game identity verified on {checked} matrices x 3 permutations");
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// HEAVY-TIER ARM (arm/heavy). Probes for the gt_10k matrices with nnz >= 250k
-// or n >= 100k, which the frontier's (n, nnz) gates exclude from almost every
-// candidate family.
-// ────────────────────────────────────────────────────────────────────────────
-
-/// The heavy-tier target set (gt_10k, nnz >= 250k or n >= 100k).
-const HEAVY_TARGETS: [&str; 15] = [
-    "faclay75",
-    "nuclear104",
-    "kissing2",
-    "faclay35",
-    "acopf_case9241pegase_qcqp",
-    "gabriel10",
-    "unitcommit_200_100_1_mod_8",
-    "transswitch2736spr",
-    "transswitch2383wpr",
-    "nuclear10a",
-    "cont6-qq",
-    "gams05",
-    "pooling_sppc3pq",
-    "pooling_sppb5pq",
-    "pooling_sppc1pq",
-];
-
-fn heavy_selected(name: &str) -> bool {
-    let only = std::env::var("SSI_HEAVY_ONLY").unwrap_or_default();
-    if only.is_empty() {
-        HEAVY_TARGETS.contains(&name)
-    } else {
-        only.split(',').any(|s| s.trim() == name)
-    }
-}
-
-/// Induced subgraph on `keep`. Returns (`new_to_old`, pattern).
-fn heavy_induced(sp: &ScoringPattern, keep: &[bool]) -> (Vec<usize>, ScoringPattern) {
-    let n = sp.n;
-    let mut new_to_old = Vec::new();
-    let mut old_to_new = vec![usize::MAX; n];
-    for v in 0..n {
-        if keep[v] {
-            old_to_new[v] = new_to_old.len();
-            new_to_old.push(v);
-        }
-    }
-    let m = new_to_old.len();
-    let mut col_ptr = Vec::with_capacity(m + 1);
-    let mut row_idx = Vec::new();
-    col_ptr.push(0usize);
-    for &v in &new_to_old {
-        for k in sp.col_ptr[v]..sp.col_ptr[v + 1] {
-            let u = sp.row_idx[k];
-            if keep[u] {
-                row_idx.push(old_to_new[u]);
-            }
-        }
-        col_ptr.push(row_idx.len());
-    }
-    (new_to_old, ScoringPattern { n: m, col_ptr, row_idx })
-}
-
-fn heavy_amd_on(sp: &ScoringPattern) -> Option<Vec<usize>> {
-    if sp.n == 0 {
-        return Some(Vec::new());
-    }
-    let cp: Vec<i32> = sp.col_ptr.iter().map(|&x| x as i32).collect();
-    let ri: Vec<i32> = sp.row_idx.iter().map(|&x| x as i32).collect();
-    let core = feral_ordering_core::CscPattern::new(sp.n, &cp, &ri)?;
-    feral_amd::amd_order(&core)
-        .ok()
-        .map(|p| p.into_iter().map(|x| x as usize).collect())
-}
-
-fn heavy_metis_on(sp: &ScoringPattern, opts: &feral_metis::MetisOptions) -> Option<Vec<usize>> {
-    if sp.n == 0 {
-        return Some(Vec::new());
-    }
-    let cp: Vec<i32> = sp.col_ptr.iter().map(|&x| x as i32).collect();
-    let ri: Vec<i32> = sp.row_idx.iter().map(|&x| x as i32).collect();
-    let core = feral_ordering_core::CscPattern::new(sp.n, &cp, &ri)?;
-    feral_metis::metis_order_full(&core, opts)
-        .ok()
-        .map(|(p, _, _)| p.into_iter().map(|x| x as usize).collect())
-}
-
-/// PART 1 — full per-candidate census on the heavy tier: every family the
-/// crate exposes, run ALONE, with its exact flops ratio and its isolated
-/// wall-clock cost (min of 2 timings, single-timed when a pass costs > 3 s).
-///
-/// `SSI_HEAVY_ONLY=name1,name2` restricts the matrix set.
-/// `SSI_HEAVY_STAGE=amd|amf|part|misc|relabel|all` restricts the family set.
-#[test]
-#[ignore]
-fn probe_heavy_census() {
-    let stage = std::env::var("SSI_HEAVY_STAGE").unwrap_or_else(|_| "all".to_string());
-    let want = |s: &str| stage == "all" || stage == s;
-    let corpus = crate::corpus::corpus();
-    for (name, pat) in &corpus {
-        if !heavy_selected(name) {
-            continue;
-        }
-        let n = pat.n;
-        let nnz = pat.nnz();
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core)
-                .unwrap()
-                .into_iter()
-                .map(|x| x as usize)
-                .collect::<Vec<_>>(),
-        ) as f64;
-        let md = probe_max_deg(pat);
-        println!(
-            "\n=== {name}  n={n} nnz={nnz} avg_deg={:.2} max_deg={md} base_flops={base:.0} ===",
-            nnz as f64 / n as f64
-        );
-
-        let mut rows: Vec<(String, f64, f64)> = Vec::new();
-        {
-            let mut eval = |label: String, f: &dyn Fn() -> Option<Vec<usize>>| {
-                let mut best_t = f64::INFINITY;
-                let mut ratio = f64::NAN;
-                for _ in 0..2 {
-                    let t = Instant::now();
-                    let r = f();
-                    let el = t.elapsed().as_secs_f64();
-                    best_t = best_t.min(el);
-                    if let Some(p) = r {
-                        if is_bijection(&p, n) {
-                            ratio = flops_of(&sp, &p) as f64 / base;
-                        }
-                    }
-                    if el > 3.0 {
-                        break;
-                    }
-                }
-                println!("  {label:<40} ratio={ratio:.4}  {best_t:.3}s");
-                rows.push((label, ratio, best_t));
-                (ratio, best_t)
-            };
-
-            const ALPHAS: [f64; 11] = [-1.0, 0.5, 1.0, 2.0, 2.5, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0];
-
-            if want("amd") {
-                for agg in [true, false] {
-                    for a in ALPHAS {
-                        let o = feral_amd::AmdOptions { aggressive: agg, dense_alpha: a };
-                        eval(format!("amd agg={agg} a={a}"), &|| {
-                            feral_amd::amd_order_opts(&core, &o)
-                                .ok()
-                                .map(|(p, _)| p.into_iter().map(|x| x as usize).collect())
-                        });
-                    }
-                }
-            }
-
-            if want("amf") {
-                for a in ALPHAS {
-                    let o = feral_amf::AmfOptions { dense_alpha: a };
-                    eval(format!("amf a={a}"), &|| {
-                        feral_amf::amf_order_opts(&core, &o)
-                            .ok()
-                            .map(|(p, _)| p.into_iter().map(|x| x as usize).collect())
-                    });
-                }
-            }
-
-            if want("misc") {
-                eval("nd_order".to_string(), &|| {
-                    Some(nd_order(pat).into_iter().map(|x| x as usize).collect())
-                });
-                eval("ndfm_order".to_string(), &|| {
-                    Some(ndfm_order(pat).into_iter().map(|x| x as usize).collect())
-                });
-                eval("biconn".to_string(), &|| {
-                    Some(biconn::biconn_order(pat).into_iter().map(|x| x as usize).collect())
-                });
-                eval("biconn_heavy(24,32,150k)".to_string(), &|| {
-                    Some(
-                        biconn::biconn_heavy_order(pat, 24, 32, 150_000)
-                            .into_iter()
-                            .map(|x| x as usize)
-                            .collect(),
-                    )
-                });
-                eval("rcm".to_string(), &|| {
-                    Some(rcm_order(pat).into_iter().map(|x| x as usize).collect())
-                });
-                eval("sloan(2,1)".to_string(), &|| {
-                    Some(sloan_order(pat, 2, 1).into_iter().map(|x| x as usize).collect())
-                });
-            }
-
-            if want("part") {
-                // METIS: default first; open the option grid only if affordable.
-                let (_, mt_t) = eval("metis default".to_string(), &|| {
-                    heavy_metis_on(&sp, &feral_metis::MetisOptions::default())
-                });
-                let grid = mt_t <= 2.0;
-                let seeds: &[u64] = if grid { &[2, 3, 4, 5, 6, 7, 8] } else { &[2, 3] };
-                for &s in seeds {
-                    let o = feral_metis::MetisOptions { seed: s, ..Default::default() };
-                    eval(format!("metis seed={s}"), &|| heavy_metis_on(&sp, &o));
-                }
-                if grid {
-                    for np in [1u32, 3, 15, 31] {
-                        let o = feral_metis::MetisOptions { niparts: np, ..Default::default() };
-                        eval(format!("metis niparts={np}"), &|| heavy_metis_on(&sp, &o));
-                    }
-                    for cf in [30u32, 60, 240, 480] {
-                        let o =
-                            feral_metis::MetisOptions { coarsen_floor: cf, ..Default::default() };
-                        eval(format!("metis coarsen_floor={cf}"), &|| heavy_metis_on(&sp, &o));
-                    }
-                    for sw in [30u32, 60, 600, 2000, 8000] {
-                        let o =
-                            feral_metis::MetisOptions { nd_to_amd_switch: sw, ..Default::default() };
-                        eval(format!("metis nd2amd={sw}"), &|| heavy_metis_on(&sp, &o));
-                    }
-                    for th in [0.6f64, 0.75, 0.95] {
-                        let o = feral_metis::MetisOptions {
-                            two_hop_ratio_threshold: th,
-                            ..Default::default()
-                        };
-                        eval(format!("metis twohop={th}"), &|| heavy_metis_on(&sp, &o));
-                    }
-                    for mi in [0.02f64, 0.05, 0.10, 0.30, 0.45] {
-                        let o =
-                            feral_metis::MetisOptions { max_imbalance: mi, ..Default::default() };
-                        eval(format!("metis imbal={mi}"), &|| heavy_metis_on(&sp, &o));
-                    }
-                    for fp in [1u32, 4, 20, 40] {
-                        let o = feral_metis::MetisOptions { fm_passes: fp, ..Default::default() };
-                        eval(format!("metis fm={fp}"), &|| heavy_metis_on(&sp, &o));
-                    }
-                }
-                for dq in [None, Some(16usize), Some(64), Some(256)] {
-                    let o = feral_metis::MetisOptions {
-                        dense_quotient_enabled: true,
-                        dense_quotient_threshold: dq,
-                        ..Default::default()
-                    };
-                    eval(format!("metis dq={dq:?}"), &|| heavy_metis_on(&sp, &o));
-                }
-
-                let (_, sc_t) = eval("scotch default".to_string(), &|| {
-                    feral_scotch::scotch_order(&core)
-                        .ok()
-                        .map(|p| p.into_iter().map(|x| x as usize).collect())
-                });
-                if sc_t <= 4.0 {
-                    let base_sc = feral_scotch::ScotchOptions::default();
-                    let mut variants: Vec<(String, feral_scotch::ScotchOptions)> = Vec::new();
-                    variants.push((
-                        "scotch compress=false".into(),
-                        feral_scotch::ScotchOptions { compress: false, ..base_sc.clone() },
-                    ));
-                    for t in [1u32, 3, 10] {
-                        variants.push((
-                            format!("scotch trials={t}"),
-                            feral_scotch::ScotchOptions { n_sep_trials: t, ..base_sc.clone() },
-                        ));
-                    }
-                    for s in [60u32, 300, 1200] {
-                        variants.push((
-                            format!("scotch amd_switch={s}"),
-                            feral_scotch::ScotchOptions { amd_switch: s, ..base_sc.clone() },
-                        ));
-                    }
-                    for mi in [0.02f64, 0.10, 0.20] {
-                        variants.push((
-                            format!("scotch imbal={mi}"),
-                            feral_scotch::ScotchOptions { max_imbalance: mi, ..base_sc.clone() },
-                        ));
-                    }
-                    for sd in [1u64, 7, 12345] {
-                        variants.push((
-                            format!("scotch seed={sd}"),
-                            feral_scotch::ScotchOptions { seed: sd, ..base_sc.clone() },
-                        ));
-                    }
-                    for (lab, o) in variants {
-                        eval(lab, &|| {
-                            feral_scotch::scotch_order_full(&core, &o)
-                                .ok()
-                                .map(|(p, _, _)| p.into_iter().map(|x| x as usize).collect())
-                        });
-                    }
-                }
-
-                let (_, kh_t) = eval("kahip default".to_string(), &|| {
-                    feral_kahip::kahip_order(&core)
-                        .ok()
-                        .map(|p| p.into_iter().map(|x| x as usize).collect())
-                });
-                if kh_t <= 4.0 {
-                    for mode in [
-                        feral_kahip::KahipMode::Fast,
-                        feral_kahip::KahipMode::Eco,
-                        feral_kahip::KahipMode::Strong,
-                    ] {
-                        for sd in [1u64, 2, 3, 7] {
-                            let o = feral_kahip::KahipOptions { seed: sd, mode };
-                            eval(format!("kahip {mode:?} seed={sd}"), &|| {
-                                feral_kahip::kahip_order_full(&core, &o)
-                                    .ok()
-                                    .map(|(p, _, _)| p.into_iter().map(|x| x as usize).collect())
-                            });
-                        }
-                    }
-                }
-            }
-
-            if want("relabel") {
-                for s in 1u64..=16 {
-                    eval(format!("relabelAMD seed={s}"), &|| {
-                        let q = relabel(n, s);
-                        let b = permute_pattern(&sp, &q);
-                        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                        let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
-                        let pb = feral_amd::amd_order(&bcore).ok()?;
-                        Some(pb.iter().map(|&x| q[x as usize]).collect())
-                    });
-                }
-                let ndopts =
-                    feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
-                for s in 1u64..=8 {
-                    eval(format!("relabelAMDnd seed={s}"), &|| {
-                        let q = relabel(n, s);
-                        let b = permute_pattern(&sp, &q);
-                        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                        let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
-                        let (pb, _) = feral_amd::amd_order_opts(&bcore, &ndopts).ok()?;
-                        Some(pb.iter().map(|&x| q[x as usize]).collect())
-                    });
-                }
-                let amfopts = feral_amf::AmfOptions { dense_alpha: 5.0 };
-                for s in 1u64..=8 {
-                    eval(format!("relabelAMF5 seed={s}"), &|| {
-                        let q = relabel(n, s);
-                        let b = permute_pattern(&sp, &q);
-                        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                        let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
-                        let (pb, _) = feral_amf::amf_order_opts(&bcore, &amfopts).ok()?;
-                        Some(pb.iter().map(|&x| q[x as usize]).collect())
-                    });
-                }
-            }
-        }
-
-        rows.retain(|r| r.1.is_finite());
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        println!("  --- best 8 for {name} ---");
-        for (lab, r, t) in rows.iter().take(8) {
-            println!("  BEST {lab:<40} ratio={r:.4}  {t:.3}s");
-        }
-    }
-}
-
-/// PART 2 — structure of the heavy tier: degree distribution, hub census,
-/// connected components, bipartite (KKT variable/constraint) split.
-#[test]
-#[ignore]
-fn probe_heavy_structure() {
-    let corpus = crate::corpus::corpus();
-    for (name, pat) in &corpus {
-        if !heavy_selected(name) {
-            continue;
-        }
-        let n = pat.n;
-        let nnz = pat.nnz();
-        let mut deg: Vec<usize> = (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).collect();
-        let mean = nnz as f64 / n as f64;
-        let mut sorted = deg.clone();
-        sorted.sort_unstable();
-        let q = |f: f64| sorted[((n as f64 - 1.0) * f) as usize];
-        // connected components
-        let mut comp = vec![usize::MAX; n];
-        let mut ncomp = 0usize;
-        let mut sizes: Vec<usize> = Vec::new();
-        let mut stack = Vec::new();
-        for s in 0..n {
-            if comp[s] != usize::MAX {
-                continue;
-            }
-            comp[s] = ncomp;
-            stack.push(s);
-            let mut sz = 0usize;
-            while let Some(v) = stack.pop() {
-                sz += 1;
-                for k in pat.col_ptr[v]..pat.col_ptr[v + 1] {
-                    let u = pat.row_idx[k];
-                    if comp[u] == usize::MAX {
-                        comp[u] = ncomp;
-                        stack.push(u);
-                    }
-                }
-            }
-            sizes.push(sz);
-            ncomp += 1;
-        }
-        sizes.sort_unstable_by(|a, b| b.cmp(a));
-        // bipartite 2-coloring (KKT: constraint rows form an independent set)
-        let mut color = vec![-1i8; n];
-        let mut bip = true;
-        let mut side = [0usize; 2];
-        for s in 0..n {
-            if color[s] >= 0 {
-                continue;
-            }
-            color[s] = 0;
-            side[0] += 1;
-            stack.push(s);
-            while let Some(v) = stack.pop() {
-                for k in pat.col_ptr[v]..pat.col_ptr[v + 1] {
-                    let u = pat.row_idx[k];
-                    if u == v {
-                        continue;
-                    }
-                    if color[u] < 0 {
-                        color[u] = 1 - color[v];
-                        side[color[u] as usize] += 1;
-                        stack.push(u);
-                    } else if color[u] == color[v] {
-                        bip = false;
-                    }
-                }
-            }
-            if !bip {
-                break;
-            }
-        }
-        stack.clear();
-        // hub census at multiples of mean
-        let hubs: Vec<(f64, usize)> = [2.0f64, 4.0, 8.0, 16.0, 32.0]
-            .iter()
-            .map(|&t| (t, deg.iter().filter(|&&d| d as f64 > t * mean).count()))
-            .collect();
-        // diagonal-only (isolated) count
-        let iso = deg.iter().filter(|&&d| d <= 1).count();
-        deg.sort_unstable_by(|a, b| b.cmp(a));
-        println!(
-            "\n{name}  n={n} nnz={nnz} mean={mean:.2} p50={} p90={} p99={} max={} iso={iso}",
-            q(0.5),
-            q(0.9),
-            q(0.99),
-            sorted[n - 1]
-        );
-        println!("  top20 degrees: {:?}", &deg[..20.min(n)]);
-        println!("  hubs>t*mean: {hubs:?}");
-        println!(
-            "  components={ncomp} largest={} top5={:?}",
-            sizes[0],
-            &sizes[..5.min(sizes.len())]
-        );
-        println!("  bipartite={bip} sides={side:?}");
-        // AMD's own dense threshold for reference
-        for a in [0.5f64, 1.0, 2.0, 5.0, 10.0] {
-            let thr = ((a * (n as f64).sqrt()).floor() as usize).max(16).min(n);
-            let cnt = sorted.iter().filter(|&&d| d > thr).count();
-            print!("  amd_thr(a={a})={thr}->{cnt} deferred;");
-        }
-        println!();
-    }
-}
-
-/// PART 2b — structural transforms AMD alone cannot find, scored with the
-/// exact objective: explicit degree peel at thresholds far below AMD's
-/// `max(16, alpha*sqrt(n))` floor, and partitioner-on-sparse-core.
-#[test]
-#[ignore]
-fn probe_heavy_peel() {
-    let corpus = crate::corpus::corpus();
-    for (name, pat) in &corpus {
-        if !heavy_selected(name) {
-            continue;
-        }
-        let n = pat.n;
-        let nnz = pat.nnz();
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core)
-                .unwrap()
-                .into_iter()
-                .map(|x| x as usize)
-                .collect::<Vec<_>>(),
-        ) as f64;
-        let deg: Vec<usize> = (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).collect();
-        let mean = nnz as f64 / n as f64;
-        println!("\n=== {name} n={n} nnz={nnz} mean_deg={mean:.2} ===");
-
-        for t in [1.5f64, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 20.0, 40.0] {
-            let thr = (t * mean).ceil() as usize;
-            let keep: Vec<bool> = deg.iter().map(|&d| d <= thr).collect();
-            let npeel = n - keep.iter().filter(|&&k| k).count();
-            if npeel == 0 || npeel >= n / 2 {
-                println!("  t={t} thr={thr} peel={npeel} (skipped)");
-                continue;
-            }
-            let t0 = Instant::now();
-            let (n2o, sub) = heavy_induced(&sp, &keep);
-            let Some(core_ord) = heavy_amd_on(&sub) else { continue };
-            // hub block ordered by AMD on its induced subgraph
-            let hub_keep: Vec<bool> = keep.iter().map(|&k| !k).collect();
-            let (h2o, hsub) = heavy_induced(&sp, &hub_keep);
-            let Some(hub_ord) = heavy_amd_on(&hsub) else { continue };
-            let mut perm: Vec<usize> = core_ord.iter().map(|&x| n2o[x]).collect();
-            perm.extend(hub_ord.iter().map(|&x| h2o[x]));
-            let secs = t0.elapsed().as_secs_f64();
-            let r = if is_bijection(&perm, n) {
-                flops_of(&sp, &perm) as f64 / base
-            } else {
-                f64::NAN
-            };
-            // same peel but METIS on the sparse core
-            let mut r_metis = f64::NAN;
-            let mut secs_m = 0.0;
-            if nnz <= 700_000 {
-                let t1 = Instant::now();
-                if let Some(mo) = heavy_metis_on(&sub, &feral_metis::MetisOptions::default()) {
-                    let mut pm: Vec<usize> = mo.iter().map(|&x| n2o[x]).collect();
-                    pm.extend(hub_ord.iter().map(|&x| h2o[x]));
-                    if is_bijection(&pm, n) {
-                        r_metis = flops_of(&sp, &pm) as f64 / base;
-                    }
-                }
-                secs_m = t1.elapsed().as_secs_f64();
-            }
-            println!(
-                "  t={t:<4} thr={thr:<6} peel={npeel:<7} amdcore={r:.4} ({secs:.3}s)  metiscore={r_metis:.4} ({secs_m:.3}s)"
-            );
-        }
-    }
-}
-
-/// HEAVY-TIER RELABELLED-AMF MULTISTART value/cost curve. The dense heavy
-/// tier (`nnz > 6n`, nnz >= 250k) currently receives NO relabel restarts of
-/// any kind: `budget/nnz` is 0 above nnz=300k and both `heavy_multi` and
-/// `mid_multi` require `nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n`. AMF is the
-/// family that WINS on that tier (pooling_*), so relabelled AMF is diversity
-/// inside the winning family. This measures the running best over seeds and
-/// the per-restart cost INCLUDING the exact scoring pass, which is what the
-/// time gate has to be sized against.
-#[test]
-#[ignore]
-fn probe_heavy_amf_multistart() {
-    let corpus = crate::corpus::corpus();
-    for (name, pat) in &corpus {
-        if !heavy_selected(name) {
-            continue;
-        }
-        let n = pat.n;
-        let nnz = pat.nnz();
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core)
-                .unwrap()
-                .into_iter()
-                .map(|x| x as usize)
-                .collect::<Vec<_>>(),
-        ) as f64;
-        let cur = flops_of(&sp, &order(pat)) as f64 / base;
-        println!("\n=== {name} n={n} nnz={nnz} frontier={cur:.4} ===");
-        for alpha in [-1.0f64, 2.0, 2.5, 5.0] {
-            let opts = feral_amf::AmfOptions { dense_alpha: alpha };
-            let mut best = f64::INFINITY;
-            let t0 = Instant::now();
-            let mut marks: Vec<(usize, f64, f64)> = Vec::new();
-            for s in 1u64..=24 {
-                let q = relabel(n, s);
-                let b = permute_pattern(&sp, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
-                    if let Ok((pb, _)) = feral_amf::amf_order_opts(&bcore, &opts) {
-                        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
-                        if is_bijection(&perm, n) {
-                            let r = flops_of(&sp, &perm) as f64 / base;
-                            if r < best {
-                                best = r;
-                            }
-                        }
-                    }
-                }
-                if [1usize, 2, 4, 6, 8, 12, 16, 24].contains(&(s as usize)) {
-                    marks.push((s as usize, best, t0.elapsed().as_secs_f64()));
-                }
-            }
-            print!("  amf a={alpha:<5}");
-            for (k, b, t) in &marks {
-                print!(" k{k}={b:.4}/{t:.2}s");
-            }
-            println!();
-        }
-    }
-}
-
-/// A/B the heavy-tier arm against the unchanged frontier IN THE SAME RUN, on
-/// the same matrices, under the same machine load — the only comparison that
-/// is meaningful on this box. Reports the full corpus score both ways, every
-/// per-matrix ratio change, and per-matrix `order()` seconds both ways
-/// (min of 2, interleaved so drift hits both arms equally).
-#[test]
-#[ignore]
-fn probe_heavy_ab() {
-    let corpus = crate::corpus::corpus();
-    let mut ls_off = [0.0f64; 3];
-    let mut ls_on = [0.0f64; 3];
-    let mut ct = [0usize; 3];
-    let mut worst_off = (0.0f64, String::new());
-    let mut worst_on = (0.0f64, String::new());
-    let mut moved: Vec<(String, f64, f64, f64, f64)> = Vec::new();
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        if n == 0 {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core)
-                .unwrap()
-                .into_iter()
-                .map(|x| x as usize)
-                .collect::<Vec<_>>(),
-        ) as f64;
-        let (mut t_off, mut t_on) = (f64::INFINITY, f64::INFINITY);
-        let (mut r_off, mut r_on) = (f64::NAN, f64::NAN);
-        for _ in 0..2 {
-            HEAVY_AMF_ARM.with(|c| c.set(false));
-            let t = Instant::now();
-            let p = order(pat);
-            t_off = t_off.min(t.elapsed().as_secs_f64());
-            r_off = flops_of(&sp, &p) as f64 / base;
-            HEAVY_AMF_ARM.with(|c| c.set(true));
-            let t = Instant::now();
-            let p = order(pat);
-            t_on = t_on.min(t.elapsed().as_secs_f64());
-            r_on = flops_of(&sp, &p) as f64 / base;
-        }
-        let b = bucket(n);
-        ls_off[b] += r_off.ln();
-        ls_on[b] += r_on.ln();
-        ct[b] += 1;
-        if t_off > worst_off.0 {
-            worst_off = (t_off, name.clone());
-        }
-        if t_on > worst_on.0 {
-            worst_on = (t_on, name.clone());
-        }
-        if (r_on - r_off).abs() > 1e-9 || t_on - t_off > 0.05 {
-            moved.push((name.clone(), r_off, r_on, t_off, t_on));
-        }
-    }
-    println!("\nname\tratio_off\tratio_on\tsecs_off\tsecs_on");
-    for (nm, a, b, c, d) in &moved {
-        println!("{nm}\t{a:.4}\t{b:.4}\t{c:.3}\t{d:.3}");
-    }
-    for b in 0..3 {
-        if ct[b] > 0 {
-            println!(
-                "{}\tcount={}\toff={:.6}\ton={:.6}",
-                BUCKET_NAMES[b],
-                ct[b],
-                (ls_off[b] / ct[b] as f64).exp(),
-                (ls_on[b] / ct[b] as f64).exp()
-            );
-        }
-    }
-    println!("SCORE off = {:.6}", aggregate(&ls_off, &ct));
-    println!("SCORE on  = {:.6}", aggregate(&ls_on, &ct));
-    println!("WORST off = {:.3}s ({})", worst_off.0, worst_off.1);
-    println!("WORST on  = {:.3}s ({})", worst_on.0, worst_on.1);
-}
-// ── PARALLEL-PORTFOLIO PROBES (arm/parallel) ───────────────────────────────
-
-/// STRONGEST identity check for the parallel restructure: run `order()` on
-/// EVERY corpus matrix twice in the same process — once with every batch
-/// forced onto the sequential path (`parallel::FORCE_SEQUENTIAL`) and once on
-/// the real up-to-4-thread path — and assert the two returned permutations are
-/// element-for-element equal. A hash is printed per matrix so a diff of two
-/// runs is also meaningful, but the assertion is on the full vectors, not on
-/// the hash.
-#[test]
-#[ignore]
-fn probe_parallel_identity() {
-    let corpus = crate::corpus::corpus();
-    let mut mismatches: Vec<String> = Vec::new();
-    let mut checked = 0usize;
-    let mut hash_all: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, pat) in &corpus {
-        if pat.n == 0 {
-            continue;
-        }
-        parallel::FORCE_SEQUENTIAL.with(|c| c.set(true));
-        let seq = order(pat);
-        parallel::FORCE_SEQUENTIAL.with(|c| c.set(false));
-        let par = order(pat);
-        // Second parallel run: also proves the parallel path is stable
-        // run-to-run (the determinism gate runs `order()` twice).
-        let par2 = order(pat);
-        checked += 1;
-        let h = fnv_perm(&par);
-        hash_all ^= h.wrapping_mul(0x100_0000_01b3);
-        if seq != par {
-            let d = seq.iter().zip(par.iter()).position(|(a, b)| a != b);
-            mismatches.push(format!("{name}: seq != par at position {d:?}"));
-        }
-        if par != par2 {
-            mismatches.push(format!("{name}: par run-to-run differs"));
-        }
-        println!("{name}\tn={}\tnnz={}\thash={h:016x}", pat.n, pat.nnz());
-    }
-    println!("checked={checked} corpus_hash={hash_all:016x}");
-    assert!(
-        mismatches.is_empty(),
-        "parallel path is NOT output-identical:\n{}",
-        mismatches.join("\n")
-    );
-}
-
-fn fnv_perm(p: &[usize]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &v in p {
-        h ^= v as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// A/B wall-clock: sequential-forced `order()` vs the parallel `order()` on
-/// the same matrices in the SAME process (so both see the same machine load),
-/// min-of-`REPS` for each. Prints per-matrix seconds and the speedup, sorted
-/// by sequential cost, plus the corpus totals and both worst cases.
-///
-/// `SSI_PAR_REPS` (default 2) and `SSI_PAR_TOP` (default: all matrices with
-/// sequential time >= 0.05 s) tune the run. Test-only; nothing here is
-/// compiled into the shipped binary.
-#[test]
-#[ignore]
-fn probe_parallel_speedup() {
-    let reps: usize = std::env::var("SSI_PAR_REPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
-    let min_secs: f64 = std::env::var("SSI_PAR_MIN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-
-    let corpus = crate::corpus::corpus();
-    let mut rows: Vec<(f64, f64, String, usize, usize)> = Vec::new();
-    let (mut tot_seq, mut tot_par) = (0.0f64, 0.0f64);
-    for (name, pat) in &corpus {
-        if pat.n == 0 {
-            continue;
-        }
-        let mut sq = f64::INFINITY;
-        let mut pr = f64::INFINITY;
-        for _ in 0..reps {
-            parallel::FORCE_SEQUENTIAL.with(|c| c.set(true));
-            let t = Instant::now();
-            let a = order(pat);
-            sq = sq.min(t.elapsed().as_secs_f64());
-            parallel::FORCE_SEQUENTIAL.with(|c| c.set(false));
-            let t = Instant::now();
-            let b = order(pat);
-            pr = pr.min(t.elapsed().as_secs_f64());
-            assert_eq!(a, b, "{name}: parallel output differs from sequential");
-        }
-        if sq < min_secs {
-            continue;
-        }
-        tot_seq += sq;
-        tot_par += pr;
-        rows.push((sq, pr, name.clone(), pat.n, pat.nnz()));
-    }
-    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    println!("\nseq_s\tpar_s\tspeedup\tmatrix\tn\tnnz");
-    for (sq, pr, name, n, nnz) in rows.iter() {
-        println!("{sq:.4}\t{pr:.4}\t{:.2}x\t{name}\t{n}\t{nnz}", sq / pr);
-    }
-    let worst_seq = rows.iter().map(|r| r.0).fold(0.0f64, f64::max);
-    let worst_par = rows.iter().map(|r| r.1).fold(0.0f64, f64::max);
-    println!("\nTOTAL seq={tot_seq:.3}s par={tot_par:.3}s speedup={:.2}x", tot_seq / tot_par);
-    println!("WORST seq={worst_seq:.3}s par={worst_par:.3}s");
+    (0..pat.n)
+        .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+        .max()
+        .unwrap_or(0)
 }
