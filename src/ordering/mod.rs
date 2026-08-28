@@ -918,7 +918,7 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
 const PAIR_DESCENT_MIN_N: usize = 1_000;
 const PAIR_DESCENT_MAX_N: usize = 4_000;
 const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-const PAIR_DESCENT_SWEEPS: usize = 2;
+const PAIR_DESCENT_SWEEPS: usize = 3;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
