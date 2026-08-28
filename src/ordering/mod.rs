@@ -3941,17 +3941,19 @@ fn order_with_options(
     // GATES. `RGREEDY_MAX_N` = 3000: memory is ~n²/4 bytes (two bitset
     // adjacency copies), and more importantly the LNS's per-iteration cost is
     // O(n·⌈n/64⌉), so above ~3000 the budget buys too few iterations to escape
-    // the incumbent's basin. `RGREEDY_MAX_NNZ` = 250_000 keeps the two densest
-    // admitted matrices (`maxcsp-ehi-85-297-71` nnz=207_996,
-    // `qspp_0_14_0_1_10_1` nnz=120_274, both measured wins) in and bounds the
-    // reset cost. `RGREEDY_BUDGET` is in WORD-OPERATIONS, never wall-clock —
-    // determinism requires the stopping rule be a pure function of the pattern.
-    // Measured single-threaded worst case over all 211 admitted dev matrices at
-    // this budget: 0.22 s (on tiny `n`, where the fixed per-run overheads
-    // dominate), median ~0.15 s.
+    // the incumbent's basin. `RGREEDY_MAX_NNZ` = 60_000 keeps dense small
+    // matrices out of this exact-game search and bounds reset cost. The budget
+    // is in WORD-OPERATIONS, never wall-clock, so the stopping rule remains a
+    // deterministic pure function of the pattern.
+    //
+    // Current-frontier paired measurement on the 207-matrix admitted dev slice:
+    // 300M ops scored 0.882950 / fill 0.961854; 400M scored 0.882031 / fill
+    // 0.961480. The unrestricted local run reached an unrelated timeout on
+    // `gabriel09` (n=21688, outside this gate), after the candidate built and
+    // scored the entire affected small tier successfully.
     const RGREEDY_MAX_N: usize = 3_000;
     const RGREEDY_MAX_NNZ: usize = 60_000;
-    const RGREEDY_BUDGET: i64 = 300_000_000;
+    const RGREEDY_BUDGET: i64 = 400_000_000;
     if rgreedy_enabled && n <= RGREEDY_MAX_N && nnz <= RGREEDY_MAX_NNZ && nnz > 0 {
         if let Some((cand, _)) = rgreedy::search(
             n,
