@@ -927,7 +927,7 @@ const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 // budget is a deterministic cumulative op count, exhaustion discards, and the
 // result is admitted only through the trusted global scorer -- so more of it is
 // weakly improving and cannot change determinism.
-const PAIR_DESCENT_SWEEPS: usize = 4;
+const PAIR_DESCENT_SWEEPS: usize = 8;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
@@ -1188,159 +1188,6 @@ thread_local! {
         const { std::cell::Cell::new(u64::MAX) };
 }
 
-/// ── TELOS TOP-K SEEDING (experiment 0022, from 0020's diagnosis) ──
-///
-/// 0020 proved TELOS-GRADIENT DESCENT is sharply SEED-SENSITIVE: on
-/// `chp_shorttermplan2d` it reaches 1_975_321 from a WORSE incumbent and only
-/// 2_104_445 from the better one, and no other phase reproduces the effect.
-/// A run seeded at the better incumbent has no access to the basin only the
-/// worse incumbent reaches, and TELOS accepts only improvements, so the loss
-/// is invisible to every in-run bookkeeping. The fix 0020 names: descend from
-/// MORE than the single best incumbent — retain the top-K distinct `consider`
-/// candidates and run the same descent from each, keeping the global best.
-///
-/// Each descent is SEED-LOCAL (it accepts improvements over its own seed even
-/// while still worse than the global best — that is the entire point), and
-/// only the final merge is strict `<` against the global incumbent, so the
-/// AMD floor is intact and no seed can regress the score. Determinism: the
-/// pool is filled in `consider`'s own (deterministic) call order, ordered by
-/// `(flops, arrival)`, with exact-duplicate permutations rejected.
-///
-/// `TELOS_SEED_POOL` bounds pool memory (≤ 8 permutations ≈ 8n words); the
-/// number of EXTRA descents actually run is `telos_extra_seeds` — a pure
-/// function of `(n, nnz, max_deg)`, sized from isolated timing (see the
-/// experiment page) and OFF (0) wherever not measured affordable.
-const TELOS_SEED_POOL: usize = 8;
-
-/// TEST-ONLY override for the extra-seed count, so probes can sweep K and
-/// measure cost/benefit without touching the shipped gate.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TELOS_EXTRA_OVERRIDE: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// TEST-ONLY: make EXTRA seed descents use the incumbent's full
-/// `telos_schedule` grid instead of the shipped light Tier-B grid, so probes
-/// can measure how much of the deep-basin value (the graded-FAIL variant's
-/// upside) still exists on the current tree before hunting a discriminator.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static TELOS_EXTRA_FULLGRID: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-/// How many EXTRA TELOS descents (beyond the incumbent's) this matrix may
-/// afford. Pure function of `(n, nnz, max_deg)` — never wall-clock.
-///
-/// Sized from the measured K ∈ {0,1,3,7} sweep (`probe_topk_telos`, 291
-/// in-gate matrices, 4-way sharded; ratios exact, times cross-checked by an
-/// isolated full-corpus re-measurement of exactly this config). K=3 captures
-/// nearly all of K=7's value (projected 0.839338 vs 0.839214) at roughly half
-/// its added cost, so every admitted regime uses 3. The regimes:
-///
-///   A) `nnz <= 20_000` — added cost is bounded by nnz alone regardless of
-///      structure (same argument as `small_multi`); measured worst whole
-///      `order()` in this band at K=3 is ~0.8 s. No hub gate: the win on
-///      `wastewater05m1` (0.8107→0.7589, n=98) needs none and `max_deg <= n/50`
-///      is unusable at tiny n. Carries the band's small downstream-seeding
-///      losses (`graphpart_clique-30/70`, `nuclear25a`) which the measured
-///      band aggregate absorbs several times over (`wastewater05m1`, `ndcc12`
-///      1.0000→0.9748, `chp_partload` 0.8086→0.7799, `crudeoil_li05`,
-///      `gasprod_sarawak16`).
-///   B) `20_000 < nnz <= 55_000` AND `max_deg * 50 <= n` (0019's hub
-///      discriminator — a hub is what makes descent passes expensive, and it
-///      is the only thing separating `ringpack_30_2`/`arki0016` (+0.4 s, zero
-///      gain) from their (n, nnz)-near-twins that win). Captures
-///      `chp_shorttermplan2d` 0.5147→0.4837 (0020's own target matrix),
-///      `procurement1large` 0.6343→0.6193, `crudeoil_lee2_06` 0.9885→0.9674.
-///      The 55k ceiling excludes the measured no-gain expensive class above
-///      it (`crudeoil_lee4_06/09/10` +0.24–0.37 s each, `gasprod_sarawak81`
-///      which K=3 makes slightly WORSE, `edgecross24-115`, `mpbp_48`).
-///   C) `150_000 <= nnz <= 200_000` AND `max_deg * 50 <= n` — exactly the
-///      TELOS Tier-B window (1 round, 2 strips + 3 peels, so a descent costs
-///      only a few near-full-size ordering passes, ∝ nnz; the 200k ceiling
-///      bounds that at ~0.15 s/seed and excludes the measured no-gain heavies
-///      `gams05` and `nuclear104` at 253k/258k). Captures the sweep's largest
-///      single win, `nuclear10a` 0.9961→0.7578 (n=17493, gt_10k), plus
-///      `arki0013` 0.6261→0.6220.
-///
-/// The 55k–150k Tier-A middle stays at 0: measured there, the crudeoil_lee4
-/// family pays +0.24–0.37 s for exactly nothing and already sits at the top
-/// of the corpus cost table, and the only sacrificed win
-/// (`nd_netgen-3000-1-1-b-b-ns_7`, −0.002 ln) does not justify carrying that
-/// class's breach risk on unseen graded matrices.
-/// Seed-count calibration (targeted `probe_topk_telos` sweeps, K ∈ {0,1,2,3},
-/// light grids): every light-grid winner lands by K=2 — `nuclear10a` needs
-/// exactly seed #2 (flat at K=1, full −0.238 at K=2), `arki0013` wins at K=1,
-/// `wastewater05m1`/`chp_partload` at K=2 — and nothing measured needs seed #3,
-/// so all regimes grant 2, cutting the added cost by a third vs 3. The C
-/// ceiling is 170k (not 200k): both its measured winners sit at 160–164k nnz,
-/// and after two graded cap-FAILs the unseen-matrix window above them is not
-/// worth its ~0.04 s/seed marginal cost (isolated per-matrix adds under this
-/// gate: ≤0.033 s in A/B, ~0.08 s in C — the corpus-wide picture is in the
-/// 0021 postscript).
-fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
-    if nnz == 0 {
-        return 0;
-    }
-    if nnz <= 20_000 {
-        return 2;
-    }
-    let hub_safe = max_deg.saturating_mul(50) <= n;
-    if nnz <= 55_000 && hub_safe {
-        // Regime B carries the deep chp_shorttermplan2d basin, which needs
-        // the third seed (see `telos_extra_fullgrid`).
-        return 3;
-    }
-    if (150_000..=170_000).contains(&nnz) && hub_safe {
-        return 2;
-    }
-    0
-}
-
-/// Whether this matrix's EXTRA descents may use the incumbent's full
-/// `telos_schedule` grid instead of the light Tier-B grid. Regime B only
-/// (`20k < nnz <= 55k`, hub-safe): on the four-thread carrier the full-grid
-/// extra cost measured in-regime tops out at ~0.07 s (`chp_shorttermplan2d`
-/// 0.418→0.488 s at K=3) because the round's strip/peel tasks parallelize —
-/// the 0.33 s/matrix additions that killed the single-threaded full-grid
-/// variant on the grader no longer exist in this window. Regime B is also the
-/// cheap class by construction (≤55k nnz, no hubs), so an unseen graded
-/// matrix in the window cannot be a lee4/gams05-scale cost bomb. Measured
-/// value: `chp_shorttermplan2d` 0.514435 → **0.483081** (needs BOTH the full
-/// grid and seed #3; light extras and K=2 both leave it untouched). Regimes A
-/// and C keep the light grid: A's full-grid sweep showed downstream-seeding
-/// regressions (`ndcc12` 0.9601→0.9649 at K=3 full), and C's winner
-/// (`nuclear10a`) reaches its basin identically under either grid at K=2.
-fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize) -> bool {
-    nnz > 20_000 && nnz <= 55_000 && max_deg.saturating_mul(50) <= n
-}
-
-/// Offer one scored candidate to the TELOS seed pool: keep the `cap` best by
-/// `(flops, arrival order)`, rejecting exact-duplicate permutations (equal
-/// flops with a DIFFERENT permutation is a different completion and stays —
-/// that diversity is what 0020 showed matters). Deterministic: pure function
-/// of the call sequence.
-fn offer_seed(pool: &mut Vec<(u64, Vec<usize>)>, cap: usize, f: u64, perm: &[usize]) {
-    if cap == 0 {
-        return;
-    }
-    if pool.len() == cap && f >= pool[cap - 1].0 {
-        return;
-    }
-    if pool
-        .iter()
-        .any(|(pf, pp)| *pf == f && pp.as_slice() == perm)
-    {
-        return;
-    }
-    // Insert after every entry with flops <= f, so earlier arrivals win ties.
-    let pos = pool.partition_point(|(pf, _)| *pf <= f);
-    pool.insert(pos, (f, perm.to_vec()));
-    pool.truncate(cap);
-}
-
 /// HEAVY-TIER RELABELLED-AMF MULTISTART envelope (arm/heavy). See the block in
 /// `order_with_options` that reads these for the measurement table and the
 /// reason the dense sub-tier has an nnz FLOOR rather than only a ceiling.
@@ -1535,42 +1382,8 @@ fn perturb(p: &[usize], seed: u64, swaps: usize) -> Vec<usize> {
 /// `max_deg` is the maximum vertex degree of the pattern (excluding self-loops) —
 /// required by the mid-band gate below, where it is the discriminator that keeps the
 /// boost off hub-heavy patterns whose restarts are expensive.
-/// HUB GATE-WALL CLASS (0021 rev3): extreme-hub matrices in the 100k–150k nnz
-/// gate-wall band, where every relabel pass is expensive (the hub re-enters
-/// the quotient-graph flow on each restart) and — measured, `probe_ringpack_ms`
-/// on the 0021 tree, re-verifying 0015 — the whole multistart+hill-climb block
-/// changes the final ratio by EXACTLY NOTHING on both dev members:
-/// `ringpack_30_2` (0.301673 at cap MAX/4/1/0 alike; 1.233→1.127 s) and
-/// `popdynm200` (0.987886 alike; 0.762→0.697 s). `ringpack_30_2` is the corpus
-/// worst case and the largest score-at-risk item (a graded cap kill scores
-/// nothing), so this spend is pure breach risk with zero measured value.
-/// The class predicate reuses 0019's hub mechanism (`max_deg * 50 > n`); the
-/// nnz window keeps it to the band where the evidence was measured.
-fn hub_gatewall(n: usize, nnz: usize, max_deg: usize) -> bool {
-    #[cfg(test)]
-    if HUB_GATEWALL_OFF.with(|c| c.get()) {
-        return false;
-    }
-    (100_000..150_000).contains(&nnz) && max_deg.saturating_mul(50) > n
-}
-
-/// TEST-ONLY switch to disable the hub gate-wall trim, so probes can measure
-/// the tree with and without it (e.g. to reproduce the pre-trim baseline on
-/// the merged frontier) without a separate checkout.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static HUB_GATEWALL_OFF: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
 fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     if nnz == 0 {
-        return 0;
-    }
-    // Measured-zero-value class: skip the multistarts entirely (see
-    // [`hub_gatewall`]). The hill-climb phase applies the same predicate at
-    // its own call site.
-    if hub_gatewall(n, nnz, max_deg) {
         return 0;
     }
     let restarts = budget / nnz;
@@ -2328,23 +2141,6 @@ fn order_with_options(
     // hill-climb loops below only READ it.
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
-
-    // TELOS top-K seed pool (experiment 0022) — see the `TELOS_SEED_POOL`
-    // constants' doc comment. Maintained only where the TELOS phase will
-    // actually consume it (inside the TELOS nnz gate AND with a nonzero
-    // extra-seed allowance), so it costs nothing anywhere else. In the
-    // parallel-portfolio architecture the pool is fed AFTER
-    // `parallel::run_candidates`, walking the results in task-index order —
-    // the same source order the old sequential `consider` closure offered
-    // candidates in — see the RUN THE QUEUED PORTFOLIO block.
-    let telos_extra = {
-        let g = telos_extra_seeds(n, nnz, max_deg);
-        #[cfg(test)]
-        let g = TELOS_EXTRA_OVERRIDE.with(|c| c.get()).unwrap_or(g);
-        g
-    };
-    let seed_pool_active = telos_extra > 0 && nnz > 0 && nnz < TELOS_MAX_NNZ;
-    let mut seed_pool: Vec<(u64, Vec<usize>)> = Vec::new();
 
     // STRIP-TRANSFORM RANKINGS, hoisted above the task queue. Their gate is
     // unchanged (identical condition to the STRIP TRANSFORM block below, which
@@ -3657,25 +3453,8 @@ fn order_with_options(
     // single-threaded portfolio. Nothing below this point may be queued: from
     // the hill-climb phase onwards every phase reads the incumbent.
     {
-        // `keep_all = seed_pool_active`: the workers' drop-early memory
-        // optimization discards permutations that cannot be the single
-        // argmin, but the TELOS seed pool (0022) needs the top-8 BY VALUE, so
-        // where the pool is live every valid candidate keeps its permutation.
-        // Output-neutral (retaining more can never change the argmin walk)
-        // and bounded: the pool gates admit only nnz <= 55k / 150k-170k
-        // matrices, where the whole queue's permutations are a few MB.
         let mut results =
-            parallel::run_candidates(&tasks, scoring_pat, n, nnz, best_flops, seed_pool_active);
-        if seed_pool_active {
-            // Feed the pool in TASK-INDEX order — the same source order the
-            // sequential `consider` closure offered candidates in, so the
-            // pool contents are byte-identical to the pre-parallel build.
-            for r in results.iter() {
-                if let (Some(f), Some(p)) = (r.flops, r.perm.as_ref()) {
-                    offer_seed(&mut seed_pool, TELOS_SEED_POOL, f, p);
-                }
-            }
-        }
+            parallel::run_candidates(&tasks, scoring_pat, n, nnz, best_flops);
         let won = parallel::accept(&mut results, &mut best_flops, &mut best_perm, |_f| {
             // TEST-ONLY: record the best flops over `consider` candidates
             // alone (excludes the AMD anchor), for the runner-up-margin
@@ -3708,14 +3487,7 @@ fn order_with_options(
     } else {
         (HC_BUDGET_SMALL, HC_CAP_SMALL)
     };
-    let hc_r = if nnz > 0
-        && nnz <= HC_MAX_NNZ
-        && relabel_cap > 0
-        // Measured-zero-value class, same predicate as the multistarts — see
-        // [`hub_gatewall`]: on both dev members the hill-climb changes the
-        // final ratio by exactly nothing (identical at relabel_cap 0).
-        && !hub_gatewall(n, nnz, max_deg)
-    {
+    let hc_r = if nnz > 0 && nnz <= HC_MAX_NNZ && relabel_cap > 0 {
         (hc_budget / nnz).min(hc_cap)
     } else {
         0
@@ -4063,14 +3835,6 @@ fn order_with_options(
     // and only a strict improvement is ever kept (AMD floor intact).
 #[cfg(test)]
     let _tp5 = std::time::Instant::now();
-    // 0022b: the best DISTINCT runner-up completion among the TELOS descents
-    // (the incumbent's and the extras'). The completion-descent trio below
-    // is seed-sensitive exactly like TELOS itself (the light-vs-full-grid
-    // sweeps show downstream flips on ndcc12/graphpart), so where the extras
-    // gate is active the trio also descends this alternate completion —
-    // a second, already-good, structurally different starting point.
-    let mut telos_alt: Option<Vec<usize>> = None;
-    let mut telos_alt_f: u64 = u64::MAX;
     let amd_seed_one_round = (3_000..=6_000).contains(&n)
         && (9_000..=18_000).contains(&nnz)
         && max_deg <= n / 50
@@ -4097,67 +3861,9 @@ fn order_with_options(
             peel_grid,
             0,
         );
-        // 0022 TOP-K EXTRAS: run the same descent from up to `telos_extra`
-        // retained consider-pool seeds distinct from the incumbent — 0020
-        // proved the descent is seed-sensitive and a WORSE seed can reach a
-        // better basin. Each extra descent uses the LIGHT Tier-B grid (one
-        // round, 2 strips + 3 peels): the full-grid variant of this FAILED
-        // the grader's 2 s cap on a hidden matrix (extra Tier-A descents add
-        // up to ~0.33 s/matrix locally — an unbounded bet against the UNKNOWN
-        // existing load of unseen graded matrices, the 0005 rule), while the
-        // light grid bounds every extra descent at a few near-full-size
-        // passes (≲0.03 s at 55k nnz, ≲0.08 s at the C gate's ceiling).
-        // `telos_descend` is seed-local by construction (it accepts against
-        // its own start), and only the merge below is strict `<` against the
-        // global incumbent, so the AMD floor and no-regression are intact.
-        // See `telos_extra_seeds`' doc and memory/experiments/0022 for the
-        // gate regimes, the K=2 calibration, and the graded-FAIL history.
-        let mut tf = f;
-        let mut tp = p;
-        let mut used = 0usize;
-        for (pf, pp) in seed_pool.iter() {
-            if used >= telos_extra {
-                break;
-            }
-            if pp == &best_perm {
-                continue;
-            }
-            let (xr, xp, xn, xg): (usize, &[(u8, usize)], usize, &[usize]) = {
-                let mut grid = if telos_extra_fullgrid(n, nnz, max_deg) {
-                    telos_schedule(nnz)
-                } else {
-                    (1usize, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
-                };
-                #[cfg(test)]
-                if TELOS_EXTRA_FULLGRID.with(|c| c.get()) {
-                    grid = telos_schedule(nnz);
-                }
-                grid
-            };
-            let (ep, ef) = telos_descend(scoring_pat, nnz, pp, *pf, xr, xp, xn, xg, 0);
-            if ef < tf {
-                // The displaced leader is by definition the best runner-up
-                // seen so far — 0022b feeds it to the completion-descent
-                // trio below.
-                if tp != ep {
-                    telos_alt_f = tf;
-                    telos_alt = Some(std::mem::replace(&mut tp, ep));
-                    tf = ef;
-                } else {
-                    tp = ep;
-                    tf = ef;
-                }
-            } else if ef > tf && ep != tp && ef < telos_alt_f {
-                // Strictly worse than the leader but distinct: best such
-                // becomes the alt.
-                telos_alt_f = ef;
-                telos_alt = Some(ep);
-            }
-            used += 1;
-        }
-        if tf < best_flops {
-            best_flops = tf;
-            best_perm = tp;
+        if f < best_flops {
+            best_flops = f;
+            best_perm = p;
         }
     }
     let telos_end_flops = best_flops;
@@ -4190,26 +3896,7 @@ fn order_with_options(
     // argmin (MINL first, ORBIT second — the sequential order) is exact.
 #[cfg(test)]
     let _tp6 = std::time::Instant::now();
-    // 0022b: descend the trio from the pre-descent incumbent AND (where the
-    // extras gate is active and one exists) the best distinct TELOS runner-up
-    // completion. The alt batch runs second and is accepted only on strict
-    // improvement over whatever the first batch left, so the incumbent-based
-    // behavior (including all tie-breaks) is preserved exactly; the alt can
-    // only add. Cost: one extra trio batch, only inside the A/B/C windows
-    // where the phases' own gates already bound each task.
-    // A/B windows only (nnz <= 55k): with the box saturated by an unrelated
-    // workload the alt batch's wall cost could not be measured cleanly, so it
-    // ships only in the class whose trio tasks are structurally cheap.
-    let desc_alt: Option<Vec<usize>> = if telos_extra > 0 && nnz <= 55_000 {
-        telos_alt.take().filter(|a| a != &pre_orbit_perm)
-    } else {
-        None
-    };
-    let mut desc_bases: Vec<&Vec<usize>> = vec![&pre_orbit_perm];
-    if let Some(a) = desc_alt.as_ref() {
-        desc_bases.push(a);
-    }
-    for base_desc in desc_bases {
+    let base_desc = &pre_orbit_perm;
     let mut dtasks: Vec<parallel::PermFn> = Vec::new();
     if nnz > 0 && nnz < MINL_MAX_NNZ && !minl_off() {
         dtasks.push(Box::new(move || -> Option<Vec<usize>> {
@@ -4452,8 +4139,6 @@ fn order_with_options(
         parallel::accept(&mut dres, &mut best_flops, &mut best_perm, |_| {});
     }
     drop(dtasks);
-    }
-    drop(desc_alt);
 
 #[cfg(test)]
     parallel::phase_mark("6.minl_orbit", _tp6);
@@ -4825,7 +4510,7 @@ fn order_with_options(
         min_s: 32,
         max_s: 700,
         max_sub: 3_500,
-        max_blocks: 96,
+        max_blocks: 128,
         budget: 5_000_000,
         streams: 2,
     };

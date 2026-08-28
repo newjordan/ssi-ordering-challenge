@@ -110,13 +110,6 @@ pub(crate) fn run_candidates(
     n: usize,
     nnz: usize,
     incumbent: u64,
-    // `true` disables the drop-early memory optimization so EVERY valid
-    // candidate keeps its permutation — required by the TELOS seed pool
-    // (0022), which needs the top-8 by value, not just the argmin. Retaining
-    // more can never change the argmin `accept` picks, so this is
-    // output-neutral; callers pass `true` only under the pool's small-matrix
-    // gates, where the retained permutations total a few MB.
-    keep_all: bool,
 ) -> Vec<CandOut> {
     run_generic(
         tasks.len(),
@@ -124,7 +117,7 @@ pub(crate) fn run_candidates(
         n,
         nnz,
         incumbent,
-        keep_all,
+        false,
         &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
             Ok(Ok(perm_i32)) => Some(perm_i32.into_iter().map(|x| x as usize).collect()),
             _ => None,
