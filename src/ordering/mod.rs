@@ -915,6 +915,18 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
         .min(cap)
 }
 
+/// Final exact adjacent-transposition descent. It targets only the `1k_10k`
+/// bucket: the `n < 1000` near-AMD mass is floor-limited, while exact bitset
+/// replay grows as `n * ceil(n / 64)` per pivot. One cycle contains parity
+/// zero and one; a second cycle starts only from the first cycle's trusted,
+/// strictly accepted output. Each cycle has its own deterministic hard budget.
+const PAIR_DESCENT_MIN_N: usize = 1_000;
+const PAIR_DESCENT_MAX_N: usize = 4_000;
+const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
+const PAIR_DESCENT_CYCLES: usize = 2;
+const PAIR_DESCENT_SWEEPS: usize = 2;
+const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -4250,12 +4262,11 @@ fn order_with_options(
     // -0.00236 at equal budget). Both paths live in the same `Game`, selected
     // by `n` — a pure function of the pattern, so determinism is untouched.
     //
-    // `RGREEDY_MAX_NNZ` = 250_000. Density is NOT a cost driver for this phase
-    // — the bitset word count is `⌈n/64⌉` regardless of nnz, so
-    // `maxcsp-ehi-85-297-71` (n=2372, nnz=207_996) costs 0.049 s and `qapw`
-    // (n=705, nnz=87_496) 0.066 s, both cheaper than sparse matrices half
-    // their size. An earlier 60_000 ceiling was a proxy for "the frontier is
-    // already slow here", which the parallel portfolio has since fixed.
+    // `RGREEDY_MAX_NNZ` = 60_000. The tighter reach removes the dense-small
+    // hidden-cap hazard and spends the reclaimed envelope as search depth on
+    // the sparse side. Two complete 300-pattern causal runs of this 60k/600M
+    // trade on the common lineage were byte-identical and improved score by
+    // 0.000728; 1.2B was worse, making 600M the measured knee.
     //
     // `RGREEDY_BUDGET` is a PER-STREAM budget in WORD-OPERATIONS, never
     // wall-clock: determinism requires the stopping rule be a pure function of
@@ -4267,21 +4278,20 @@ fn order_with_options(
     // an ordering), and `Game::run` hard-stops at 1.25x the budget so an
     // unseen matrix whose randomized fill explodes cannot overshoot by a whole
     // run. Without the first of these the same budget cost 0.32 s instead of
-    // 0.08 s at n≈5000. Measured added wall time at 200M/stream: p50 0.077 s,
-    // p90 0.092 s, MAX 0.094 s in a quiet run, across both tiers.
+    // 0.08 s at n≈5000. The 600M budget is admitted only inside the contracted
+    // sparse gate; operation limits remain deterministic and per stream.
     //
     // FOUR STREAMS instead of one. The grader has 4 vCPUs, so four independent
     // searches cost the same wall time as one and buy 4x the search. Measured
-    // A/B: one stream at 300M ops scores -0.00197 with p50 0.076 s / MAX
-    // 0.144 s added; four streams at 200M each score -0.00236 with p50
-    // 0.067 s / MAX 0.094 s — better on BOTH axes. Each stream is a pure
+    // A/B: one stream at 300M ops scores -0.00197; four independent streams
+    // recover more distinct basins. Each stream is a pure
     // function of `(pattern, incumbent, budget, stream index)` with no shared
     // state, and the merge is a strict argmin walked in stream-index order, so
     // the output is byte-identical regardless of completion order or thread
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
     const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
-    const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
+    const RGREEDY_MAX_NNZ: usize = 60_000;
+    const RGREEDY_BUDGET: i64 = 600_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
     // ties at 1.0000) and that class is where the portfolio is already slow.
     const RGREEDY_MAX_AVG_DEG: usize = 100;
@@ -4475,6 +4485,51 @@ fn order_with_options(
             }
         }
     }
+
+    #[cfg(test)]
+    let _tp10 = std::time::Instant::now();
+    // ── FINAL EXACT ADJACENT-PAIR DESCENT ─────────────────────────────────
+    // Replay the final post-RGSUB incumbent through the exact elimination
+    // graph and orient disjoint adjacent pivot pairs lower-live-degree first.
+    // The two orientations of an adjacent pair leave the same residual graph;
+    // only the first column-count term differs. Two parity sweeps cover every
+    // boundary, and one bounded follow-up cycle catches inversions exposed by
+    // the first cycle's swaps.
+    //
+    // The internal theorem is not trusted for admission. Every completed cycle
+    // must return a bijection and beat the current FINAL score through the
+    // shared exact workspace. Failure or non-improvement stops immediately,
+    // and no downstream phase consumes the result.
+    if n >= PAIR_DESCENT_MIN_N
+        && n <= PAIR_DESCENT_MAX_N
+        && nnz > 0
+        && nnz <= PAIR_DESCENT_MAX_NNZ
+    {
+        for _cycle in 0..PAIR_DESCENT_CYCLES {
+            let Some(cand) = rgreedy::adjacent_pair_descent(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &best_perm,
+                PAIR_DESCENT_SWEEPS,
+                PAIR_DESCENT_OPS_BUDGET,
+            ) else {
+                break;
+            };
+            if !is_bijection(&cand, n) {
+                break;
+            }
+            let f = ws.flops(scoring_pat, &cand);
+            if f >= best_flops {
+                break;
+            }
+            best_flops = f;
+            best_perm = cand;
+        }
+    }
+
+    #[cfg(test)]
+    parallel::phase_mark("10.pair_descent", _tp10);
 
     let _ = best_flops;
 
