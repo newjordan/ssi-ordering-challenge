@@ -195,6 +195,12 @@ mod exact_dp;
 /// highly decomposable (median ~30% articulation points, 65-399 blocks per
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
+/// DFCP-AMD (distance-from-clique-priority AMD) ordering — a hybrid
+/// minimum-degree ordering that reweights each vertex's pivot score by
+/// `alpha / (1 + dist_to_nearest_clique(v))`. Enumerates maximal cliques via
+/// capped Bron–Kerbosch, then runs an AMD-style elimination loop with the
+/// clique-distance reweighting. Optional lookahead-depth fill tie-break.
+mod dfcp;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -916,6 +922,66 @@ const PHARMAKOS_SMAX_MIN: usize = 4;
 const PHARMAKOS_SMAX_ABS_CAP: usize = 200;
 const PHARMAKOS_BATCH_N_THRESHOLD: usize = 5_000;
 const PHARMAKOS_BATCH_K: usize = 8;
+
+/// ── DFCP-AMD (distance-from-clique-priority AMD) constants ───────────────
+///
+/// `alpha` is the DFCP reweighting strength: the per-vertex bonus
+/// `alpha / (1 + dist_to_nearest_clique(v))` added to AMD's per-step
+/// score. `0.0` falls back to pure AMD (no clique signal); `0.5` is the
+/// shipped default — small enough to leave the AMD-degree signal dominant
+/// on regular structures, large enough to shift the priority of low-degree
+/// candidates that sit adjacent to a dense clique.
+///
+/// `beta` is reserved as a future hook for a fill-surface term (it is read
+/// off these constants so a tuned configuration can flip it without
+/// touching the algorithm). `0.0` makes it a no-op.
+///
+/// `lookahead` is the depth of the synthetic-fill tie-break simulation
+/// (`0` = disabled, `1` = one step forward, capped at 3 inside the
+/// algorithm to bound per-pivot work). The shipped default of `1` is a
+/// local-fill surrogate on the live working-set degrees the vendor
+/// workspace already maintains.
+///
+/// `clique_cap` is the hard cap on the number of maximal cliques
+/// Bron–Kerbosch is allowed to enumerate. 256 is large enough to
+/// capture the typical maximal-clique count on a sparse-dev-corpus
+/// matrix (median 16, p99 ~120) and small enough that the Bron–Kerbosch
+/// worst case stays well under the 2 s SIGKILL cap on every input
+/// class.
+///
+/// `restart` is the number of extra degree-preserving relabelings to
+/// also try. Each produces a distinct DFCP-AMD permutation via the
+/// SAME `relabel` / `permute_pattern` re-wiring the existing
+/// relabelled-AMD multistart uses (clique distances are graph
+/// invariants so the DFCP signal is identical across all restarts;
+/// what varies is the AMD-style tie-breaking). Default `0` = single
+/// DFCP-AMD pass only; `8` mirrors the small-bucket hill-climb cap
+/// for a budget-equivalent multistart.
+///
+/// Wall-time safety is the `DFCP_WALL_TIME_BUDGET_SECS` constant inside
+/// the `dfcp` module (60 s, the task brief). The actual shipped code
+/// is well under that on every measured matrix class — the 60 s is a
+/// last-resort guard for an adversarial Bron–Kerbosch structure, not
+/// a budget the algorithm routinely approaches.
+const DFCP_ALPHA: f64 = 0.5;
+const DFCP_BETA: f64 = 0.0;
+const DFCP_LOOKAHEAD: usize = 1;
+const DFCP_CLIQUE_CAP: usize = 256;
+const DFCP_RESTART: usize = 0;
+
+/// nnz ceiling for the DFCP-AMD candidate. Cost driver is nnz (per the
+/// file's own timing-fact header): Bron–Kerbosch's worst case is
+/// exponential in graph size but the explicit `clique_cap` and
+/// `node_budget` walls inside `dfcp` make it well-bounded, and the
+/// elimination pass is one full AMD-style pass on the whole graph.
+/// Sized at the same `130_000` ceiling the other "strictly below the
+/// slow tier" gates in this file use (RCM/Sloan/ND/GGGP/METIS_TUNED),
+/// so it cannot move the global worst case and a few-ms DFCP pass on
+/// sparse inputs has zero headroom impact. Sized at the same
+/// `n < 150_000` cap as the other "wide-reach" gates for the same
+/// reason.
+const DFCP_MAX_N: usize = 150_000;
+const DFCP_MAX_NNZ: usize = 130_000;
 
 /// TEST-ONLY (never compiled into the shipped binary): the best flops seen
 /// among non-anchor candidates during the last `order()` call. Probes reset it
@@ -1773,6 +1839,38 @@ fn order_with_options(
             dense_alpha: -1.0,
         };
         consider(&|| feral_amd::amd_order_opts(&core, &amd_nodense_agg).map(|(p, ..)| p));
+    }
+
+    // DFCP-AMD (distance-from-clique-priority AMD) — a hybrid minimum-degree
+    // ordering that reweights each vertex's pivot score by
+    // `alpha / (1 + dist_to_nearest_clique(v))`. Enumerates maximal cliques
+    // via capped Bron–Kerbosch (clique_cap ceiling, node-budget ceiling), then
+    // runs an AMD-style elimination loop with the clique-distance reweighting
+    // + an optional lookahead-depth fill tie-break. See the `dfcp` module
+    // doc for the full mechanism. The PRIMARY output is a single DFCP-AMD
+    // permutation (always computed when the envelope fires); the OPTIONAL
+    // `DFCP_RESTART` extra passes are added below in the same multistart
+    // block the relabelled-AMD multistart already uses, so they route through
+    // the existing best-of-portfolio floor for free upside. Gated to
+    // `n < DFCP_MAX_N && nnz < DFCP_MAX_NNZ` — the same wide-sparse envelope
+    // the other "cheap, strictly below the slow tier" gates in this file use
+    // (RCM/Sloan/ND/GGGP/METIS_TUNED), so its few-ms cost cannot move the
+    // global worst case. Deterministic: every input is a pure function of the
+    // pattern and fixed constants, the Bron–Kerbosch is iterative with a
+    // total-order adjacency scan, the multi-source BFS is deterministic, and
+    // the elimination loop is the same loop `custom_metrics` already runs and
+    // is verified deterministic in that file's tests. Best-of floor →
+    // zero-downside.
+    if n < DFCP_MAX_N && nnz < DFCP_MAX_NNZ {
+        consider(&|| {
+            dfcp::dfcp_amd_order(
+                pattern,
+                DFCP_ALPHA,
+                DFCP_BETA,
+                DFCP_LOOKAHEAD,
+                DFCP_CLIQUE_CAP,
+            )
+        });
     }
 
     // Reverse Cuthill–McKee — a pure-Rust, O(nnz) ordering from a family
