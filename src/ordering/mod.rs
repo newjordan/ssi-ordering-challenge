@@ -4671,14 +4671,27 @@ fn order_with_options(
         && nnz <= RGREEDY_MAX_NNZ
         && nnz <= RGREEDY_MAX_AVG_DEG * n;
     if rgreedy_enabled && n <= RGREEDY_MAX_N && (rgreedy_pep_gate || rgreedy_rgs_gate) {
-        let found = if rgreedy_pep_gate {
+        // Policy information is concentrated in the graph's mean degree. On
+        // the local corpus, Rényi-2 degree/signature collisions and a GF(2)
+        // neighborhood-sketch rank add no out-of-sample predictive value, but
+        // this one-threshold rule survives both leave-one-out and five-fold
+        // validation. Keep the incumbent varied policy above the PEP tier;
+        // inside it, sparse graphs get its broader mix of search policies.
+        let sparse_policy = nnz.saturating_mul(40) <= n.saturating_mul(207);
+        let use_default = rgreedy_pep_gate && !sparse_policy;
+        let budget = if rgreedy_pep_gate {
+            RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor)
+        } else {
+            RGREEDY_BUDGET.max(rgreedy_slack_floor)
+        };
+        let found = if use_default {
             rgreedy::search_par_default_seeds(
                 n,
                 &pattern.col_ptr,
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
+                budget,
             )
         } else {
             rgreedy::search_par(
@@ -4687,7 +4700,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_BUDGET.max(rgreedy_slack_floor),
+                budget,
                 0x9E37_79B9_7F4A_7C15,
             )
         };
