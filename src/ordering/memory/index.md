@@ -123,5 +123,12 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   systemic correction: the "`nnz<130000` is below the slow tier" premise in **eleven** doc comments
   is refuted — 130k is where cost is MAXIMAL (`ringpack_30_2`, nnz=121458, is the worst matrix).
 
+- [0014-biconn-cross-family.md](experiments/0014-biconn-cross-family.md) — **SLICE WIN,
+  official validation required.** Replaced later block-local relabelled-AMD slots with AMF and
+  no-dense AMD families under the same 24-pass global / seven-extra per-block budgets and exact
+  local flop selection. Same-export `n<=10k`/255 comparison: 0.888004→0.887437, fill
+  0.963530→0.963385. The initial 60k gate capped at `arki0016`, so the final whole-matrix gate is
+  30k. Full local scoring remains unavailable because clean HEAD also caps in inherited paths.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

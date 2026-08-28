@@ -360,9 +360,9 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
 }
 
 /// PER-BLOCK-HEAVY variant: same decomposition and block-cut-tree emission as
-/// [`biconn_order`], but blocks large enough to matter get a best-of-K
-/// relabelled-AMD multi-start scored by EXACT local flops (`flops_of` on the
-/// block's own induced subgraph) instead of a single AMD pass.
+/// [`biconn_order`], but blocks large enough to matter get a small cross-family
+/// portfolio scored by EXACT local flops (`flops_of` on the block's own induced
+/// subgraph) instead of a single AMD pass.
 ///
 /// Why this is a different mechanism, not just more search: the whole-graph
 /// relabel multi-start in `mod.rs` is gated out of the big sparse gt_10k
@@ -373,10 +373,13 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
 /// articulation) means improving a block's local flops improves the composed
 /// ordering. Deterministic: same `relabel(m, seed)` stream as the portfolio.
 ///
-/// Restart budget is allocated LARGEST-BLOCK-FIRST (flops concentrate in the
+/// Candidate budget is allocated LARGEST-BLOCK-FIRST (flops concentrate in the
 /// biggest blocks) under a global cap `total_restarts`, so worst-case added
-/// cost is bounded independent of the (possibly huge) block count: each
-/// restart is one block-local AMD pass plus one `flops_of`, both O(block).
+/// cost is bounded independent of the (possibly huge) block count. The first
+/// slots deliberately cross algorithm families (AMF and no-dense AMD) before
+/// spending later slots on additional relabelled default-AMD seeds. This keeps
+/// the total number of extra ordering passes at or below `total_restarts` -- it
+/// does not multiply the old restart budget by the number of families.
 pub fn biconn_heavy_order(
     pattern: &Pattern,
     total_restarts: usize,
@@ -472,11 +475,12 @@ pub fn biconn_heavy_order(
     let mut block_order: Vec<usize> = (0..nc).collect();
     block_order.sort_unstable_by(|&a, &b| depth[b].cmp(&depth[a]).then(a.cmp(&b)));
 
-    // Restart allocation, largest-block-first: block "size" for budget purposes
-    // is its owned-vertex count (the part that gets ordered here). Each block
-    // with size >= min_block draws `1 + extra` passes (the base AMD plus
-    // `extra` relabelled restarts) until the global restart budget is spent.
-    // `extra` per block is capped so one huge block cannot eat the whole budget.
+    // Candidate allocation, largest-block-first: block "size" for budget
+    // purposes is its owned-vertex count (the part that gets ordered here).
+    // Each block with size >= min_block draws `1 + extra` passes (the base AMD
+    // plus `extra` cross-family/relabel candidates) until the global budget is
+    // spent. `extra` per block is capped so one huge block cannot eat the whole
+    // budget.
     //
     // COST SAFETY: a restart on a block costs ~O(block_nnz) (one block-local
     // AMD pass + one flops_of). Blocks whose edge count exceeds
@@ -585,8 +589,8 @@ pub fn biconn_heavy_order(
             continue;
         }
 
-        // Heavy path: best-of-(1+extra) relabelled AMD, scored by exact local
-        // flops. Build the usize ScoringPattern once for flops_of.
+        // Heavy path: best-of-(1+extra) block-local portfolio, scored by exact
+        // local flops. Build the usize ScoringPattern once for flops_of.
         let cp_us: Vec<usize> = col_ptr.iter().map(|&x| x as usize).collect();
         let ri_us: Vec<usize> = row_idx.iter().map(|&x| x as usize).collect();
         let spat = super::ScoringPattern {
@@ -596,24 +600,65 @@ pub fn biconn_heavy_order(
         };
         let mut best_local: Option<Vec<u32>> = None;
         let mut best_flops = u64::MAX;
-        // Restart 0 is plain AMD on the un-relabelled block; restarts 1..=extra
-        // are AMD on `relabel(m, seed)` relabellings, composed back. Same seed
-        // stream as the portfolio's multi-start.
-        for r in 0..=extra {
-            let cand: Option<Vec<u32>> = if r == 0 {
-                feral_amd::amd_order(&core)
+        // Slot 0 is plain default AMD. Extra slots are ordered by diversity:
+        //
+        //   1  plain AMF                 5  relabelled default AMD, seed 2
+        //   2  plain no-dense AMD        6  relabelled AMF, seed 2
+        //   3  relabelled AMD, seed 1    7  relabelled no-dense AMD, seed 2
+        //   4  relabelled AMF, seed 1
+        //
+        // `EXTRA_CAP == 7`, so this is the complete per-block schedule. AMF
+        // minimizes a fill proxy rather than degree, while no-dense AMD keeps
+        // hubs in the quotient-graph flow; both therefore reach basins that
+        // default AMD relabellings cannot. Every candidate is still compared
+        // by the challenge's exact local flop objective below.
+        let amd_nodense = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        let amf_default = feral_amf::AmfOptions::default();
+        for slot in 0..=extra {
+            let cand: Option<Vec<u32>> = match slot {
+                0 => feral_amd::amd_order(&core)
                     .ok()
-                    .map(|p| p.iter().map(|&x| x as u32).collect())
-            } else {
-                let q = super::relabel(m, r as u64);
-                let bpat = feral::ordering::amd::permute_pattern(&spat, &q);
-                let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
-                feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
-                    feral_amd::amd_order(&bc).ok().map(|pb| {
-                        pb.iter().map(|&x| q[x as usize] as u32).collect()
+                    .map(|p| p.iter().map(|&x| x as u32).collect()),
+                1 => feral_amf::amf_order_opts(&core, &amf_default)
+                    .ok()
+                    .map(|(p, ..)| p.iter().map(|&x| x as u32).collect()),
+                2 => feral_amd::amd_order_opts(&core, &amd_nodense)
+                    .ok()
+                    .map(|(p, ..)| p.iter().map(|&x| x as u32).collect()),
+                _ => {
+                    // Later slots use two relabel seeds across three families.
+                    // The sequence deliberately gives default AMD the first
+                    // seed before cross-family relabels, preserving the old
+                    // heavy path's highest-value first restart.
+                    let (family, seed) = match slot {
+                        3 => (0u8, 1u64),
+                        4 => (1u8, 1u64),
+                        5 => (0u8, 2u64),
+                        6 => (1u8, 2u64),
+                        7 => (2u8, 2u64),
+                        _ => unreachable!("per-block extra cap is seven"),
+                    };
+                    let q = super::relabel(m, seed);
+                    let bpat = feral::ordering::amd::permute_pattern(&spat, &q);
+                    let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+                    feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
+                        let pb = match family {
+                            0 => feral_amd::amd_order(&bc).ok(),
+                            1 => feral_amf::amf_order_opts(&bc, &amf_default)
+                                .ok()
+                                .map(|(p, ..)| p),
+                            2 => feral_amd::amd_order_opts(&bc, &amd_nodense)
+                                .ok()
+                                .map(|(p, ..)| p),
+                            _ => unreachable!(),
+                        }?;
+                        Some(pb.iter().map(|&x| q[x as usize] as u32).collect())
                     })
-                })
+                }
             };
             let Some(local) = cand else { continue };
             let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();

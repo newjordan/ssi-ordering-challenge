@@ -1862,21 +1862,21 @@ fn order_with_options(
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_order(pattern))
         });
 
-        // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
-        // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
-        // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
-        // local flops, largest-block-first under a 24-restart global budget.
+        // PER-BLOCK-HEAVY biconn: eligible blocks (>=32 owned vertices,
+        // <=150k block-nnz) receive up to seven extra cross-family candidates:
+        // AMF, no-dense AMD, and relabelled AMD/AMF/no-dense, selected by exact
+        // local flops. Allocation stays largest-block-first under the existing
+        // 24-pass global budget.
         // Decomposition shrinks the problem, so this reaches blocks the
         // whole-graph relabel multi-start is gated out of on the big gt_10k
         // matrices. Adds crudeoil_lee1_07 (0.9032->0.8781) and syn30m03m
         // (0.9977->0.9957) over plain biconn; worst isolated cost 0.368s
         // (nuclear104). Restart 0 is plain AMD, so per-block quality >= plain
         // biconn; best-of floor makes the composed candidate zero-downside.
-        // CAP-SAFETY (round-2 merge): heavy variant gated at nnz <= 60k —
-        // its measured wins (crudeoil_lee1_07, syn30m03m) are far below this,
-        // and per-block relabel restarts on the hot 100k+ gate-wall class
-        // (ringpack_30_2) added +0.14 s to the portfolio's worst case.
-        if nnz <= 60_000 {
+        // CAP-SAFETY: the tighter 30k gate supersedes the earlier 60k trial.
+        // Its measured wins (crudeoil_lee1_07, syn30m03m) are below 30k, and
+        // it now excludes the `arki0016` local cap wall (nnz=37,208).
+        if nnz <= 30_000 {
             consider(&|| {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
                     biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
