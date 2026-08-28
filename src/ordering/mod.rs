@@ -4654,7 +4654,7 @@ fn order_with_options(
     // (n = 8) is the SLOWEST matrix under n = 1000 at 0.664 s -- worse than any
     // matrix in the 1k-4k band. Below this bound the floor buys nothing and
     // costs the most, so it is simply not applied.
-    const RGREEDY_SLACK_MIN_N: usize = 64;
+    const RGREEDY_SLACK_MIN_N: usize = 256;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
@@ -4828,8 +4828,23 @@ fn order_with_options(
         max_blocks: 96,
         budget: 5_000_000,
         streams: 2,
+        rank_blocks: false,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        // Sparse-large RGSUB is breadth-limited, but postorder position is an
+        // arbitrary way to spend that breadth. Rank eligible disjoint blocks
+        // by their exact incumbent contribution and search the top 64. Against
+        // the promoted 96-block selector this cuts block-search work by one
+        // third while improving the exact dev score (2 wins, 2 losses).
+        let rgsub_cfg = if n >= 10_000 && nnz <= 125_000 {
+            rgreedy::SubCfg {
+                max_blocks: 64,
+                rank_blocks: true,
+                ..RGSUB_CFG
+            }
+        } else {
+            RGSUB_CFG
+        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4855,7 +4870,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
