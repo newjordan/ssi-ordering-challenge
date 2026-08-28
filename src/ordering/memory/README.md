@@ -34,6 +34,22 @@ linking liberally is what turns isolated notes into a navigable base.
 - **Lint periodically** → reconcile contradictions, mark stale claims (the
   corpus rebaselines per round, so old absolute scores expire), fix orphan
   pages and broken links, and file new gaps into `open-questions.md`.
+- **Editing these pages** → re-read the exact target range **immediately before**
+  every line-anchored edit, and never reuse line numbers from a read taken before
+  an earlier edit in the same session. Then, after any edit to a list or index,
+  `git diff -- <file> | grep '^-'` and confirm every deleted line is one you meant
+  to rewrite.
+
+  This is not pedantry. In one session (2026-08-28) editing with pre-mutation line
+  numbers produced three failures here, escalating: a doc comment silently
+  re-parented onto the wrong item (it still compiled), an orphaned `- [ ]` checkbox
+  that made a superseded note grep as live work, and finally an anchor that remapped
+  onto a different line and **destroyed** it — the `0009` entry, a load-bearing
+  negative result, vanished from `index.md` and the first repair attempt did not
+  bring it back because the edit had *replaced* the line rather than inserted beside
+  it. It was recovered from `git show HEAD:`. The deletion diff above catches this
+  entire class in one command; checking only the region you expected to change does
+  not.
 
 ## Trust
 

@@ -622,7 +622,12 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
         (RELABEL_BUDGET, RELABEL_MAX_RESTARTS)
     };
     let restarts =
-        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
+        // `usize::MAX` deliberately disables the mid-band restart floor: this frozen copy
+        // exists to prove byte-identical equivalence with the PRE-boost `order()`, so it
+        // must keep the old restart counts. The gate is `max_deg <= n / 50`, so any value
+        // above `n / 50` switches the floor off, and `usize::MAX` cannot overflow it.
+        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, usize::MAX)
+            .min(relabel_cap);
     for r in 0..restarts {
         let seed = r as u64 + 1;
         consider(&|| {
