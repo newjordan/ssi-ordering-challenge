@@ -202,6 +202,12 @@ fn run_generic(
     let gmin = AtomicU64::new(incumbent);
 
     let eval = |i: usize, ws: &mut Option<ScoreWorkspace>| -> CandOut {
+        #[cfg(test)]
+        let _t_task = std::time::Instant::now();
+        #[cfg(test)]
+        let _lbl = task_label(i);
+        #[cfg(test)]
+        let _guard = TaskMark(_lbl, _t_task);
         let Some(perm) = produce(i) else {
             return CandOut::default();
         };
@@ -367,5 +373,34 @@ pub(crate) fn phase_take() -> Vec<(&'static str, f64)> {
     match PHASE_SECS.lock() {
         Ok(mut v) => std::mem::take(&mut *v),
         Err(_) => Vec::new(),
+    }
+}
+
+/// TEST-ONLY per-task family labels for the ONE portfolio drain, so
+/// `probe_sched_cost` can attribute the drain's CPU time to the candidate
+/// family that produced each task. `mod.rs` fills this immediately before
+/// `run_candidates` and clears it immediately after; every other batch sees
+/// an empty vector and is not instrumented. Never compiled into the shipped
+/// binary.
+#[cfg(test)]
+pub(crate) static TASK_LABELS: std::sync::Mutex<Vec<&'static str>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn task_label(i: usize) -> Option<&'static str> {
+    TASK_LABELS.lock().ok().and_then(|v| v.get(i).copied())
+}
+
+/// Drop guard so a task's CPU time is recorded on every exit path (including
+/// the early returns for a failed producer or a non-bijection).
+#[cfg(test)]
+struct TaskMark(Option<&'static str>, std::time::Instant);
+
+#[cfg(test)]
+impl Drop for TaskMark {
+    fn drop(&mut self) {
+        if let Some(l) = self.0 {
+            phase_mark(l, self.1);
+        }
     }
 }
