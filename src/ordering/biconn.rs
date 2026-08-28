@@ -218,7 +218,10 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
             // Root = largest block in this tree (ties: lowest id).
             let mut root = tree_blocks[0];
             for &b in &tree_blocks[1..] {
-                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                let (bs, rs) = (
+                    comp_verts[b as usize].len(),
+                    comp_verts[root as usize].len(),
+                );
                 if bs > rs || (bs == rs && b < root) {
                     root = b;
                 }
@@ -439,7 +442,10 @@ pub fn biconn_heavy_order(
             }
             let mut root = tree_blocks[0];
             for &b in &tree_blocks[1..] {
-                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                let (bs, rs) = (
+                    comp_verts[b as usize].len(),
+                    comp_verts[root as usize].len(),
+                );
                 if bs > rs || (bs == rs && b < root) {
                     root = b;
                 }
@@ -610,9 +616,9 @@ pub fn biconn_heavy_order(
                 let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
                 let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
                 feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
-                    feral_amd::amd_order(&bc).ok().map(|pb| {
-                        pb.iter().map(|&x| q[x as usize] as u32).collect()
-                    })
+                    feral_amd::amd_order(&bc)
+                        .ok()
+                        .map(|pb| pb.iter().map(|&x| q[x as usize] as u32).collect())
                 })
             };
             let Some(local) = cand else { continue };
