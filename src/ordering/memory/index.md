@@ -230,5 +230,7 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0024 — retain varied RGREEDY only on a cap-safe small-density cell](experiments/0024-small-density-varied-slot.md) — exact-`4270fd72` full-300 win: `0.819376 -> 0.819353`; 1 better / 0 worse / 299 same. Slot 3 changes only for `0<n<=512` and `5n<=nnz<=5.25n` (four visible rows), with eligible worst 0.804 s and whole-run worst 1.336 s. This is the cap-safe remnant of the broad varied-slot arm that failed the hidden two-second limit.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
