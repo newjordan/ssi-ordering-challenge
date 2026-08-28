@@ -4214,8 +4214,8 @@ fn order_with_options(
     // the output is byte-identical regardless of completion order or thread
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
     const RGREEDY_MAX_N: usize = 3_000;
-    const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
+    const RGREEDY_MAX_NNZ: usize = 60_000;
+    const RGREEDY_BUDGET: i64 = 600_000_000;
     #[cfg(test)]
     let _tp = std::time::Instant::now();
     if rgreedy_enabled && n <= RGREEDY_MAX_N && nnz <= RGREEDY_MAX_NNZ && nnz > 0 {
