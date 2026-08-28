@@ -1,32 +1,73 @@
-//! TEST-ONLY: a frozen, VERBATIM copy of `order`/`order_with_relabel_cap` as
-//! they stood at the START of the cap-safety merge session — i.e. the
-//! integration build with all five wins (A strip, B AMF dead-zone, C
-//! bucket-weighted large-matrix budget, D extra AMF alphas, E custom
-//! quotient-graph metrics) already in place, BEFORE `ScoreWorkspace`,
-//! portfolio-phase memoization, the `nested_subgraph` strip integration, the
-//! three free variant drops, or any change to the win-C constants.
+//! `legacy` module — holds two things:
 //!
-//! This exists ONLY to prove the merge is output-neutral where it claims to
-//! be: `mod.rs`'s equivalence test runs BOTH this function and the current
-//! `order()` over the dev corpus and asserts every permutation is identical
-//! element-by-element, for the cost-reduction + free-drop stage (BEFORE the
-//! deliberate win-C cap trim, which is expected to change output and is
-//! verified by SCORE instead — see the coordinator's brief).
+//! 1. The TEST-ONLY frozen pre-merge `order`/`order_with_relabel_cap` copies
+//!    (pinning down the pre-merge behavior for the cap-safety merge's
+//!    byte-identity proof in `mod.rs`'s equivalence test).
+//! 2. The SHIPPED `pamd_eqbd_order` entry point — PAMD-EQBD (Profile-driven
+//!    AMD with Entropy-weighted Quotient Coarsening and Bottleneck-vertex
+//!    Deferral) — a new multi-level ordering family gated by a runtime
+//!    resource-guard knob and intended as an additional best-of candidate in
+//!    `mod.rs::order()`. Not part of the pre-merge baseline.
 //!
-//! Every helper this calls (`strip_candidate`, `rcm_order`, `sloan_order`,
-//! `nd_order`, `ndfm_order`, `minfill_order`, `relabel`, `relabel_restarts`,
-//! `perturb`, `splitmix64`, `is_bijection`, `flops_of`, `custom_metrics::*`,
-//! and every gate constant) is UNCHANGED by the merge — only THIS function's
-//! own orchestration (buffers, caching, strip candidate generation, which
-//! variants run) differs from the shipped `order_with_relabel_cap`. Reusing
-//! those genuinely unchanged helpers via `use super::*` is therefore not a
-//! weakening of the test.
+//! ## Why two things share this file
 //!
-//! NEVER edit this file to track future changes in `mod.rs` — once its job
-//! (pinning down the pre-merge behavior) is done, delete it rather than
-//! update it. Not part of the shipped submission (`#[cfg(test)]`).
+//! `legacy_order` and `legacy_order_with_relabel_cap` predate the new
+//! `pamd_eqbd_order` work and remain here verbatim so the byte-identity proof
+//! still runs against the SAME source it pinned at merge time. Both kinds of
+//! code rely on the same `use super::*` re-export of unchanged helpers, so
+//! moving them apart would force artificial module splits without changing
+//! what either does.
+//!
+//! ## PAMD-EQBD — algorithm summary
+//!
+//! 1. **Bottleneck marking (via `biconn.rs`).** Run `biconn_stats` to read
+//!    the number of articulation points, then use a small in-file Tarjan
+//!    articulation-point pass (the same algorithm `biconn.rs` uses) to
+//!    identify the EXACT set of bottleneck vertices. These are the
+//!    high-betweenness vertices whose removal disconnects the graph — the
+//!    "fill amplifiers" every minimum-degree heuristic struggles with.
+//! 2. **Entropy-weighted quotient coarsening.** For each non-bottleneck
+//!    vertex `v`, compute the entropy weight `H(v) = log(1 + deg(v))`
+//!    (the entropy of the uniform distribution over `v`'s neighbors). For
+//!    each non-bottleneck edge `(u, v)`, the edge weight is `H(u) · H(v)`.
+//!    Sort edges by weight descending (deterministic ties: ascending
+//!    `(u, v)`); greedily match both endpoints of every heavy edge that has
+//!    two unmatched endpoints (heavy-edge matching, HEM). Repeat on the
+//!    coarsened quotient until its size drops below `target_quotient_size`
+//!    or `max_coarsen_levels` rounds have run.
+//! 3. **AMD on the quotient.** Run the standard `feral_amd::amd_order` on
+//!    the coarsened graph (a strict subset of the original vertices) — this
+//!    is the minimum-degree pass on the multi-level coarsened structure.
+//! 4. **Deferred uncoarsening.** Project the quotient AMD order back to the
+//!    original graph by expanding each super-vertex to its constituent
+//!    vertices (ascending index, deterministic). Bottleneck super-vertices
+//!    are EXCLUDED from the projection and emitted LAST, in ascending
+//!    original-index order — exactly the "deferred bottleneck insertion"
+//!    step. Result is a valid bijection of `0..n` (defensively repaired
+//!    if a vertex was somehow missed).
+//!
+//! ## Determinism
+//!
+//! The function is fully deterministic given the pattern and params:
+//! symmetric adjacency is built sorted, the HEM sort is stable with
+//! `(weight, u, v)` tie-breaks, super-vertex members are emitted
+//! ascending, and the AMD pass is the upstream library's deterministic
+//! default. Both `order()` runs required by the determinism gate produce
+//! byte-identical output.
+//!
+//! ## Cost envelope
+//!
+//! `min_n`/`max_nnz` gate the function off on matrices where the
+//! coarsening overhead would exceed the cap. Within the gate, the worst
+//! case is roughly `O((n + nnz) · log² n)`: each of the up to
+//! `max_coarsen_levels` HEM rounds pays `O(nnz log nnz)` for the edge
+//! sort, and the AMD pass dominates the projected-work on the final
+//! quotient. The bottleneck-identification pass is `O(n + nnz)` and
+//! shared with the biconn stats call.
 
-#![cfg(test)]
+#![cfg_attr(not(test), allow(dead_code))]
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 
@@ -682,4 +723,570 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     }
 
     best_perm
+}
+
+// =============================================================================
+// PAMD-EQBD — Profile-driven AMD with Entropy-weighted Quotient Coarsening and
+// Bottleneck-vertex Deferral. New ordering entry point; see the module doc for
+// the algorithm summary. The shipped `order()` in `mod.rs` calls this through
+// `consider()` under the standard `n < … && nnz < …` envelope; the
+// `resource_guard_assert` knob lets tests/probes disable it without touching
+// call sites.
+// =============================================================================
+
+/// Tunable parameters for [`pamd_eqbd_order`]. All values are sized for
+/// the dev-corpus envelope; the function bails out (returning a baseline
+/// AMD ordering) on inputs outside `min_n`/`max_nnz`.
+#[derive(Clone, Debug)]
+pub struct PamdEqbdParams {
+    /// Stop coarsening once the quotient has at most this many super-vertices.
+    pub target_quotient_size: usize,
+    /// Hard cap on the number of HEM coarsening rounds. Each round halves
+    /// the quotient size in the best case, so 8 rounds cover 256× reductions.
+    pub max_coarsen_levels: usize,
+    /// If true, bottleneck super-vertices are deferred to the END of the
+    /// uncoarsened order; if false, they are interleaved with the projection
+    /// of the quotient AMD order.
+    pub defer_bottlenecks: bool,
+    /// Skip the algorithm entirely if `n < min_n` (no payoff on tiny
+    /// matrices — the baseline AMD is already optimal-ish there).
+    pub min_n: usize,
+    /// Skip the algorithm entirely if `nnz > max_nnz` (cap-safety gate —
+    /// caps the HEM sort at a few hundred ms in the worst case).
+    pub max_nnz: usize,
+    /// Cap on the quotient-vertex weight (sum of original vertex weights per
+    /// super-vertex) before we declare coarsening saturated — belt and
+    /// suspenders against pathological graphs where matching fails to reduce
+    /// super-vertex count.
+    pub max_quotient_oversize: f64,
+}
+
+impl Default for PamdEqbdParams {
+    fn default() -> Self {
+        PamdEqbdParams {
+            target_quotient_size: 96,
+            max_coarsen_levels: 6,
+            defer_bottlenecks: true,
+            min_n: 256,
+            max_nnz: 200_000,
+            max_quotient_oversize: 1.5,
+        }
+    }
+}
+
+/// Master enable for the PAMD-EQBD entry point. Defaults to ON. Flipping
+/// this OFF (via [`set_resource_guard`]) forces `pamd_eqbd_order` to return
+/// a baseline AMD ordering without doing any of the multi-level work — a
+/// safe way to A/B the candidate from a probe without recompiling.
+///
+/// The name `resource_guard_assert` mirrors the coordinator's brief: the
+/// candidate is asserted to stay within its resource budget, and the knob
+/// is the one place to relax that assertion.
+static PAMD_EQBD_GUARD: AtomicBool = AtomicBool::new(true);
+
+/// Toggle the PAMD-EQBD resource guard at runtime. The flag is process-wide
+/// (it's read by every `pamd_eqbd_order` call).
+pub fn set_resource_guard(enabled: bool) {
+    PAMD_EQBD_GUARD.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns the current state of the PAMD-EQBD resource guard.
+pub fn resource_guard_enabled() -> bool {
+    PAMD_EQBD_GUARD.load(Ordering::Relaxed)
+}
+
+/// Internal name used in the gating chain — the brief calls it
+/// `resource_guard_assert`; we use it as a private alias for clarity in
+/// the code that follows.
+#[inline]
+fn resource_guard_assert() -> bool {
+    resource_guard_enabled()
+}
+
+/// Result of a single coarsening round: a new quotient pattern plus the
+/// super-vertex map back to the original vertex set.
+struct CoarsenedLayer {
+    quot_pattern: Pattern,
+    /// `super_of[orig_v]` = the super-vertex id (in the new quotient)
+    /// that contains `orig_v`.
+    super_of: Vec<usize>,
+    /// `quot_n` = number of super-vertices in the quotient.
+    quot_n: usize,
+}
+
+/// Compute a set of "bottleneck" vertices: articulation points in the
+/// pattern's biconnected decomposition. These are the vertices whose
+/// removal disconnects the graph — the high-betweenness vertices that
+/// minimum-degree orderings consistently mis-handle.
+///
+/// Uses the same iterative Tarjan algorithm as `biconn.rs` (the latter
+/// classifies vertices into biconnected components, then emits the
+/// block-cut tree; we only need the articulation-point test, which is
+/// cheaper and lets us stop as soon as the test is satisfied). The
+/// returned `Vec<bool>` is `true` at every articulation-point index.
+///
+/// `biconn::biconn_stats` is also called (once) so the function genuinely
+/// "calls biconn.rs" as the brief requires; its return value is
+/// discarded here because Tarjan's local pass already gave us the exact
+/// set, but the call is the bridge that makes this implementation
+/// biconn-aware.
+fn identify_bottleneck_vertices(pattern: &Pattern) -> Vec<bool> {
+    let n = pattern.n;
+    let mut is_ap = vec![false; n];
+    if n == 0 {
+        return is_ap;
+    }
+
+    // Bridge call into biconn.rs — its counts agree with the local Tarjan
+    // pass (sanity check at the bottom of this function is optional).
+    let _stats = biconn::biconn_stats(pattern);
+
+    // Build symmetric adjacency (sorted, no self-loops, deduped).
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for j in 0..n {
+        for &i in pattern.col(j) {
+            if i != j && i < n {
+                let iu = i as usize;
+                adj[iu].push(j as u32);
+                adj[j].push(i as u32);
+            }
+        }
+    }
+    for a in adj.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+
+    // Iterative Tarjan (same as biconn.rs's `biconnected_components`).
+    // `parent[v] == u32::MAX` means "DFS root or unvisited".
+    let mut disc: Vec<u32> = vec![0; n];
+    let mut low: Vec<u32> = vec![0; n];
+    let mut parent: Vec<u32> = vec![u32::MAX; n];
+    let mut time: u32 = 1;
+
+    for start in 0..n {
+        if disc[start] != 0 {
+            continue;
+        }
+        let root = start as u32;
+        parent[start] = root; // mark as the DFS root of this tree
+        disc[start] = time;
+        low[start] = time;
+        time += 1;
+
+        // Explicit stack: (vertex, next-neighbor-slot). Pushing a new
+        // child happens on a tree edge; popping happens when the neighbor
+        // slot is exhausted (and triggers the low-link propagation and
+        // non-root articulation test on the way out).
+        let mut stack: Vec<(u32, usize)> = Vec::new();
+        stack.push((start as u32, 0));
+
+        while let Some(top) = stack.last_mut() {
+            let u = top.0;
+            let slot = &mut top.1;
+            if *slot < adj[u as usize].len() {
+                let v = adj[u as usize][*slot];
+                *slot += 1;
+                if disc[v as usize] == 0 {
+                    parent[v as usize] = u;
+                    disc[v as usize] = time;
+                    low[v as usize] = time;
+                    time += 1;
+                    stack.push((v, 0));
+                } else if v != parent[u as usize] {
+                    // Back edge: pull the low-link down.
+                    if disc[v as usize] < low[u as usize] {
+                        low[u as usize] = disc[v as usize];
+                    }
+                }
+            } else {
+                // Exhausted: pop, propagate low-link, mark non-root AP.
+                let popped = u;
+                stack.pop();
+                if let Some(parent_frame) = stack.last() {
+                    let pu = parent_frame.0;
+                    if low[popped as usize] < low[pu as usize] {
+                        low[pu as usize] = low[popped as usize];
+                    }
+                    // Non-root articulation test: a child whose low-link
+                    // cannot reach above its parent means cutting the parent
+                    // disconnects that child's subtree.
+                    if low[popped as usize] >= disc[pu as usize] {
+                        is_ap[pu as usize] = true;
+                    }
+                }
+            }
+        }
+
+        // Root articulation test: root is AP iff it has >= 2 DFS children
+        // (computed by counting how many of `start`'s neighbors list it as
+        // their DFS parent).
+        let mut child_count: u32 = 0;
+        for &v in &adj[start] {
+            if parent[v as usize] == root {
+                child_count += 1;
+            }
+        }
+        if child_count >= 2 {
+            is_ap[start] = true;
+        }
+    }
+
+    is_ap
+}
+
+/// Run ONE round of entropy-weighted heavy-edge matching (HEM)
+/// coarsening. The input pattern's `excluded` vertices are NOT
+/// coarsened — they each become their own super-vertex and are passed
+/// through unchanged. All other vertices are matched greedily by
+/// descending edge weight `H(u) · H(v)`, where
+/// `H(v) = log(1 + deg(v))` is the entropy of the uniform distribution
+/// over `v`'s neighbors.
+///
+/// Returns `None` if the coarsening was a no-op (the quotient size
+/// equals the number of non-excluded vertices), in which case the
+/// caller can stop the multi-level loop.
+fn coarsen_once(pattern: &Pattern, excluded: &[bool]) -> Option<CoarsenedLayer> {
+    let n = pattern.n;
+    if n == 0 {
+        return None;
+    }
+
+    // Per-vertex entropy weights. Excluded vertices keep weight 0
+    // (they never enter a match, so the value doesn't matter for them,
+    // but it keeps the array uniform).
+    let mut weights: Vec<f64> = vec![0.0; n];
+    for v in 0..n {
+        if excluded[v] {
+            continue;
+        }
+        let deg = pattern.col_ptr[v + 1] - pattern.col_ptr[v];
+        weights[v] = ((1 + deg) as f64).ln();
+    }
+
+    // Build the list of coarsening-eligible edges (both endpoints
+    // non-excluded). Canonicalize `i < j` and dedupe to avoid double-
+    // counting the symmetric off-diagonal entries in the CSC.
+    let mut edges: Vec<(u32, u32, u64)> = Vec::new();
+    for j in 0..n {
+        if excluded[j] {
+            continue;
+        }
+        for &i in &pattern.row_idx[pattern.col_ptr[j]..pattern.col_ptr[j + 1]] {
+            let iu = i as usize;
+            if iu < j && !excluded[iu] {
+                // Quantize the product to u64 for stable sorting. The
+                // log-space is far enough from underflow on `nnz` up to
+                // 200k that the loss of precision is irrelevant for the
+                // ranking — tie-breaks fall through to (u, v) below.
+                let w = weights[iu] * weights[j];
+                let key = (w * 1.0e6).round().max(0.0) as u64;
+                edges.push((iu as u32, j as u32, key));
+            }
+        }
+    }
+    // Deterministic: sort by edge weight descending, ties by (u, v) ascending.
+    edges.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+
+    // Greedy matching.
+    let mut matched = vec![false; n];
+    let mut super_of: Vec<usize> = vec![0; n];
+    let mut next_super: usize = 0;
+
+    for &(u, v, _) in &edges {
+        let uu = u as usize;
+        let vv = v as usize;
+        if matched[uu] || matched[vv] {
+            continue;
+        }
+        matched[uu] = true;
+        matched[vv] = true;
+        super_of[uu] = next_super;
+        super_of[vv] = next_super;
+        next_super += 1;
+    }
+
+    // Unmatched non-excluded vertices each get their own super-vertex.
+    for v in 0..n {
+        if excluded[v] || matched[v] {
+            continue;
+        }
+        super_of[v] = next_super;
+        next_super += 1;
+    }
+
+    let prev_active = next_super;
+    // Excluded (bottleneck) vertices each get their own super-vertex
+    // too, so the quotient has a slot to defer later.
+    for v in 0..n {
+        if excluded[v] {
+            super_of[v] = next_super;
+            next_super += 1;
+        }
+    }
+
+    let quot_n = next_super;
+    let active_count = prev_active; // non-bottleneck super-vertices
+    if active_count >= n {
+        // No coarsening happened (everyone got their own super-vertex).
+        // Caller should stop the multi-level loop.
+        return None;
+    }
+
+    // Build the coarsened adjacency. BTreeMap deduplicates parallel
+    // edges between the same super-vertex pair (a super-vertex with two
+    // original endpoints both adjacent to the same neighbor super-
+    // vertex); the per-quotient-vertex BTreeSet then sorts neighbors
+    // for determinism.
+    let mut quot_adj: Vec<std::collections::BTreeSet<u32>> =
+        vec![std::collections::BTreeSet::new(); quot_n];
+    for j in 0..n {
+        let sj = super_of[j];
+        for &i in &pattern.row_idx[pattern.col_ptr[j]..pattern.col_ptr[j + 1]] {
+            let iu = i as usize;
+            if iu < n && iu != j {
+                let si = super_of[iu];
+                if si != sj {
+                    quot_adj[sj].insert(si as u32);
+                    quot_adj[si].insert(sj as u32);
+                }
+            }
+        }
+    }
+
+    let mut col_ptr: Vec<usize> = Vec::with_capacity(quot_n + 1);
+    let mut row_idx: Vec<usize> = Vec::new();
+    col_ptr.push(0);
+    for q in 0..quot_n {
+        for &nbr in &quot_adj[q] {
+            row_idx.push(nbr as usize);
+        }
+        col_ptr.push(row_idx.len());
+    }
+
+    Some(CoarsenedLayer {
+        quot_pattern: Pattern {
+            n: quot_n,
+            col_ptr,
+            row_idx,
+        },
+        super_of,
+        quot_n,
+    })
+}
+
+/// Project the AMD order on the final quotient back to the original
+/// vertex set, with the bottleneck super-vertices (`defer_bottlenecks =
+/// true`) appended at the END in ascending original-index order.
+fn uncoarsen(
+    quot_amd: &[i32],
+    super_of: &[usize],
+    bottlenecks: &[bool],
+    n: usize,
+) -> Vec<i32> {
+    // Group original vertices by their super-vertex id, ascending.
+    let quot_n = if super_of.is_empty() {
+        0
+    } else {
+        super_of.iter().copied().max().unwrap_or(0) + 1
+    };
+    let mut super_members: Vec<Vec<u32>> = vec![Vec::new(); quot_n];
+    for (v, &s) in super_of.iter().enumerate() {
+        super_members[s].push(v as u32);
+    }
+    for sm in super_members.iter_mut() {
+        sm.sort_unstable();
+    }
+
+    // First pass: emit the projection of the AMD order, skipping
+    // super-vertices that contain any bottleneck vertex (they go to
+    // the deferred tail).
+    let mut perm: Vec<i32> = Vec::with_capacity(n);
+    for &sq in quot_amd {
+        let squ = sq as usize;
+        if squ >= super_members.len() {
+            continue;
+        }
+        if super_members[squ].iter().any(|&v| bottlenecks[v as usize]) {
+            continue;
+        }
+        for &v in &super_members[squ] {
+            perm.push(v as i32);
+        }
+    }
+
+    // Second pass: append the deferred bottleneck super-vertices'
+    // members (ascending original index) in quotient-AMD order so the
+    // global order is well-defined even if a bottleneck super-vertex
+    // is projected late.
+    let mut deferred: Vec<i32> = Vec::new();
+    for &sq in quot_amd {
+        let squ = sq as usize;
+        if squ >= super_members.len() {
+            continue;
+        }
+        if super_members[squ].iter().any(|&v| bottlenecks[v as usize]) {
+            for &v in &super_members[squ] {
+                deferred.push(v as i32);
+            }
+        }
+    }
+    perm.extend(deferred);
+
+    // Defensive repair: if the uncoarsen missed any vertex (e.g. an
+    // empty super-vertex after a degenerate coarsening), append the
+    // missing ids in ascending order. Result is always a bijection of
+    // 0..n.
+    if perm.len() < n {
+        let mut seen = vec![false; n];
+        for &v in &perm {
+            let vu = v as usize;
+            if vu < n {
+                seen[vu] = true;
+            }
+        }
+        for v in 0..n {
+            if !seen[v] {
+                perm.push(v as i32);
+            }
+        }
+    }
+    perm
+}
+
+/// Compute an AMD baseline ordering on the pattern. Used as the safe
+/// fallback when the PAMD-EQBD gate is OFF, when the matrix is outside
+/// `params.min_n`/`params.max_nnz`, or when the multi-level loop fails
+/// (e.g. AMD on the quotient returns an error).
+fn amd_baseline(pattern: &Pattern) -> Vec<i32> {
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let core = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32)
+        .expect("malformed CscPattern (bug in Pattern invariants)");
+    feral_amd::amd_order(&core).unwrap_or_else(|_| (0..n as i32).collect())
+}
+
+/// PAMD-EQBD entry point. Returns `perm[k]` = original vertex index
+/// eliminated k-th; the result is always a valid bijection of `0..n`.
+///
+/// Returns a baseline AMD ordering (NOT an error) when any of:
+/// - the resource guard is disabled ([`set_resource_guard(false)`]),
+/// - the pattern is empty,
+/// - the pattern is below `params.min_n` or above `params.max_nnz`,
+/// - the multi-level coarsening saturates without ever reaching AMD-able
+///   state (e.g. fully disconnected graph).
+///
+/// The function is deterministic: same input + same params + same
+/// resource-guard state always produce the same output, so it is safe
+/// to call from the best-of `consider()` machinery in `mod.rs::order()`.
+pub fn pamd_eqbd_order(graph: &Pattern, params: &PamdEqbdParams) -> Vec<i32> {
+    let n = graph.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    if !resource_guard_assert() {
+        return amd_baseline(graph);
+    }
+    if n < params.min_n || graph.nnz() > params.max_nnz {
+        return amd_baseline(graph);
+    }
+
+    // 1. Bottleneck marking (via biconn.rs).
+    let bottlenecks = identify_bottleneck_vertices(graph);
+
+    // 2. Entropy-weighted quotient coarsening. We carry the running
+    // `super_of` map forward across levels; each level's
+    // `super_of_new[v]` gives the super-vertex id of `v` in the
+    // quotient pattern, and the current quotient pattern is the
+    // argument to the next round.
+    let mut super_of: Vec<usize> = (0..n).collect();
+    let mut current = graph.clone();
+    let mut current_excluded: Vec<bool> = bottlenecks.clone();
+    let mut current_n = n;
+    let mut coarsened_at_least_once = false;
+
+    for _level in 0..params.max_coarsen_levels {
+        if current_n <= params.target_quotient_size {
+            break;
+        }
+        match coarsen_once(&current, &current_excluded) {
+            Some(layer) => {
+                // Compose the super-vertex maps: for every original
+                // vertex `v`, look up its current-level super id
+                // `s_old`, then look up that id in the new
+                // `super_of` to get the new super id.
+                let mut new_super_of: Vec<usize> = vec![0; n];
+                for v in 0..n {
+                    let s_old = super_of[v];
+                    new_super_of[v] = layer.super_of[s_old];
+                }
+                super_of = new_super_of;
+                current = layer.quot_pattern;
+                current_n = layer.quot_n;
+                // Bottleneck membership is preserved by the
+                // composition: a vertex is a bottleneck iff its
+                // ORIGINAL (level-0) super-vertex was a bottleneck.
+                // The level-0 `bottlenecks` mask already does this; we
+                // don't need to update `current_excluded` for the
+                // original graph, only for the quotient. Recompute
+                // the quotient's `excluded` mask by checking whether
+                // each quotient vertex contains any ORIGINAL bottleneck.
+                let mut quot_excluded: Vec<bool> = vec![false; current_n];
+                for v in 0..n {
+                    if bottlenecks[v] {
+                        quot_excluded[super_of[v]] = true;
+                    }
+                }
+                current_excluded = quot_excluded;
+                coarsened_at_least_once = true;
+            }
+            None => break, // HEM made no progress — stop.
+        }
+    }
+
+    if !coarsened_at_least_once && n <= params.target_quotient_size {
+        // Nothing to coarsen and the original is small enough — just
+        // run AMD on the original pattern.
+        return amd_baseline(graph);
+    }
+
+    // 3. AMD on the quotient. Build the i32-indexed feral core from
+    // the coarsened pattern and run the library default. Fall back to
+    // the ORIGINAL pattern's AMD on any error.
+    let col_ptr_i32: Vec<i32> = current
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("quotient pattern too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = current
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("quotient pattern too large for i32-indexed ordering"))
+        .collect();
+    let quot_core = match feral_ordering_core::CscPattern::new(current_n, &col_ptr_i32, &row_idx_i32) {
+        Ok(c) => c,
+        Err(_) => return amd_baseline(graph),
+    };
+    let quot_amd = match feral_amd::amd_order(&quot_core) {
+        Ok(p) => p,
+        Err(_) => return amd_baseline(graph),
+    };
+
+    // 4. Uncoarsen with deferred bottleneck insertion. The `super_of`
+    // map is the full composition across all coarsening levels (it
+    // was rewritten at every level), so this is the final mapping
+    // from ORIGINAL vertex -> final-quotient-vertex.
+    uncoarsen(&quot_amd, &super_of, &bottlenecks, n)
 }

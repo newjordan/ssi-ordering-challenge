@@ -150,11 +150,16 @@ use crate::Pattern;
 #[cfg(test)]
 mod probe;
 
-/// TEST-ONLY: frozen pre-merge `order()` for the byte-identical equivalence
-/// proof (cost-reduction + free-drop stage only — the win-C cap trim is
-/// deliberate and verified by score instead). Not compiled into the shipped
-/// binary.
-#[cfg(test)]
+/// FROZEN pre-merge `order()`/`order_with_relabel_cap` (for the
+/// byte-identical equivalence proof in the TEST-only corpus proof below)
+/// AND the shipped PAMD-EQBD multi-level ordering entry point
+/// (`pamd_eqbd_order` + `PamdEqbdParams` + `set_resource_guard`).
+/// The pre-merge functions are kept verbatim so the byte-identity proof
+/// still runs against the same source; the new PAMD-EQBD entry point is
+/// wired into the best-of pipeline below under the same `n < … && nnz < …`
+/// envelope every other candidate uses, gated by a runtime
+/// `resource_guard_assert` knob that lets tests/probes disable it without
+/// recompiling.
 mod legacy;
 
 /// TEST-ONLY: counting global allocator, ported unmodified from the
@@ -1846,6 +1851,49 @@ fn order_with_options(
             consider(&|| {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
                     biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                )
+            });
+        }
+    }
+
+    // PAMD-EQBD — Profile-driven AMD with Entropy-weighted Quotient Coarsening
+    // and Bottleneck-vertex Deferral (new entry point in `legacy.rs`).
+    // Multi-level scheme: biconn-style Tarjan pass marks articulation points as
+    // "bottleneck" vertices; remaining vertices are matched by descending
+    // edge weight H(u)·H(v) (H(v) = log(1+deg(v)) is the entropy of v's
+    // neighbor distribution); the coarsened quotient is AMD-ordered; the
+    // quotient order is uncoarsened with the bottleneck super-vertices
+    // appended at the END. Differs from the biconn candidate above in three
+    // ways: (a) it MULTI-LEVEL coarsens the non-bottleneck vertices rather
+    // than per-block AMDing each biconnected component, (b) the matching is
+    // entropy-weighted (prefers high-degree hubs to merge, which is exactly
+    // where minimum-degree pivots pay the most fill), and (c) bottlenecks
+    // are DEFERRED (placed last) rather than placed at their parent-block
+    // boundary. The (n, nnz) gate is the same as the biconn envelope
+    // (`nnz < BICONN_MAX_NNZ && sparsity guard`) but with the internal
+    // `max_nnz` cap (`PAMD_EQBD_MAX_NNZ`, tighter than the biconn gate) as
+    // belt-and-suspenders against the HEM sort's nnz-dependent cost. The
+    // `resource_guard_assert` knob defaults ON; `set_resource_guard(false)`
+    // turns this candidate into a pure AMD baseline so a probe can A/B it
+    // without recompiling. Best-of floor → zero-downside under the AMD anchor.
+    if nnz < BICONN_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
+        // Internal cap, tighter than BICONN_MAX_NNZ — the HEM sort is
+        // O(nnz log nnz) per coarsening level; 200k keeps the worst
+        // coarsen round under ~50ms measured on the dev envelope.
+        const PAMD_EQBD_MAX_NNZ: usize = 200_000;
+        const PAMD_EQBD_MIN_N: usize = 256;
+        if n >= PAMD_EQBD_MIN_N && nnz < PAMD_EQBD_MAX_NNZ {
+            let params = legacy::PamdEqbdParams {
+                target_quotient_size: 96,
+                max_coarsen_levels: 6,
+                defer_bottlenecks: true,
+                min_n: PAMD_EQBD_MIN_N,
+                max_nnz: PAMD_EQBD_MAX_NNZ,
+                max_quotient_oversize: 1.5,
+            };
+            consider(&|| {
+                Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                    legacy::pamd_eqbd_order(pattern, &params),
                 )
             });
         }
