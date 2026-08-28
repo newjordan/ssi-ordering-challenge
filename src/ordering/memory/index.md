@@ -235,5 +235,11 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
   0024 grader failure. Also: the hub-gated dense RGS mid arm admits zero dev matrices.
 
+- [0026-rgsub-round-ladder.md](experiments/0026-rgsub-round-ladder.md) — **KEEPER: RGSUB 3rd
+  round on sparse gt** (`n>=10k && nnz<=100k`, fires only when round 2 accepted): rig gt geomean
+  0.729592→0.729403 (−0.000076 full). Negatives: 4th round marginal, max_s 900 WORSE, min_s 24
+  marginal-with-tail-cost, ranked selection below 10k byte-neutral. Introduces the 43-second
+  gt_10k-only SSI_CORPUS_FILE rig.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

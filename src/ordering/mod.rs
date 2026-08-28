@@ -4891,9 +4891,14 @@ fn order_with_options(
                 ..RGSUB_CFG
             }
         } else {
+            // (Ranked selection below n = 10000 was measured BYTE-NEUTRAL on
+            // the scoped dev set — postorder-first-96 and density-ranked-96
+            // pick equivalent blocks there — so the sub-10k path keeps the
+            // promoted config untouched.)
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        let rgsub_rounds = if n >= 10_000 && nnz <= 100_000 { 3 } else { 2 };
+        for _round in 0..rgsub_rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
