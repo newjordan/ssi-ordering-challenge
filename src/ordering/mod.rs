@@ -1109,7 +1109,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (600_000 / nnz).clamp(1, 200)
+        (1_500_000 / nnz).clamp(1, 400)
     } else {
         0
     };
@@ -1571,6 +1571,7 @@ fn order_with_options(
     // exactly the wrong property to have in THIS build, which raises that
     // budget for large matrices). Only `consider` inserts; the relabel and
     // hill-climb loops below only READ it.
+    const FLOPS_CACHE_MAX: usize = 96;
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
 
@@ -1592,7 +1593,19 @@ fn order_with_options(
                 cached
             } else {
                 let v = ws.flops(&scoring_pat, &perm);
-                flops_cache.insert(perm.clone(), v);
+                // BOUNDED (`0022`): insert only while the table is small. This closure is the
+                // single insert point, and the relabel multistarts below route through it -
+                // several hundred candidates per matrix in the `nnz <= 20_000` class, where the
+                // cache's own doc comment above already records a measured near-0% within-phase
+                // duplicate rate. Every one of those inserts clones an `n`-element key and hashes
+                // it, for a hit rate of approximately zero. Capping the table keeps the
+                // portfolio-phase memoization it was built for (that phase's ~40 repeated
+                // candidates all land well inside the bound) and stops paying for the rest.
+                // Purely a cost change: the table is memoization only, so which entries it holds
+                // cannot alter any ordering.
+                if flops_cache.len() < FLOPS_CACHE_MAX {
+                    flops_cache.insert(perm.clone(), v);
+                }
                 v
             };
             // TEST-ONLY: record the best flops over `consider` candidates alone
