@@ -1100,16 +1100,11 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     //
     // Since `restarts = budget / nnz`, added time is `budget * c` and therefore roughly
     // CONSTANT across this class, independent of nnz. At the measured c ≈ 4.5e-7 s/nnz,
-    // 600_000 buys ~0.27 s per matrix, keeping the class's worst at ~0.88 s of a 2.0 s
-    // cap. That is the number this budget is set by; re-measure before changing it, and
-    // do not re-derive it from the heavy tier's constant.
-    //
-    // This is also the regime 0010 probed in aggregate — 24 to 2000 restarts moved
-    // `lt_1k` 0.90702 -> 0.90642 — and dismissed as small; at this stage of diminishing
-    // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
-    // claiming rather than ignoring.
+    // 1_500_000 buys a bounded low-nnz restart floor while keeping the explicit 400-pass
+    // ceiling below; the gate remains confined to this class and does not affect the
+    // mid-band or heavy restart rules.
     let small_multi = if nnz <= 20_000 {
-        (600_000 / nnz).clamp(1, 200)
+        (1_500_000 / nnz).clamp(1, 400)
     } else {
         0
     };
