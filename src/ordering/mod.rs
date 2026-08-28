@@ -1464,7 +1464,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (3_000_000 / nnz).clamp(1, 800)
+        (600_000 / nnz).clamp(1, 200)
     } else {
         0
     };
@@ -4427,18 +4427,21 @@ fn order_with_options(
     // pockets rather than one deep one.
     const RGSUB_MAX_NNZ: usize = 1_500_000;
     const RGSUB_CFG: rgreedy::SubCfg = rgreedy::SubCfg {
-        min_s: 64,
-        max_s: 600,
-        max_sub: 3_000,
-        max_blocks: 64,
-        budget: 4_000_000,
-        streams: 1,
+        min_s: 32,
+        max_s: 700,
+        max_sub: 3_500,
+        max_blocks: 96,
+        budget: 5_000_000,
+        streams: 2,
     };
-    if rgreedy_enabled && n > RGREEDY_MAX_N && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
-        let permuted = permute_pattern(&scoring_pat, &best_perm);
-        let etree = EliminationTree::from_pattern(&permuted);
-        let post = etree.postorder();
-        if post.len() == n {
+    if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        for _round in 0..2 {
+            let permuted = permute_pattern(&scoring_pat, &best_perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            if post.len() != n {
+                break;
+            }
             let mut post_of = vec![0usize; n];
             for (k, &p) in post.iter().enumerate() {
                 post_of[p] = k;
@@ -4464,7 +4467,11 @@ fn order_with_options(
                 if f < best_flops {
                     best_flops = f;
                     best_perm = work;
+                } else {
+                    break;
                 }
+            } else {
+                break;
             }
         }
     }
