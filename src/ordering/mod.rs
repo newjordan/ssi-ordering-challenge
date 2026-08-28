@@ -895,6 +895,20 @@ const TELOS_MS_HUB_MIN_NNZ: usize = 100_000;
 /// descents from `TELOS_MS_WORK_BUDGET / est` would spend time for nothing.
 const TELOS_MS_MAX_DESCENTS: usize = TELOS_MS_PLAN.len();
 
+/// BWD-AMD-WLP time-cap shrink. Depth/window cut TELOS + MINL/ORBIT/HC
+/// rounds; relabel and TELOS-MS caps are scaled, not extended.
+const WLP_WINDOW: usize = 4;
+const WLP_DEPTH: usize = 1;
+const WLP_RELABEL_BUDGET_FRACTION_NUM: usize = 12;
+const WLP_RELABEL_BUDGET_FRACTION_DEN: usize = 100;
+const WLP_TELOS_CAP_SCALE_NUM: usize = 1;
+const WLP_TELOS_CAP_SCALE_DEN: usize = 2;
+const WLP_SWAPS: usize = 1;
+
+fn wlp_relabel_budget(base: usize) -> usize {
+    base * WLP_RELABEL_BUDGET_FRACTION_NUM / WLP_RELABEL_BUDGET_FRACTION_DEN
+}
+
 /// How many entries of [`TELOS_MS_PLAN`] this matrix may run. Pure function of
 /// `(n, nnz, max_deg)` — never wall-clock — so both required `order()` runs
 /// agree. `cap` is the probe-only A/B switch (0 = the phase off entirely).
@@ -913,6 +927,8 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     (TELOS_MS_WORK_BUDGET / est)
         .clamp(1, TELOS_MS_MAX_DESCENTS)
         .min(cap)
+        * WLP_TELOS_CAP_SCALE_NUM
+        / WLP_TELOS_CAP_SCALE_DEN
 }
 
 const PAIR_DESCENT_MIN_N: usize = 1_000;
@@ -1009,7 +1025,7 @@ const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 const MINL_MAX_NNZ: usize = 700_000;
 const MINL_MAX_LNNZ: usize = 2_400_000;
 const MINL_OPS_BUDGET: i64 = 60_000_000;
-const MINL_MAX_ROUNDS: usize = 8;
+const MINL_MAX_ROUNDS: usize = WLP_WINDOW;
 const MINL_MAX_COMMON: usize = 2_000;
 const WATCH_MINL_MAX_N: usize = 30_000;
 const WATCH_MINL_MAX_FILL: usize = 145_000;
@@ -1109,10 +1125,10 @@ const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 const ORBIT_MAX_N: usize = 30_000;
 const ORBIT_MAX_LNNZ: usize = 600_000;
 const ORBIT_OPS_BUDGET: i64 = 20_000_000;
-const ORBIT_MAX_ROUNDS: usize = 8;
+const ORBIT_MAX_ROUNDS: usize = WLP_WINDOW;
 const ORBIT_MAX_COMMON: usize = MINL_MAX_COMMON;
 const ORBIT_MAX_REMOVED: usize = 20_000;
-const ORBIT_WL_MAX_ROUNDS: usize = 8;
+const ORBIT_WL_MAX_ROUNDS: usize = WLP_WINDOW;
 
 /// ── PHARMAKOS ORDERING — Girardian scapegoat/expulsion phase, ported from
 /// `sbx-pharmakos` (see `~/ssi-ordering-LEARNINGS/data/priming-round4/girard.md`,
@@ -1360,7 +1376,7 @@ const HC_MAX_NNZ: usize = 165_000;
 const HC_BUDGET_GT10K: usize = 300_000;
 const HC_CAP_GT10K: usize = 24;
 const HC_BUDGET_SMALL: usize = 100_000;
-const HC_CAP_SMALL: usize = 8;
+const HC_CAP_SMALL: usize = WLP_WINDOW;
 
 /// The relabeling used by the hill-climb phase: the incumbent best permutation
 /// with `swaps` random transpositions applied. Pure function of its arguments
@@ -2005,7 +2021,7 @@ fn telos_descend(
 fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static [usize]) {
     if nnz < TELOS_TIER_A_MAX_NNZ {
         (
-            2,
+            WLP_DEPTH,
             &TELOS_PRIO[..],
             (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A),
             &TELOS_PEEL_A[..],
@@ -3091,7 +3107,8 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
+    let (relabel_budget, relabel_cap_bucket) =
+        (wlp_relabel_budget(RELABEL_BUDGET), RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
@@ -3138,8 +3155,14 @@ fn order_with_options(
             dense_alpha: 5.0,
             ..Default::default()
         };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+        let amf_restarts = relabel_restarts(
+            wlp_relabel_budget(RELABEL_BUDGET),
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            max_deg,
+        )
+        .min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             // Cloned per restart: each queued closure is a `move` closure and
@@ -3282,8 +3305,14 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: -1.0,
         };
-        let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+        let amdnd_restarts = relabel_restarts(
+            wlp_relabel_budget(RELABEL_BUDGET),
+            RELABEL_MAX_RESTARTS,
+            n,
+            nnz,
+            max_deg,
+        )
+        .min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
             // Cloned per restart — see the relabelled-AMF loop above.
@@ -3515,7 +3544,7 @@ fn order_with_options(
         for j in 0..wave {
             let rr = r + j;
             let seed = (rr as u64 + 1).wrapping_mul(0x9E37);
-            let swaps = if rr % 2 == 0 { n / 16 } else { n / 4 };
+            let swaps = WLP_SWAPS;
             htasks.push(Box::new(move || {
                 let q = perturb(base, seed, swaps);
                 let b = permute_pattern(scoring_pat, &q);
