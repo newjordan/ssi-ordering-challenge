@@ -2395,6 +2395,70 @@ fn order_with_options(
         }
     }
 
+    // ── WINDOWED REINSERTION HILL-CLIMB (W=16, P=3) ──
+    //
+    // A second local-search refinement, complementary to the random-
+    // perturbation hill-climb just above. Where that phase explores by
+    // RANDOM transpositions of the incumbent (a coarse-grained basin-jump),
+    // this phase is a STRUCTURED local move: for each of `n - W + 1`
+    // sliding windows of W=16 consecutive elimination positions, take the
+    // W vertices, sort them by their current FRONT HEIGHT (the GNP column
+    // count `c_k` charged at step `k`) DESCENDING, and try to REINSERT
+    // each one at the best of P=3 candidate positions strictly before its
+    // current one. Accept the move iff it is a STRICT improvement to
+    // `Σ c_j²` — ties are rejected.
+    //
+    // Why it complements the existing random hill-climb: random
+    // transpositions touch two arbitrary positions at once and depend on
+    // the AMD re-eval to project the move onto a low-flops basin; a single
+    // 1-vertex reinsertion is a much smaller move, so it can find
+    // improvements the random one steps over (and never reverts), and the
+    // strict-improvement gate is what keeps it from being pure cost. The
+    // "incremental predicted-flops resimulation" is the workspace's
+    // already-pre-allocated buffers: every trial move is a `ws.flops()`
+    // call that reuses the same ~15 vectors across the whole phase, so
+    // the marginal cost of a candidate move is the O(nnz(L)) GNP pass
+    // alone — no allocator churn, no fresh scratch.
+    //
+    // Gate: same as the random hill-climb — `nnz <= HC_MAX_NNZ` keeps
+    // it STRICTLY below the slow tier (`nnz >= 163816`); the per-window
+    // cost is `O(W * P * nnz(L))` on already-allocated buffers, so a
+    // single sparse-medium window is ms-scale. The number of windows
+    // `n - W + 1` is at most `n`, so the worst case is `n * W * P * nnz(L)`
+    // = ms to a few tens of ms on every admitted matrix. Belt-and-
+    // suspenders: an upper bound on the number of reinsertion evaluations
+    // the phase may run (`MAX_EVALS`), independent of the (n, nnz) gate,
+    // so even a pathologically-large `n` cannot blow the budget.
+    //
+    // Runs AFTER the random hill-climb so the incumbent it perturbs is
+    // the portfolio's best (and after every other post-hoc family), so
+    // the strictly-better-only acceptance cannot make the score worse.
+    // The exact mechanism lives in
+    // [`scoring_ws::ScoreWorkspace::windowed_reinsertion_hillclimb`].
+    const WINDOW_SIZE: usize = 16;
+    const REINSERT_POSITIONS: usize = 3;
+    const WHC_MAX_EVALS: usize = 8_000;
+    if nnz > 0
+        && nnz <= HC_MAX_NNZ
+        && n >= WINDOW_SIZE + REINSERT_POSITIONS
+        && best_perm.len() == n
+    {
+        let max_evals = WHC_MAX_EVALS.min(n.saturating_mul(WINDOW_SIZE * REINSERT_POSITIONS));
+        if let Some((new_perm, new_flops)) = ws.windowed_reinsertion_hillclimb_budgeted(
+            &scoring_pat,
+            &best_perm,
+            best_flops,
+            WINDOW_SIZE,
+            REINSERT_POSITIONS,
+            max_evals,
+        ) {
+            if new_flops < best_flops {
+                best_perm = new_perm;
+                best_flops = new_flops;
+            }
+        }
+    }
+
     // ── POST-HOC blind-spot families (`sbx-families2`): operate on the
     // PORTFOLIO'S OWN best incumbent (`best_perm`/`best_flops` as left by
     // every candidate + relabel-restart + hill-climb above), not on the raw

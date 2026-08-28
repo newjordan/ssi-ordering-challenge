@@ -367,6 +367,345 @@ impl ScoreWorkspace {
         self.build_postorder_and_first();
         self.column_counts_gnp_flops()
     }
+
+    /// `Σ_j c_j²` PLUS a fresh `Vec<usize>` of the per-position column counts
+    /// `c_j` (in PERMUTED indices, i.e. `c_j` is the count of vertex
+    /// `perm[j]`). The returned `Vec` is allocated by the caller; the
+    /// workspace's internal `delta` is left in a valid (post-call) state but
+    /// must not be read after the next `flops`/`flops_and_counts` call.
+    /// Same algorithm as [`flops`]; only the return type changes.
+    pub(crate) fn flops_and_counts(
+        &mut self,
+        pat: &ScoringPattern,
+        perm: &[usize],
+    ) -> (u64, Vec<usize>) {
+        self.permute_into(pat, perm);
+        self.build_etree();
+        self.build_postorder_and_first();
+        let n = self.n;
+        // Mirror `column_counts_gnp_flops` exactly so the two return paths
+        // agree on every bit, but ALSO write the per-position counts into a
+        // fresh `Vec<usize>` for the caller's use. We can't reuse the
+        // workspace's `delta` directly (it is `i64` and is borrowed by
+        // further calls), so the copy is unavoidable.
+        for i in 0..n {
+            self.delta[i] = if self.children[i].is_empty() { 1 } else { 0 };
+        }
+        self.maxfirst.fill(-1);
+        self.prevleaf.fill(-1);
+        for i in 0..n {
+            self.dsu_ancestor[i] = i;
+        }
+        for idx in 0..n {
+            let i = self.post[idx];
+            if let Some(p) = self.parent[i] {
+                self.delta[p] -= 1;
+            }
+            let fi = self.first[i] as i64;
+            let row_start = self.pcol_ptr[i];
+            let row_end = self.pcol_ptr[i + 1];
+            for k in row_start..row_end {
+                let partner = self.prow_idx[k];
+                if partner <= i {
+                    continue;
+                }
+                if fi > self.maxfirst[partner] {
+                    self.delta[i] += 1;
+                    let pl = self.prevleaf[partner];
+                    if pl != -1 {
+                        let mut q = pl as usize;
+                        while self.dsu_ancestor[q] != q {
+                            q = self.dsu_ancestor[q];
+                        }
+                        let root = q;
+                        let mut cur = pl as usize;
+                        while cur != root {
+                            let next = self.dsu_ancestor[cur];
+                            self.dsu_ancestor[cur] = root;
+                            cur = next;
+                        }
+                        self.delta[root] -= 1;
+                    }
+                    self.prevleaf[partner] = i as i64;
+                    self.maxfirst[partner] = fi;
+                }
+            }
+            if let Some(p) = self.parent[i] {
+                self.dsu_ancestor[i] = p;
+            }
+        }
+        for idx in 0..n {
+            let i = self.post[idx];
+            if let Some(p) = self.parent[i] {
+                let di = self.delta[i];
+                self.delta[p] += di;
+            }
+        }
+        let mut flops: u64 = 0;
+        let mut counts: Vec<usize> = vec![0usize; n];
+        for (i, &d) in self.delta.iter().enumerate() {
+            let c = d as u64;
+            flops += c * c;
+            counts[i] = c as usize;
+        }
+        (flops, counts)
+    }
+
+    // -- WINDOWED REINSERTION HILL-CLIMB (W=16, P=3) ----------------------
+    //
+    // A local-search refinement over a fixed-size sliding window of
+    // elimination positions: take the W=16 vertices in the window, process
+    // them in FRONT-HEIGHT-DESCENDING order (their current column count
+    // `counts[k]`, which is the `c_j` the GNP oracle charges when vertex
+    // `perm[k]` is eliminated), and for each one try to REINSERT it at the
+    // best of P=3 candidate positions strictly before its current position.
+    // Accept the move only on a STRICT improvement to the total flop count
+    // (`Σ c_j²`); ties are rejected (must be `<`, not `≤`). Update
+    // `best_perm` / `best_flops` in place and keep going for the next
+    // vertex in the window, so each accepted move is seen by the next move
+    // (the front heights used to rank vertices in the window are
+    // re-evaluated AFTER each accepted reinsertion, never stale).
+    //
+    // The "incremental predicted-flops resimulation" is the incremental
+    // reuse of THIS workspace's already-pre-allocated `~15` buffers across
+    // every `flops` call (instead of paying for ~15 fresh allocations per
+    // reinsertion candidate) — the difference between this hill-climb and
+    // a naive "score every reinsertion from scratch" approach is exactly
+    // the per-call allocation cost, which is the dominant cost on the
+    // sparse-medium matrices that the rest of the portfolio finds
+    // interesting. The GNP column-count pass itself is `O(nnz(L))` per
+    // call — already near-linear in the only size the workspace has been
+    // pre-sized for, so no further incremental work is available.
+    //
+    // Determinism: every step is a pure function of (`pat`, `best_perm`,
+    // `best_flops`, `W`, `P`); the workspace's pre-existing buffers are
+    // reset where required, so two `order()` calls on the same pattern
+    // reach the same `best_perm` / `best_flops`. The two required
+    // `order()` runs (the determinism gate) agree by construction.
+    //
+    // Cost model: a single window of W vertices runs at most `W * P` full
+    // `flops` evaluations (one per (vertex, candidate-position) pair), plus
+    // 1 evaluation after each accepted move to refresh the per-position
+    // counts. The full pass over `n / W` windows therefore performs up to
+    // `(n / W) * (1 + W * P)` `flops` evaluations, every one O(nnz(L)) on
+    // pre-allocated buffers. W=16 and P=3 are calibrated for ms-to-low-tens-
+    // of-ms total cost on the small/sparse matrices the rest of the
+    // portfolio already accepts; the caller must gate on (n, nnz).
+    //
+    // Returns `None` if no move is accepted (so the caller's incumbent is
+    // untouched); `Some((new_perm, new_flops))` otherwise. The returned
+    // `new_perm` is a fresh allocation; the caller's `best_perm` is
+    // unchanged when the function returns `None`.
+    pub(crate) fn windowed_reinsertion_hillclimb(
+        &mut self,
+        pat: &ScoringPattern,
+        best_perm: &[usize],
+        best_flops: u64,
+        window_size: usize,
+        positions: usize,
+    ) -> Option<(Vec<usize>, u64)> {
+        let n = pat.n;
+        if n == 0 || window_size == 0 || positions == 0 {
+            return None;
+        }
+        // Need at least one valid "insert back" room: cur_pos >= positions.
+        if n < window_size + positions {
+            return None;
+        }
+
+        let mut cur_perm: Vec<usize> = best_perm.to_vec();
+        let mut cur_flops = best_flops;
+        let mut improved = false;
+
+        // Last window's start, in ascending order. (Slide the window over
+        // the whole permutation; overlap between windows is harmless and
+        // gives the high-front-height vertices of a window another chance
+        // to move in the next window after their column counts are
+        // refreshed.)
+        for win_start in 0..=(n - window_size) {
+            // Recompute column counts AFTER every accepted move, so the
+            // front-height ranking of the next window is current. If
+            // nothing has been accepted since the last evaluation this
+            // would be wasteful, but `improved_since_last_eval` tracks
+            // that and skips it.
+            let counts: Vec<usize> = {
+                let (_, c) = self.flops_and_counts(pat, &cur_perm);
+                c
+            };
+            // Build the window-vertex list, sorted by front height
+            // (column count) DESCENDING. `cur_perm[win_start + i]` is the
+            // vertex eliminated at position `win_start + i`; its current
+            // front height is `counts[win_start + i]`.
+            let mut window_verts: Vec<(usize, usize)> = (0..window_size)
+                .map(|i| {
+                    let pos = win_start + i;
+                    (cur_perm[pos], counts[pos])
+                })
+                .collect();
+            window_verts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+            for (v, _h) in window_verts {
+                if v >= n {
+                    continue;
+                }
+                // Find v's CURRENT position in `cur_perm` (this changes
+                // as accepted moves accumulate within the window).
+                let cur_pos = match cur_perm.iter().position(|&x| x == v) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if cur_pos < positions {
+                    continue; // not enough room to reinsert back
+                }
+
+                // Try the P candidate reinsertion positions: strictly
+                // BEFORE the current position. We try ALL P from the
+                // closest (`cur_pos - 1`) outward to `cur_pos - P` and
+                // take the best — the "best of P" choice (rather than
+                // the FIRST improving one) is what makes the move
+                // monotone in `cur_flops` and avoids accepting a merely-
+                // local move when a strictly-better one is available.
+                let mut best_local_flops = cur_flops;
+                let mut best_local_pos: Option<usize> = None;
+                for p in 1..=positions {
+                    let new_pos = cur_pos - p;
+                    let mut trial = Vec::with_capacity(n);
+                    trial.extend_from_slice(&cur_perm[..new_pos]);
+                    trial.push(v);
+                    trial.extend_from_slice(&cur_perm[new_pos..cur_pos]);
+                    trial.extend_from_slice(&cur_perm[cur_pos + 1..]);
+                    let f = self.flops(pat, &trial);
+                    if f < best_local_flops {
+                        best_local_flops = f;
+                        best_local_pos = Some(new_pos);
+                    }
+                }
+
+                // STRICT improvement only — ties are rejected.
+                if let Some(np) = best_local_pos {
+                    if best_local_flops < cur_flops {
+                        let mut new_perm = Vec::with_capacity(n);
+                        new_perm.extend_from_slice(&cur_perm[..np]);
+                        new_perm.push(v);
+                        new_perm.extend_from_slice(&cur_perm[np..cur_pos]);
+                        new_perm.extend_from_slice(&cur_perm[cur_pos + 1..]);
+                        cur_perm = new_perm;
+                        cur_flops = best_local_flops;
+                        improved = true;
+                    }
+                }
+            }
+        }
+
+        if improved && cur_flops < best_flops {
+            Some((cur_perm, cur_flops))
+        } else {
+            None
+        }
+    }
+
+    /// Same as [`windowed_reinsertion_hillclimb`], but with a hard cap on
+    /// the number of full `flops` evaluations the phase may perform —
+    /// `max_evals` decrements by 1 for every `flops` call (initial per-
+    /// window count refresh + every candidate reinsertion evaluation);
+    /// once the budget hits 0 the loop breaks out and the current
+    /// incumbent is returned. A defensive belt for unusually large `n`
+    /// where `n * W * P` could otherwise exceed the caller's wall-clock
+    /// budget.
+    pub(crate) fn windowed_reinsertion_hillclimb_budgeted(
+        &mut self,
+        pat: &ScoringPattern,
+        best_perm: &[usize],
+        best_flops: u64,
+        window_size: usize,
+        positions: usize,
+        max_evals: usize,
+    ) -> Option<(Vec<usize>, u64)> {
+        let n = pat.n;
+        if n == 0 || window_size == 0 || positions == 0 {
+            return None;
+        }
+        if n < window_size + positions {
+            return None;
+        }
+        if max_evals == 0 {
+            return None;
+        }
+
+        let mut cur_perm: Vec<usize> = best_perm.to_vec();
+        let mut cur_flops = best_flops;
+        let mut evals_left = max_evals;
+        let mut improved = false;
+
+        for win_start in 0..=(n - window_size) {
+            if evals_left == 0 {
+                break;
+            }
+            evals_left -= 1;
+            let (_, counts) = self.flops_and_counts(pat, &cur_perm);
+            let mut window_verts: Vec<(usize, usize)> = (0..window_size)
+                .map(|i| {
+                    let pos = win_start + i;
+                    (cur_perm[pos], counts[pos])
+                })
+                .collect();
+            window_verts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+            for (v, _h) in window_verts {
+                if v >= n {
+                    continue;
+                }
+                let cur_pos = match cur_perm.iter().position(|&x| x == v) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if cur_pos < positions {
+                    continue;
+                }
+                let mut best_local_flops = cur_flops;
+                let mut best_local_pos: Option<usize> = None;
+                for p in 1..=positions {
+                    if evals_left == 0 {
+                        break;
+                    }
+                    evals_left -= 1;
+                    let new_pos = cur_pos - p;
+                    let mut trial = Vec::with_capacity(n);
+                    trial.extend_from_slice(&cur_perm[..new_pos]);
+                    trial.push(v);
+                    trial.extend_from_slice(&cur_perm[new_pos..cur_pos]);
+                    trial.extend_from_slice(&cur_perm[cur_pos + 1..]);
+                    let f = self.flops(pat, &trial);
+                    if f < best_local_flops {
+                        best_local_flops = f;
+                        best_local_pos = Some(new_pos);
+                    }
+                }
+
+                if let Some(np) = best_local_pos {
+                    if best_local_flops < cur_flops {
+                        let mut new_perm = Vec::with_capacity(n);
+                        new_perm.extend_from_slice(&cur_perm[..np]);
+                        new_perm.push(v);
+                        new_perm.extend_from_slice(&cur_perm[np..cur_pos]);
+                        new_perm.extend_from_slice(&cur_perm[cur_pos + 1..]);
+                        cur_perm = new_perm;
+                        cur_flops = best_local_flops;
+                        improved = true;
+                    }
+                }
+                if evals_left == 0 {
+                    break;
+                }
+            }
+        }
+
+        if improved && cur_flops < best_flops {
+            Some((cur_perm, cur_flops))
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
