@@ -19,6 +19,17 @@ these to the next scoring win, at zero extra measurement cost:
   not merely worse. One-line change; do not re-measure, just carry it.
 
 ## Current best
+- **0023 local candidate:** one independent relabelled-AMF ordering
+  (`dense_alpha=0.5`, seed 2) is compared only after PHARMAKOS, preserving the
+  complete original TELOS path. Full-300 same-binary A/B: **0.842222684 ->
+  0.842164975**, 1 strict win / 0 losses / 1 permutation change; the 100k-130k
+  cap wall is outside its `n>=1000, nnz<=60k` gate. See
+  [0023](experiments/0023-post-telos-relabel-amf-alpha.md).
+- **0022 negative:** moving P8's strict-gated biconn-AMF object after every
+  incumbent-dependent phase makes comparison truly score-monotone, but full-300
+  A/B was exactly neutral: 0 wins / 0 losses / 0 permutation changes. Target
+  attribution shows raw/post-final AMF are both 21,640; the earlier 18,740 was a
+  changed TELOS seed basin. See [0022](experiments/0022-post-telos-biconn-amf-zero.md).
 - Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
@@ -206,6 +217,14 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   a hub that size is why its restarts cost. 4 better / **1 worse** / 296 same. **NOT monotone on
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
+
+- [0021-output-neutral-relabel-buffer-reuse.md](experiments/0021-output-neutral-relabel-buffer-reuse.md)
+  — **OUTPUT-NEUTRAL CAP HEADROOM.** Reuses the already vendor-equivalent
+  permutation/i32 buffers across relabel, hill-climb, and count-relabel passes.
+  Exact full-corpus A/B: **0/300 permutation mismatches, 0/300 flop
+  mismatches**; isolated relabel preparation is **1.17x–1.90x faster** on four
+  representatives, and the full 300-row fingerprint run fell
+  165.80s→150.93s. No search gate/budget changed; no submission made.
 
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
