@@ -915,6 +915,17 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
         .min(cap)
 }
 
+/// Final exact adjacent-transposition descent. This intentionally targets only
+/// the `1k_10k` bucket: the `n < 1000` near-AMD mass is measured floor-limited,
+/// while the exact bitset replay's cost grows as `n * ceil(n / 64)` per pivot.
+/// The hard operation budget is cumulative across both parity sweeps and makes
+/// dense-fill or adversarial seeds fail closed before trusted scoring.
+const PAIR_DESCENT_MIN_N: usize = 1_000;
+const PAIR_DESCENT_MAX_N: usize = 4_000;
+const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
+const PAIR_DESCENT_SWEEPS: usize = 2;
+const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -4468,6 +4479,45 @@ fn order_with_options(
             }
         }
     }
+
+    #[cfg(test)]
+    let _tp10 = std::time::Instant::now();
+    // ── FINAL EXACT ADJACENT-PAIR DESCENT ─────────────────────────────────
+    // Independent sibling after all other phases: replay the exact elimination
+    // graph and locally orient disjoint adjacent pivot pairs by current degree.
+    // For an adjacent pair, both orientations have the same second-pivot
+    // degree and leave the same residual graph, so lower-degree-first is an
+    // exact strict improvement; alternating parity covers every boundary.
+    //
+    // The theorem and internal accumulator are not trusted for admission:
+    // malformed input, a hard-op-budget exit, or no swap returns None; any
+    // candidate must still be a bijection and beat the existing FINAL score
+    // through the shared exact scorer. No downstream phase consumes it.
+    if n >= PAIR_DESCENT_MIN_N
+        && n <= PAIR_DESCENT_MAX_N
+        && nnz > 0
+        && nnz <= PAIR_DESCENT_MAX_NNZ
+    {
+        if let Some(cand) = rgreedy::adjacent_pair_descent(
+            n,
+            &pattern.col_ptr,
+            &pattern.row_idx,
+            &best_perm,
+            PAIR_DESCENT_SWEEPS,
+            PAIR_DESCENT_OPS_BUDGET,
+        ) {
+            if is_bijection(&cand, n) {
+                let f = ws.flops(scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    parallel::phase_mark("10.pair_descent", _tp10);
 
     let _ = best_flops;
 
