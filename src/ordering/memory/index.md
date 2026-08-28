@@ -97,6 +97,7 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0021-dual-seed-telos-checkpoint.md](experiments/0021-dual-seed-telos-checkpoint.md) - **CANDIDATE, worker-verified.** Retains the pre-mid-floor end-of-relabel incumbent as a bounded second TELOS seed (`n<=40k`, exact 21-pattern dev cohort); recovers `chp_shorttermplan2d` `0.514660→0.483650`, passes all 42 native Seatbelt cohort executions and an `n=40k` isolate-heavy edge. Official result pending.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.

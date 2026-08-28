@@ -1176,6 +1176,53 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
         .max(small_multi)
 }
 
+/// Restart policy immediately before the mid-band and low-nnz floors were
+/// added. The heavy sparse floor predates those two regimes and remains part
+/// of this checkpoint. It is used only to retain a second, causally distinct
+/// TELOS seed on matrices whose shipped restart count was actually raised.
+fn relabel_restarts_before_floors(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
+    if nnz == 0 {
+        return 0;
+    }
+
+    let restarts = budget / nnz;
+    let heavy_multi = if nnz > 150_000
+        && nnz <= RELABEL_HEAVY_MAX_NNZ
+        && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
+    {
+        (900_000 / nnz).clamp(1, 4)
+    } else {
+        0
+    };
+
+    if restarts == 0 {
+        heavy_multi
+    } else {
+        restarts.max(heavy_multi).min(cap)
+    }
+}
+
+const TELOS_CHECKPOINT_MAX_N: usize = 40_000;
+
+/// Admit the second TELOS basin only inside the measured mid-floor envelope.
+/// The explicit `n` ceiling bounds the extra O(n log n) ranking and O(n)
+/// candidate work on isolate-heavy hidden patterns; all 21 matching dev
+/// matrices remain below this ceiling.
+fn should_run_checkpoint_telos(
+    n: usize,
+    nnz: usize,
+    max_deg: usize,
+    restarts: usize,
+    checkpoint_restarts: usize,
+) -> bool {
+    n <= TELOS_CHECKPOINT_MAX_N
+        && nnz > 30_000
+        && nnz <= 150_000
+        && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
+        && max_deg <= n / 50
+        && restarts > checkpoint_restarts
+}
+
 /// STRIP TRANSFORM envelope. Delete the k densest (or highest-L-column-count)
 /// vertices, AMD the induced subgraph on what remains, append the deleted
 /// vertices last in ascending-degree order, and score the RESULT on the true
@@ -1464,6 +1511,124 @@ fn strip_from_induced(
     tail.sort_unstable_by_key(|&v| (sp.col_ptr[v + 1] - sp.col_ptr[v], v));
     perm.extend(tail.into_iter().map(|v| v as i32));
     Some(perm)
+}
+
+/// Run the shipped TELOS descent from one explicit incumbent seed.
+///
+/// Keeping the seed explicit lets the caller descend from both the normal
+/// portfolio incumbent and the pre-restart-floor checkpoint without
+/// duplicating any upstream candidate generation. Every candidate is still
+/// validated and scored by the exact symbolic objective, so adding a seed can
+/// only improve (or tie) the returned result.
+fn telos_descent(
+    pattern: &Pattern,
+    scoring_pat: &ScoringPattern,
+    mut best_perm: Vec<usize>,
+    mut best_flops: u64,
+    ws: &mut ScoreWorkspace,
+    flops_cache: &std::collections::HashMap<Vec<usize>, u64>,
+) -> (Vec<usize>, u64) {
+    let n = pattern.n;
+    let nnz = pattern.nnz();
+    if nnz == 0 || nnz >= TELOS_MAX_NNZ {
+        return (best_perm, best_flops);
+    }
+
+    let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+    let sub_nd = |c: &feral_ordering_core::CscPattern| {
+        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+        feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
+    };
+    let sub_mf = |c: &feral_ordering_core::CscPattern| {
+        let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+        feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+    };
+
+    let (max_rounds, prio, passes, peel_grid): (usize, &[(u8, usize)], usize, &[usize]) =
+        if nnz < TELOS_TIER_A_MAX_NNZ {
+            (
+                2,
+                &TELOS_PRIO[..],
+                (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A),
+                &TELOS_PEEL_A[..],
+            )
+        } else {
+            (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
+        };
+
+    for _round in 0..max_rounds {
+        let permuted = permute_pattern(scoring_pat, &best_perm);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let mut cnt = vec![0usize; n];
+        for (pos, &v) in best_perm.iter().enumerate() {
+            cnt[v] = counts[pos];
+        }
+        let mut ranked: Vec<usize> = (0..n).collect();
+        ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+
+        let mut round_f = best_flops;
+        let mut round_p: Option<Vec<usize>> = None;
+        let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+            if !is_bijection(&cand, n) {
+                return;
+            }
+            let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                cached
+            } else {
+                ws.flops(scoring_pat, &cand)
+            };
+            if f < *round_f {
+                *round_f = f;
+                *round_p = Some(cand);
+            }
+        };
+
+        for &(subi, k) in prio.iter().take(passes) {
+            if k >= n {
+                continue;
+            }
+            let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                match subi {
+                    0 => &sub_amd,
+                    1 => &sub_nd,
+                    _ => &sub_mf,
+                };
+            if let Some(cand) = strip_general_v2(scoring_pat, &ranked, k, sub) {
+                try_cand(cand, &mut round_f, &mut round_p);
+            }
+        }
+
+        for &k in peel_grid {
+            if k >= n {
+                continue;
+            }
+            let mut fat = vec![false; n];
+            for &v in &ranked[..k] {
+                fat[v] = true;
+            }
+            let mut cand: Vec<usize> = Vec::with_capacity(n);
+            for &v in &best_perm {
+                if !fat[v] {
+                    cand.push(v);
+                }
+            }
+            let mut tail: Vec<usize> = ranked[..k].to_vec();
+            tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+            cand.extend(tail);
+            try_cand(cand, &mut round_f, &mut round_p);
+        }
+
+        match round_p {
+            Some(p) if round_f < best_flops => {
+                best_flops = round_f;
+                best_perm = p;
+            }
+            _ => break,
+        }
+    }
+
+    (best_perm, best_flops)
 }
 
 /// Return an elimination order for `pattern` (best-of over the ordering family).
@@ -2328,6 +2493,79 @@ fn order_with_options(
         consider(&|| feral_amd::amd_order_opts(&core, &amd_heavy_nodense).map(|(p, ..)| p));
     }
 
+    // All remaining generated candidates are relabel restarts. End the
+    // portfolio-phase closure here because the checkpoint path below must
+    // inspect each accepted permutation while preserving the shipped cache,
+    // scoring, and strict-best update semantics.
+    drop(consider);
+
+    let restarts = relabel_restarts(
+        RELABEL_BUDGET,
+        RELABEL_MAX_RESTARTS,
+        n,
+        nnz,
+        max_deg,
+    )
+    .min(relabel_cap);
+    let checkpoint_restarts = relabel_restarts_before_floors(
+        RELABEL_BUDGET,
+        RELABEL_MAX_RESTARTS,
+        n,
+        nnz,
+    )
+    .min(relabel_cap);
+
+    // Only matrices whose restart count was genuinely raised retain a second
+    // seed. The checkpoint is updated by the exact same generated candidates
+    // for seeds `1..=checkpoint_restarts`; no extra AMD/AMF work is performed.
+    // Later, TELOS descends once from this pre-floor basin and once from the
+    // shipped basin, keeping the exact-oracle best. This directly addresses
+    // the measured between-basin regression isolated in experiment 0020.
+    let mut telos_checkpoint = should_run_checkpoint_telos(
+        n,
+        nnz,
+        max_deg,
+        restarts,
+        checkpoint_restarts,
+    )
+    .then(|| (best_flops, best_perm.clone()));
+
+    let mut consider_relabel =
+        |produce: &dyn Fn() -> Result<Vec<i32>, feral_ordering_core::OrderingError>,
+         include_in_checkpoint: bool| {
+            let produced =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
+            let Ok(Ok(perm_i32)) = produced else {
+                return;
+            };
+            let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
+            if !is_bijection(&perm, n) {
+                return;
+            }
+            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                cached
+            } else {
+                let v = ws.flops(&scoring_pat, &perm);
+                flops_cache.insert(perm.clone(), v);
+                v
+            };
+            #[cfg(test)]
+            BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+
+            if include_in_checkpoint {
+                if let Some((checkpoint_flops, checkpoint_perm)) = telos_checkpoint.as_mut() {
+                    if f < *checkpoint_flops {
+                        *checkpoint_flops = f;
+                        *checkpoint_perm = perm.clone();
+                    }
+                }
+            }
+            if f < best_flops {
+                best_flops = f;
+                best_perm = perm;
+            }
+        };
+
     // RELABELLED-AMD MULTI-START — a randomized-restart minimum degree, for free.
     //
     // AMD's output is decided by its tie-breaking, and its tie-breaking reads the
@@ -2368,12 +2606,9 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
-    let restarts =
-        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
         let seed = r as u64 + 1;
-        consider(&|| {
+        consider_relabel(&|| {
             let q = relabel(n, seed);
             let b = permute_pattern(&scoring_pat, &q);
             let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
@@ -2383,7 +2618,7 @@ fn order_with_options(
             let pb = feral_amd::amd_order(&bcore)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
             Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-        });
+        }, r < checkpoint_restarts);
     }
 
     // RELABELLED-AMF MULTISTART (`sbx-relabel-amf`): the relabel trick above
@@ -2415,11 +2650,10 @@ fn order_with_options(
             dense_alpha: 5.0,
             ..Default::default()
         };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+        let amf_restarts = restarts;
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
-            consider(&|| {
+            consider_relabel(&|| {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
                 let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
@@ -2429,7 +2663,7 @@ fn order_with_options(
                 let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
+            }, r < checkpoint_restarts);
         }
     }
 
@@ -2466,11 +2700,10 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: -1.0,
         };
-        let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+        let amdnd_restarts = restarts;
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
-            consider(&|| {
+            consider_relabel(&|| {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
                 let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
@@ -2480,10 +2713,11 @@ fn order_with_options(
                 let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
+            }, r < checkpoint_restarts);
         }
     }
 
+    drop(consider_relabel);
 
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
@@ -2802,110 +3036,37 @@ fn order_with_options(
         }
     }
 
-    // ── TELOS-GRADIENT DESCENT — see the `TELOS_*` constants' doc comment
-    // for the rationale, the measured per-bucket marginal, and the cost
-    // model. Runs LAST so the counts it descends on are the final
-    // incumbent's; same hand-rolled discipline as the other post-hoc
-    // phases (reads `best_perm` directly, read-only `flops_cache`, evals
-    // through the reused workspace). Deterministic: every candidate is a
-    // pure function of (`best_perm`, pattern) with total-order tie-breaks,
-    // and only a strict improvement is ever kept (AMD floor intact).
-    if nnz > 0 && nnz < TELOS_MAX_NNZ {
-        let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
-        let sub_nd = |c: &feral_ordering_core::CscPattern| {
-            let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
-            feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
-        };
-        let sub_mf = |c: &feral_ordering_core::CscPattern| {
-            let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
-            feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
-        };
-
-        let (max_rounds, prio, passes, peel_grid): (usize, &[(u8, usize)], usize, &[usize]) =
-            if nnz < TELOS_TIER_A_MAX_NNZ {
-                (
-                    2,
-                    &TELOS_PRIO[..],
-                    (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A),
-                    &TELOS_PEEL_A[..],
-                )
-            } else {
-                // Tier B (150k..TELOS_MAX_NNZ): eval-bound class — ONE round,
-                // minimal eval count. See the cap-calibration re-gate note on
-                // the `TELOS_*` constants.
-                (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
-            };
-
-        for _round in 0..max_rounds {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut cnt = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                cnt[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
-
-            let mut round_f = best_flops;
-            let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
-                };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
-
-            for &(subi, k) in prio.iter().take(passes) {
-                if k >= n {
-                    continue;
-                }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
-                    };
-                if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
-                    try_cand(cand, &mut round_f, &mut round_p);
-                }
-            }
-
-            for &k in peel_grid {
-                if k >= n {
-                    continue;
-                }
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in &best_perm {
-                    if !fat[v] {
-                        cand.push(v);
-                    }
-                }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
-                cand.extend(tail);
-                try_cand(cand, &mut round_f, &mut round_p);
-            }
-
-            match round_p {
-                Some(p) if round_f < best_flops => {
-                    best_flops = round_f;
-                    best_perm = p;
-                }
-                _ => break,
-            }
+    // ── TELOS-GRADIENT DESCENT ─────────────────────────────────────────────
+    // Descend from the normal incumbent first, preserving the shipped path.
+    // On matrices whose restart floor changed, also descend from the exact
+    // pre-floor checkpoint retained above. The two basins are independent
+    // candidates under the same exact best-of oracle; all other matrices run
+    // one descent exactly as before. The exact comparison is local to the
+    // TELOS boundary: downstream seed-sensitive phases may still respond
+    // differently, so the activation cohort is checked end-to-end.
+    // A byte-identical checkpoint is the same basin and would only repeat
+    // work. Compare before the normal descent changes the incumbent.
+    let telos_checkpoint = telos_checkpoint.filter(|(_, perm)| perm != &best_perm);
+    (best_perm, best_flops) = telos_descent(
+        pattern,
+        &scoring_pat,
+        best_perm,
+        best_flops,
+        &mut ws,
+        &flops_cache,
+    );
+    if let Some((checkpoint_flops, checkpoint_perm)) = telos_checkpoint {
+        let (checkpoint_perm, checkpoint_flops) = telos_descent(
+            pattern,
+            &scoring_pat,
+            checkpoint_perm,
+            checkpoint_flops,
+            &mut ws,
+            &flops_cache,
+        );
+        if checkpoint_flops < best_flops {
+            best_flops = checkpoint_flops;
+            best_perm = checkpoint_perm;
         }
     }
 
@@ -4658,6 +4819,28 @@ mod tests {
             assert!(v < n && !seen[v], "not a bijection of 0..{n}");
             seen[v] = true;
         }
+    }
+
+    #[test]
+    fn checkpoint_telos_gate_boundaries_are_bounded() {
+        let n = TELOS_CHECKPOINT_MAX_N;
+        let max_deg = n / 50;
+        let admitted = |n, nnz, max_deg, restarts, checkpoint_restarts| {
+            should_run_checkpoint_telos(n, nnz, max_deg, restarts, checkpoint_restarts)
+        };
+
+        assert!(admitted(n, 30_001, max_deg, 24, 5));
+        assert!(admitted(n, 150_000, max_deg, 24, 5));
+        assert!(!admitted(n + 1, 30_001, max_deg, 24, 5));
+        assert!(!admitted(n, 30_000, max_deg, 24, 5));
+        assert!(!admitted(n, 150_001, max_deg, 24, 5));
+        assert!(!admitted(n, 30_001, max_deg + 1, 24, 5));
+        assert!(!admitted(n, 30_001, max_deg, 5, 5));
+
+        let sparse_n = 6_000;
+        let sparse_max_deg = sparse_n / 50;
+        assert!(admitted(sparse_n, 6 * sparse_n, sparse_max_deg, 24, 5));
+        assert!(!admitted(sparse_n, 6 * sparse_n + 1, sparse_max_deg, 24, 5));
     }
 
     /// PROOF OF OUTPUT NEUTRALITY for the cap-safety merge's cost-reduction

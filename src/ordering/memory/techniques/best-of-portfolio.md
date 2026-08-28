@@ -91,8 +91,27 @@ It also changed the shape of a gate. Every other candidate here uses a hard
 the budget its own gate. That pattern is reusable for any candidate whose cost
 scales with nnz and whose quality improves with repetition.
 
+## Best-of is not globally monotone when later phases are seed-sensitive
+
+A strict best-of over an enlarged candidate set is monotone only at that stage.
+If a later heuristic transforms the current incumbent, a locally better
+incumbent can enter a worse basin. [0020](../experiments/0020-telos-seed-sensitivity.md)
+proved this for TELOS: the expanded relabel pool was strictly better, but its
+single TELOS seed produced a worse final result.
+
+The bounded repair in [0021](../experiments/0021-dual-seed-telos-checkpoint.md)
+retains a causally distinct end-of-relabel checkpoint, descends TELOS from both
+seeds, and exact-compares the results. The transferable rule is to preserve
+multiple measured basins at the seed-sensitive boundary rather than merely
+raise upstream search depth. Keep K and the activation envelope bounded by the
+downstream phase's actual work covariates. A second descent is score-safe only
+at its immediate comparison boundary; later seed-sensitive transforms can
+break global monotonicity, and it is never timeout-safe by construction.
+
 ## Links
 - [amd.md](amd.md) — the anchor, and why it is hard to beat here.
 - [nested-dissection.md](nested-dissection.md) — the separator family in the portfolio.
 - [experiments/0002](../experiments/0002-measured-gates-metis-kahip.md) — the measurements above.
 - [experiments/0003](../experiments/0003-relabelled-amd-multistart.md) — the relabelled-AMD multi-start and the budget-as-gate pattern.
+- [experiments/0020](../experiments/0020-telos-seed-sensitivity.md) — causal phase-gating diagnosis of TELOS seed sensitivity.
+- [experiments/0021](../experiments/0021-dual-seed-telos-checkpoint.md) — bounded dual-basin checkpoint repair and worker validation.
