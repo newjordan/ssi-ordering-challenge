@@ -63,6 +63,13 @@ these to the next scoring win, at zero extra measurement cost:
 - See the latest entry in [log.md](log.md).
 
 ## Tooling
+- **`~/ssi-ordering-LEARNINGS/bin/ssi-grader-log.sh`** - reads the grader's PUBLIC verdict, which
+  `yukon submissions` does not show. No arg = verdict for every one of our submissions; `<id>` =
+  one; `<id> --full` = the whole failed step. The benchmark workflow runs on branch
+  `submissions/<uuid>` in `Layr-Labs/ssi-ordering-challenge`. **Read this before theorising about
+  any `failed` row.** It also distinguishes the two failure classes: an EMPTY commit column in
+  `yukon submissions` means the submission never packaged (checkout behind `origin/main` after
+  your own promotion - fast-forward and resubmit), and no benchmark run will exist for it.
 - [`../probe.rs`](../probe.rs) — TEST-ONLY measurement module (`#[cfg(test)]`,
   never shipped, never read by the grader). The harness prints `(capped)` instead
   of a time, so this is the only way to see the cap. Run:
