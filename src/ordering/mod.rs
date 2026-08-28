@@ -1464,7 +1464,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (3_000_000 / nnz).clamp(1, 800)
+        (600_000 / nnz).clamp(1, 200)
     } else {
         0
     };
@@ -4280,8 +4280,8 @@ fn order_with_options(
     // the output is byte-identical regardless of completion order or thread
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
     const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
-    const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
+    const RGREEDY_MAX_NNZ: usize = 60_000;
+    const RGREEDY_BUDGET: i64 = 600_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
     // ties at 1.0000) and that class is where the portfolio is already slow.
     const RGREEDY_MAX_AVG_DEG: usize = 100;
