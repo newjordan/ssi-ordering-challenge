@@ -927,7 +927,7 @@ const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 // budget is a deterministic cumulative op count, exhaustion discards, and the
 // result is admitted only through the trusted global scorer -- so more of it is
 // weakly improving and cannot change determinism.
-const PAIR_DESCENT_SWEEPS: usize = 4;
+const PAIR_DESCENT_SWEEPS: usize = 5;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
