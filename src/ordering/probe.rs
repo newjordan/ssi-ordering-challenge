@@ -3778,3 +3778,5 @@ fn probe_biconn_heavy() {
 fn probe_max_deg(pat: &Pattern) -> usize {
     (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
 }
+
+

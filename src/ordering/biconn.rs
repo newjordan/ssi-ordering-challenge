@@ -623,6 +623,28 @@ pub fn biconn_heavy_order(
                 best_local = Some(local);
             }
         }
+
+        // Try AMF alpha=5.0 on this block
+        if let Ok((p_amf, ..)) = feral_amf::amf_order_opts(&core, &feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() }) {
+            let local: Vec<u32> = p_amf.iter().map(|&x| x as u32).collect();
+            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+            let f = super::flops_of(&spat, &local_us);
+            if f < best_flops {
+                best_flops = f;
+                best_local = Some(local);
+            }
+        }
+
+        // Try no-dense AMD on this block
+        if let Ok((p_nd, ..)) = feral_amd::amd_order_opts(&core, &feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 }) {
+            let local: Vec<u32> = p_nd.iter().map(|&x| x as u32).collect();
+            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+            let f = super::flops_of(&spat, &local_us);
+            if f < best_flops {
+                let _ = best_flops;
+                best_local = Some(local);
+            }
+        }
         match best_local {
             Some(local) => perm.extend(local.iter().map(|&x| owned[x as usize] as usize)),
             None => perm.extend(owned.iter().map(|&v| v as usize)),
