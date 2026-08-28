@@ -1009,7 +1009,10 @@ fn perturb(p: &[usize], seed: u64, swaps: usize) -> Vec<usize> {
     q
 }
 
-fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
+/// `max_deg` is the maximum vertex degree of the pattern (excluding self-loops) —
+/// required by the mid-band gate below, where it is the discriminator that keeps the
+/// boost off hub-heavy patterns whose restarts are expensive.
+fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     if nnz == 0 {
         return 0;
     }
@@ -1034,10 +1037,143 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
     } else {
         0
     };
+
+    // MID-BAND MULTI-RESTART (`probe_leverage_census`, 2026-08-28). `budget / nnz`
+    // starves the 30k-150k nnz band — it gets 2-9 restarts — while `heavy_multi`
+    // above only fires at nnz > 150_000. That gap leaves matrices with 0.6-1.3 s of
+    // UNUSED budget: measured slack 0.62 s on `crudeoil_lee4_10` (2 restarts),
+    // 1.32 s on `procurement1large` (7), 1.40 s on `mpbp_15` (9). A census at 50-94
+    // seeds found real gains there — ratio 0.7271 -> 0.7042, 0.6524 -> 0.6258,
+    // 0.8169 -> 0.8090 — so the band is seed-starved, not saturated (0017's sweep
+    // only reached 96 restarts and moved the GLOBAL budget, which is pinned by the
+    // one matrix that has no slack).
+    //
+    // THE HUB GATE IS LOAD-BEARING. `ringpack_30_2` is an (n, nnz)-TWIN of
+    // `crudeoil_lee4_10` — n 17999 vs 17809, nnz 121458 vs 120632, avg degree 6.75
+    // vs 6.77 — so no (n, nnz) rule can separate them, and it must be separated:
+    // ringpack holds the corpus worst case at 1.85 s of the 2.0 s cap (0.15 s slack)
+    // and a FAIL there scores nothing at all. What does separate them is MAX DEGREE:
+    // 1632 vs 168. A hub of that size is exactly why each of ringpack's restarts is
+    // expensive, so `max_deg <= n / 50` is both the cheap discriminator and the
+    // mechanism: admit the band only where no giant hub makes a restart costly.
+    // Excludes ringpack (1632 > 360) and `pooling_sppc1pq` (542 > 282); admits
+    // crudeoil_lee4_10 (168 <= 356), crudeoil_lee4_09 (136 <= 318),
+    // procurement1large (84 <= 288), mpbp_15 (38 <= 197).
+    //
+    // Same sparsity guard as the heavy tier — it is load-bearing there (the one-pass
+    // floor without it FAILED the grader on eval matrices with nnz/n up to 497).
+    let mid_multi = if nnz > 30_000
+        && nnz <= 150_000
+        && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
+        && max_deg <= n / 50
+    {
+        (1_500_000 / nnz).clamp(1, 24)
+    } else {
+        0
+    };
+
+    // LOW-NNZ MULTI-RESTART (`probe_leverage_census`, 2026-08-28). Below the mid band
+    // the binding constraint is not the budget but `RELABEL_MAX_RESTARTS` itself:
+    // `budget / nnz` would allow 19-78 restarts on these patterns and the cap clamps
+    // them to 24, while the census found gains at 198-780 seeds — `chimera_lga-01`
+    // 0.8706 -> 0.8085, `chimera_selby-c16-02` 0.5748 -> 0.5557, `hydroenergy2`
+    // 0.8745 -> 0.8622, `sporttournament48` 0.6639 -> 0.6531.
+    //
+    // NO HUB GATE HERE, deliberately, and that is not an oversight. The mid band needs
+    // one because at nnz ~120k a hub makes each restart expensive; at nnz <= 20k the
+    // whole pattern is small enough that restart cost is bounded by nnz alone
+    // regardless of structure. `chimera_lga-01` is the proof: max degree ~1119 of
+    // n=1120 (a near-complete hub, which the mid band's `max_deg <= n / 50` would
+    // reject outright) yet 1.78 s of measured slack and the largest single census gain
+    // on the corpus. Applying the mid band's gate down here would discard exactly the
+    // matrix worth having.
+    //
+    // Cost: the slowest pattern in this whole class currently runs 0.606 s
+    // (`crudeoil_lee1_07`, nnz 19322). SIZED FROM MEASUREMENT, not from the heavy
+    // tier's cost constant: 0007's ~6e-8 s/nnz per pass was measured on sparse heavy
+    // patterns and does NOT transfer here. A first attempt at 3_000_000 gave that
+    // matrix 155 passes and cost **+1.226 s**, i.e. ~4.1e-7 s/nnz — seven times the
+    // inherited constant — which pushed it to 1.832 s and put SIX matrices above 1.4 s
+    // where one had been. The max alone stayed under the incumbent's 1.852 s, but six
+    // matrices near a hard cap is a materially worse risk profile than one, and a FAIL
+    // scores nothing at all.
+    //
+    // Since `restarts = budget / nnz`, added time is `budget * c` and therefore roughly
+    // CONSTANT across this class, independent of nnz. At the measured c ≈ 4.5e-7 s/nnz,
+    // 600_000 buys ~0.27 s per matrix, keeping the class's worst at ~0.88 s of a 2.0 s
+    // cap. That is the number this budget is set by; re-measure before changing it, and
+    // do not re-derive it from the heavy tier's constant.
+    //
+    // This is also the regime 0010 probed in aggregate — 24 to 2000 restarts moved
+    // `lt_1k` 0.90702 -> 0.90642 — and dismissed as small; at this stage of diminishing
+    // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
+    // claiming rather than ignoring.
+    let small_multi = if nnz <= 20_000 {
+        (600_000 / nnz).clamp(1, 200)
+    } else {
+        0
+    };
+    // WHY THE OUTER CLAMP DOES NOT NULLIFY `small_multi`. Every call site wraps this
+    // function as `relabel_restarts(...).min(relabel_cap)`, which looks like it would
+    // clamp 155-800 passes straight back down. It does not: in the shipped path
+    // `order()` calls `order_with_relabel_cap(pattern, usize::MAX)`, so `relabel_cap` is
+    // unbounded and the outer `.min` is inert. That parameter exists only so probes can
+    // pass `0` and measure the portfolio with the multi-start switched off. The cap that
+    // actually binds this class is the `cap` argument (`RELABEL_MAX_RESTARTS` = 24, or
+    // the bucket-weighted variant at the first site), which is why `small_multi` is
+    // applied AFTER `.min(cap)` below. Confirmed empirically as well as by reading: the
+    // regime moved the score 0.842584 -> 0.842223 and took `crudeoil_lee1_07` from
+    // 0.606 s to 1.832 s at a 3_000_000 budget, neither of which a no-op could do.
+    // `mid_multi` participates via the same `max` as `heavy_multi`, so it is a FLOOR on
+    // the restart count and never an addition: a matrix already getting more from
+    // `budget / nnz` keeps it, and `cap` still bounds everything.
+    //
+    // NOT MONOTONE ON SCORE, despite that. The cause was isolated by experiment, not
+    // argued, because two plausible readings of it are both wrong:
+    //
+    //   - NOT budget contention. `hc_r` is `(hc_budget / nnz).min(hc_cap)`, and the
+    //     three relabel counts are three independent `relabel_restarts` calls. No
+    //     downstream phase is short of budget when the restart count rises.
+    //   - NOT a defect in the best-of. Seeds are `1..=restarts`, so raising the count
+    //     gives a strict SUPERSET of candidates, and `consider` scores every one with
+    //     the exact grader objective and accepts on strict `<`. Measured on
+    //     `chp_shorttermplan2d`: 24 restarts evaluates 508 candidates with a minimum of
+    //     2_189_795 against 5 restarts' 280 candidates and 2_415_825. The best-of is
+    //     monotone exactly as claimed.
+    //
+    // The loss is SEEDING OF `TELOS-GRADIENT DESCENT`. Both finals beat their own
+    // `consider` minimum (2_104_445 and 1_975_321 respectively), i.e. the winner is
+    // produced downstream, and TELOS descends from `best_perm` as the restart phase
+    // leaves it. Its outcome is sharply seed-sensitive: from the WORSE incumbent it
+    // reaches 1_975_321, from the BETTER one only 2_104_445. Disabling TELOS alone flips
+    // the pair monotone (0.524048 at 24 restarts vs 0.558157 at 5); disabling the
+    // hill-climb, the post-hoc families, ORBIT, PHARMAKOS, SHOT-3 or COMPLETION-LATTICE
+    // instead leaves the regression fully intact. Net over the corpus: -0.000138, with
+    // `chp_shorttermplan2d` 0.4840 -> 0.5150 against 4 gains (`mpbp_48` -0.0250,
+    // `procurement1large` -0.0180, `mpbp_15` -0.0030,
+    // `nd_netgen-3000-1-1-b-b-ns_7` -0.0030).
+    //
+    // So this is a BETWEEN-CONFIG effect that no bookkeeping inside one run can see: a
+    // run seeded at the better incumbent has no access to the basin only the worse
+    // incumbent reaches. Improving a seed is not free, and no amount of extra restart
+    // budget repairs it. The fix, if it is ever worth its time, is to run TELOS from
+    // more than the single best incumbent (retain the top-K and descend from each) —
+    // which costs exactly the resource that binds here. Until then: do not widen these
+    // gates on the assumption that more restarts cannot hurt.
+    //
+    // `small_multi` is applied AFTER `.min(cap)`, unlike the other two floors, because
+    // for that class the cap IS the binding constraint — `budget / nnz` already allows
+    // 19-78 passes and `RELABEL_MAX_RESTARTS` clamps them to 24. Respecting the cap
+    // here would make the regime a no-op. Its own `clamp(1, 800)` is the bound instead,
+    // and it is sized against measured time rather than inherited from the cap.
     if restarts == 0 {
-        return heavy_multi;
+        return heavy_multi.max(mid_multi).max(small_multi);
     }
-    restarts.max(heavy_multi).min(cap)
+    restarts
+        .max(heavy_multi)
+        .max(mid_multi)
+        .min(cap)
+        .max(small_multi)
 }
 
 /// STRIP TRANSFORM envelope. Delete the k densest (or highest-L-column-count)
@@ -1406,8 +1542,16 @@ fn order_with_options(
     let mut best_perm: Vec<usize> = amd_perm.clone();
     let mut best_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
 
-    // Candidate set gated purely by (n, nnz) so both required runs agree.
+    // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
+    // the pattern's maximum column length — see `relabel_restarts`, where a hub is
+    // what makes a restart expensive and is the only thing distinguishing
+    // `ringpack_30_2` from its (n, nnz)-twin `crudeoil_lee4_10`. Still a pure
+    // deterministic function of the pattern, so both required runs agree.
     let nnz = pattern.nnz();
+    let max_deg = (0..n)
+        .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
+        .max()
+        .unwrap_or(0);
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -1429,6 +1573,31 @@ fn order_with_options(
     // hill-climb loops below only READ it.
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
+
+    // SECOND TELOS SEED (`0020-telos-seed-sensitivity`). `TELOS-GRADIENT DESCENT` below
+    // descends from the incumbent, and experiment 0020 measured that its result depends
+    // more on WHICH point it starts from than on how good that point is: on
+    // `chp_shorttermplan2d` it reached 1_975_321 from a worse incumbent and only
+    // 2_104_445 from a better one. So keep the AMD anchor - a structurally distant,
+    // already-paid-for point - and descend a second time from it, keeping whichever
+    // result is better. That is zero-downside on score by construction (the outcome is
+    // `min` of the current behaviour and one extra basin), unlike adding a candidate
+    // family, which can only be justified by a measured win.
+    //
+    // Gated on the SAME `max_deg <= n / 50` hub discriminator as the mid-band restart
+    // floor, for a different but equally measured reason: a second descent costs at most
+    // the largest measured TELOS time (0.314 s), and 299 of the 300 dev matrices stay
+    // under 1.85 s with it. The single exception is `ringpack_30_2`, which is both the
+    // slowest matrix (1.788 s) and the one with the largest TELOS time, and would reach
+    // 2.102 s against a 2.0 s cap. Its max degree is 1632 against `n / 50` = 360, so the
+    // hub gate already excludes it. Structural gate, never wall-clock: the run must stay
+    // deterministic.
+    let telos_second_seed = nnz > 0 && nnz < TELOS_MAX_NNZ && max_deg <= n / 50;
+    let telos_anchor: Option<(Vec<usize>, u64)> = if telos_second_seed {
+        Some((best_perm.clone(), best_flops))
+    } else {
+        None
+    };
 
     // Try a candidate produced by `f`; keep it if it is a valid bijection with
     // strictly fewer flops. `catch_unwind` guards against a candidate panicking
@@ -2226,7 +2395,7 @@ fn order_with_options(
     // score-vs-cap curve.
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
-        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
+        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
         let seed = r as u64 + 1;
         consider(&|| {
@@ -2272,7 +2441,7 @@ fn order_with_options(
             ..Default::default()
         };
         let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
+            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             consider(&|| {
@@ -2323,7 +2492,7 @@ fn order_with_options(
             dense_alpha: -1.0,
         };
         let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz).min(relabel_cap);
+            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
             consider(&|| {
@@ -2692,76 +2861,97 @@ fn order_with_options(
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
 
-        for _round in 0..max_rounds {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut cnt = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                cnt[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+        // Descend once from the incumbent, then - when the hub gate admitted a second
+        // seed - again from the AMD anchor, keeping whichever result is better. The
+        // no-second-seed path takes the incumbent by `mem::take` so the common case pays
+        // no extra clone; `best_perm` is reassigned at the top of every iteration.
+        let telos_seeds: Vec<(Vec<usize>, u64)> = match telos_anchor {
+            Some(anchor) => vec![(best_perm.clone(), best_flops), anchor],
+            None => vec![(std::mem::take(&mut best_perm), best_flops)],
+        };
+        let mut telos_out: Option<(Vec<usize>, u64)> = None;
+        for (seed_perm, seed_flops) in telos_seeds {
+            best_perm = seed_perm;
+            best_flops = seed_flops;
+            for _round in 0..max_rounds {
+                let permuted = permute_pattern(&scoring_pat, &best_perm);
+                let etree = EliminationTree::from_pattern(&permuted);
+                let counts = column_counts_gnp(&permuted, &etree);
+                let mut cnt = vec![0usize; n];
+                for (pos, &v) in best_perm.iter().enumerate() {
+                    cnt[v] = counts[pos];
+                }
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
 
-            let mut round_f = best_flops;
-            let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
-                };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
-
-            for &(subi, k) in prio.iter().take(passes) {
-                if k >= n {
-                    continue;
-                }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
+                let mut round_f = best_flops;
+                let mut round_p: Option<Vec<usize>> = None;
+                let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
                     };
-                if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
-                    try_cand(cand, &mut round_f, &mut round_p);
-                }
-            }
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
+                };
 
-            for &k in peel_grid {
-                if k >= n {
-                    continue;
-                }
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in &best_perm {
-                    if !fat[v] {
-                        cand.push(v);
+                for &(subi, k) in prio.iter().take(passes) {
+                    if k >= n {
+                        continue;
+                    }
+                    let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                        match subi {
+                            0 => &sub_amd,
+                            1 => &sub_nd,
+                            _ => &sub_mf,
+                        };
+                    if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
+                        try_cand(cand, &mut round_f, &mut round_p);
                     }
                 }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
-                cand.extend(tail);
-                try_cand(cand, &mut round_f, &mut round_p);
-            }
 
-            match round_p {
-                Some(p) if round_f < best_flops => {
-                    best_flops = round_f;
-                    best_perm = p;
+                for &k in peel_grid {
+                    if k >= n {
+                        continue;
+                    }
+                    let mut fat = vec![false; n];
+                    for &v in &ranked[..k] {
+                        fat[v] = true;
+                    }
+                    let mut cand: Vec<usize> = Vec::with_capacity(n);
+                    for &v in &best_perm {
+                        if !fat[v] {
+                            cand.push(v);
+                        }
+                    }
+                    let mut tail: Vec<usize> = ranked[..k].to_vec();
+                    tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+                    cand.extend(tail);
+                    try_cand(cand, &mut round_f, &mut round_p);
                 }
-                _ => break,
+
+                match round_p {
+                    Some(p) if round_f < best_flops => {
+                        best_flops = round_f;
+                        best_perm = p;
+                    }
+                    _ => break,
+                }
             }
+            telos_out = match telos_out {
+                Some((p, f)) if f <= best_flops => Some((p, f)),
+                _ => Some((std::mem::take(&mut best_perm), best_flops)),
+            };
+        }
+        if let Some((p, f)) = telos_out {
+            best_perm = p;
+            best_flops = f;
         }
     }
 

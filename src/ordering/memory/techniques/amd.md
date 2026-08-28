@@ -52,6 +52,30 @@ doing AMD-vs-AMD.** What the corpus shows now is stronger than that — 122 of 3
 matrices tie AMD at exactly 1.000 even against METIS, Scotch, KaHIP, RCM, Sloan,
 AMF and two hand-rolled ND variants. On this corpus AMD is not a soft baseline.
 
+## How strong, measured — AMD is at or near OPTIMAL on the tie class
+
+Stronger than "un-beaten so far". Three independent measurements:
+
+- [0012](../experiments/0012-exact-dp-small-n.md): exact minimum-flop subset DP over
+  the elimination game, all 30 dev matrices with `n ≤ 24` — **zero** improvements.
+  AMD is provably **optimal** there, so those ties are a floor, not a gap.
+- [0018](../experiments/0018-headroom-census.md): ~**125× the shipped search depth**
+  (3000 relabel seeds × AMD+AMF, ~546 000 scored orderings) on all 91 matrices left
+  at ratio ≥ 0.995 with `n ≤ 20 000` — only **3 improved**, two negligible. The one
+  real gain (`ndcc12`, 1.5%) needed seed 2666, unreachable inside the 2 s cap. So
+  0012's optimality result generalises far above its `n ≤ 24` proof.
+- [0016](../experiments/0016-spectral-fiedler-nd.md): a wholly orthogonal family
+  (spectral/Fiedler bisection) ran across 88 of those same matrices and was **never
+  the argmin** — so the ties are not an artifact of the portfolio lacking a method.
+
+**Consequence for planning.** The tie class is **floor-limited** — not
+method-limited (0016) and not budget-limited (0010, [0017](../experiments/0017-relabel-budget-saturation.md)).
+Do not aim a new candidate, transform, or search schedule at it: that ground is
+already won and there is nothing left there to take. The remaining leverage is
+`gt_10k` (geomean 0.7748 at weight **0.40**) — the matrices the portfolio **already
+beats AMD on** — where the question is how to beat AMD/AMF *further*, not how to
+cover a blind spot.
+
 ## Links
 - Literature: _(add Amestoy-Davis-Duff 1996 note)_
 - Compare: [nested-dissection.md](nested-dissection.md)

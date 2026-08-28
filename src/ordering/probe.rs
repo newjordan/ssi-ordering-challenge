@@ -791,7 +791,7 @@ fn probe_relabel_budget() {
 
         let rmax = POLICIES
             .iter()
-            .map(|&(b, c)| relabel_restarts(b, c, n, nnz))
+            .map(|&(b, c)| relabel_restarts(b, c, n, nnz, probe_max_deg(pat)))
             .max()
             .unwrap_or(0);
 
@@ -821,7 +821,7 @@ fn probe_relabel_budget() {
         cur.0[bkt] += (cur_flops / base).ln();
         cur.1[bkt] += 1;
         for (pi, &(bd, cap)) in POLICIES.iter().enumerate() {
-            let r = relabel_restarts(bd, cap, n, nnz);
+            let r = relabel_restarts(bd, cap, n, nnz, probe_max_deg(pat));
             let f = best_after[r];
             pol[pi].0[bkt] += (f / base).ln();
             pol[pi].1[bkt] += 1;
@@ -1031,7 +1031,7 @@ fn probe_relabel_structured() {
 
         let start_perm = order(pat);
         let cur_flops = flops_of(&sp, &start_perm) as f64;
-        let rmax = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz);
+        let rmax = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, probe_max_deg(pat));
 
         // One AMD pass on relabeling q; returns (flops, perm) if valid.
         let try_q = |q: &[usize]| -> Option<(f64, Vec<usize>)> {
@@ -1174,7 +1174,7 @@ fn probe_relabel_schedule() {
 
         let start_perm = order_with_relabel_cap(pat, 0);
         let start_flops = flops_of(&sp, &start_perm) as f64;
-        let rmax = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz);
+        let rmax = relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, probe_max_deg(pat));
 
         let try_q = |q: &[usize]| -> Option<(f64, Vec<usize>)> {
             let b = permute_pattern(&sp, q);
@@ -3773,4 +3773,8 @@ fn probe_biconn_heavy() {
     for (name, n, nnz, r) in win_rows.iter().take(50) {
         println!("WIN\t{name}\t{n}\t{nnz}\t{r:.4}");
     }
+}
+
+fn probe_max_deg(pat: &Pattern) -> usize {
+    (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
 }

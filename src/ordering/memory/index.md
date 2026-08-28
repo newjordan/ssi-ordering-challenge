@@ -3,8 +3,23 @@
 The map of the knowledge base. One line per page, grouped by type. Read this
 first; keep it current whenever you add, rename, or retire a page.
 
+## Ready to ship, waiting on a carrier
+
+Changes that are **pre-verified and score-neutral**, so they cannot be submitted on
+their own (a submission must *strictly* beat the frontier — a 0.00% diff is rejected,
+which is exactly the frontier holder's own recent streak). Attach the next one of
+these to the next scoring win, at zero extra measurement cost:
+
+- **`RELABEL_BUDGET` 300_000 → 150_000.** Score **identical** (0.842722, every bucket
+  unchanged) and worst-case `order()` **1.858 s → 1.832 s**, i.e. +0.026 s of margin
+  against the 2.0 s SIGKILL. Measured in the 8-policy sweep in
+  [0017](experiments/0017-relabel-budget-saturation.md). Matters because the shipped
+  frontier config runs at **93% of the cap** while local run-to-run variance is
+  recorded at ~1.6× and grader timing is invisible — a FAIL scores nothing at all,
+  not merely worse. One-line change; do not re-measure, just carry it.
+
 ## Current best
-- Best score: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -74,11 +89,15 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
 - [best-of-portfolio.md](techniques/best-of-portfolio.md) — **the architecture**: why
   the AMD anchor makes every candidate free upside, and why the real problem is
   the time budget. Read this first.
-- [amd.md](techniques/amd.md) — the anchor (score 1.00 by definition); strong on dense KKT.
+- [amd.md](techniques/amd.md) — the anchor (score 1.00 by definition); strong on dense KKT. Now also
+  carries the **measured optimality** result: the tie class is **floor-limited**, not method- or
+  budget-limited (0012 exact DP at n≤24, 0018's 125×-depth census, 0016's orthogonal family) — so do
+  NOT aim a new candidate or transform at the ties; leverage is `gt_10k` at weight 0.40.
 - [nested-dissection.md](techniques/nested-dissection.md) — the separator family; in the
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
 - [0001-amd-quotient-graph.md](experiments/0001-amd-quotient-graph.md) — AMD port; matched the baseline. **Superseded**: that hand-rolled `amd.rs` is no longer in the tree.
@@ -122,6 +141,71 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   documented intent REGRESSED gt_10k — those 7 variants do win on the gate-wall matrices. And a
   systemic correction: the "`nnz<130000` is below the slow tier" premise in **eleven** doc comments
   is refuted — 130k is where cost is MAXIMAL (`ringpack_30_2`, nnz=121458, is the worst matrix).
+
+- [0014-ndfm-amd-leaves.md](experiments/0014-ndfm-amd-leaves.md) — **NEGATIVE, reverted; dev
+  0.842722→0.842722 (byte-identical in all three buckets).** Closed the ND-leaf lead: half its
+  premise was already false (`nd_order_impl` carries `amd_leaves` and BOTH forms already ship), and
+  giving `ndfm` the same AMD leaves bought exactly zero, because `nd_order`'s gate nearly subsumes
+  ndfm's so the best-of floor already held an equal-or-better candidate wherever an AMD leaf wins.
+  0010b in reverse: **quality inside an already-covered family pays nothing; only new blind spots
+  do.** Reverted on cost, since a zero-gain candidate still spends the scarce resource. Carries two
+  operational findings that outlive the experiment: (a) `PROVENANCE.txt`'s "worst ~0.55 s" is stale
+  — the untouched frontier tree measures **worst `order()` = 1.852 s against the 2.0 s cap**, and
+  the matrix holding that worst case earns it (`ringpack_30_2`, ratio 0.3017), so timing it out
+  costs **+0.0084** of score while `faclay75`/`nuclear104` burn >1.1 s each for ratio exactly
+  1.0000; (b) the cap is unguarded wall-clock, so a scored run on a loaded host fails spuriously
+  AND misattributes the breach to the ordering code — this change "breached" on `ex8_4_1` (n=32)
+  which an isolated probe times at 0.0000 s, with the box at 15-min load average 19.07.
+
+- [0015-zero-return-time-attribution.md](experiments/0015-zero-return-time-attribution.md) — **MEASUREMENT,
+  actionable lead.** Phase attribution on the nine highest-time / ratio-1.0000 matrices: the relabel
+  multi-start is the entire reclaimable cost (ORBIT/PHARMAKOS ≤0.03 s) and changes their ratio by
+  **exactly nothing** (0.017–0.336 s each, `faclay75` biggest). Headline is **`ringpack_30_2`**, which
+  holds both the corpus worst case (1.827 s) and its largest win (0.3017): the multi-start contributes
+  ZERO to that ratio while spending 0.153 s — so trimming it there is score-neutral BY MEASUREMENT and
+  buys 8% of the worst case, the largest score-at-risk item (+0.0084 if a slower grader times it out).
+  Not shipped: needs a gate that predicts the tie before paying for it; two discriminators recorded.
+
+- [0016-spectral-fiedler-nd.md](experiments/0016-spectral-fiedler-nd.md) — **NEGATIVE, reverted; dev
+  0.842722→0.842722.** A genuinely NEW family (spectral/Fiedler bisection — nothing shipping uses the
+  graph's algebraic structure) bought **exactly zero**, never the argmin anywhere, and NOT for want of
+  coverage: the gate admitted **260/300** matrices incl. **88 of the 100 at ratio ≥0.995**. Worst
+  `order()` 1.852→1.829 s, so affordable and still worthless. **Answers "does candidate diversity
+  saturate?"** — 0010b's still-climbing 25-variant curve was measured against an AMD-only baseline;
+  against the real portfolio a new orthogonal method adds nothing, so "candidate generation is the
+  whole game" does NOT hold for what we ship. With 0014 (quality inside a covered family: also zero)
+  that is two zeros from opposite directions, leaving [0015](experiments/0015-zero-return-time-attribution.md)'s
+  REALLOCATION lead as the live one. Implementation preserved outside the checkout.
+
+- [0017-relabel-budget-saturation.md](experiments/0017-relabel-budget-saturation.md) — **NEGATIVE,
+  conclusive + a fragility finding.** The random multi-start budget is saturated BOTH ways: 3× budget /
+  4× cap buys 0.000025 of score while pushing worst_s to **1.986 s against the 2.0 s SIGKILL**, and
+  HALVING it costs **exactly zero** while returning 0.026 s of margin — the shipped 300 000 is past
+  diminishing returns. Also corrects 0015: the cap is PER MATRIX, so cross-matrix reallocation is
+  impossible by construction. **Incumbent fragility:** the shipped frontier config's worst case is
+  1.858 s of 2.0 s (7% margin) against a recorded ~1.6× local variance — a FAIL scores nothing at all.
+  The free 150 000 fix cannot ship alone (score-neutral submissions are rejected at 0.00%); bank it as
+  a free rider. With 0014 and 0016 this is **three lever types, three zeros** — the portfolio is at a
+  local optimum none of them moves, matching the frontier holder's 12 consecutive 0.00% rejections.
+
+- [0018-headroom-census.md](experiments/0018-headroom-census.md) — **CONCLUSIVE NEGATIVE; retires the
+  near-AMD-mass premise.** ~125x the shipped search depth (3000 seeds x AMD+AMF, ~546k orderings) on
+  all 91 matrices at ratio >=0.995 improved only **3**, two negligible; the one real gain was found at
+  seed 2666, unreachable within the cap. With 0016 (orthogonal family, never the argmin on 88 of the
+  same matrices) this says AMD is at/near OPTIMAL on that class — 0012's n<=24 proof generalises far
+  further up. **The ties are immovable and the depth is saturated (0017), so remaining leverage is
+  `gt_10k` (0.7748 @ weight 0.40) — matrices we already WIN — not the ties.** Flops-only, so it ran
+  with the box saturated (24 threads, 390-900% CPU); probe preserved outside the checkout.
+
+- [0019-mid-band-restart-floor.md](experiments/0019-mid-band-restart-floor.md) — **WIN, dev
+  0.842722→0.842584** (fill 0.949319→0.949068), worst `order()` 1.852→**1.796 s**. Turning 0018's
+  census on the WINNERS found 15 of 100 improve (Σln −0.28279) vs the ties' 3 of 91 — leverage is in
+  `gt_10k`. The 30k–150k nnz band is seed-STARVED (2–9 restarts while 50–94 pay) with 0.6–1.4 s idle.
+  **Hub gate is the trick:** `ringpack_30_2` (worst case, no slack) is an (n,nnz)-TWIN of
+  `crudeoil_lee4_10`, separable only by **max degree 1632 vs 168** — which is also the mechanism, since
+  a hub that size is why its restarts cost. 4 better / **1 worse** / 296 same. **NOT monotone on
+  score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
+  blindly.
 
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
