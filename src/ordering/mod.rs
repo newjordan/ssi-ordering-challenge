@@ -168,6 +168,17 @@ mod alloc_probe;
 /// best-of floor.
 mod custom_metrics;
 
+/// Generic quotient-graph pivot-score family (shot C) — SHIPPED, not
+/// test-gated. `order_generic` drives a parameterized MetricSpec through
+/// `feral_ordering_core::quotient_graph`'s near-linear machinery, and
+/// `EXTRA_METRICS` is the 15-spec greedy forward-selection (picks #8-#22
+/// of a 42-point grid) the `sbx-metrics2` research sweep found still
+/// moves the score on top of the 7 `custom_metrics` variants already
+/// shipped. Per the module's own doc, the 30-variant combined selection
+/// flattens the portfolio from 0.840926 (top-7) to 0.840468 — strictly
+/// better, no candidate can make the score worse.
+mod metric_sweep;
+
 /// Reusable per-`order()`-call scoring/permutation workspace — allocates the
 /// ~15 buffers `flops_of`/`permute_pattern` need exactly ONCE per matrix and
 /// reuses them across every candidate, restart, and hill-climb step. See its
@@ -1715,6 +1726,29 @@ fn order_with_options(
                 custom_metrics::ScoreVariant::DegSqrt,
             ] {
                 consider(&|| custom_metrics::order_variant(&core, 10.0, true, variant));
+            }
+        }
+
+        // SHOT C: the next 15 positive-marginal specs (picks #8-#22 of the
+        // 42-point grid) beyond the 7 already shipped as `custom_metrics`.
+        // Same "world" as WIN F (raw-degree write-back, never the saturated-
+        // RMF branch implicated in the `AmindNorm` cost cliff), same
+        // gate (`nnz < WINF_MAX_NNZ`, already-active in this block), each
+        // gated by a greedy forward-selection against the real portfolio on
+        // the 427-matrix reconstructed corpus. Per the `metric_sweep.rs`
+        // module doc, the 30-variant combined selection flattens the
+        // portfolio from 0.840926 (top-7) to 0.840468 on the reconstructed
+        // corpus — strictly better, no candidate can raise a per-matrix
+        // ratio under the best-of floor. Cost is the same AMF-class pass
+        // already paid for by the WIN F block above: each `order_generic`
+        // call is one elimination walk on the same `core`, so the per-pass
+        // cost is identical to a custom-metrics variant. Best-of floor →
+        // zero downside.
+        if nnz < WINF_MAX_NNZ {
+            for spec in metric_sweep::EXTRA_METRICS.iter() {
+                consider(&|| {
+                    metric_sweep::order_generic(&core, 10.0, true, spec)
+                });
             }
         }
     } else if n < AMF_SWEEP_MAX_N && nnz >= 130_000 && nnz < 400_000 {
