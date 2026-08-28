@@ -837,6 +837,34 @@ pub(crate) fn stream_params(k: usize) -> Params {
     p
 }
 
+/// Diverse search policies for subtree refinement streams:
+/// Stream 0: pure min-degree
+/// Stream 1: slack-1
+/// Stream 2: min-deficiency (slack-1 + fill tiebreak)
+/// Stream 3: slack-2
+pub(crate) fn sub_stream_params(k: usize) -> Params {
+    let mut p = Params::DEFAULT;
+    match k % 4 {
+        0 => {
+            p.prefix_mode = 1;
+            p.pol_mask = 0b0000_0001; // pure min-degree
+        }
+        1 => {
+            p.prefix_mode = 0;
+            p.pol_mask = 0b0000_0010; // slack-1
+        }
+        2 => {
+            p.prefix_mode = 2;
+            p.pol_mask = 0b0000_1000; // min-deficiency (slack-1 + fill tiebreak)
+        }
+        _ => {
+            p.prefix_mode = 1;
+            p.pol_mask = 0b0000_0100; // slack-2
+        }
+    }
+    p
+}
+
 /// Run `threads` INDEPENDENT searches concurrently and return the best.
 ///
 /// Each stream is a pure function of `(pattern, seed, params, budget)` with no
@@ -1059,6 +1087,46 @@ pub(crate) fn adjacent_pair_descent(
 /// must still re-score `perm` through the trusted scorer and keep it only on a
 /// strict improvement.
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct SubtreeCand {
+    start: usize,
+    root: usize,
+    size: usize,
+    flop_mass: u64,
+}
+
+/// Re-order the inside of elimination-tree SUBTREES of a postordered incumbent.
+///
+/// ## Why a subtree is an exactly-separable subproblem
+///
+/// Let `S` be the vertex set of a subtree of the elimination tree of `perm`.
+/// Two standard facts make the inside of `S` independently optimizable:
+///
+/// 1. `col_F(v)` — hence `c_v` — depends only on `v`'s DESCENDANTS in the etree
+///    (Liu's reachable-set characterisation: `w ∈ col_F(v)` iff `w` is reachable
+///    from `v` through vertices eliminated earlier, and those are exactly `v`'s
+///    descendants). A subtree is closed under descendants, so for `v ∈ S` the
+///    whole computation lives inside `S ∪ N_A(S)` and no vertex eliminated
+///    before `S`'s block can touch it.
+/// 2. The fill graph after eliminating a SET does not depend on the order
+///    within the set. So everything ABOVE the subtree root — every `c_w` for
+///    `w ∉ S` — is unchanged by any internal reordering.
+///
+/// Therefore `Σ_j c_j²` splits as `(fixed part) + Σ_{v∈S} c_v²`, and any
+/// improvement found inside `S` is a global improvement of exactly the same
+/// size. That is what makes this affordable on `gt_10k`: the search never sees
+/// the whole matrix, only a block of a few hundred to a few thousand vertices
+/// plus its boundary.
+///
+/// `perm` MUST be postordered with respect to its own elimination tree (which
+/// leaves `Σ c_j²` unchanged), so that each subtree occupies a CONTIGUOUS range
+/// of positions `[j - size(j) + 1, j]` — otherwise reordering inside `S` would
+/// also move non-`S` vertices across `S`'s members and fact 1 would not apply.
+///
+/// Returns the number of blocks improved; `perm` is edited in place. The caller
+/// must still re-score `perm` through the trusted scorer and keep it only on a
+/// strict improvement.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn subtree_refine(
     n: usize,
     col_ptr: &[usize],
@@ -1079,70 +1147,212 @@ pub(crate) fn subtree_refine(
         }
     }
 
-    // ── pick disjoint blocks, topmost-eligible first ────────────────────────
-    // Descending position order visits ancestors before descendants, so the
-    // first eligible node on any root-to-leaf path wins and everything below it
-    // is marked covered. Deterministic: a plain descending scan, no tie-breaks.
+    // ── collect candidate subtrees and rank by FLOP yield / mass ────────────
+    let mut cands: Vec<SubtreeCand> = Vec::new();
+    for j in 0..n {
+        let sz = size[j] as usize;
+        if sz >= cfg.min_s && sz <= cfg.max_s {
+            let a = j + 1 - sz;
+            let flop_mass: u64 = counts[a..=j]
+                .iter()
+                .map(|&c| {
+                    let c = c as u64;
+                    c * c
+                })
+                .sum();
+            cands.push(SubtreeCand {
+                start: a,
+                root: j,
+                size: sz,
+                flop_mass,
+            });
+        }
+    }
+
+    // Sort candidate subtrees by FLOP mass descending (highest yield first),
+    // breaking ties deterministically by subtree size, then start position.
+    cands.sort_unstable_by(|a, b| {
+        b.flop_mass
+            .cmp(&a.flop_mass)
+            .then_with(|| b.size.cmp(&a.size))
+            .then_with(|| a.start.cmp(&b.start))
+    });
+
+    // ── pick disjoint candidate blocks (highest yield first) ───────────────
     let mut covered = vec![false; n];
     let mut blocks: Vec<(usize, usize)> = Vec::new();
-    for j in (0..n).rev() {
-        if covered[j] {
+
+    for cand in cands {
+        let a = cand.start;
+        let b = cand.root;
+
+        let mut overlap = false;
+        for &c in &covered[a..=b] {
+            if c {
+                overlap = true;
+                break;
+            }
+        }
+        if overlap {
             continue;
         }
-        let sz = size[j] as usize;
-        if sz < cfg.min_s || sz > cfg.max_s {
-            continue;
-        }
-        let a = j + 1 - sz;
-        for c in covered.iter_mut().take(j + 1).skip(a) {
+
+        for c in &mut covered[a..=b] {
             *c = true;
         }
-        blocks.push((a, j));
+        blocks.push((a, b));
         if blocks.len() >= cfg.max_blocks {
             break;
         }
     }
+
     if blocks.is_empty() {
         return 0;
     }
 
-    // ── search the blocks, in parallel over BLOCKS ──────────────────────────
-    // Blocks are disjoint position ranges and each builds its own local
-    // subgraph from the ORIGINAL pattern, so there is no shared mutable state:
-    // the threads only READ `perm` and return `(start, new order)` pairs that
-    // are applied afterwards to disjoint ranges. Completion order therefore
-    // cannot affect the result. Parallelising over blocks rather than over
-    // search streams is the cheaper axis — a block's search is short, and this
-    // way all four vCPUs stay busy even on a matrix with one big block set.
-    let nthreads = super::parallel::PAR_MAX_THREADS.max(1).min(blocks.len());
+    // ── search the blocks in parallel with dynamic load balancing ───────────
+    let nthreads = super::parallel::PAR_MAX_THREADS.max(1);
     let perm_ro: &[usize] = perm;
-    let blocks_ro: &[(usize, usize)] = &blocks;
-    let parts: Vec<Vec<(usize, Vec<usize>)>> = std::thread::scope(|sc| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|t| {
-                sc.spawn(move || {
-                    let mut local: Vec<u32> = vec![u32::MAX; n];
-                    let mut touched: Vec<usize> = Vec::new();
-                    let mut verts: Vec<usize> = Vec::new();
-                    let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
-                    let mut bi = t;
-                    while bi < blocks_ro.len() {
-                        let (a, b) = blocks_ro[bi];
-                        bi += nthreads;
-                        let ssz = b + 1 - a;
-                        verts.clear();
-                        for &c in touched.iter() {
-                            local[c] = u32::MAX;
+    let max_w = cfg.max_sub.div_ceil(64);
+    let max_adj_words = cfg.max_sub * max_w;
+
+    let parts: Vec<Vec<(usize, Vec<usize>)>> = if blocks.len() >= nthreads {
+        let mut sorted_blocks = blocks.clone();
+        sorted_blocks.sort_by_key(|&(a, b)| std::cmp::Reverse(b + 1 - a));
+        let next_block = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..nthreads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut local: Vec<u32> = vec![u32::MAX; n];
+                        let mut touched: Vec<usize> = Vec::new();
+                        let mut verts: Vec<usize> = Vec::new();
+                        let mut adj0: Vec<u64> = vec![0u64; max_adj_words];
+                        let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
+
+                        loop {
+                            let bi = next_block.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if bi >= sorted_blocks.len() {
+                                break;
+                            }
+                            let (a, b) = sorted_blocks[bi];
+                            let ssz = b + 1 - a;
+                            verts.clear();
+                            for &c in touched.iter() {
+                                local[c] = u32::MAX;
+                            }
+                            touched.clear();
+
+                            for &v in &perm_ro[a..=b] {
+                                local[v] = verts.len() as u32;
+                                touched.push(v);
+                                verts.push(v);
+                            }
+                            for i in 0..ssz {
+                                let v = verts[i];
+                                for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
+                                    if u < n && local[u] == u32::MAX {
+                                        local[u] = verts.len() as u32;
+                                        touched.push(u);
+                                        verts.push(u);
+                                    }
+                                }
+                            }
+                            let m = verts.len();
+                            if m > cfg.max_sub || m > MAX_N {
+                                continue;
+                            }
+
+                            let w = m.div_ceil(64);
+                            adj0[..m * w].fill(0);
+                            for (li, &v) in verts.iter().enumerate() {
+                                for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
+                                    if u >= n {
+                                        continue;
+                                    }
+                                    let lu = local[u];
+                                    if lu == u32::MAX || lu as usize == li {
+                                        continue;
+                                    }
+                                    let lu = lu as usize;
+                                    adj0[li * w + (lu >> 6)] |= 1u64 << (lu & 63);
+                                    adj0[lu * w + (li >> 6)] |= 1u64 << (li & 63);
+                                }
+                            }
+
+                            let seed_flops: u64 = counts[a..=b]
+                                .iter()
+                                .map(|&c| {
+                                    let c = c as u64;
+                                    c * c
+                                })
+                                .sum();
+                            let seed: Vec<usize> = (0..ssz).collect();
+                            let mut best: Option<(Vec<usize>, u64)> = None;
+                            for k in 0..cfg.streams.max(1) {
+                                let r = search_with_nelim(
+                                    m,
+                                    &adj0[..m * w],
+                                    ssz,
+                                    &seed,
+                                    seed_flops,
+                                    cfg.budget,
+                                    stream_rng(k),
+                                    sub_stream_params(k),
+                                );
+                                if let Some((o, f)) = r {
+                                    if best.as_ref().is_none_or(|(_, bf)| f < *bf) {
+                                        best = Some((o, f));
+                                    }
+                                }
+                            }
+                            if let Some((ord, _)) = best {
+                                if ord.len() == ssz {
+                                    got.push((a, ord.iter().map(|&li| verts[li]).collect()));
+                                }
+                            }
                         }
-                        touched.clear();
-                        // S first, in incumbent block order: the seed order is
-                        // then the identity, and local id i is position a + i.
+                        got
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    } else {
+        // Dynamic fan-out of search streams across worker threads when B < PAR_MAX_THREADS
+        let num_blocks = blocks.len();
+        let mut sorted_blocks = blocks.clone();
+        sorted_blocks.sort_by_key(|&(a, b)| std::cmp::Reverse(b + 1 - a));
+        let sorted_blocks_ro: &[(usize, usize)] = &sorted_blocks;
+
+        let tasks: Vec<(usize, usize)> = match num_blocks {
+            1 => (0..4).map(|k| (0, k)).collect(),
+            2 => vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+            3 => vec![(0, 0), (0, 1), (1, 0), (2, 0)],
+            _ => (0..num_blocks).map(|bi| (bi, 0)).collect(),
+        };
+
+        let stream_results: Vec<Option<(usize, usize, u64, Vec<usize>)>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = tasks
+                .iter()
+                .copied()
+                .map(|(bi, stream_idx)| {
+                    sc.spawn(move || {
+                        let (a, b) = sorted_blocks_ro[bi];
+                        let ssz = b + 1 - a;
+                        let mut local: Vec<u32> = vec![u32::MAX; n];
+                        let mut touched: Vec<usize> = Vec::new();
+                        let mut verts: Vec<usize> = Vec::new();
+
                         for &v in &perm_ro[a..=b] {
                             local[v] = verts.len() as u32;
                             touched.push(v);
                             verts.push(v);
                         }
-                        // Boundary: original-graph neighbours of S outside S.
                         for i in 0..ssz {
                             let v = verts[i];
                             for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
@@ -1155,10 +1365,9 @@ pub(crate) fn subtree_refine(
                         }
                         let m = verts.len();
                         if m > cfg.max_sub || m > MAX_N {
-                            continue;
+                            return None;
                         }
 
-                        // Induced adjacency over S u boundary, as bitsets.
                         let w = m.div_ceil(64);
                         let mut adj0 = vec![0u64; m * w];
                         for (li, &v) in verts.iter().enumerate() {
@@ -1176,7 +1385,6 @@ pub(crate) fn subtree_refine(
                             }
                         }
 
-                        // The block's exact contribution to the global objective.
                         let seed_flops: u64 = counts[a..=b]
                             .iter()
                             .map(|&c| {
@@ -1185,39 +1393,50 @@ pub(crate) fn subtree_refine(
                             })
                             .sum();
                         let seed: Vec<usize> = (0..ssz).collect();
-                        let mut best: Option<(Vec<usize>, u64)> = None;
-                        for k in 0..cfg.streams.max(1) {
-                            let r = search_with_nelim(
-                                m,
-                                &adj0,
-                                ssz,
-                                &seed,
-                                seed_flops,
-                                cfg.budget,
-                                stream_rng(k),
-                                stream_params(k),
-                            );
-                            if let Some((o, f)) = r {
-                                if best.as_ref().is_none_or(|(_, bf)| f < *bf) {
-                                    best = Some((o, f));
-                                }
-                            }
-                        }
-                        if let Some((ord, _)) = best {
+
+                        let r = search_with_nelim(
+                            m,
+                            &adj0,
+                            ssz,
+                            &seed,
+                            seed_flops,
+                            cfg.budget,
+                            stream_rng(stream_idx),
+                            sub_stream_params(stream_idx),
+                        );
+
+                        if let Some((ord, flops)) = r {
                             if ord.len() == ssz {
-                                got.push((a, ord.iter().map(|&li| verts[li]).collect()));
+                                let global_ord: Vec<usize> = ord.iter().map(|&li| verts[li]).collect();
+                                return Some((bi, stream_idx, flops, global_ord));
                             }
                         }
-                    }
-                    got
+                        None
+                    })
                 })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+
+        let mut best_per_block: Vec<Option<(u64, usize, usize, Vec<usize>)>> = vec![None; num_blocks];
+        for res in stream_results.into_iter().flatten() {
+            let (bi, stream_idx, flops, ord) = res;
+            let (a, _) = sorted_blocks[bi];
+            if best_per_block[bi].as_ref().is_none_or(|(bf, bs, _, _)| flops < *bf || (flops == *bf && stream_idx < *bs)) {
+                best_per_block[bi] = Some((flops, stream_idx, a, ord));
+            }
+        }
+
+        let mut got = Vec::new();
+        for item in best_per_block.into_iter().flatten() {
+            let (_, _, a, ord) = item;
+            got.push((a, ord));
+        }
+        vec![got]
+    };
 
     let mut improved = 0usize;
     for part in parts {
@@ -1246,4 +1465,77 @@ pub(crate) struct SubCfg {
     /// Streams per block (sequential here; the caller parallelises over
     /// blocks, which is the coarser and cheaper axis).
     pub(crate) streams: usize,
+}
+
+/// Adaptive Tiered Subtree Configuration based on matrix size $n$ and sparsity $nnz/n$.
+pub(crate) fn rgsub_config(n: usize, nnz: usize) -> (usize, SubCfg) {
+    let avg_deg = if n > 0 { nnz as f64 / n as f64 } else { 0.0 };
+    if n >= 100_000 {
+        // Very large matrices: 2 rounds, bounded block count to control memory/etree cost
+        (
+            2,
+            SubCfg {
+                min_s: 32,
+                max_s: 600,
+                max_sub: 2_500,
+                max_blocks: 64,
+                budget: 3_000_000,
+                streams: 4,
+            },
+        )
+    } else if n >= 10_000 {
+        if avg_deg <= 8.0 {
+            // gt_10k Sparse: deep trees, narrow separators, high leverage
+            (
+                3,
+                SubCfg {
+                    min_s: 20,
+                    max_s: 800,
+                    max_sub: 3_200,
+                    max_blocks: 80,
+                    budget: 4_500_000,
+                    streams: 4,
+                },
+            )
+        } else {
+            // gt_10k Medium
+            (
+                2,
+                SubCfg {
+                    min_s: 32,
+                    max_s: 500,
+                    max_sub: 2_500,
+                    max_blocks: 64,
+                    budget: 3_500_000,
+                    streams: 4,
+                },
+            )
+        }
+    } else if n >= 1_000 {
+        // 1k_10k Band
+        (
+            2,
+            SubCfg {
+                min_s: 24,
+                max_s: 600,
+                max_sub: 3_000,
+                max_blocks: 80,
+                budget: 3_500_000,
+                streams: 4,
+            },
+        )
+    } else {
+        // Small band: 500 <= n < 1000
+        (
+            1,
+            SubCfg {
+                min_s: 24,
+                max_s: 350,
+                max_sub: 1_200,
+                max_blocks: 32,
+                budget: 2_500_000,
+                streams: 4,
+            },
+        )
+    }
 }
