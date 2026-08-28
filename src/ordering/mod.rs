@@ -1293,6 +1293,18 @@ fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
         // the third seed (see `telos_extra_fullgrid`).
         return 3;
     }
+    // Regime D (re-opened on the 4-thread carrier): the sparse half of the
+    // 55k–150k Tier-A middle. The band was closed when full-grid extras cost
+    // +0.24–0.37 s/matrix single-threaded; on the parallel carrier the same
+    // extras measure +0.05–0.10 s. The density guard `nnz <= 4n` keeps the
+    // crudeoil_lee4 cost class (avg deg 5.3–6.8, zero measured gain) out
+    // while admitting the class of `gasprod_sarawak81` (avg deg 3.4), whose
+    // full-grid extras measure 0.9934 → 0.9198 on the current tree — a win
+    // that did NOT exist pre-carrier (it measured as a small LOSS
+    // single-threaded): a closed lane whose closing reason was removed.
+    if (55_000..150_000).contains(&nnz) && hub_safe && nnz <= 4 * n {
+        return 3;
+    }
     if (150_000..=170_000).contains(&nnz) && hub_safe {
         return 2;
     }
@@ -1314,7 +1326,14 @@ fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
 /// regressions (`ndcc12` 0.9601→0.9649 at K=3 full), and C's winner
 /// (`nuclear10a`) reaches its basin identically under either grid at K=2.
 fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize) -> bool {
-    nnz > 20_000 && nnz <= 55_000 && max_deg.saturating_mul(50) <= n
+    let hub_safe = max_deg.saturating_mul(50) <= n;
+    if nnz > 20_000 && nnz <= 55_000 && hub_safe {
+        return true;
+    }
+    // Regime D — see `telos_extra_seeds`: the sparse (nnz <= 4n) half of the
+    // 55k–150k middle, whose measured win (`gasprod_sarawak81` 0.9934→0.9198)
+    // exists only under the full grid.
+    (55_000..150_000).contains(&nnz) && hub_safe && nnz <= 4 * n
 }
 
 /// Offer one scored candidate to the TELOS seed pool: keep the `cap` best by
