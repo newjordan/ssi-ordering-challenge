@@ -916,7 +916,7 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
 }
 
 const PAIR_DESCENT_MIN_N: usize = 1_000;
-const PAIR_DESCENT_MAX_N: usize = 4_000;
+const PAIR_DESCENT_MAX_N: usize = 10_000;
 const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 // Spend the stranded per-matrix slack on the newest phase. The 2 s cap is
 // charged per matrix; the grader's own Actions log for the promoting run shows
@@ -4339,7 +4339,7 @@ fn order_with_options(
     // (n = 8) is the SLOWEST matrix under n = 1000 at 0.664 s -- worse than any
     // matrix in the 1k-4k band. Below this bound the floor buys nothing and
     // costs the most, so it is simply not applied.
-    const RGREEDY_SLACK_MIN_N: usize = 64;
+    const RGREEDY_SLACK_MIN_N: usize = 256;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
