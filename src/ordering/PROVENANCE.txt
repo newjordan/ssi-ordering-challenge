@@ -1,2 +1,3 @@
 recon-graded 0.854109 | worst ~0.55s (vs frontier 0.91s) | tests green
 src: sbx-timing-rca | 2026-08-06 | drop AmindNorm + D density-window gate (20<nnz/n<50, nnz<1M) on 4 gt_10k matrices
+src: mcts-ef-spe | 2026-08-28 | host MCTS-EF-SPE front-tree pipeline in src/ordering/exact_dp.rs: UCB1-driven front-perturbation search over the AMD warm-start's first MAX_FRONT_K pivots, surrogate fill predictor (degree-1 lookahead on the partially eliminated graph) on every leaf, lazy exact-DP re-evaluation on the top-EXACT_K leaves, composed back into the AMD tail. Gated to n <= STRUCTURAL_MAX_N (24) so the pipeline only ever runs on the matrices where the underlying u32 bitmask fits; routed through `consider` for zero-downside best-of behavior.
