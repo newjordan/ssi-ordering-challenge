@@ -3421,13 +3421,13 @@ fn probe_stack() {
         let full = order(pat);
         let f_full = flops_of(&sp, &full) as f64;
 
-        let no_orbit = order_with_options(pat, usize::MAX, false, true);
+        let no_orbit = order_with_options(pat, usize::MAX, false, true, true);
         let f_no_orbit = flops_of(&sp, &no_orbit) as f64;
 
-        let no_pharmakos = order_with_options(pat, usize::MAX, true, false);
+        let no_pharmakos = order_with_options(pat, usize::MAX, true, false, true);
         let f_no_pharmakos = flops_of(&sp, &no_pharmakos) as f64;
 
-        let neither = order_with_options(pat, usize::MAX, false, false);
+        let neither = order_with_options(pat, usize::MAX, false, false, true);
         let f_neither = flops_of(&sp, &neither) as f64;
 
         let this_orbit_fired = f_full < f_no_orbit - 0.5;
@@ -3777,4 +3777,444 @@ fn probe_biconn_heavy() {
 
 fn probe_max_deg(pat: &Pattern) -> usize {
     (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MID-BAND ARM (arm/midband). The 1k_10k bucket plus the light end of gt_10k
+// (n < 100k, nnz < 250k). Per PROBE_TIMING these matrices run at 0.07-0.85 s
+// against a 2.0 s cap, so there is real budget; and the gate constants shut
+// almost every partitioner variant off above n ≈ 5k-12k (METIS_VAR_MAX_N=5000,
+// SCOTCH_MAX_N=12000, KAHIP_MAX_N=6000, METIS_TUNED_MAX_N=21000), which is
+// exactly where the surviving ratio ≥ 0.95 families live (squfl*, emfl*,
+// supplychainr*, gasprod_*, faclay*, popdynm*, nd_netgen*, powerflow*, syn*,
+// rsyn*, p_ball*).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Labels for [`mid_perm`], in index order.
+const MID_LABELS: [&str; 58] = [
+    // AMF dense_alpha grid
+    "amf0.5", "amf1", "amf2", "amf2.5", "amf5", "amf10", "amf20", "amf-1",
+    // AMD option grid
+    "amdNoAgg", "amdA1", "amdA2.5", "amdA5", "amdA20", "amdA-1", "amdA-1NoAgg",
+    // METIS
+    "mtDef", "mtS2", "mtS3", "mtS5", "mtS21", "mtS97", "mtI02", "mtI05", "mtI10",
+    "mtI30", "mtI45", "mtW50", "mtW100", "mtW400", "mtW800", "mtP16", "mtP32",
+    "mtP64", "mtC40", "mtC300", "mtH50", "mtH95", "mtDQ",
+    // SCOTCH
+    "scDef", "scS2", "scS3", "scT10", "scT20", "scA40", "scA300", "scC40",
+    "scC300", "scI02", "scI15", "scNoCmp", "scFM",
+    // KaHIP
+    "khS1", "khS2", "khS3", "khS5", "khEco", "khStrong",
+    // MinFill
+    "minfill",
+];
+
+/// The variant at `idx`. `pat` is only needed by the MinFill index.
+fn mid_perm(
+    idx: usize,
+    core: &feral_ordering_core::CscPattern<'_>,
+    pat: &Pattern,
+) -> Option<Vec<i32>> {
+    use feral_amd::AmdOptions;
+    use feral_amf::AmfOptions;
+    use feral_kahip::{KahipMode, KahipOptions};
+    use feral_metis::MetisOptions;
+    use feral_scotch::ScotchOptions;
+    let amf = |a: f64| {
+        feral_amf::amf_order_opts(core, &AmfOptions { dense_alpha: a })
+            .ok()
+            .map(|(p, _)| p)
+    };
+    let amd = |agg: bool, a: f64| {
+        feral_amd::amd_order_opts(core, &AmdOptions { aggressive: agg, dense_alpha: a })
+            .ok()
+            .map(|(p, _)| p)
+    };
+    let mt = |o: MetisOptions| feral_metis::metis_order_full(core, &o).ok().map(|(p, _, _)| p);
+    let sc = |o: ScotchOptions| feral_scotch::scotch_order_full(core, &o).ok().map(|(p, _, _)| p);
+    let kh = |o: KahipOptions| feral_kahip::kahip_order_full(core, &o).ok().map(|(p, _, _)| p);
+    match idx {
+        0 => amf(0.5),
+        1 => amf(1.0),
+        2 => amf(2.0),
+        3 => amf(2.5),
+        4 => amf(5.0),
+        5 => amf(10.0),
+        6 => amf(20.0),
+        7 => amf(-1.0),
+        8 => amd(false, 10.0),
+        9 => amd(true, 1.0),
+        10 => amd(true, 2.5),
+        11 => amd(true, 5.0),
+        12 => amd(true, 20.0),
+        13 => amd(true, -1.0),
+        14 => amd(false, -1.0),
+        15 => mt(MetisOptions::default()),
+        16 => mt(MetisOptions { seed: 2, ..Default::default() }),
+        17 => mt(MetisOptions { seed: 3, ..Default::default() }),
+        18 => mt(MetisOptions { seed: 5, ..Default::default() }),
+        19 => mt(MetisOptions { seed: 21, ..Default::default() }),
+        20 => mt(MetisOptions { seed: 97, ..Default::default() }),
+        21 => mt(MetisOptions { max_imbalance: 0.02, ..Default::default() }),
+        22 => mt(MetisOptions { max_imbalance: 0.05, ..Default::default() }),
+        23 => mt(MetisOptions { max_imbalance: 0.10, ..Default::default() }),
+        24 => mt(MetisOptions { max_imbalance: 0.30, ..Default::default() }),
+        25 => mt(MetisOptions { max_imbalance: 0.45, ..Default::default() }),
+        26 => mt(MetisOptions { nd_to_amd_switch: 50, ..Default::default() }),
+        27 => mt(MetisOptions { nd_to_amd_switch: 100, ..Default::default() }),
+        28 => mt(MetisOptions { nd_to_amd_switch: 400, ..Default::default() }),
+        29 => mt(MetisOptions { nd_to_amd_switch: 800, ..Default::default() }),
+        30 => mt(MetisOptions { niparts: 16, fm_passes: 20, ..Default::default() }),
+        31 => mt(MetisOptions { niparts: 32, fm_passes: 30, ..Default::default() }),
+        32 => mt(MetisOptions { niparts: 64, fm_passes: 40, ..Default::default() }),
+        33 => mt(MetisOptions { coarsen_floor: 40, ..Default::default() }),
+        34 => mt(MetisOptions { coarsen_floor: 300, ..Default::default() }),
+        35 => mt(MetisOptions { two_hop_ratio_threshold: 0.50, ..Default::default() }),
+        36 => mt(MetisOptions { two_hop_ratio_threshold: 0.95, ..Default::default() }),
+        37 => mt(MetisOptions { dense_quotient_enabled: true, ..Default::default() }),
+        38 => sc(ScotchOptions::default()),
+        39 => sc(ScotchOptions { seed: 2, ..Default::default() }),
+        40 => sc(ScotchOptions { seed: 3, ..Default::default() }),
+        41 => sc(ScotchOptions { n_sep_trials: 10, ..Default::default() }),
+        42 => sc(ScotchOptions { n_sep_trials: 20, ..Default::default() }),
+        43 => sc(ScotchOptions { amd_switch: 40, ..Default::default() }),
+        44 => sc(ScotchOptions { amd_switch: 300, ..Default::default() }),
+        45 => sc(ScotchOptions { coarsen_floor: 40, ..Default::default() }),
+        46 => sc(ScotchOptions { coarsen_floor: 300, ..Default::default() }),
+        47 => sc(ScotchOptions { max_imbalance: 0.02, ..Default::default() }),
+        48 => sc(ScotchOptions { max_imbalance: 0.15, ..Default::default() }),
+        49 => sc(ScotchOptions { compress: false, ..Default::default() }),
+        50 => sc(ScotchOptions { fm_pass_cap: 64, fm_move_cap: 600, ..Default::default() }),
+        51 => kh(KahipOptions::default()),
+        52 => kh(KahipOptions { seed: 2, ..Default::default() }),
+        53 => kh(KahipOptions { seed: 3, ..Default::default() }),
+        54 => kh(KahipOptions { seed: 5, ..Default::default() }),
+        55 => kh(KahipOptions { mode: KahipMode::Eco, ..Default::default() }),
+        56 => kh(KahipOptions { mode: KahipMode::Strong, ..Default::default() }),
+        57 => Some(minfill_order(pat)),
+        _ => None,
+    }
+}
+
+/// Mid-band scope: the 1k_10k bucket plus light gt_10k.
+fn mid_in_scope(n: usize, nnz: usize) -> bool {
+    (1_000..10_000).contains(&n) || (n >= 10_000 && n < 100_000 && nnz < 250_000)
+}
+
+/// WIDE SWEEP. For every in-scope matrix whose CURRENT `order()` ratio is
+/// ≥ `MID_RATIO_FLOOR`, run every [`MID_LABELS`] candidate and print its ratio
+/// and seconds. Two TSV sections: `SWEEP` (per matrix × candidate) and `COST`
+/// (per candidate total seconds). Set `SSI_MID_FLOOR` to change the floor.
+#[test]
+#[ignore]
+fn probe_mid_sweep() {
+    let floor: f64 = std::env::var("SSI_MID_FLOOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.94);
+    let only: Option<String> = std::env::var("SSI_MID_ONLY").ok();
+    let corpus = crate::corpus::corpus();
+    let mut cost = vec![0.0f64; MID_LABELS.len()];
+    println!("\nSWEEP\tmatrix\tn\tnnz\tcur_r\tcur_s\tcand\tr\ts");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 || !mid_in_scope(n, nnz) {
+            continue;
+        }
+        if let Some(o) = &only {
+            if !name.contains(o.as_str()) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
+        ) as f64;
+        let t0 = Instant::now();
+        let cur = flops_of(&sp, &order(pat)) as f64 / base;
+        let cur_s = t0.elapsed().as_secs_f64();
+        if cur < floor {
+            continue;
+        }
+        for (i, lab) in MID_LABELS.iter().enumerate() {
+            let t = Instant::now();
+            let p = mid_perm(i, &core, pat);
+            let s = t.elapsed().as_secs_f64();
+            cost[i] += s;
+            let r = match p {
+                Some(p) => {
+                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&p, n) {
+                        flops_of(&sp, &p) as f64 / base
+                    } else {
+                        f64::NAN
+                    }
+                }
+                None => f64::NAN,
+            };
+            println!("SWEEP\t{name}\t{n}\t{nnz}\t{cur:.5}\t{cur_s:.4}\t{lab}\t{r:.5}\t{s:.4}");
+        }
+    }
+    println!("\nCOST\tcand\ttotal_s");
+    for (i, lab) in MID_LABELS.iter().enumerate() {
+        println!("COST\t{lab}\t{:.3}", cost[i]);
+    }
+}
+
+/// MINFILL GATE WALL. `MINFILL_MAX_N=3000` / `MINFILL_MAX_NNZ=12000` are the
+/// tightest gates in the portfolio, and the mid-band sweep found MinFill
+/// beating the whole shipped portfolio on `rsyn0815m02hfsg` (n=3054 — 18 nodes
+/// past the wall). This measures MinFill's ratio AND cost on every matrix up to
+/// `SSI_MF_MAX_N` (default 40000), against the current `order()` ratio, so the
+/// gate can be sized from data. Memory: `minfill_order` allocates `n*n` bytes,
+/// so n=40000 is 1.6 GB — do not raise the default without switching the
+/// membership matrix to a bitset.
+#[test]
+#[ignore]
+fn probe_minfill_wall() {
+    let max_n: usize = std::env::var("SSI_MF_MAX_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40_000);
+    let corpus = crate::corpus::corpus();
+    println!("\nMF\tmatrix\tn\tnnz\tmaxdeg\tcur_r\tmf_r\tmf_s\tgain");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 || n > max_n {
+            continue;
+        }
+        let max_deg = (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0);
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
+        ) as f64;
+        let cur = flops_of(&sp, &order(pat)) as f64 / base;
+        let t = Instant::now();
+        let p = minfill_order(pat);
+        let s = t.elapsed().as_secs_f64();
+        let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+        let r = if is_bijection(&p, n) { flops_of(&sp, &p) as f64 / base } else { f64::NAN };
+        println!(
+            "MF\t{name}\t{n}\t{nnz}\t{max_deg}\t{cur:.5}\t{r:.5}\t{s:.4}\t{:.5}",
+            cur - r
+        );
+    }
+}
+
+/// Seed-count grid at which [`probe_mid_census`] reports the running best.
+const MID_K_GRID: [usize; 13] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 200, 300];
+
+/// MID-BAND LEVERAGE CENSUS. Flops-only (no wall-clock in the measurement), so
+/// it is deterministic and safe to run on a loaded box. For every in-scope
+/// matrix it spends FAR more relabel restarts than the 2 s cap permits, across
+/// all three shipped relabel objectives (AMD, AMF α5, no-dense AMD), and
+/// reports the best it finds and the seed at which it was found — the 0019
+/// method applied to the mid band. A gain found at seed ≤ ~50 is reachable by a
+/// gate change; one found at seed 500 is not.
+///
+/// Columns: `cur_r` (shipped `order()`), then per objective the best ratio and
+/// its seed, then the overall best and the shipped restart count.
+#[test]
+#[ignore]
+fn probe_mid_census() {
+    let seeds: u64 = std::env::var("SSI_MID_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let threads: usize = std::env::var("SSI_MID_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
+    let corpus = crate::corpus::corpus();
+    let jobs: Vec<&(String, Pattern)> = corpus
+        .iter()
+        .filter(|(_, p)| p.n > 0 && mid_in_scope(p.n, p.nnz()))
+        .collect();
+    println!(
+        "\nCEN\tmatrix\tn\tnnz\tmaxdeg\tcur_r\tamd_r\tamd_seed\tamf_r\tamf_seed\tnd_r\tnd_seed\tbest_r\tgain\tshipped_restarts"
+    );
+    println!("\nPFX\tmatrix\tobj\t{}", MID_K_GRID.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("\t"));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::<String>::new());
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= jobs.len() {
+                    return;
+                }
+                let (name, pat) = jobs[i];
+                let n = pat.n;
+                let nnz = pat.nnz();
+                let max_deg =
+                    (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0);
+                let sp = scoring_pattern(pat);
+                let (cp, ri) = core_of(pat);
+                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+                let base = flops_of(
+                    &sp,
+                    &feral_amd::amd_order(&core)
+                        .unwrap()
+                        .into_iter()
+                        .map(|x| x as usize)
+                        .collect::<Vec<_>>(),
+                ) as f64;
+                let cur = flops_of(&sp, &order(pat)) as f64 / base;
+                // seed budget scaled so huge patterns do not dominate the run
+                let s_max = (3_000_000u64 / nnz.max(1) as u64).clamp(40, seeds);
+                let amf_opts = feral_amf::AmfOptions { dense_alpha: 5.0 };
+                let nd_opts =
+                    feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                let mut best = [f64::INFINITY; 3];
+                let mut bseed = [0u64; 3];
+                let mut pfx = [[f64::INFINITY; MID_K_GRID.len()]; 3];
+                for s in 1..=s_max {
+                    let q = relabel(n, s);
+                    let b = permute_pattern(&sp, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore =
+                        match feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                    let mut eval = |k: usize, pb: Vec<i32>| {
+                        let p: Vec<usize> =
+                            pb.iter().map(|&x| q[x as usize]).collect();
+                        if is_bijection(&p, n) {
+                            let r = flops_of(&sp, &p) as f64 / base;
+                            if r < best[k] {
+                                best[k] = r;
+                                bseed[k] = s;
+                            }
+                            for (gi, &g) in MID_K_GRID.iter().enumerate() {
+                                if (s as usize) <= g && best[k] < pfx[k][gi] {
+                                    pfx[k][gi] = best[k];
+                                }
+                            }
+                        }
+                    };
+                    if let Ok(p) = feral_amd::amd_order(&bcore) {
+                        eval(0, p);
+                    }
+                    if let Ok((p, _)) = feral_amf::amf_order_opts(&bcore, &amf_opts) {
+                        eval(1, p);
+                    }
+                    if let Ok((p, _)) = feral_amd::amd_order_opts(&bcore, &nd_opts) {
+                        eval(2, p);
+                    }
+                }
+                let ov = best[0].min(best[1]).min(best[2]);
+                let ship =
+                    relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg);
+                let line = format!(
+                    "CEN\t{name}\t{n}\t{nnz}\t{max_deg}\t{cur:.5}\t{:.5}\t{}\t{:.5}\t{}\t{:.5}\t{}\t{ov:.5}\t{:.5}\t{ship}",
+                    best[0], bseed[0], best[1], bseed[1], best[2], bseed[2], cur - ov
+                );
+                let mut lines = vec![line];
+                for (k, obj) in ["amd", "amf", "nd"].iter().enumerate() {
+                    let cells: Vec<String> =
+                        pfx[k].iter().map(|v| format!("{v:.5}")).collect();
+                    lines.push(format!("PFX\t{name}\t{obj}\t{}", cells.join("\t")));
+                }
+                out.lock().unwrap().extend(lines);
+            });
+        }
+    });
+    let mut v = out.into_inner().unwrap();
+    v.sort();
+    for l in v {
+        println!("{l}");
+    }
+}
+
+/// A/B FOR THE MID-BAND RELABEL EXTENSION. Runs the FULL portfolio twice per
+/// matrix in the SAME probe run — `midx_enabled = false` (the unchanged
+/// frontier) and `midx_enabled = true` — reporting ratio and seconds for each,
+/// interleaved so a drifting machine load hits both arms equally. Covers every
+/// matrix in the extension's window plus (with `SSI_AB_ALL=1`) the corpus-wide
+/// worst-case matrices, so the global worst can be checked against the
+/// frontier's own worst measured in the same run.
+#[test]
+#[ignore]
+fn probe_midx_ab() {
+    let all = std::env::var("SSI_AB_ALL").is_ok();
+    let corpus = crate::corpus::corpus();
+    println!("\nAB\tmatrix\tn\tnnz\tmaxdeg\toff_r\toff_s\ton_r\ton_s\tdr\tds");
+    let mut worst_off = (0.0f64, String::new());
+    let mut worst_on = (0.0f64, String::new());
+    let mut log_off = 0.0f64;
+    let mut log_on = 0.0f64;
+    let mut cnt = 0usize;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 {
+            continue;
+        }
+        let max_deg = (0..n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0);
+        let in_window = nnz > 60_000
+            && nnz <= MIDX_AMF_MAX_NNZ
+            && nnz <= MIDX_MAX_AVG_DEG * n
+            && max_deg <= n / MIDX_HUB_DIV;
+        if !all && !in_window {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
+        ) as f64;
+        let reps: usize = std::env::var("SSI_AB_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let mut off_s = f64::INFINITY;
+        let mut on_s = f64::INFINITY;
+        let mut off = Vec::new();
+        let mut on = Vec::new();
+        for _ in 0..reps.max(1) {
+            let t0 = Instant::now();
+            off = order_with_options(pat, usize::MAX, true, true, false);
+            off_s = off_s.min(t0.elapsed().as_secs_f64());
+            let t1 = Instant::now();
+            on = order_with_options(pat, usize::MAX, true, true, true);
+            on_s = on_s.min(t1.elapsed().as_secs_f64());
+        }
+        let off_r = flops_of(&sp, &off) as f64 / base;
+        let on_r = flops_of(&sp, &on) as f64 / base;
+        if off_s > worst_off.0 {
+            worst_off = (off_s, name.clone());
+        }
+        if on_s > worst_on.0 {
+            worst_on = (on_s, name.clone());
+        }
+        log_off += off_r.ln();
+        log_on += on_r.ln();
+        cnt += 1;
+        println!(
+            "AB\t{name}\t{n}\t{nnz}\t{max_deg}\t{off_r:.5}\t{off_s:.4}\t{on_r:.5}\t{on_s:.4}\t{:.5}\t{:.4}",
+            on_r - off_r,
+            on_s - off_s
+        );
+    }
+    println!(
+        "\nAB_SUMMARY\tn={cnt}\tgeomean_off={:.6}\tgeomean_on={:.6}\tworst_off={:.4}({})\tworst_on={:.4}({})",
+        (log_off / cnt as f64).exp(),
+        (log_on / cnt as f64).exp(),
+        worst_off.0,
+        worst_off.1,
+        worst_on.0,
+        worst_on.1
+    );
 }
