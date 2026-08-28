@@ -856,9 +856,12 @@ const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
 /// seed) was measured and is WRONG: rgreedy is seeded from `best_perm` and is
 /// seed-sensitive exactly as TELOS is, so descending first cost 6 losses on
 /// the rgreedy tier against 0 losses when the descents run last.
-const TELOS_MS_PLAN: [(u8, u8); 14] = [
+const TELOS_MS_PLAN: [(u8, u8); 17] = [
     (0, 7), (1, 2), (1, 7), (0, 2), (1, 0), (0, 6), (1, 3),
     (0, 3), (0, 0), (1, 6), (0, 1), (1, 5), (0, 4), (0, 5),
+    // Portfolio shoulder: deliberately last, so every previously measured
+    // best/AMD descent remains ahead of it at tighter work budgets.
+    (2, 7), (2, 2), (2, 0),
 ];
 
 /// Per-descent work proxy and its budget. One descent costs `passes`
@@ -913,6 +916,74 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     (TELOS_MS_WORK_BUDGET / est)
         .clamp(1, TELOS_MS_MAX_DESCENTS)
         .min(cap)
+}
+
+/// Select one near-elite portfolio ordering whose terminal structure is far
+/// from the portfolio argmin.  This is a bounded, per-matrix analogue of the
+/// diversity/shoulder archives used by MetaFlip: quality admits an item to the
+/// shortlist, while max-min structural distance decides which non-winner is
+/// preserved as a downstream search seed.
+///
+/// Only the 12 lowest-flop candidates that beat the AMD anchor participate.
+/// Distance is measured on the final 256 elimination positions, where
+/// `sum(c_j^2)` concentrates: first by suffix-set disagreement, then by exact
+/// positional disagreement.  Ties prefer lower flops and earlier source
+/// order.  The returned permutation is only a TELOS seed; every descendant is
+/// still admitted by the trusted scorer on strict improvement.
+fn portfolio_shoulder(
+    results: &[parallel::CandOut],
+    n: usize,
+    anchor_flops: u64,
+) -> Option<(u64, Vec<usize>)> {
+    let mut ranked: Vec<(u64, usize)> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let f = r.flops?;
+            (f < anchor_flops && r.perm.as_ref().is_some()).then_some((f, i))
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.truncate(12);
+    if ranked.len() < 2 {
+        return None;
+    }
+
+    let best_i = ranked[0].1;
+    let best = results[best_i].perm.as_ref()?;
+    let tail = n.min(256);
+    let start = n - tail;
+    let mut in_best_tail = vec![false; n];
+    for &v in &best[start..] {
+        if v < n {
+            in_best_tail[v] = true;
+        }
+    }
+
+    let mut chosen: Option<(usize, usize, u64, usize)> = None;
+    for &(f, i) in ranked.iter().skip(1) {
+        let Some(p) = results[i].perm.as_ref() else { continue };
+        if p.len() != n {
+            continue;
+        }
+        let set_diff = p[start..]
+            .iter()
+            .filter(|&&v| v >= n || !in_best_tail[v])
+            .count();
+        let pos_diff = p[start..]
+            .iter()
+            .zip(&best[start..])
+            .filter(|(a, b)| a != b)
+            .count();
+        let key = (set_diff, pos_diff, u64::MAX - f, usize::MAX - i);
+        if chosen.is_none_or(|old| key > old) {
+            chosen = Some(key);
+        }
+    }
+    let (_, _, inv_f, inv_i) = chosen?;
+    let f = u64::MAX - inv_f;
+    let i = usize::MAX - inv_i;
+    Some((f, results[i].perm.as_ref()?.clone()))
 }
 
 const PAIR_DESCENT_MIN_N: usize = 1_000;
@@ -3452,9 +3523,11 @@ fn order_with_options(
     // in — so `best_perm`/`best_flops` end up byte-identical to the
     // single-threaded portfolio. Nothing below this point may be queued: from
     // the hill-climb phase onwards every phase reads the incumbent.
+    let portfolio_shoulder_seed;
     {
         let mut results =
-            parallel::run_candidates(&tasks, scoring_pat, n, nnz, best_flops);
+            parallel::run_candidates_keep_all(&tasks, scoring_pat, n, nnz, best_flops);
+        portfolio_shoulder_seed = portfolio_shoulder(&results, n, anchor_flops);
         let won = parallel::accept(&mut results, &mut best_flops, &mut best_perm, |_f| {
             // TEST-ONLY: record the best flops over `consider` candidates
             // alone (excludes the AMD anchor), for the runner-up-margin
@@ -4414,13 +4487,20 @@ fn order_with_options(
         // long as the batch lives, and the acceptance below writes
         // `best_perm`.
         let seed_perm = best_perm.clone();
-        let slots: [(u64, &[usize]); 2] =
-            [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
+        let mut slots: Vec<(u64, &[usize])> =
+            vec![(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
+        if let Some((f, p)) = portfolio_shoulder_seed.as_ref() {
+            slots.push((*f, &p[..]));
+        }
         // `telos_end_flops` is where the shipped TELOS phase came to rest under
         // mode 0. On the AMD-seed gate this only suppresses a re-walk from the
         // one-round endpoint; slot 1 below is keyed by `anchor_flops`, so its
         // full AMD mode-0 continuation remains available.
-        let mut done: Vec<(u64, u8)> = vec![(telos_end_flops, 0)];
+        // Slots 0/1 retain the historical flops-based deduplication.  The
+        // shoulder gets its own tag even when its objective equals another
+        // seed: equal-score/different-structure is precisely the basin signal
+        // this archive preserves.
+        let mut done: Vec<(u64, u8, u8)> = vec![(telos_end_flops, 0, 0)];
         let mut used = 0usize;
         // WHICH descents run is decided ENTIRELY UP FRONT (arm/parallel): the
         // plan, the seed slots, the dedup key `(seed flops, mode)` and the
@@ -4436,8 +4516,11 @@ fn order_with_options(
             if used >= telos_ms {
                 break;
             }
+            if slot as usize >= slots.len() {
+                continue;
+            }
             let (sf, _) = slots[slot as usize];
-            let key = (sf, mode);
+            let key = (sf, mode, if slot >= 2 { slot } else { 0 });
             if done.contains(&key) {
                 continue;
             }
