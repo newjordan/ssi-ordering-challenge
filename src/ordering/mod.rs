@@ -716,6 +716,17 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
 
+/// Narrow, measured shape in which the portfolio runner-up reaches a TELOS
+/// basin that the incumbent misses. The runner-up replaces the incumbent as
+/// TELOS's one seed; it never adds a second descent.
+const TELOS_RANK2_MIN_N: usize = 12_000;
+const TELOS_RANK2_MAX_N: usize = 15_000;
+const TELOS_RANK2_MIN_NNZ: usize = 40_000;
+const TELOS_RANK2_MAX_NNZ: usize = 45_000;
+/// Require `(runner_up - best) / best > 0.001` using integer arithmetic.
+const TELOS_RANK2_GAP_NUM: u64 = 1;
+const TELOS_RANK2_GAP_DEN: u64 = 1_000;
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -956,6 +967,33 @@ const PHARMAKOS_BATCH_K: usize = 8;
 thread_local! {
     pub(crate) static BEST_NON_ANCHOR: std::cell::Cell<u64> =
         const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// Preserve the ordinary strict-best update while optionally retaining the
+/// best distinct runner-up. Tracking is enabled only inside the narrow
+/// rank-two TELOS shape, so every other matrix keeps the original allocation
+/// and update path. A strict new best demotes the old best without cloning.
+fn accept_with_runner_up(
+    cand: Vec<usize>,
+    f: u64,
+    track_runner_up: bool,
+    best_flops: &mut u64,
+    best_perm: &mut Vec<usize>,
+    second_flops: &mut u64,
+    second_perm: &mut Option<Vec<usize>>,
+) {
+    if f < *best_flops {
+        if track_runner_up {
+            *second_flops = *best_flops;
+            *second_perm = Some(std::mem::replace(best_perm, cand));
+        } else {
+            *best_perm = cand;
+        }
+        *best_flops = f;
+    } else if track_runner_up && f < *second_flops && cand != *best_perm {
+        *second_flops = f;
+        *second_perm = Some(cand);
+    }
 }
 
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
@@ -1572,6 +1610,11 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
+    let track_runner_up = (TELOS_RANK2_MIN_N..=TELOS_RANK2_MAX_N).contains(&n)
+        && (TELOS_RANK2_MIN_NNZ..=TELOS_RANK2_MAX_NNZ).contains(&nnz)
+        && max_deg <= n / 50;
+    let mut second_perm: Option<Vec<usize>> = None;
+    let mut second_flops = u64::MAX;
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -1619,10 +1662,15 @@ fn order_with_options(
             // (excludes the AMD anchor), for the runner-up-margin census.
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
-            if f < best_flops {
-                best_flops = f;
-                best_perm = perm;
-            }
+            accept_with_runner_up(
+                perm,
+                f,
+                track_runner_up,
+                &mut best_flops,
+                &mut best_perm,
+                &mut second_flops,
+                &mut second_perm,
+            );
         };
 
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
@@ -2500,14 +2548,22 @@ fn order_with_options(
             };
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
-            if f < best_flops
+            let promote = f < best_flops
                 || (f == best_flops
                     && best_relabel_priority != 0
-                    && original_priority < best_relabel_priority)
-            {
+                    && original_priority < best_relabel_priority);
+            if promote {
+                if track_runner_up {
+                    second_flops = best_flops;
+                    second_perm = Some(std::mem::replace(&mut best_perm, perm));
+                } else {
+                    best_perm = perm;
+                }
                 best_flops = f;
-                best_perm = perm;
                 best_relabel_priority = original_priority;
+            } else if track_runner_up && f < second_flops && perm != best_perm {
+                second_flops = f;
+                second_perm = Some(perm);
             }
         };
 
@@ -2608,10 +2664,15 @@ fn order_with_options(
             };
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
-            if f < best_flops {
-                best_flops = f;
-                best_perm = perm;
-            }
+            accept_with_runner_up(
+                perm,
+                f,
+                track_runner_up,
+                &mut best_flops,
+                &mut best_perm,
+                &mut second_flops,
+                &mut second_perm,
+            );
         }
     }
 
@@ -2689,10 +2750,15 @@ fn order_with_options(
                         } else {
                             ws.flops(&scoring_pat, &cand)
                         };
-                        if f < best_flops {
-                            best_flops = f;
-                            best_perm = cand;
-                        }
+                        accept_with_runner_up(
+                            cand,
+                            f,
+                            track_runner_up,
+                            &mut best_flops,
+                            &mut best_perm,
+                            &mut second_flops,
+                            &mut second_perm,
+                        );
                     }
                 }
             }
@@ -2728,10 +2794,15 @@ fn order_with_options(
                 } else {
                     ws.flops(&scoring_pat, &cand)
                 };
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = cand;
-                }
+                accept_with_runner_up(
+                    cand,
+                    f,
+                    track_runner_up,
+                    &mut best_flops,
+                    &mut best_perm,
+                    &mut second_flops,
+                    &mut second_perm,
+                );
             }
         }
     }
@@ -2764,7 +2835,11 @@ fn order_with_options(
             feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
         };
 
-        let mut try_cand = |cand_opt: Option<Vec<usize>>, best_flops: &mut u64, best_perm: &mut Vec<usize>| {
+        let mut try_cand = |cand_opt: Option<Vec<usize>>,
+                            best_flops: &mut u64,
+                            best_perm: &mut Vec<usize>,
+                            second_flops: &mut u64,
+                            second_perm: &mut Option<Vec<usize>>| {
             let Some(cand) = cand_opt else { return };
             if !is_bijection(&cand, n) {
                 return;
@@ -2774,10 +2849,15 @@ fn order_with_options(
             } else {
                 ws.flops(&scoring_pat, &cand)
             };
-            if f < *best_flops {
-                *best_flops = f;
-                *best_perm = cand;
-            }
+            accept_with_runner_up(
+                cand,
+                f,
+                track_runner_up,
+                best_flops,
+                best_perm,
+                second_flops,
+                second_perm,
+            );
         };
 
         // ---- STRIP-V2 sv2inc: ranked by INCUMBENT exact column count
@@ -2805,7 +2885,13 @@ fn order_with_options(
                     break;
                 }
                 let cand = strip_general_v2(&scoring_pat, &ranked, k, &sub_amd);
-                try_cand(cand, &mut best_flops, &mut best_perm);
+                try_cand(
+                    cand,
+                    &mut best_flops,
+                    &mut best_perm,
+                    &mut second_flops,
+                    &mut second_perm,
+                );
             }
         }
 
@@ -2852,7 +2938,13 @@ fn order_with_options(
                     break;
                 }
                 let cand = strip_general_v2(&scoring_pat, &deg_ranked, k, sub);
-                try_cand(cand, &mut best_flops, &mut best_perm);
+                try_cand(
+                    cand,
+                    &mut best_flops,
+                    &mut best_perm,
+                    &mut second_flops,
+                    &mut second_perm,
+                );
             }
         }
 
@@ -2866,12 +2958,24 @@ fn order_with_options(
                 if let Some(fcore) = feral_ordering_core::CscPattern::new(n, &fcp, &fri) {
                     if let Ok(p) = feral_amd::amd_order(&fcore) {
                         let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                        try_cand(Some(cand), &mut best_flops, &mut best_perm);
+                        try_cand(
+                            Some(cand),
+                            &mut best_flops,
+                            &mut best_perm,
+                            &mut second_flops,
+                            &mut second_perm,
+                        );
                     }
                     let nd_opts = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
                     if let Ok((p, ..)) = feral_amd::amd_order_opts(&fcore, &nd_opts) {
                         let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                        try_cand(Some(cand), &mut best_flops, &mut best_perm);
+                        try_cand(
+                            Some(cand),
+                            &mut best_flops,
+                            &mut best_perm,
+                            &mut second_flops,
+                            &mut second_perm,
+                        );
                     }
                 }
             }
@@ -2911,6 +3015,30 @@ fn order_with_options(
                 // the `TELOS_*` constants.
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
+
+        // In the measured procurement-shaped band, a genuinely distinct
+        // runner-up reaches a basin the incumbent misses. Replace TELOS's one
+        // seed instead of adding another invocation, and retain the original
+        // pre-TELOS incumbent as a strict fallback. The u128 products make the
+        // relative-gap comparison overflow-safe for every u64 objective.
+        let use_runner_up = track_runner_up
+            && second_perm.is_some()
+            && second_flops > best_flops
+            && ((second_flops - best_flops) as u128) * (TELOS_RANK2_GAP_DEN as u128)
+                > (best_flops as u128) * (TELOS_RANK2_GAP_NUM as u128);
+        let incumbent_fallback = if use_runner_up {
+            let runner_up = second_perm
+                .take()
+                .expect("rank-two seed gate requires a retained runner-up");
+            let incumbent = (
+                best_flops,
+                std::mem::replace(&mut best_perm, runner_up),
+            );
+            best_flops = second_flops;
+            Some(incumbent)
+        } else {
+            None
+        };
 
         for _round in 0..max_rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
@@ -2981,6 +3109,12 @@ fn order_with_options(
                     best_perm = p;
                 }
                 _ => break,
+            }
+        }
+        if let Some((incumbent_flops, incumbent_perm)) = incumbent_fallback {
+            if incumbent_flops <= best_flops {
+                best_flops = incumbent_flops;
+                best_perm = incumbent_perm;
             }
         }
     }
