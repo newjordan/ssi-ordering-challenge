@@ -1,32 +1,39 @@
-//! TEST-ONLY: a frozen, VERBATIM copy of `order`/`order_with_relabel_cap` as
-//! they stood at the START of the cap-safety merge session — i.e. the
-//! integration build with all five wins (A strip, B AMF dead-zone, C
-//! bucket-weighted large-matrix budget, D extra AMF alphas, E custom
-//! quotient-graph metrics) already in place, BEFORE `ScoreWorkspace`,
-//! portfolio-phase memoization, the `nested_subgraph` strip integration, the
-//! three free variant drops, or any change to the win-C constants.
+//! PART 1: frozen, VERBATIM copy of `order`/`order_with_relabel_cap` as they
+//! stood at the START of the cap-safety merge session — i.e. the integration
+//! build with all five wins (A strip, B AMF dead-zone, C bucket-weighted
+//! large-matrix budget, D extra AMF alphas, E custom quotient-graph metrics)
+//! already in place, BEFORE `ScoreWorkspace`, portfolio-phase memoization, the
+//! `nested_subgraph` strip integration, the three free variant drops, or any
+//! change to the win-C constants.
 //!
-//! This exists ONLY to prove the merge is output-neutral where it claims to
-//! be: `mod.rs`'s equivalence test runs BOTH this function and the current
+//! PART 2 (NEW, shipped): the small-bucket exact-fill branch-and-bound entry
+//! point `ordering_sb_efb` — see its doc comment for the full design. Both
+//! parts share the file because Part 1 already pulls in every helper Part 2
+//! needs (`relabel`, `permute_pattern`, `is_bijection`, `flops_of`,
+//! `ScoringPattern`, `feral_amd::amd_order`) via `use super::*`, and splitting
+//! the file would just duplicate the imports.
+//!
+//! ## Part 1 purpose
+//!
+//! `mod.rs`'s equivalence test runs BOTH this function and the current
 //! `order()` over the dev corpus and asserts every permutation is identical
 //! element-by-element, for the cost-reduction + free-drop stage (BEFORE the
 //! deliberate win-C cap trim, which is expected to change output and is
-//! verified by SCORE instead — see the coordinator's brief).
+//! verified by SCORE instead — see the coordinator's brief). NEVER edit
+//! Part 1 to track future changes in `mod.rs` — once its job (pinning down
+//! the pre-merge behavior) is done, delete it rather than update it.
 //!
-//! Every helper this calls (`strip_candidate`, `rcm_order`, `sloan_order`,
-//! `nd_order`, `ndfm_order`, `minfill_order`, `relabel`, `relabel_restarts`,
-//! `perturb`, `splitmix64`, `is_bijection`, `flops_of`, `custom_metrics::*`,
-//! and every gate constant) is UNCHANGED by the merge — only THIS function's
-//! own orchestration (buffers, caching, strip candidate generation, which
-//! variants run) differs from the shipped `order_with_relabel_cap`. Reusing
-//! those genuinely unchanged helpers via `use super::*` is therefore not a
-//! weakening of the test.
-//!
-//! NEVER edit this file to track future changes in `mod.rs` — once its job
-//! (pinning down the pre-merge behavior) is done, delete it rather than
-//! update it. Not part of the shipped submission (`#[cfg(test)]`).
+//! Part 1's `legacy_order` is `#[cfg(test)]` (the equivalence test); Part 2's
+//! `ordering_sb_efb` is SHIPPED. Every helper both call (`strip_candidate`,
+//! `rcm_order`, `sloan_order`, `nd_order`, `ndfm_order`, `minfill_order`,
+//! `relabel`, `relabel_restarts`, `perturb`, `splitmix64`, `is_bijection`,
+//! `flops_of`, `custom_metrics::*`, and every gate constant) is UNCHANGED by
+//! the merge — only Part 1's own orchestration (buffers, caching, strip
+//! candidate generation, which variants run) differs from the shipped
+//! `order_with_relabel_cap`. Reusing those genuinely unchanged helpers via
+//! `use super::*` is therefore not a weakening of the test.
 
-#![cfg(test)]
+#![cfg_attr(test, allow(dead_code))]
 
 use super::*;
 
