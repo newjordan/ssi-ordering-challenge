@@ -2023,7 +2023,24 @@ fn order_with_options(
         if nnz <= 60_000 {
             consider(&|| {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    // Preserve all 24 promoted relabelled-AMD slots. One
+                    // additional AMF block candidate has its own budget and
+                    // a strict small-pattern gate.  The old nnz-only 10k gate
+                    // reached a hidden 2 s wall: it bounded AMF edges but not
+                    // the rest of an enormous sparse matrix.  Bounding n,
+                    // nnz, and max degree keeps both the selected block and
+                    // the already-live portfolio far below that wall.
+                    biconn::biconn_heavy_order(
+                        pattern,
+                        24,
+                        usize::from(
+                            n <= 192
+                                && nnz <= 1_200
+                                && max_deg <= 64,
+                        ),
+                        32,
+                        150_000,
+                    ),
                 )
             });
         }

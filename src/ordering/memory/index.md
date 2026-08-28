@@ -207,5 +207,9 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0021-biconn-additive-amf-restack.md](experiments/0021-biconn-additive-amf-restack.md) — **review candidate, current-frontier controlled win.** Restacks the P4 one-AMF biconn block slot onto official `5141ad0` without replacing any of its new restart floors or any promoted biconn AMD-relabel slot. On the exact 186-matrix `nnz <= 10k` population: `0.906951 -> 0.906481`; timing evidence supports only this narrow gate, not a submission.
+
+- [0022-biconn-amf-static-cost-gate.md](experiments/0022-biconn-amf-static-cost-gate.md) — **local positive, official retry not submitted here.** Corrects 0021's hidden 2 s failure and incomplete 186-row audit: production `Pattern::nnz()` admitted 191 matrices because the JSON field includes the diagonal. Replaces the nnz-only gate with `n<=192 && nnz<=1200 && max_deg<=64`; exact full-300 A/B keeps the sole strict win and moves `0.842222684 -> 0.841958705`, while the causal gate's slowest public call is about 0.103 s.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
