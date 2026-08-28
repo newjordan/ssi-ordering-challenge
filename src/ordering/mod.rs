@@ -4269,12 +4269,12 @@ fn order_with_options(
     // -0.00236 at equal budget). Both paths live in the same `Game`, selected
     // by `n` — a pure function of the pattern, so determinism is untouched.
     //
-    // `RGREEDY_MAX_NNZ` = 250_000. Density is NOT a cost driver for this phase
-    // — the bitset word count is `⌈n/64⌉` regardless of nnz, so
-    // `maxcsp-ehi-85-297-71` (n=2372, nnz=207_996) costs 0.049 s and `qapw`
-    // (n=705, nnz=87_496) 0.066 s, both cheaper than sparse matrices half
-    // their size. An earlier 60_000 ceiling was a proxy for "the frontier is
-    // already slow here", which the parallel portfolio has since fixed.
+    // The exact-b451 frontier A/B reverses the old wide/shallow allocation:
+    // keeping only the sparse `nnz <= 60_000` arm and tripling each stream's
+    // depth from 200M to 600M word-ops improves public dev
+    // 0.820416 -> 0.820113. Dense reach is affordable, but spending those exact
+    // deterministic operations on sparse trajectories has higher value even
+    // after adjacent-pair descent and the strengthened small-multi/TELOS stack.
     //
     // `RGREEDY_BUDGET` is a PER-STREAM budget in WORD-OPERATIONS, never
     // wall-clock: determinism requires the stopping rule be a pure function of
@@ -4291,16 +4291,18 @@ fn order_with_options(
     //
     // FOUR STREAMS instead of one. The grader has 4 vCPUs, so four independent
     // searches cost the same wall time as one and buy 4x the search. Measured
-    // A/B: one stream at 300M ops scores -0.00197 with p50 0.076 s / MAX
-    // 0.144 s added; four streams at 200M each score -0.00236 with p50
-    // 0.067 s / MAX 0.094 s — better on BOTH axes. Each stream is a pure
+    // Historical A/B: one stream at 300M ops scores -0.00197 with p50 0.076 s /
+    // MAX 0.144 s added; four streams at 200M each score -0.00236 with p50
+    // 0.067 s / MAX 0.094 s. The latest 600M restack has score evidence only:
+    // timings came from separate runs under changing shared-host load and are
+    // not causal runtime evidence. Each stream is a pure
     // function of `(pattern, incumbent, budget, stream index)` with no shared
     // state, and the merge is a strict argmin walked in stream-index order, so
     // the output is byte-identical regardless of completion order or thread
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
     const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
-    const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
+    const RGREEDY_MAX_NNZ: usize = 60_000;
+    const RGREEDY_BUDGET: i64 = 600_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
     // ties at 1.0000) and that class is where the portfolio is already slow.
     const RGREEDY_MAX_AVG_DEG: usize = 100;

@@ -207,5 +207,13 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0024-rgreedy-sparse-depth-restack-b451.md](experiments/0024-rgreedy-sparse-depth-restack-b451.md) —
+  **WIN on exact live `b451435`, dev 0.820416→0.820113 (−0.000303).** Reallocate
+  whole-graph RGREEDY from wide/shallow (`nnz≤250k`, 200M ops/stream) to
+  sparse/deep (`nnz≤60k`, 600M). The gain survives the newly promoted
+  adjacent-pair descent, 3M/800 small-multi and AMD-seeded TELOS: small and mid
+  improve, heavy is unchanged. Tests and network-denied production build pass;
+  separate-run shared-host timing is explicitly non-causal.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
