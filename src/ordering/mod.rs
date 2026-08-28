@@ -4307,7 +4307,10 @@ fn order_with_options(
     // state, and the merge is a strict argmin walked in stream-index order, so
     // the output is byte-identical regardless of completion order or thread
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
-    const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
+    // The 3k-6k band has measured headroom and benefits from whole-graph
+    // search; keep its streams at the base budget below rather than extending
+    // the small/mid slack floor into this newly admitted band.
+    const RGREEDY_MAX_N: usize = 6_000;
     const RGREEDY_MAX_NNZ: usize = 250_000;
     const RGREEDY_BUDGET: i64 = 200_000_000;
     const RGREEDY_PEP_MAX_NNZ: usize = 60_000;
@@ -4346,8 +4349,12 @@ fn order_with_options(
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
-    } else {
+    } else if n <= 3_000 {
         RGREEDY_SLACK_MID
+    } else {
+        // `RGREEDY_MAX_N` admits this band, but the base per-stream budget is
+        // the cap-safe measured policy here.
+        0
     };
     #[cfg(test)]
     let _tp = std::time::Instant::now();
@@ -4513,8 +4520,23 @@ fn order_with_options(
         max_blocks: 96,
         budget: 5_000_000,
         streams: 2,
+        rank_blocks: false,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        // Sparse-large RGSUB is breadth-limited, but postorder position is an
+        // arbitrary way to spend that breadth. Rank eligible disjoint blocks
+        // by their exact incumbent contribution and search the top 64. Against
+        // the promoted 96-block selector this cuts block-search work by one
+        // third while improving the exact dev score (2 wins, 2 losses).
+        let rgsub_cfg = if n >= 10_000 && nnz <= 125_000 {
+            rgreedy::SubCfg {
+                max_blocks: 64,
+                rank_blocks: true,
+                ..RGSUB_CFG
+            }
+        } else {
+            RGSUB_CFG
+        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4540,7 +4562,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
