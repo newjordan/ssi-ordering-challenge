@@ -806,6 +806,27 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 /// under the eval-bound cap ceiling — see the re-gate note above.
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
+/// Strip/peel `k` window: only the first 8 of `ranked` (and prio/peel entries
+/// with `k <= 8`) are admissible. Crown walked TELOS_PRIO out to k=96 and
+/// TELOS_PEEL_A out to k=192.
+const TELOS_K_WINDOW: usize = 8;
+/// Coarse score-bucket stride for TELOS ranking: `pas = max(n / 12, 1)`.
+/// Crown ranking (when it bucketed) used `n / 8`.
+const TELOS_BUCKET_DIV: usize = 12;
+/// `0.5 * per-bucket (incumbent − AMD) flop deficit` mixed into every
+/// `rank_mode` key. Absent from the crown ranking.
+const TELOS_DEFICIT_WEIGHT_NUM: i64 = 1;
+const TELOS_DEFICIT_WEIGHT_DEN: i64 = 2;
+/// Work-budget fraction this arm spends vs the crown's full
+/// [`TELOS_MS_WORK_BUDGET`] / [`RELABEL_BUDGET`] (0.3).
+const TELOS_ARM_BUDGET_FRAC_NUM: usize = 3;
+const TELOS_ARM_BUDGET_FRAC_DEN: usize = 10;
+/// Extra multi-start seeds are 1-swap perturbations of the incumbent, not
+/// the hill-climb `n/16`/`n/4` schedule.
+const TELOS_MS_SWAPS: usize = 1;
+/// Never skip a strip/peel candidate on a predicted flop-delta; evaluate,
+/// then keep only a strict `best_flops` improvement (AMD floor).
+const TELOS_PREDICTED_FLOP_DELTA_GATE: bool = false;
 
 /// ── TELOS MULTI-START / MULTI-MOVE-SET (descent arm, 2026-08) ────────────
 /// EXTRA `telos_descend` runs, beyond the one the shipped TELOS phase already
@@ -910,7 +931,10 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     if est > TELOS_MS_MAX_WORK {
         return 0;
     }
-    (TELOS_MS_WORK_BUDGET / est)
+    let work_budget = TELOS_MS_WORK_BUDGET
+        .saturating_mul(TELOS_ARM_BUDGET_FRAC_NUM)
+        / TELOS_ARM_BUDGET_FRAC_DEN.max(1);
+    (work_budget / est)
         .clamp(1, TELOS_MS_MAX_DESCENTS)
         .min(cap)
 }
@@ -1827,6 +1851,23 @@ fn strip_from_induced(
     Some(perm)
 }
 
+/// Quantize a column-count score into a coarse bucket with
+/// [`TELOS_BUCKET_DIV`] = 12. Same fine-then-coarse scheme as AMF / custom
+/// metrics, just a tighter stride than the crown `n/8`.
+#[inline(always)]
+fn telos_score_bucket(score: i64, n: usize) -> usize {
+    if score <= 0 {
+        return 0;
+    }
+    let s = score as usize;
+    if s <= n {
+        return s;
+    }
+    let pas = (n / TELOS_BUCKET_DIV.max(1)).max(1);
+    let nbbuck = 2 * n;
+    ((s - n) / pas + n).min(nbbuck)
+}
+
 /// ── TELOS-GRADIENT DESCENT, extracted (descent arm, 2026-08) ─────────────
 /// One TELOS descent from an arbitrary seed `(start_perm, start_flops)`,
 /// returning the descended `(perm, flops)` (the seed itself if nothing
@@ -1837,9 +1878,9 @@ fn strip_from_induced(
 /// can be run from MORE THAN ONE seed and under MORE THAN ONE move set — see
 /// [`TELOS_MS_PLAN`].
 ///
-/// Pure function of `(sp, start_perm, schedule, rank_mode)`; `flops_cache` is
-/// unused here (the parallel scorer owns evaluation) and `ws` is not needed
-/// for the same reason, so determinism is unaffected.
+/// Pure function of `(sp, start_perm, schedule, rank_mode, amd_cnt)`;
+/// `flops_cache` is unused here (the parallel scorer owns evaluation) and
+/// `ws` is not needed for the same reason, so determinism is unaffected.
 #[allow(clippy::too_many_arguments)]
 fn telos_descend(
     sp: &ScoringPattern,
@@ -1851,6 +1892,7 @@ fn telos_descend(
     passes: usize,
     peel_grid: &[usize],
     rank_mode: u8,
+    amd_cnt: &[usize],
 ) -> (Vec<usize>, u64) {
     let n = sp.n;
     let mut cur_perm: Vec<usize> = start_perm.to_vec();
@@ -1868,51 +1910,78 @@ fn telos_descend(
         // column count, descending, ties by ascending id). The alternatives
         // hand `strip_general_v2` and the peel splice a different subset for
         // the same `k` at no extra cost per pass. All are total orders, so
-        // every mode is deterministic.
-        let mut ranked: Vec<usize> = (0..n).collect();
+        // every mode is deterministic. Each primary key is then mixed with
+        // `0.5 * per-bucket deficit vs the AMD floor` (bucket stride n/12).
+        let mut pk = vec![0i64; n];
         match rank_mode {
-            1 => ranked.sort_unstable_by(|&a, &b| {
-                let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
-                let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
-                db.cmp(&da).then(a.cmp(&b))
-            }),
-            2 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = (cnt[a] as u64) * ((sp.col_ptr[a + 1] - sp.col_ptr[a]) as u64);
-                let kb = (cnt[b] as u64) * ((sp.col_ptr[b + 1] - sp.col_ptr[b]) as u64);
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            3 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = cnt[a] as i64 - (sp.col_ptr[a + 1] - sp.col_ptr[a]) as i64;
-                let kb = cnt[b] as i64 - (sp.col_ptr[b + 1] - sp.col_ptr[b]) as i64;
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            4 => ranked.sort_unstable_by(|&a, &b| {
-                let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
-                let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
-                cnt[b].cmp(&cnt[a]).then(db.cmp(&da)).then(a.cmp(&b))
-            }),
-            5 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = (cnt[a] as u64) * (cnt[a] as u64)
-                    / ((sp.col_ptr[a + 1] - sp.col_ptr[a]) as u64 + 1);
-                let kb = (cnt[b] as u64) * (cnt[b] as u64)
-                    / ((sp.col_ptr[b + 1] - sp.col_ptr[b]) as u64 + 1);
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            6 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = cnt[a] + (sp.col_ptr[a + 1] - sp.col_ptr[a]);
-                let kb = cnt[b] + (sp.col_ptr[b + 1] - sp.col_ptr[b]);
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            7 => {
-                // Elimination POSITION, last-eliminated first: a move set with
-                // no reference to the counts at all.
-                let mut pos = vec![0usize; n];
-                for (i, &v) in cur_perm.iter().enumerate() {
-                    pos[v] = i;
+            1 => {
+                for v in 0..n {
+                    pk[v] = (sp.col_ptr[v + 1] - sp.col_ptr[v]) as i64;
                 }
-                ranked.sort_unstable_by(|&a, &b| pos[b].cmp(&pos[a]));
             }
-            _ => ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b))),
+            2 => {
+                for v in 0..n {
+                    pk[v] = (cnt[v] as i64)
+                        .saturating_mul((sp.col_ptr[v + 1] - sp.col_ptr[v]) as i64);
+                }
+            }
+            3 => {
+                for v in 0..n {
+                    pk[v] = cnt[v] as i64 - (sp.col_ptr[v + 1] - sp.col_ptr[v]) as i64;
+                }
+            }
+            4 => {
+                for v in 0..n {
+                    pk[v] = cnt[v] as i64;
+                }
+            }
+            5 => {
+                for v in 0..n {
+                    pk[v] = (cnt[v] as i64).saturating_mul(cnt[v] as i64)
+                        / ((sp.col_ptr[v + 1] - sp.col_ptr[v]) as i64 + 1);
+                }
+            }
+            6 => {
+                for v in 0..n {
+                    pk[v] = cnt[v] as i64 + (sp.col_ptr[v + 1] - sp.col_ptr[v]) as i64;
+                }
+            }
+            7 => {
+                for (i, &v) in cur_perm.iter().enumerate() {
+                    pk[v] = i as i64;
+                }
+            }
+            _ => {
+                for v in 0..n {
+                    pk[v] = cnt[v] as i64;
+                }
+            }
+        }
+        if amd_cnt.len() == n {
+            let mut bdef = vec![0i64; 2 * n + 2];
+            for v in 0..n {
+                let b = telos_score_bucket(cnt[v] as i64, n);
+                let inc = (cnt[v] as i64).saturating_mul(cnt[v] as i64);
+                let amd = (amd_cnt[v] as i64).saturating_mul(amd_cnt[v] as i64);
+                bdef[b] = bdef[b].saturating_add(inc.saturating_sub(amd));
+            }
+            for v in 0..n {
+                let b = telos_score_bucket(cnt[v] as i64, n);
+                pk[v] = pk[v].saturating_add(
+                    bdef[b].saturating_mul(TELOS_DEFICIT_WEIGHT_NUM)
+                        / TELOS_DEFICIT_WEIGHT_DEN.max(1),
+                );
+            }
+        }
+        let mut ranked: Vec<usize> = (0..n).collect();
+        if rank_mode == 4 {
+            ranked.sort_unstable_by(|&a, &b| {
+                let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
+                let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
+                pk[b].cmp(&pk[a]).then(db.cmp(&da)).then(a.cmp(&b))
+            });
+        } else {
+            ranked.sort_unstable_by(|&a, &b| pk[b].cmp(&pk[a]).then(a.cmp(&b)));
         }
 
         // PARALLEL WITHIN THE ROUND. Every candidate of one round is built
@@ -1926,11 +1995,19 @@ fn telos_descend(
         let ranked = &ranked;
         let base_perm = &base_perm;
         let mut rtasks: Vec<parallel::PermFn> = Vec::new();
+        let mut n_strip = 0usize;
 
-        for &(subi, k) in prio.iter().take(passes) {
-            if k >= n {
+        for &(subi, k) in prio.iter() {
+            if k == 0 || k >= n || k > TELOS_K_WINDOW {
                 continue;
             }
+            if TELOS_PREDICTED_FLOP_DELTA_GATE {
+                continue;
+            }
+            if n_strip >= passes {
+                break;
+            }
+            n_strip += 1;
             rtasks.push(Box::new(move || {
                 // The three sub-orderers are rebuilt per task rather than
                 // shared: `strip_general_v2` takes a `&dyn Fn` which is not
@@ -1955,7 +2032,10 @@ fn telos_descend(
         }
 
         for &k in peel_grid {
-            if k >= n {
+            if k == 0 || k >= n || k > TELOS_K_WINDOW {
+                continue;
+            }
+            if TELOS_PREDICTED_FLOP_DELTA_GATE {
                 continue;
             }
             rtasks.push(Box::new(move || {
@@ -2005,7 +2085,7 @@ fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static
         // Tier B (150k..TELOS_MAX_NNZ): eval-bound class — ONE round,
         // minimal eval count. See the cap-calibration re-gate note on
         // the `TELOS_*` constants.
-        (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
+        (2, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
     }
 }
 
@@ -2100,6 +2180,10 @@ fn order_with_options(
     // Seed for the descent-arm multi-start (see `TELOS_MS_PLAN`): the anchor's
     // own flops, before any candidate can lower `best_flops`.
     let anchor_flops = best_flops;
+    let mut amd_cnt_by_v = vec![0usize; n];
+    for (pos, &v) in amd_perm.iter().enumerate() {
+        amd_cnt_by_v[v] = amd_counts[pos];
+    }
 
     // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
     // the pattern's maximum column length — see `relabel_restarts`, where a hub is
@@ -3082,7 +3166,12 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
+    let (relabel_budget, relabel_cap_bucket) = (
+        RELABEL_BUDGET
+            .saturating_mul(TELOS_ARM_BUDGET_FRAC_NUM)
+            / TELOS_ARM_BUDGET_FRAC_DEN.max(1),
+        RELABEL_MAX_RESTARTS,
+    );
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
@@ -3851,6 +3940,7 @@ fn order_with_options(
             passes,
             peel_grid,
             0,
+            &amd_cnt_by_v,
         );
         if f < best_flops {
             best_flops = f;
@@ -4302,7 +4392,7 @@ fn order_with_options(
     const RGREEDY_MAX_NNZ: usize = 250_000;
     const RGREEDY_BUDGET: i64 = 200_000_000;
     const RGREEDY_PEP_MAX_NNZ: usize = 60_000;
-    const RGREEDY_PEP_BUDGET: i64 = 600_000_000;
+    const RGREEDY_PEP_BUDGET: i64 = 300_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
     // ties at 1.0000) and that class is where the portfolio is already slow.
     // Pep's accepted selector did not apply it inside the <=60k envelope.
@@ -4367,56 +4457,80 @@ fn order_with_options(
     let telos_ms = telos_ms_count(telos_ms, n, nnz, max_deg);
     if telos_ms > 0 {
         let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
-        // Seed slots, in `TELOS_MS_PLAN`'s numbering.
-        // Snapshot the incumbent: the queued descents borrow their seed for as
-        // long as the batch lives, and the acceptance below writes
-        // `best_perm`.
+        // Snapshot the incumbent: queued descents own their seed for the
+        // batch lifetime. Cap is still [`telos_ms_count`]. Extra seeds
+        // beyond the first incumbent / AMD-anchor slots are 1-swap
+        // perturbations of the incumbent from a SplitMix64 stream — not
+        // the hill-climb `n/16`/`n/4` swap schedule.
         let seed_perm = best_perm.clone();
-        let slots: [(u64, &[usize]); 2] =
-            [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
-        // `telos_end_flops` is where the shipped TELOS phase came to rest under
-        // mode 0. On the AMD-seed gate this only suppresses a re-walk from the
-        // one-round endpoint; slot 1 below is keyed by `anchor_flops`, so its
-        // full AMD mode-0 continuation remains available.
         let mut done: Vec<(u64, u8)> = vec![(telos_end_flops, 0)];
         let mut used = 0usize;
-        // WHICH descents run is decided ENTIRELY UP FRONT (arm/parallel): the
-        // plan, the seed slots, the dedup key `(seed flops, mode)` and the
-        // budget are all pure functions of the pattern — no entry's
-        // admission depends on any earlier descent's RESULT. So the selection
-        // walk below produces the same list whether or not the descents have
-        // run, and the descents themselves can all run concurrently. The
-        // sequential version then took `winner` = the first entry, in plan
-        // order, attaining the strict minimum below `best_flops` — exactly
-        // `parallel::accept` over the plan-ordered task list.
-        let mut plan: Vec<(usize, u8)> = Vec::new();
+        let mut inc_uses = 0usize;
+        let mut sm_state: u64 = 0xD1B5_4A32_D192_ED03u64
+            .wrapping_mul((n as u64) ^ 0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(nnz as u64)
+            .wrapping_add(max_deg as u64);
+        let mut descents: Vec<(Vec<usize>, u64, u8)> = Vec::new();
         for &(slot, mode) in TELOS_MS_PLAN.iter() {
             if used >= telos_ms {
                 break;
             }
-            let (sf, _) = slots[slot as usize];
-            let key = (sf, mode);
-            if done.contains(&key) {
-                continue;
+            if slot == 0 {
+                inc_uses += 1;
+                if inc_uses == 1 {
+                    let key = (best_flops, mode);
+                    if done.contains(&key) {
+                        continue;
+                    }
+                    done.push(key);
+                    used += 1;
+                    descents.push((seed_perm.clone(), best_flops, mode));
+                } else {
+                    let seed = splitmix64(&mut sm_state);
+                    let q = perturb(&seed_perm, seed, TELOS_MS_SWAPS);
+                    if !is_bijection(&q, n) {
+                        continue;
+                    }
+                    let sf = flops_of(scoring_pat, &q);
+                    used += 1;
+                    descents.push((q, sf, mode));
+                }
+            } else {
+                let key = (anchor_flops, mode);
+                if done.contains(&key) {
+                    continue;
+                }
+                done.push(key);
+                used += 1;
+                descents.push((amd_perm.clone(), anchor_flops, mode));
             }
-            done.push(key);
-            used += 1;
-            plan.push((slot as usize, mode));
         }
+        while used < telos_ms {
+            let seed = splitmix64(&mut sm_state);
+            let q = perturb(&seed_perm, seed, TELOS_MS_SWAPS);
+            if !is_bijection(&q, n) {
+                break;
+            }
+            let sf = flops_of(scoring_pat, &q);
+            let mode = TELOS_MS_PLAN.get(used).map(|&(_, m)| m).unwrap_or(0);
+            used += 1;
+            descents.push((q, sf, mode));
+        }
+        let amd_cnt = &amd_cnt_by_v;
         let mut mtasks: Vec<parallel::PermFn> = Vec::new();
-        for &(slot, mode) in plan.iter() {
-            let (sf, sperm) = slots[slot];
+        for (sperm, sf, mode) in descents {
             mtasks.push(Box::new(move || {
                 let (p, _f) = telos_descend(
                     scoring_pat,
                     nnz,
-                    sperm,
+                    &sperm,
                     sf,
                     max_rounds,
                     prio,
                     passes,
                     peel_grid,
                     mode,
+                    amd_cnt,
                 );
                 Some(p)
             }));
@@ -4534,6 +4648,23 @@ fn order_with_options(
                 if f < best_flops {
                     best_flops = f;
                     best_perm = cand;
+                }
+            }
+        }
+    }
+
+    // EXACT subset-DP on tiny n. Call-site ceiling is 48; u32 bitmasks make
+    // n>32 type-impossible and 2^n tables must never allocate above
+    // STRUCTURAL_MAX_N=24. Effective gate = min(48, STRUCTURAL_MAX_N).
+    // Keep-if-strictly-better vs best_flops; bijection-checked.
+    const EXACT_DP_MAX_N: usize = 48;
+    let exact_n = EXACT_DP_MAX_N.min(exact_dp::STRUCTURAL_MAX_N);
+    if n > 0 && n <= exact_n {
+        if let Some(adj) = exact_dp::adjacency(n, &pattern.col_ptr, &pattern.row_idx) {
+            if let Some((perm, dp_flops)) = exact_dp::exact_min_flops_order(n, &adj) {
+                if is_bijection(&perm, n) && dp_flops < best_flops {
+                    best_flops = dp_flops;
+                    best_perm = perm;
                 }
             }
         }

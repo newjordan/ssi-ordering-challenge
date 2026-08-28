@@ -145,7 +145,7 @@ fn score_bucket_of(score: i64, n: usize) -> usize {
     if s <= n {
         return s;
     }
-    let pas = (n / 8).max(1);
+    let pas = (n / 12).max(1);
     let nbbuck = 2 * n;
     ((s - n) / pas + n).min(nbbuck)
 }
