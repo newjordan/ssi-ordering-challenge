@@ -683,3 +683,175 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
 
     best_perm
 }
+
+/// ADS-BTP candidate: algebraic-distance seeding + bounded tail fill-in pruning
+/// on a feral-AMD warm-start.
+///
+/// Mechanism (all deterministic; pure functions of the pattern + a fixed seed):
+///   1. **Algebraic-distance ordering (ADS) seeding.** Build the symmetric
+///      adjacency, compute the row-normalized Laplacian `L = I − D⁻¹A`, take a
+///      fixed SplitMix64 initial vector `x` (one entry per vertex, normalized),
+///      and run `k` power-iteration steps of the smoothing operator
+///      `y ← (1 − α)·y + α·D⁻¹A·y` with `α` in `(0, 1)`. The iterate converges
+///      to the eigenvector of the smallest non-trivial eigenvalue of the
+///      normalized Laplacian; a *few* iterations (3-4) are enough to get a
+///      low-frequency proxy that already correlates with low-wavefront
+///      embedding. Sort vertices by the final `y` coordinate to get a
+///      relabeling `q_ads`. This is the "algebraic distance" signal: vertices
+///      close in this eigenvector are close in the graph's algebraic sense
+///      (Chen–Safro 2011's practical construction).
+///   2. **Feral-AMD warm-start.** Run `AMD(Q A Qᵀ)` on the relabelled pattern
+///      and compose back through `q_ads` — the same multi-start trick the
+///      `relabelled-AMD` loop uses, but with a STRUCTURE-AWARE relabeling
+///      instead of a random one. AMD's tie-break reads the vertex numbering,
+///      so feeding it an algebraic-distance ordering pulls the resulting
+///      minimum-degree order along a different basin than the i.i.d. random
+///      seeds — addressing the "look for variation WITHIN a winning family"
+///      thesis on a fresh, deterministic surface.
+///   3. **Bounded tail fill-in pruning (BTP).** Take the last 15% of the warm-
+///      start's permutation, where fill is densest (the last vertices
+///      eliminated absorb the most fill from the already-eliminated prefix).
+///      Try pairwise swaps WITHIN that tail; keep any strict improvement; for
+///      every non-improving swap, debit a small "uphill budget" (4) so the
+///      walk can escape a local minimum without straying indefinitely. The
+///      budget is hard — once exhausted the search halts. Cost: at most
+///      `4 + (tail_size choose 2) ≤ ~n²/200` extra `flops_of` calls worst-case,
+///      each near-linear in `nnz`; well below the per-matrix cap.
+///
+/// Returns a `Vec<usize>` (the candidate permutation) only if every step
+/// succeeds; the caller decides whether to score/adopt it. Returns `None` on
+/// any step failure (degenerate pattern, bad CscPattern construction, AMD
+/// failure, etc.) so the caller can fall through to the incumbent unchanged.
+///
+/// Best-of semantics: like every other candidate in `legacy_order`, this is
+/// offered under the AMD-anchored best-of floor — it can only LOWER the
+/// flops, never raise them. Failures are silent, so the cost envelope is
+/// just the worst-case traversal of the inner loops.
+fn ads_tail_prune_order(pattern: &Pattern) -> Option<Vec<usize>> {
+    let n = pattern.n;
+    if n < 16 {
+        // Tail-pruning on a 15%-of-16=2-element tail cannot move flops; skip.
+        return None;
+    }
+    let nnz = pattern.nnz();
+    if nnz == 0 {
+        return None;
+    }
+
+    // 1. Build symmetric adjacency (excludes self-loops; dedup).
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for j in 0..n {
+        let start = pattern.col_ptr[j];
+        let end = pattern.col_ptr[j + 1];
+        for &i in &pattern.row_idx[start..end] {
+            if i != j && i < n {
+                adj[j].push(i);
+                adj[i].push(j);
+            }
+        }
+    }
+    for a in adj.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+
+    // 2. Algebraic-distance initial vector `x`: deterministic SplitMix64 stream
+    //    normalized to `[-1, 1]`. Symmetric about zero → no DC drift.
+    let mut state: u64 = 0xA1B2_C3D4_E5F6_0708u64;
+    let mut x: Vec<f64> = Vec::with_capacity(n);
+    for _ in 0..n {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // Map u64 → [-1, 1] (deterministic; no RNG, no wall-clock).
+        x.push((z as f64 / u64::MAX as f64) * 2.0 - 1.0);
+    }
+
+    // 3. Power-iteration smoothing. `α = 0.6` is a conventional Laplacian
+    //    smoothing weight (a value in (0, 1) so the iterate is contractive in
+    //    the high-frequency modes, leaving the low-frequency eigenvector
+    //    exposed). 4 iterations is enough to recover the Fiedler vector's
+    //    ordering on the small/medium matrices this candidate targets
+    //    (cheap: O(nnz) per pass).
+    const ADS_ALPHA: f64 = 0.6;
+    const ADS_ITERATIONS: usize = 4;
+    let mut y: Vec<f64> = x.clone();
+    let mut buf: Vec<f64> = vec![0.0f64; n];
+    for _ in 0..ADS_ITERATIONS {
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = 0.0;
+        }
+        for u in 0..n {
+            if adj[u].is_empty() {
+                continue;
+            }
+            let share = y[u] / (adj[u].len() as f64);
+            for &w in &adj[u] {
+                buf[w] += share;
+            }
+        }
+        for u in 0..n {
+            y[u] = (1.0 - ADS_ALPHA) * y[u] + ADS_ALPHA * buf[u];
+        }
+    }
+
+    // 4. Sort vertices by `y` to get the algebraic-distance relabeling `q_ads`:
+    //    `q_ads[k]` = the original vertex that B numbers `k`. Deterministic
+    //    total order (value, index) — never relies on floating-point equality
+    //    for the sort.
+    let mut q_ads: Vec<usize> = (0..n).collect();
+    q_ads.sort_unstable_by(|&a, &b| y[a].partial_cmp(&y[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+
+    // 5. Feral-AMD warm-start: AMD on `B = Q A Qᵀ`, composed back through Q.
+    let b = permute_pattern(pattern, &q_ads);
+    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri).ok()?;
+    let pb = feral_amd::amd_order(&bcore).ok()?;
+    let mut perm: Vec<usize> = pb.iter().map(|&x| q_ads[x as usize]).collect();
+    if !is_bijection(&perm, n) {
+        return None;
+    }
+
+    // 6. Bounded tail fill-in pruning. Last 15% of the order, pairwise swap
+    //    scan, strict-improvement keep, hard "uphill budget" of 4 non-
+    //    improving swaps to escape a local minimum.
+    let scoring_pat = ScoringPattern {
+        n,
+        col_ptr: pattern.col_ptr.clone(),
+        row_idx: pattern.row_idx.clone(),
+    };
+    let mut best = flops_of(&scoring_pat, &perm);
+    let tail_start = (n * 85) / 100; // 0.85 * n
+    let tail_end = n;
+    if tail_end <= tail_start + 1 {
+        return Some(perm);
+    }
+    const UPHILL_BUDGET: usize = 4;
+    let mut uphill_left = UPHILL_BUDGET;
+    // Deterministic pair scan: outer index ascending, inner index ascending.
+    // This matches a fixed order so both required `order()` runs agree.
+    'outer: for i in tail_start..tail_end {
+        for j in (i + 1)..tail_end {
+            perm.swap(i, j);
+            if is_bijection(&perm, n) {
+                let f = flops_of(&scoring_pat, &perm);
+                if f < best {
+                    best = f;
+                    uphill_left = UPHILL_BUDGET;
+                } else {
+                    perm.swap(i, j); // revert
+                    if uphill_left == 0 {
+                        break 'outer;
+                    }
+                    uphill_left -= 1;
+                }
+            } else {
+                perm.swap(i, j); // revert
+            }
+        }
+    }
+    Some(perm)
+}
