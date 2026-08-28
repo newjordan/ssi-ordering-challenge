@@ -72,6 +72,12 @@ fn core_of(pattern: &Pattern) -> (Vec<i32>, Vec<i32>) {
 #[test]
 #[ignore]
 fn probe_timing_and_score() {
+    // Optional exact same-tree A/B for the raw-seed MINL experiment.
+    // Unset exercises the shipped structural gate.
+    let raw_minl_override = std::env::var("SSI_RAW_MINL")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"));
+    RAW_SEED_MINL_OVERRIDE.with(|c| c.set(raw_minl_override));
     let corpus = crate::corpus::corpus();
     let mut rows: Vec<(f64, String, usize, usize, f64)> = Vec::new();
     let mut log_sums = [0.0f64; 3];
@@ -133,6 +139,7 @@ fn probe_timing_and_score() {
     }
     println!("SCORE = {:.6}", aggregate(&log_sums, &counts));
     println!("WORST order() = {:.3} s", rows[0].0);
+    RAW_SEED_MINL_OVERRIDE.with(|c| c.set(None));
 }
 
 /// List the matrices where the current `order()` is still tied at (or above)
@@ -5690,6 +5697,84 @@ fn probe_minl_value() {
     println!("\nscore MINL ON  = {:.6}", aggregate(&log_on, &cnt));
     println!("score MINL OFF = {:.6}", aggregate(&log_off, &cnt));
     println!("total secs ON={t_on:.2} OFF={t_off:.2}   worst ON={w_on:.3} OFF={w_off:.3}");
+}
+
+/// Targeted A/B for the raw consider-pool seed -> ordinary MINL lead. This is
+/// deliberately restricted to the small `nnz <= 20k` safety window, and runs
+/// the shipped pipeline twice on the same matrix with only that extra MINL
+/// candidate disabled/enabled. `SSI_PROBE_MATRIX` optionally selects exact
+/// comma-separated names.
+#[test]
+#[ignore]
+fn probe_raw_seed_minl() {
+    let name_filter: Option<Vec<String>> = std::env::var("SSI_PROBE_MATRIX")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    let corpus = crate::corpus::corpus();
+    let mut better = 0usize;
+    let mut worse = 0usize;
+    let mut same = 0usize;
+    let mut dln = [0.0f64; 3];
+    let mut worst_on = (0.0f64, String::new());
+
+    println!("RSMINL\tmatrix\tn\tnnz\tbase_flops\tcand_flops\tbase_r\tcand_r\tbase_s\tcand_s");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 || nnz == 0 || nnz > 20_000 {
+            continue;
+        }
+        if let Some(f) = &name_filter {
+            if !f.iter().any(|x| x == name) {
+                continue;
+            }
+        }
+
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect::<Vec<_>>();
+        let anchor = flops_of(&sp, &amd) as f64;
+
+        RAW_SEED_MINL_OVERRIDE.with(|c| c.set(Some(false)));
+        let t0 = Instant::now();
+        let off_perm = order(pat);
+        let off_s = t0.elapsed().as_secs_f64();
+        let off = flops_of(&sp, &off_perm);
+
+        RAW_SEED_MINL_OVERRIDE.with(|c| c.set(Some(true)));
+        let t0 = Instant::now();
+        let on_perm = order(pat);
+        let on_s = t0.elapsed().as_secs_f64();
+        let on = flops_of(&sp, &on_perm);
+        RAW_SEED_MINL_OVERRIDE.with(|c| c.set(None));
+
+        if on < off {
+            better += 1;
+        } else if on > off {
+            worse += 1;
+        } else {
+            same += 1;
+        }
+        dln[bucket(n)] += ((on as f64) / (off as f64)).ln();
+        if on_s > worst_on.0 {
+            worst_on = (on_s, name.clone());
+        }
+        println!(
+            "RSMINL\t{name}\t{n}\t{nnz}\t{off}\t{on}\t{:.6}\t{:.6}\t{off_s:.4}\t{on_s:.4}",
+            off as f64 / anchor,
+            on as f64 / anchor
+        );
+    }
+    RAW_SEED_MINL_OVERRIDE.with(|c| c.set(None));
+    println!(
+        "RSMINL-AGG\tbetter={better}\tworse={worse}\tsame={same}\tdln_lt={:+.9}\tdln_mid={:+.9}\tdln_gt={:+.9}\tworst_on={:.4}s({})",
+        dln[0], dln[1], dln[2], worst_on.0, worst_on.1
+    );
 }
 
 /// TOP-K TELOS SWEEP (experiment 0021, from 0020's seed-sensitivity finding).

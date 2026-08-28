@@ -1461,6 +1461,28 @@ fn minl_off() -> bool {
     false
 }
 
+/// TEST-ONLY switch for the raw-pool-seed MINL probe. `None` exercises the
+/// shipped structural gate; probes use `Some(false/true)` for an exact A/B on
+/// the same tree and corpus.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RAW_SEED_MINL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn raw_seed_minl_enabled(n: usize, nnz: usize) -> bool {
+    let enabled = n > 1_000
+        && n <= 3_500
+        && (n <= 1_100 || n >= 3_200)
+        && nnz <= 10_000
+        && nnz.saturating_mul(2) >= n.saturating_mul(5)
+        && nnz.saturating_mul(5) <= n.saturating_mul(14);
+    #[cfg(test)]
+    let enabled = RAW_SEED_MINL_OVERRIDE.with(|c| c.get()).unwrap_or(enabled);
+    enabled
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -4205,11 +4227,30 @@ fn order_with_options(
     } else {
         None
     };
-    let mut desc_bases: Vec<&Vec<usize>> = vec![&pre_orbit_perm];
+    // A raw consider-pool seed is a genuinely different input from
+    // `desc_alt`: the latter has already gone through TELOS. Probe one such
+    // seed through ordinary MINL only, under the smallest bounded-cost TELOS
+    // window. Exclude both existing completion starts so this task cannot be
+    // an exact duplicate of either established descent batch.
+    let raw_minl_seed: Option<Vec<usize>> = if raw_seed_minl_enabled(n, nnz) {
+        seed_pool
+            .iter()
+            .find(|(_, p)| {
+                p != &pre_orbit_perm
+                    && desc_alt.as_ref().map(|a| p != a).unwrap_or(true)
+            })
+            .map(|(_, p)| p.clone())
+    } else {
+        None
+    };
+    let mut desc_bases: Vec<(&Vec<usize>, bool)> = vec![(&pre_orbit_perm, true)];
     if let Some(a) = desc_alt.as_ref() {
-        desc_bases.push(a);
+        desc_bases.push((a, true));
     }
-    for base_desc in desc_bases {
+    if let Some(a) = raw_minl_seed.as_ref() {
+        desc_bases.push((a, false));
+    }
+    for (base_desc, run_trio) in desc_bases {
     let mut dtasks: Vec<parallel::PermFn> = Vec::new();
     if nnz > 0 && nnz < MINL_MAX_NNZ && !minl_off() {
         dtasks.push(Box::new(move || -> Option<Vec<usize>> {
@@ -4326,6 +4367,7 @@ fn order_with_options(
             Some(peo)
         }));
 
+        if run_trio {
         // Proven witness-driven sibling from the previous promoted frontier.
         // The new four-thread carrier runs it concurrently with ordinary MINL
         // and ORBIT, restoring its independent completion basin without adding
@@ -4384,6 +4426,7 @@ fn order_with_options(
             }
             Some(minl_mcs_peo(n, &adj))
         }));
+        }
     }
 
     // ── COMPONENT B: ORBIT-BATCHED COMPLETION-LATTICE DESCENT — see the
@@ -4400,7 +4443,7 @@ fn order_with_options(
     // "CAP-BREACH POST-MORTEM" section. This is the fix for a real grader
     // cap breach on the giants (gams04, watercontamination0202/0303,
     // transswitch2736spp) in the first submission of this build.
-    if orbit_enabled && nnz > 0 && n <= ORBIT_MAX_N {
+    if run_trio && orbit_enabled && nnz > 0 && n <= ORBIT_MAX_N {
         dtasks.push(Box::new(move || -> Option<Vec<usize>> {
             let (fcp, fri) = filled_graph(scoring_pat, base_desc, ORBIT_MAX_LNNZ)?;
             let mut adj: Vec<Vec<u32>> = (0..n)
@@ -4454,6 +4497,7 @@ fn order_with_options(
     drop(dtasks);
     }
     drop(desc_alt);
+    drop(raw_minl_seed);
 
 #[cfg(test)]
     parallel::phase_mark("6.minl_orbit", _tp6);
