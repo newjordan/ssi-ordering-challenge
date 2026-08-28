@@ -207,5 +207,13 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0024-p300-slot3-varied-mix.md](experiments/0024-p300-slot3-varied-mix.md) —
+  **NARROW WIN on exact `5e96293`, dev 0.820071→0.820034 (−0.000037).** Keep
+  three default P300 seeds and replace only slot 3 with the varied schedule's
+  alternating-prefix, narrowed-policy-mask stream. Total work remains 4×300M;
+  mid-tier gain outweighs a small-tier loss and heavy is unchanged. Tests and
+  network-denied build pass. Hidden reversal remains plausible, so do not bundle
+  another slot change before the official result.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
