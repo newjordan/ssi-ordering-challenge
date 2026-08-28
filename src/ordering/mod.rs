@@ -938,6 +938,119 @@ thread_local! {
         const { std::cell::Cell::new(u64::MAX) };
 }
 
+/// ── TELOS TOP-K SEEDING (experiment 0021, from 0020's diagnosis) ──
+///
+/// 0020 proved TELOS-GRADIENT DESCENT is sharply SEED-SENSITIVE: on
+/// `chp_shorttermplan2d` it reaches 1_975_321 from a WORSE incumbent and only
+/// 2_104_445 from the better one, and no other phase reproduces the effect.
+/// A run seeded at the better incumbent has no access to the basin only the
+/// worse incumbent reaches, and TELOS accepts only improvements, so the loss
+/// is invisible to every in-run bookkeeping. The fix 0020 names: descend from
+/// MORE than the single best incumbent — retain the top-K distinct `consider`
+/// candidates and run the same descent from each, keeping the global best.
+///
+/// Each descent is SEED-LOCAL (it accepts improvements over its own seed even
+/// while still worse than the global best — that is the entire point), and
+/// only the final merge is strict `<` against the global incumbent, so the
+/// AMD floor is intact and no seed can regress the score. Determinism: the
+/// pool is filled in `consider`'s own (deterministic) call order, ordered by
+/// `(flops, arrival)`, with exact-duplicate permutations rejected.
+///
+/// `TELOS_SEED_POOL` bounds pool memory (≤ 8 permutations ≈ 8n words); the
+/// number of EXTRA descents actually run is `telos_extra_seeds` — a pure
+/// function of `(n, nnz, max_deg)`, sized from isolated timing (see the
+/// experiment page) and OFF (0) wherever not measured affordable.
+const TELOS_SEED_POOL: usize = 8;
+
+/// TEST-ONLY override for the extra-seed count, so probes can sweep K and
+/// measure cost/benefit without touching the shipped gate.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TELOS_EXTRA_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How many EXTRA TELOS descents (beyond the incumbent's) this matrix may
+/// afford. Pure function of `(n, nnz, max_deg)` — never wall-clock.
+///
+/// Sized from the measured K ∈ {0,1,3,7} sweep (`probe_topk_telos`, 291
+/// in-gate matrices, 4-way sharded; ratios exact, times cross-checked by an
+/// isolated full-corpus re-measurement of exactly this config). K=3 captures
+/// nearly all of K=7's value (projected 0.839338 vs 0.839214) at roughly half
+/// its added cost, so every admitted regime uses 3. The regimes:
+///
+///   A) `nnz <= 20_000` — added cost is bounded by nnz alone regardless of
+///      structure (same argument as `small_multi`); measured worst whole
+///      `order()` in this band at K=3 is ~0.8 s. No hub gate: the win on
+///      `wastewater05m1` (0.8107→0.7589, n=98) needs none and `max_deg <= n/50`
+///      is unusable at tiny n. Carries the band's small downstream-seeding
+///      losses (`graphpart_clique-30/70`, `nuclear25a`) which the measured
+///      band aggregate absorbs several times over (`wastewater05m1`, `ndcc12`
+///      1.0000→0.9748, `chp_partload` 0.8086→0.7799, `crudeoil_li05`,
+///      `gasprod_sarawak16`).
+///   B) `20_000 < nnz <= 55_000` AND `max_deg * 50 <= n` (0019's hub
+///      discriminator — a hub is what makes descent passes expensive, and it
+///      is the only thing separating `ringpack_30_2`/`arki0016` (+0.4 s, zero
+///      gain) from their (n, nnz)-near-twins that win). Captures
+///      `chp_shorttermplan2d` 0.5147→0.4837 (0020's own target matrix),
+///      `procurement1large` 0.6343→0.6193, `crudeoil_lee2_06` 0.9885→0.9674.
+///      The 55k ceiling excludes the measured no-gain expensive class above
+///      it (`crudeoil_lee4_06/09/10` +0.24–0.37 s each, `gasprod_sarawak81`
+///      which K=3 makes slightly WORSE, `edgecross24-115`, `mpbp_48`).
+///   C) `150_000 <= nnz <= 200_000` AND `max_deg * 50 <= n` — exactly the
+///      TELOS Tier-B window (1 round, 2 strips + 3 peels, so a descent costs
+///      only a few near-full-size ordering passes, ∝ nnz; the 200k ceiling
+///      bounds that at ~0.15 s/seed and excludes the measured no-gain heavies
+///      `gams05` and `nuclear104` at 253k/258k). Captures the sweep's largest
+///      single win, `nuclear10a` 0.9961→0.7578 (n=17493, gt_10k), plus
+///      `arki0013` 0.6261→0.6220.
+///
+/// The 55k–150k Tier-A middle stays at 0: measured there, the crudeoil_lee4
+/// family pays +0.24–0.37 s for exactly nothing and already sits at the top
+/// of the corpus cost table, and the only sacrificed win
+/// (`nd_netgen-3000-1-1-b-b-ns_7`, −0.002 ln) does not justify carrying that
+/// class's breach risk on unseen graded matrices.
+fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
+    if nnz == 0 {
+        return 0;
+    }
+    if nnz <= 20_000 {
+        return 3;
+    }
+    let hub_safe = max_deg.saturating_mul(50) <= n;
+    if nnz <= 55_000 && hub_safe {
+        return 3;
+    }
+    if (150_000..=200_000).contains(&nnz) && hub_safe {
+        return 3;
+    }
+    0
+}
+
+/// Offer one scored candidate to the TELOS seed pool: keep the `cap` best by
+/// `(flops, arrival order)`, rejecting exact-duplicate permutations (equal
+/// flops with a DIFFERENT permutation is a different completion and stays —
+/// that diversity is what 0020 showed matters). Deterministic: pure function
+/// of the call sequence.
+fn offer_seed(pool: &mut Vec<(u64, Vec<usize>)>, cap: usize, f: u64, perm: &[usize]) {
+    if cap == 0 {
+        return;
+    }
+    if pool.len() == cap && f >= pool[cap - 1].0 {
+        return;
+    }
+    if pool
+        .iter()
+        .any(|(pf, pp)| *pf == f && pp.as_slice() == perm)
+    {
+        return;
+    }
+    // Insert after every entry with flops <= f, so earlier arrivals win ties.
+    let pos = pool.partition_point(|(pf, _)| *pf <= f);
+    pool.insert(pos, (f, perm.to_vec()));
+    pool.truncate(cap);
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -1574,6 +1687,19 @@ fn order_with_options(
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
 
+    // TELOS top-K seed pool (experiment 0021) — see the `TELOS_SEED_POOL`
+    // constants' doc comment. Maintained only where the TELOS phase will
+    // actually consume it (inside the TELOS nnz gate AND with a nonzero
+    // extra-seed allowance), so it costs nothing anywhere else.
+    let telos_extra = {
+        let g = telos_extra_seeds(n, nnz, max_deg);
+        #[cfg(test)]
+        let g = TELOS_EXTRA_OVERRIDE.with(|c| c.get()).unwrap_or(g);
+        g
+    };
+    let seed_pool_active = telos_extra > 0 && nnz > 0 && nnz < TELOS_MAX_NNZ;
+    let mut seed_pool: Vec<(u64, Vec<usize>)> = Vec::new();
+
     // Try a candidate produced by `f`; keep it if it is a valid bijection with
     // strictly fewer flops. `catch_unwind` guards against a candidate panicking
     // (which would otherwise crash the worker and FAIL the whole run).
@@ -1599,6 +1725,9 @@ fn order_with_options(
             // (excludes the AMD anchor), for the runner-up-margin census.
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+            if seed_pool_active {
+                offer_seed(&mut seed_pool, TELOS_SEED_POOL, f, &perm);
+            }
             if f < best_flops {
                 best_flops = f;
                 best_perm = perm;
@@ -2836,75 +2965,110 @@ fn order_with_options(
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
 
-        for _round in 0..max_rounds {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut cnt = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                cnt[v] = counts[pos];
+        // Seeds: the incumbent first (shipped behavior, always), then up to
+        // `telos_extra` pool entries distinct from it — 0020 proved the
+        // descent is seed-sensitive and a WORSE seed can reach a better
+        // basin, so each extra descent is SEED-LOCAL: it accepts improvements
+        // over its own seed even while still above the global best. Only the
+        // final merge below is strict `<` against the global incumbent, so
+        // the AMD floor and the no-regression property are intact.
+        let mut seeds: Vec<(u64, Vec<usize>)> = Vec::with_capacity(1 + telos_extra);
+        seeds.push((best_flops, best_perm.clone()));
+        for (pf, pp) in seed_pool.iter() {
+            if seeds.len() > telos_extra {
+                break;
             }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+            if pp == &best_perm {
+                continue;
+            }
+            seeds.push((*pf, pp.clone()));
+        }
 
-            let mut round_f = best_flops;
-            let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
+        let mut telos_best_f = best_flops;
+        let mut telos_best_p: Option<Vec<usize>> = None;
+        for (seed_f, seed_p) in seeds {
+            let mut cur_f = seed_f;
+            let mut cur_p = seed_p;
+            for _round in 0..max_rounds {
+                let permuted = permute_pattern(&scoring_pat, &cur_p);
+                let etree = EliminationTree::from_pattern(&permuted);
+                let counts = column_counts_gnp(&permuted, &etree);
+                let mut cnt = vec![0usize; n];
+                for (pos, &v) in cur_p.iter().enumerate() {
+                    cnt[v] = counts[pos];
                 }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
-                };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
 
-            for &(subi, k) in prio.iter().take(passes) {
-                if k >= n {
-                    continue;
-                }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
+                let mut round_f = cur_f;
+                let mut round_p: Option<Vec<usize>> = None;
+                let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
                     };
-                if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
-                    try_cand(cand, &mut round_f, &mut round_p);
-                }
-            }
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
+                };
 
-            for &k in peel_grid {
-                if k >= n {
-                    continue;
-                }
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in &best_perm {
-                    if !fat[v] {
-                        cand.push(v);
+                for &(subi, k) in prio.iter().take(passes) {
+                    if k >= n {
+                        continue;
+                    }
+                    let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                        match subi {
+                            0 => &sub_amd,
+                            1 => &sub_nd,
+                            _ => &sub_mf,
+                        };
+                    if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
+                        try_cand(cand, &mut round_f, &mut round_p);
                     }
                 }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
-                cand.extend(tail);
-                try_cand(cand, &mut round_f, &mut round_p);
-            }
 
-            match round_p {
-                Some(p) if round_f < best_flops => {
-                    best_flops = round_f;
-                    best_perm = p;
+                for &k in peel_grid {
+                    if k >= n {
+                        continue;
+                    }
+                    let mut fat = vec![false; n];
+                    for &v in &ranked[..k] {
+                        fat[v] = true;
+                    }
+                    let mut cand: Vec<usize> = Vec::with_capacity(n);
+                    for &v in &cur_p {
+                        if !fat[v] {
+                            cand.push(v);
+                        }
+                    }
+                    let mut tail: Vec<usize> = ranked[..k].to_vec();
+                    tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+                    cand.extend(tail);
+                    try_cand(cand, &mut round_f, &mut round_p);
                 }
-                _ => break,
+
+                match round_p {
+                    Some(p) if round_f < cur_f => {
+                        cur_f = round_f;
+                        cur_p = p;
+                    }
+                    _ => break,
+                }
+            }
+            if cur_f < telos_best_f {
+                telos_best_f = cur_f;
+                telos_best_p = Some(cur_p);
+            }
+        }
+        if let Some(p) = telos_best_p {
+            if telos_best_f < best_flops {
+                best_flops = telos_best_f;
+                best_perm = p;
             }
         }
     }
