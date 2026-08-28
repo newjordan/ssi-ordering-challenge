@@ -1464,7 +1464,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (600_000 / nnz).clamp(1, 200)
+        (3_000_000 / nnz).clamp(1, 800)
     } else {
         0
     };
