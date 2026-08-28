@@ -915,12 +915,6 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
         .min(cap)
 }
 
-const PAIR_DESCENT_MIN_N: usize = 1_000;
-const PAIR_DESCENT_MAX_N: usize = 4_000;
-const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-const PAIR_DESCENT_SWEEPS: usize = 2;
-const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
-
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -1470,7 +1464,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (3_000_000 / nnz).clamp(1, 800)
+        (600_000 / nnz).clamp(1, 200)
     } else {
         0
     };
@@ -3826,27 +3820,14 @@ fn order_with_options(
     // and only a strict improvement is ever kept (AMD floor intact).
 #[cfg(test)]
     let _tp5 = std::time::Instant::now();
-    let amd_seed_one_round = (3_000..=6_000).contains(&n)
-        && (9_000..=18_000).contains(&nnz)
-        && max_deg <= n / 50
-        && (n <= 3_600 || nnz >= 15_000);
     if nnz > 0 && nnz < TELOS_MAX_NNZ {
         let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
-        // The AMD anchor exposes a different TELOS basin on this measured
-        // sparse, low-hub band. Replace, rather than add to, the established
-        // descent: the gated path runs exactly one round and keeps the current
-        // pre-TELOS incumbent as a strict fallback.
-        let (seed_perm, seed_flops, rounds) = if amd_seed_one_round {
-            (&amd_perm[..], anchor_flops, 1)
-        } else {
-            (&best_perm[..], best_flops, max_rounds)
-        };
         let (p, f) = telos_descend(
             scoring_pat,
             nnz,
-            seed_perm,
-            seed_flops,
-            rounds,
+            &best_perm,
+            best_flops,
+            max_rounds,
             prio,
             passes,
             peel_grid,
@@ -4300,7 +4281,11 @@ fn order_with_options(
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
     const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
     const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
+    // 0026: budget raised 200M → 400M per stream (4 streams run in parallel).
+    // Measured on the 8586bf1 base: 0.823172 → 0.822679 (−0.000493). The budget
+    // curve is NOT monotone (600M+ scores worse — fixed-seed LNS degrades past
+    // the knee), so 400M is the measured optimum. Worst `order()` stays ~0.63 s.
+    const RGREEDY_BUDGET: i64 = 400_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
     // ties at 1.0000) and that class is where the portfolio is already slow.
     const RGREEDY_MAX_AVG_DEG: usize = 100;
@@ -4356,9 +4341,9 @@ fn order_with_options(
         let slots: [(u64, &[usize]); 2] =
             [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
         // `telos_end_flops` is where the shipped TELOS phase came to rest under
-        // mode 0. On the AMD-seed gate this only suppresses a re-walk from the
-        // one-round endpoint; slot 1 below is keyed by `anchor_flops`, so its
-        // full AMD mode-0 continuation remains available.
+        // the SHIPPED ranking (mode 0); re-descending mode 0 from a seed at
+        // that exact value would re-walk a descent already known to be
+        // exhausted, so it is pre-marked done.
         let mut done: Vec<(u64, u8)> = vec![(telos_end_flops, 0)];
         let mut used = 0usize;
         // WHICH descents run is decided ENTIRELY UP FRONT (arm/parallel): the
@@ -4449,7 +4434,7 @@ fn order_with_options(
         min_s: 32,
         max_s: 700,
         max_sub: 3_500,
-        max_blocks: 96,
+        max_blocks: 192,
         budget: 5_000_000,
         streams: 2,
     };
@@ -4491,31 +4476,6 @@ fn order_with_options(
                 }
             } else {
                 break;
-            }
-        }
-    }
-
-    // Strict terminal complement to RGSUB: locally orient adjacent pivots by
-    // exact current degree, then admit only through the trusted global scorer.
-    if n >= PAIR_DESCENT_MIN_N
-        && n <= PAIR_DESCENT_MAX_N
-        && nnz > 0
-        && nnz <= PAIR_DESCENT_MAX_NNZ
-    {
-        if let Some(cand) = rgreedy::adjacent_pair_descent(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            PAIR_DESCENT_SWEEPS,
-            PAIR_DESCENT_OPS_BUDGET,
-        ) {
-            if is_bijection(&cand, n) {
-                let f = ws.flops(&scoring_pat, &cand);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = cand;
-                }
             }
         }
     }
