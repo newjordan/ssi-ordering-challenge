@@ -207,5 +207,7 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0024 — diversify one PEP stream on the slack-floor frontier](experiments/0024-slot3-varied-slack-floor.md) — exact-source-698 full-300 A/B replaces only PEP slot 3 with the deterministic varied alternating-prefix policy: **0.819962 → 0.819852** (−0.000110), 13 better / 9 worse / 278 same; middle bucket 0.8622 → 0.8616, observed worst 1.412 s. Same four streams and same per-band 800M/600M/legacy budgets; network-denied 38/38 active tests and production build pass. A fifth stream is not cap-neutral: the four-thread executor would ignore it unless scheduling/work increases.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.

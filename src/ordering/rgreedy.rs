@@ -882,7 +882,11 @@ pub(crate) fn search_par_default_seeds(
         0x8543_4123_4A92_BC10,
         0x4F1B_B12D_32C1_59A8,
     ];
-    let specs = SEEDS.map(|rng| (rng, Params::DEFAULT, budget));
+    // Keep pep's three proven default trajectories, but spend the fourth
+    // already-paid worker on the complementary alternating-prefix policy.
+    // This changes neither the four-worker cap nor any stream's budget.
+    let mut specs = SEEDS.map(|rng| (rng, Params::DEFAULT, budget));
+    specs[3] = (stream_rng(3), stream_params(3), budget);
     search_par_specs(n, col_ptr, row_idx, seed, seed_flops, specs)
 }
 
