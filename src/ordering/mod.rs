@@ -291,6 +291,13 @@ const BICONN_MAX_NNZ: usize = 1_500_000;
 /// Best-of floor makes it zero-downside.
 const ND_MAX_N: usize = 150_000;
 const ND_MAX_NNZ: usize = 180_000;
+/// Leaf size for the ND-AMD-GVS recursive-bisector (`nested_subgraph::
+/// nd_amdgvs_order`): below this vertex count, the recursion bottoms out and
+/// the existing `feral_amd::amd_order` is run on the induced subgraph (textbook
+/// ND + minimum-degree hybrid). Sized to match the AMD-leaf variant of
+/// `nd_order_impl` above (`ND_LEAF = 200`) so the two ND families have the
+/// same leaf cost profile.
+const ND_AMDGVS_LEAF: usize = 200;
 
 /// GGGP (greedy graph-growing) recursive-bisection envelope. A SECOND,
 /// algorithmically distinct nested-dissection variant (gain-based combinatorial
@@ -1872,6 +1879,31 @@ fn order_with_options(
         // pass plus O(nnz) induced-graph work, all below the slow tier.
         consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order_impl(pattern, true))
+        });
+        // ND-AMD-GVS (`nested_subgraph::nd_amdgvs_order`): recursive
+        // greedy-bisector nested dissection with a one-pass min-degree
+        // FRONTIER vertex separator — a different cut rule from the BFS
+        // median-level separator above. Bisection: each subset is partitioned
+        // by a single one-pass ascending-degree scan into LOW (the
+        // ⌈sz/2⌉ lowest-degree vertices) and HIGH (the rest); the cut-
+        // frontier vertices — those sitting on the boundary between the two
+        // halves (neighbors in BOTH halves) — form the vertex separator,
+        // which is appended LAST (textbook ND's "subdomains first,
+        // separator last" property). Below `leaf_size` it falls back to the
+        // existing `feral_amd::amd_order` on the induced subgraph, the same
+        // AMD leaf the AMD-leaf ND variant above uses. Cost is O(nnz log n)
+        // over the whole graph, strictly below the slow tier (`nnz < 130k`),
+        // iterative task stack (no recursion depth blow-up), deterministic
+        // (stable degree sort with index tie-break, partition lists scanned
+        // in ascending vertex order). Routed through the best-of floor →
+        // zero-downside; reaches the same gabriel10/arki0016-style sparse
+        // gt_10k ties the BFS-separator ND already reaches but on a
+        // different cut rule, so it covers a structural blind spot of that
+        // existing family.
+        consider(&|| {
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                nested_subgraph::nd_amdgvs_order(pattern, ND_AMDGVS_LEAF),
+            )
         });
     }
 
