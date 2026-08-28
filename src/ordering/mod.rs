@@ -4197,10 +4197,14 @@ fn order_with_options(
     // behavior (including all tie-breaks) is preserved exactly; the alt can
     // only add. Cost: one extra trio batch, only inside the A/B/C windows
     // where the phases' own gates already bound each task.
-    // A/B windows only (nnz <= 55k): with the box saturated by an unrelated
-    // workload the alt batch's wall cost could not be measured cleanly, so it
-    // ships only in the class whose trio tasks are structurally cheap.
-    let desc_alt: Option<Vec<usize>> = if telos_extra > 0 && nnz <= 55_000 {
+    // A/B windows and the narrow C winner window. C is TELOS Tier-B
+    // (one round, two strips, three peels) and is already restricted to
+    // 150k..=170k hub-safe patterns by `telos_extra_seeds`, so the second
+    // completion batch is bounded to the same two measured high-leverage
+    // families rather than the wider heavy class.
+    let desc_alt: Option<Vec<usize>> = if telos_extra > 0
+        && (nnz <= 55_000 || (150_000..=170_000).contains(&nnz))
+    {
         telos_alt.take().filter(|a| a != &pre_orbit_perm)
     } else {
         None
