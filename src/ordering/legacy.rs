@@ -89,6 +89,20 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     // Candidate set gated purely by (n, nnz) so both required runs agree.
     let nnz = pattern.nnz();
 
+    // WPS-AMD-IDB local search (mirror of the production `order_with_options`
+    // call). For the byte-equivalence test, the workspace is fresh and the
+    // phase is deterministic, so two runs on the same pattern produce the
+    // same permutation that the WPS-AMD-IDB-refined `order()` returns. See
+    // `wps_amd_idb`'s doc comment for the design.
+    {
+        let mut ws = ScoreWorkspace::new(n, nnz);
+        ws.flops(&scoring_pat, &best_perm); // seed with anchor state
+        let refined = wps_amd_idb(&mut ws, &scoring_pat, &mut best_perm, best_flops);
+        if refined < best_flops {
+            best_flops = refined;
+        }
+    }
+
     // Try a candidate produced by `f`; keep it if it is a valid bijection with
     // strictly fewer flops. `catch_unwind` guards against a candidate panicking
     // (which would otherwise crash the worker and FAIL the whole run).

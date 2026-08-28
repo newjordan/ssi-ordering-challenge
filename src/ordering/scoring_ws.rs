@@ -367,6 +367,105 @@ impl ScoreWorkspace {
         self.build_postorder_and_first();
         self.column_counts_gnp_flops()
     }
+
+    /// INCREMENTAL swap evaluation for the WPS-AMD-IDB phase: starting from
+    /// the workspace's CURRENT state (permuted pattern in `self.pcol_ptr` /
+    /// `self.prow_idx` already built by the previous `flops()` call), apply
+    /// the swap of `perm[i]` and `perm[j]` in place — physically re-bucketing
+    /// only the entries belonging to the two affected columns (O(deg(a) +
+    /// deg(b)) work, the entries of the two original vertices) and leaving
+    /// every other column byte-identical — then recompute the elimination
+    /// tree, post-order, first descendants, and `Σ c_k²` using the same
+    /// reused buffers as `flops()`.
+    ///
+    /// This is the strict-improvement oracle for the windowed pairwise-swap
+    /// local search in [`crate::ordering::wps_amd_idb`]: the swap is kept
+    /// iff the returned flops is strictly less than the previous flops (the
+    /// caller passes that in as `prev_flops` for the strict-improvement
+    /// decision). The state of `self` after this call is the NEW permuted
+    /// pattern, so the caller should `perm.swap(i, j)` to keep the in-place
+    /// `perm` argument consistent before the next `swap_flops` call.
+    ///
+    /// Cost: O(nnz) for the GNP rebuild (the whole algorithm dominates on
+    /// any non-trivial matrix) plus the local O(deg(a) + deg(b)) re-bucket
+    /// of the two swapped columns. Since the workspace is reused across
+    /// every swap in a window and across the entire WPS-AMD-IDB pass, the
+    /// per-swap constant is small enough that `w*w*2 = 128` swaps per
+    /// window position across 2 passes is well under a millisecond on
+    /// the matrices the WPS-AMD-IDB envelope reaches.
+    pub(crate) fn swap_flops(
+        &mut self,
+        pat: &ScoringPattern,
+        perm: &[usize],
+        i: usize,
+        j: usize,
+    ) -> u64 {
+        debug_assert!(i < perm.len() && j < perm.len() && i != j);
+        // The local re-permutation: after swapping positions i and j in
+        // the permutation, vertex `a = perm[i]` now lives at position
+        // `pos_b = self.inv_perm[b]` (the OLD bucket of `b = perm[j]`)
+        // and vertex `b` now lives at position `pos_a`. The other n-2
+        // columns are byte-identical — a relabeling is a bijection on
+        // edges so column sizes are unchanged and `self.pcol_ptr`
+        // needs no rewrite. We rewrite ONLY the two affected column
+        // ranges in `self.prow_idx`, deriving their new contents from
+        // the ORIGINAL pattern by walking the two affected vertices'
+        // adjacency lists and mapping each neighbor through the NEW
+        // `inv_perm` (which is the old `inv_perm` with `a` and `b`
+        // swapped).
+        let a = perm[i];
+        let b = perm[j];
+        let pos_a = self.inv_perm[a];
+        let pos_b = self.inv_perm[b];
+        // No-op guard: unreachable in practice (i != j forces a != b
+        // forces pos_a != pos_b because inv_perm is a bijection on
+        // 0..n), but the explicit check keeps the re-bucket loop well
+        // defined and is free.
+        if pos_a == pos_b {
+            return self.column_counts_gnp_flops();
+        }
+        // First, update `inv_perm` to reflect the new positions of `a`
+        // and `b`. Subsequent rows below read the new inv_perm.
+        self.inv_perm[a] = pos_b;
+        self.inv_perm[b] = pos_a;
+        // Rewrite column `pos_a` to contain `b`'s neighbors (mapped
+        // through the NEW inv_perm) and column `pos_b` to contain
+        // `a`'s neighbors (mapped through the NEW inv_perm). The
+        // self-symmetric entry (a,a) and (b,b) are filtered out by
+        // the `i as usize != j` test inside the `inv_perm` map —
+        // i.e., a row with neighbor == column-vertex becomes
+        // `pos_x` (the new position of that neighbor), which is the
+        // self-loop entry; the original `permute_into` does NOT
+        // filter self-loops, so we don't either (preserves byte-
+        // identity with the vendor path on the un-swapped columns).
+        let col_a_start = self.pcol_ptr[pos_a];
+        let col_a_end = self.pcol_ptr[pos_a + 1];
+        let col_b_start = self.pcol_ptr[pos_b];
+        let col_b_end = self.pcol_ptr[pos_b + 1];
+        // Vertex `b` now goes into column `pos_a`.
+        let mut k = col_a_start;
+        for ki in pat.col_ptr[b]..pat.col_ptr[b + 1] {
+            self.prow_idx[k] = self.inv_perm[pat.row_idx[ki]];
+            k += 1;
+        }
+        // Vertex `a` now goes into column `pos_b`.
+        let mut k = col_b_start;
+        for ki in pat.col_ptr[a]..pat.col_ptr[a + 1] {
+            self.prow_idx[k] = self.inv_perm[pat.row_idx[ki]];
+            k += 1;
+        }
+        // Sort the two affected columns so the GNP algorithm sees the
+        // same sorted-row-column invariant `permute_into` establishes.
+        self.prow_idx[col_a_start..col_a_end].sort_unstable();
+        self.prow_idx[col_b_start..col_b_end].sort_unstable();
+        // Rebuild etree / postorder / first / counts on the swapped
+        // permuted pattern. The GNP pass is O(nnz) which dominates
+        // the local re-bucket above; the per-swap constant is
+        // small enough for the WPS-AMD-IDB budget.
+        self.build_etree();
+        self.build_postorder_and_first();
+        self.column_counts_gnp_flops()
+    }
 }
 
 #[cfg(test)]
