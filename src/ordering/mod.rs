@@ -1541,17 +1541,17 @@ fn order_with_options(
     let amd_counts = column_counts_gnp(&amd_permuted, &amd_etree);
     let mut best_perm: Vec<usize> = amd_perm.clone();
     let mut best_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
-
     // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
     // the pattern's maximum column length — see `relabel_restarts`, where a hub is
     // what makes a restart expensive and is the only thing distinguishing
     // `ringpack_30_2` from its (n, nnz)-twin `crudeoil_lee4_10`. Still a pure
     // deterministic function of the pattern, so both required runs agree.
     let nnz = pattern.nnz();
-    let max_deg = (0..n)
-        .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
-        .max()
-        .unwrap_or(0);
+    let mut max_deg = 0usize;
+    for j in 0..n {
+        let d = pattern.col_ptr[j + 1] - pattern.col_ptr[j];
+        max_deg = max_deg.max(d);
+    }
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -1563,14 +1563,12 @@ fn order_with_options(
     // scoring calls below route through it.
     let mut ws = ScoreWorkspace::new(n, nnz);
 
-    // Exact-duplicate-candidate memoization, PORTFOLIO-PHASE ONLY (ported
-    // from `sbx-perf`, same scoping rationale: the relabel multi-start and
-    // hill-climb phases measured near-0% within-phase duplicate rates there,
-    // so inserting from them would be pure memory cost with no benefit, and
-    // would make the table's size scale with the relabel-restart budget —
-    // exactly the wrong property to have in THIS build, which raises that
-    // budget for large matrices). Only `consider` inserts; the relabel and
-    // hill-climb loops below only READ it.
+    // Exact-duplicate-candidate memoization, sized for the portfolio phase.
+    // The relabel multi-starts also route through `consider`, but their measured
+    // duplicate rate is near zero; letting them grow this table would clone and
+    // hash hundreds of n-element keys for no useful hits. Keep enough entries
+    // for the small fixed portfolio, then score later misses directly.
+    const FLOPS_CACHE_MAX: usize = 96;
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
 
@@ -1592,7 +1590,9 @@ fn order_with_options(
                 cached
             } else {
                 let v = ws.flops(&scoring_pat, &perm);
-                flops_cache.insert(perm.clone(), v);
+                if flops_cache.len() < FLOPS_CACHE_MAX {
+                    flops_cache.insert(perm.clone(), v);
+                }
                 v
             };
             // TEST-ONLY: record the best flops over `consider` candidates alone
@@ -1600,8 +1600,8 @@ fn order_with_options(
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
             if f < best_flops {
-                best_flops = f;
                 best_perm = perm;
+                best_flops = f;
             }
         };
 
@@ -2368,17 +2368,33 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
+    // Reuse permutation buffers across all relabelled candidates. `consider`
+    // holds the primary scoring workspace, so these closure-routed loops use a
+    // second workspace; later hand-rolled phases can reuse `ws` directly.
+    let mut permute_ws: Option<ScoreWorkspace> = None;
+    let mut relabel_cp_i32: Vec<i32> = Vec::new();
+    let mut relabel_ri_i32: Vec<i32> = Vec::new();
+
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
         let seed = r as u64 + 1;
+        let q = relabel(n, seed);
+        permute_ws
+            .get_or_insert_with(|| ScoreWorkspace::new(n, nnz))
+            .permute_i32_into(
+                &scoring_pat,
+                &q,
+                &mut relabel_cp_i32,
+                &mut relabel_ri_i32,
+            );
         consider(&|| {
-            let q = relabel(n, seed);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+            let bcore = feral_ordering_core::CscPattern::new(
+                n,
+                &relabel_cp_i32,
+                &relabel_ri_i32,
+            )
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
             let pb = feral_amd::amd_order(&bcore)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
@@ -2419,12 +2435,21 @@ fn order_with_options(
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
+            let q = relabel(n, seed);
+            permute_ws
+                .get_or_insert_with(|| ScoreWorkspace::new(n, nnz))
+                .permute_i32_into(
+                    &scoring_pat,
+                    &q,
+                    &mut relabel_cp_i32,
+                    &mut relabel_ri_i32,
+                );
             consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                let bcore = feral_ordering_core::CscPattern::new(
+                    n,
+                    &relabel_cp_i32,
+                    &relabel_ri_i32,
+                )
                     .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                 let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
@@ -2470,15 +2495,62 @@ fn order_with_options(
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
+            let q = relabel(n, seed);
+            permute_ws
+                .get_or_insert_with(|| ScoreWorkspace::new(n, nnz))
+                .permute_i32_into(
+                    &scoring_pat,
+                    &q,
+                    &mut relabel_cp_i32,
+                    &mut relabel_ri_i32,
+                );
             consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                let bcore = feral_ordering_core::CscPattern::new(
+                    n,
+                    &relabel_cp_i32,
+                    &relabel_ri_i32,
+                )
                     .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                 let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
+        }
+    }
+
+    // TWO-SEED MID-BAND NO-DENSE AMD. The existing no-dense relabel family
+    // stops at 60k nnz, but a public census found a strict win at seed 2 just
+    // above that ceiling. Extend only two seeds, only on sparse low-hub graphs;
+    // the strict best-of scorer discards non-winners.
+    const RELABEL_AMDND_MID_MAX_NNZ: usize = 130_000;
+    if nnz > RELABEL_AMDND_MAX_NNZ
+        && nnz <= RELABEL_AMDND_MID_MAX_NNZ
+        && nnz <= 8 * n
+        && max_deg <= n / 50
+        && relabel_cap > 0
+    {
+        let amd_nd_opts = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        for r in 0..2usize.min(relabel_cap) {
+            let q = relabel(n, r as u64 + 1);
+            permute_ws
+                .get_or_insert_with(|| ScoreWorkspace::new(n, nnz))
+                .permute_i32_into(
+                    &scoring_pat,
+                    &q,
+                    &mut relabel_cp_i32,
+                    &mut relabel_ri_i32,
+                );
+            consider(&|| {
+                let bcore = feral_ordering_core::CscPattern::new(
+                    n,
+                    &relabel_cp_i32,
+                    &relabel_ri_i32,
+                )
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
             });
         }
@@ -2507,10 +2579,15 @@ fn order_with_options(
         let seed = (r as u64 + 1).wrapping_mul(0x9E37);
         let swaps = if r % 2 == 0 { n / 16 } else { n / 4 };
         let q = perturb(&best_perm, seed, swaps);
-        let b = permute_pattern(&scoring_pat, &q);
-        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-        let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+        ws.permute_i32_into(
+            &scoring_pat,
+            &q,
+            &mut relabel_cp_i32,
+            &mut relabel_ri_i32,
+        );
+        let Some(bcore) =
+            feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+        else {
             continue;
         };
         let Ok(pb) = feral_amd::amd_order(&bcore) else {
@@ -2636,10 +2713,15 @@ fn order_with_options(
             } else {
                 q.sort_unstable_by(|&a, &b| cnt_by_v[a].cmp(&cnt_by_v[b]).then(a.cmp(&b)));
             }
-            let bpat = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
-            let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+            ws.permute_i32_into(
+                &scoring_pat,
+                &q,
+                &mut relabel_cp_i32,
+                &mut relabel_ri_i32,
+            );
+            let Some(bcore) =
+                feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+            else {
                 continue;
             };
             let Ok(pb) = feral_amd::amd_order(&bcore) else {
@@ -2849,20 +2931,21 @@ fn order_with_options(
 
             let mut round_f = best_flops;
             let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
+            let mut try_cand =
+                |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
+                    };
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
                 };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
 
             for &(subi, k) in prio.iter().take(passes) {
                 if k >= n {
@@ -2894,7 +2977,9 @@ fn order_with_options(
                     }
                 }
                 let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+                tail.sort_unstable_by_key(|&v| {
+                    (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v)
+                });
                 cand.extend(tail);
                 try_cand(cand, &mut round_f, &mut round_p);
             }
