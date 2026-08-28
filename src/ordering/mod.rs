@@ -1624,7 +1624,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
         && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
         && max_deg <= n / 50
     {
-        (1_500_000 / nnz).clamp(1, 24)
+        (750_000 / nnz).clamp(1, 12)
     } else {
         0
     };
@@ -1666,7 +1666,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (3_000_000 / nnz).clamp(1, 800)
+        (600_000 / nnz).clamp(1, 200)
     } else {
         0
     };
@@ -1721,7 +1721,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // `small_multi` is applied AFTER `.min(cap)`, unlike the other two floors, because
     // for that class the cap IS the binding constraint — `budget / nnz` already allows
     // 19-78 passes and `RELABEL_MAX_RESTARTS` clamps them to 24. Respecting the cap
-    // here would make the regime a no-op. Its own `clamp(1, 800)` is the bound instead,
+    // here would make the regime a no-op. Its own `clamp(1, 200)` is the bound instead,
     // and it is sized against measured time rather than inherited from the cap.
     if restarts == 0 {
         return heavy_multi.max(mid_multi).max(small_multi);
