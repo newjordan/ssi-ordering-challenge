@@ -5691,3 +5691,264 @@ fn probe_minl_value() {
     println!("score MINL OFF = {:.6}", aggregate(&log_off, &cnt));
     println!("total secs ON={t_on:.2} OFF={t_off:.2}   worst ON={w_on:.3} OFF={w_off:.3}");
 }
+
+/// TOP-K TELOS SWEEP (experiment 0021, from 0020's seed-sensitivity finding).
+/// For every matrix inside the TELOS nnz gate, run the WHOLE `order()` at
+/// several extra-seed counts K (via the `TELOS_EXTRA_OVERRIDE` test hook; the
+/// shipped gate stays untouched) and report the final flops ratio and wall
+/// time at each K. The ratio columns are exact and load-independent; the
+/// SECONDS columns carry the recorded ~1.6x run-to-run variance plus any
+/// concurrent load — size the shipped gate from an isolated re-measurement of
+/// the chosen config, never from a contended sweep (0004/0019 rule).
+///
+/// Env: `SSI_TOPK_KS=0,1,3,7` (default) picks the K grid;
+/// `SSI_PROBE_SHARD=i/m` shards the corpus; `SSI_MAX_PROBE_NNZ` caps nnz.
+#[test]
+#[ignore]
+fn probe_topk_telos() {
+    let shard = std::env::var("SSI_PROBE_SHARD")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('/')?;
+            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+        })
+        .unwrap_or((0, 1));
+    // K entries are extra-seed counts for the TELOS_EXTRA_OVERRIDE hook; the
+    // special value -1 means "no override" — i.e. measure the SHIPPED gate.
+    let ks: Vec<Option<usize>> = std::env::var("SSI_TOPK_KS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|x| {
+                    let t = x.trim();
+                    if t == "-1" {
+                        None
+                    } else {
+                        Some(t.parse().unwrap())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![Some(0), Some(1), Some(3), Some(7)]);
+    let max_nnz: usize = std::env::var("SSI_MAX_PROBE_NNZ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TELOS_MAX_NNZ);
+    // Optional comma-separated exact-name filter for targeted sweeps.
+    let name_filter: Option<Vec<String>> = std::env::var("SSI_PROBE_MATRIX")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    // SSI_TOPK_FULLGRID=1: extra descents use the full telos_schedule grid
+    // (the graded-FAIL variant) instead of the shipped light grid — for
+    // measuring how much deep-basin value remains before gate hunting.
+    TELOS_EXTRA_FULLGRID.with(|c| {
+        c.set(
+            std::env::var("SSI_TOPK_FULLGRID")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+        )
+    });
+    let corpus = crate::corpus::corpus();
+
+    let klabel = |k: &Option<usize>| match k {
+        Some(v) => v.to_string(),
+        None => "gate".to_string(),
+    };
+    let mut hdr = String::from("TOPK\tmatrix\tn\tnnz\tmaxdeg");
+    for k in &ks {
+        hdr.push_str(&format!("\tr@{}", klabel(k)));
+    }
+    for k in &ks {
+        hdr.push_str(&format!("\ts@{}", klabel(k)));
+    }
+    println!("{hdr}");
+
+    // Per-K aggregate vs the K=0 column: matrices strictly improved / worsened
+    // and the summed ln-ratio delta (negative = better), per bucket.
+    let mut better = vec![[0usize; 3]; ks.len()];
+    let mut worse = vec![[0usize; 3]; ks.len()];
+    let mut dln = vec![[0.0f64; 3]; ks.len()];
+
+    for (idx, (name, pat)) in corpus.iter().enumerate() {
+        if idx % shard.1 != shard.0 {
+            continue;
+        }
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if nnz == 0 || nnz >= TELOS_MAX_NNZ || nnz >= max_nnz {
+            continue;
+        }
+        if let Some(f) = &name_filter {
+            if !f.iter().any(|x| x == name) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let max_deg = probe_max_deg(pat);
+
+        let mut ratios: Vec<f64> = Vec::with_capacity(ks.len());
+        let mut secs: Vec<f64> = Vec::with_capacity(ks.len());
+        for &k in &ks {
+            TELOS_EXTRA_OVERRIDE.with(|c| c.set(k));
+            let t0 = Instant::now();
+            let perm = order(pat);
+            secs.push(t0.elapsed().as_secs_f64());
+            ratios.push(flops_of(&sp, &perm) as f64 / base);
+        }
+        TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
+
+        let b = bucket(n);
+        for (i, &r) in ratios.iter().enumerate() {
+            if r < ratios[0] - 1e-15 {
+                better[i][b] += 1;
+            } else if r > ratios[0] + 1e-15 {
+                worse[i][b] += 1;
+            }
+            dln[i][b] += (r / ratios[0]).ln();
+        }
+
+        let mut row = format!("TOPK\t{name}\t{n}\t{nnz}\t{max_deg}");
+        for r in &ratios {
+            row.push_str(&format!("\t{r:.6}"));
+        }
+        for s in &secs {
+            row.push_str(&format!("\t{s:.4}"));
+        }
+        println!("{row}");
+    }
+
+    println!("\n--- aggregate vs the first K column (per bucket: better/worse, sum dln) ---");
+    for (i, k) in ks.iter().enumerate() {
+        for b in 0..3 {
+            println!(
+                "K={}\t{}\tbetter={}\tworse={}\tsum_dln={:+.6}",
+                klabel(k),
+                BUCKET_NAMES[b],
+                better[i][b],
+                worse[i][b],
+                dln[i][b]
+            );
+        }
+    }
+}
+
+/// RINGPACK-CLASS MULTISTART ATTRIBUTION (0015 revisited on the 0021 tree):
+/// for the named matrices (default: the corpus worst case `ringpack_30_2` and
+/// its hub-band neighbor `popdynm200`), print final flops ratio and isolated
+/// time at relabel_cap ∈ {MAX, 4, 1, 0}. If the ratio is identical at cap 1
+/// (or 0), the multistart (and at 0, the hill-climb too) contributes nothing
+/// to that matrix's score and its spend is pure cap risk — the trim evidence
+/// 0015 recorded, re-verified on the current tree before shipping any trim.
+/// `SSI_PROBE_MATRIX` selects other matrices.
+#[test]
+#[ignore]
+fn probe_ringpack_ms() {
+    let names: Vec<String> = std::env::var("SSI_PROBE_MATRIX")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_else(|| vec!["ringpack_30_2".into(), "popdynm200".into()]);
+    let corpus = crate::corpus::corpus();
+    println!("MS\tmatrix\tcap\tratio\tsecs");
+    for (name, pat) in corpus.iter() {
+        if !names.iter().any(|x| x == name) {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(pat.n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        for cap in [usize::MAX, 4, 1, 0] {
+            let t0 = Instant::now();
+            let perm = order_with_relabel_cap(pat, cap);
+            let secs = t0.elapsed().as_secs_f64();
+            let r = flops_of(&sp, &perm) as f64 / base;
+            let cs = if cap == usize::MAX { "MAX".to_string() } else { cap.to_string() };
+            println!("MS\t{name}\t{cs}\t{r:.6}\t{secs:.4}");
+        }
+    }
+}
+
+/// MERGE ABLATION (0022 on the parallel-watcher frontier): full-corpus score
+/// under three configs on THIS tree — (a) extras off + hub trim off (= the
+/// merged frontier's own behavior, the baseline the promotions graded), (b)
+/// extras off + trim on (the trim's isolated effect — must be score-neutral),
+/// (c) shipped (trim + gated top-K extras). Flops-only; per-config worst time
+/// is also printed but under whatever load the run has.
+#[test]
+#[ignore]
+fn probe_merged_ablation() {
+    let corpus = crate::corpus::corpus();
+    for (label, extras_off, trim_off) in [
+        ("base(no-trim,no-extras)", true, true),
+        ("trim-only", true, false),
+        ("shipped", false, false),
+    ] {
+        let mut log_sums = [0.0f64; 3];
+        let mut counts = [0usize; 3];
+        let mut worst = (0.0f64, String::new());
+        for (name, pat) in &corpus {
+            let n = pat.n;
+            if n == 0 {
+                continue;
+            }
+            let sp = scoring_pattern(pat);
+            let (cp, ri) = core_of(pat);
+            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+            let base = flops_of(
+                &sp,
+                &feral_amd::amd_order(&core)
+                    .unwrap()
+                    .into_iter()
+                    .map(|x| x as usize)
+                    .collect::<Vec<_>>(),
+            ) as f64;
+            if extras_off {
+                TELOS_EXTRA_OVERRIDE.with(|c| c.set(Some(0)));
+            } else {
+                TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
+            }
+            HUB_GATEWALL_OFF.with(|c| c.set(trim_off));
+            let t0 = Instant::now();
+            let perm = order(pat);
+            let secs = t0.elapsed().as_secs_f64();
+            let ratio = flops_of(&sp, &perm) as f64 / base;
+            let b = bucket(n);
+            log_sums[b] += ratio.ln();
+            counts[b] += 1;
+            if secs > worst.0 {
+                worst = (secs, name.clone());
+            }
+        }
+        TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
+        HUB_GATEWALL_OFF.with(|c| c.set(false));
+        println!(
+            "ABL\t{label}\tscore={:.6}\tlt={:.4} mid={:.4} gt={:.4}\tworst={:.3}s({})",
+            aggregate(&log_sums, &counts),
+            (log_sums[0] / counts[0] as f64).exp(),
+            (log_sums[1] / counts[1] as f64).exp(),
+            (log_sums[2] / counts[2] as f64).exp(),
+            worst.0,
+            worst.1
+        );
+    }
+}
