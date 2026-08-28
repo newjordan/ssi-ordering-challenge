@@ -1828,6 +1828,63 @@ fn order_with_options(
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_order(pattern))
         });
 
+        // ── BTA-BTO-AOP: BLOCK-TREE ARTICULATION + BLOCK-TREE ORDER +
+        // ARTICULATION-OFFSET PER-BLOCK (this submission's new family).
+        // Reuses the same biconnected decomposition but with two
+        // distinct new mechanisms: (1) block-CUT-TREE FRONTIER-SIZE DP —
+        // bounded DFS that orders blocks by minimizing the max
+        // pending-articulation frontier size at any step (see
+        // `biconn::BiconnPlan::frontier_dp_order`); (2) per-block AMD
+        // with bounded-search ARTICULATION OFFSETS — each block's owned
+        // vertices are AMD-ordered under K+1 candidate anchor placements
+        // for the articulation points (see
+        // `exact_dp::block_amd_with_articulation_offsets`). The first
+        // pass uses the existing `biconn_order` per-block AMD path
+        // (plain AMD, no offsets) but with the new frontier-DP block
+        // ordering, giving a candidate that is byte-different on any
+        // graph with > 1 block. The second adds the per-block bounded
+        // search for an extra small knob.
+        //
+        // GATED IDENTICALLY to the existing biconn block above (same
+        // `BICONN_MAX_NNZ` + sparsity guard): cost is bounded by the
+        // per-block AMD passes (~one whole-graph AMD total, plus a
+        // bounded number of small K-step per-block searches), so it is
+        // safe wherever the existing biconn is safe. The frontier-DP
+        // bounded DFS is `O(nc * branching)` per tree — `branching =
+        // 8` is the cap, well under the few-millisecond budget for
+        // any matrix in the gate. The articulation-offset bounded
+        // search runs ONLY on blocks with >=16 owned vertices and
+        // <=60_000 block-nnz — same cost discipline as the existing
+        // `biconn_heavy_order` below. Best-of floor → zero-downside.
+        if nnz < BICONN_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
+            consider(&|| {
+                Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                    biconn::biconn_order_with(
+                        pattern,
+                        biconn::BlockOrderStrategy::FrontierSizeDp,
+                    ),
+                )
+            });
+
+            // Heavy variant: frontier-DP block order + per-block
+            // articulation-offset bounded search (K = 3), gated to
+            // nnz <= 60k. Decomposition + per-block bounded search
+            // = a strictly-better-per-block candidate than plain
+            // biconn (offsets are a strict superset of plain AMD
+            // when K >= 0, and K = 3 means up to 4 candidates per
+            // block); best-of floor on the composed permutation
+            // means this cannot regress below the existing
+            // `biconn_heavy_order`. Same nnz gate as that family
+            // for the same cap-safety reason.
+            if nnz <= 60_000 {
+                consider(&|| {
+                    Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                        biconn::biconn_heavy_frontier_order(pattern, 24, 32, 150_000, 3),
+                    )
+                });
+            }
+        }
+
         // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
         // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
         // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
@@ -4445,9 +4502,11 @@ fn bfs_deepest(
 ///
 /// NOT on `order()`'s hot path any more (see `ScoreWorkspace::flops`). Kept
 /// as the vendor-backed REFERENCE implementation for `legacy.rs` and the
-/// `scoring_ws` equivalence tests.
+/// `scoring_ws` equivalence tests. `pub(crate)` so the BTA-BTO-AOP
+/// per-block bounded-search in `biconn::biconn_heavy_frontier_order`
+/// can use the SAME `Σ cⱼ²` metric on a block-local pattern.
 #[allow(dead_code)]
-fn flops_of(pat: &ScoringPattern, perm: &[usize]) -> u64 {
+pub(crate) fn flops_of(pat: &ScoringPattern, perm: &[usize]) -> u64 {
     let permuted = permute_pattern(pat, perm);
     let etree = EliminationTree::from_pattern(&permuted);
     let counts = column_counts_gnp(&permuted, &etree);

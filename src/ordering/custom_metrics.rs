@@ -552,6 +552,155 @@ pub fn order_variant(
     Ok(finalize_permutation(&mut ws))
 }
 
+/// ── PER-BUCKET BICONNECTED-DECOMPOSITION DIAGNOSTICS ────────────────────
+/// The new BTA-BTO-AOP (Block-Tree Articulation / Block-Tree Order /
+/// Articulation-Offset Per-block) candidate family in [`super::biconn`]
+/// runs per-block AMD with articulation offsets, ordered by a frontier-
+/// size DP over the block-cut tree. The natural diagnostic surface is
+/// the DECOMPOSITION itself — how big are the blocks, how many
+/// articulation points does the graph have, how does that vary by
+/// bucket — and the natural way to expose it is a per-bucket summary
+/// that lives next to the other custom-metric exports. The harness
+/// never reads this; the data is for the agent's measurement loop.
+///
+/// The diagnostic struct is a thin aggregate of (count, sum, max, min,
+/// per-bucket) over the per-matrix `(n_components, n_articulations,
+/// largest_block_vertices, n_isolated)` tuple that
+/// [`super::biconn::biconn_stats`] already returns cheaply (one Tarjan
+/// pass + one linear scan). The bucket boundaries match the harness's
+/// `lt_1k` (n<1000), `1k_10k` (1000≤n<10000), `gt_10k` (n≥10000) split
+/// — same weights, same geomean scoring — so the per-bucket columns
+/// can be compared directly to the per-bucket score columns in
+/// `score.json` and `results.tsv`.
+#[derive(Debug, Default, Clone)]
+pub struct BiconnDiagnostics {
+    /// Number of matrices aggregated.
+    pub matrix_count: usize,
+    /// Total biconnected components summed across matrices.
+    pub total_components: u64,
+    /// Total articulation points summed across matrices.
+    pub total_articulations: u64,
+    /// Sum of (largest block vertex count) per matrix.
+    pub total_largest_block: u64,
+    /// Sum of isolated-vertex counts.
+    pub total_isolated: u64,
+    /// Largest single-block vertex count seen.
+    pub max_largest_block: u64,
+    /// Per-bucket: (count, sum_components, sum_articulations,
+    /// sum_largest_block, sum_isolated).
+    pub by_bucket: BiconnBucketAgg,
+}
+
+/// Per-bucket aggregate (the harness's three size buckets: `lt_1k`,
+/// `1k_10k`, `gt_10k`). All sums are over matrices in the bucket; the
+/// `count` field is the number of matrices that landed in this bucket.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BiconnBucketAgg {
+    pub lt_1k: BiconnBucketEntry,
+    pub k_1k_10k: BiconnBucketEntry,
+    pub gt_10k: BiconnBucketEntry,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BiconnBucketEntry {
+    pub count: u64,
+    pub sum_components: u64,
+    pub sum_articulations: u64,
+    pub sum_largest_block: u64,
+    pub sum_isolated: u64,
+}
+
+impl BiconnDiagnostics {
+    /// Fold one matrix's biconn stats into the running aggregate. The
+    /// `n` argument selects the bucket (matches the harness's own
+    /// bucket boundary at `n == 1000` and `n == 10000`).
+    pub fn record(
+        &mut self,
+        n: usize,
+        n_components: usize,
+        n_articulations: usize,
+        largest_block: usize,
+        n_isolated: usize,
+    ) {
+        self.matrix_count += 1;
+        self.total_components += n_components as u64;
+        self.total_articulations += n_articulations as u64;
+        self.total_largest_block += largest_block as u64;
+        self.total_isolated += n_isolated as u64;
+        if (largest_block as u64) > self.max_largest_block {
+            self.max_largest_block = largest_block as u64;
+        }
+        let entry = if n < 1000 {
+            &mut self.by_bucket.lt_1k
+        } else if n < 10000 {
+            &mut self.by_bucket.k_1k_10k
+        } else {
+            &mut self.by_bucket.gt_10k
+        };
+        entry.count += 1;
+        entry.sum_components += n_components as u64;
+        entry.sum_articulations += n_articulations as u64;
+        entry.sum_largest_block += largest_block as u64;
+        entry.sum_isolated += n_isolated as u64;
+    }
+
+    /// Render as a deterministic, human-readable multiline string
+    /// suitable for printing in test output or appending to a log
+    /// file. Pure function of `self` — no clocks, no RNG, so two
+    /// runs of the same diagnostic on the same matrices produce the
+    /// identical text.
+    pub fn to_pretty(&self) -> String {
+        let mut s = String::new();
+        s.push_str("biconn-diagnostics: matrices=");
+        s.push_str(&self.matrix_count.to_string());
+        s.push_str(" total_components=");
+        s.push_str(&self.total_components.to_string());
+        s.push_str(" total_articulations=");
+        s.push_str(&self.total_articulations.to_string());
+        s.push_str(" total_largest_block=");
+        s.push_str(&self.total_largest_block.to_string());
+        s.push_str(" max_largest_block=");
+        s.push_str(&self.max_largest_block.to_string());
+        s.push_str(" total_isolated=");
+        s.push_str(&self.total_isolated.to_string());
+        s.push('\n');
+        s.push_str("  lt_1k:    count=");
+        s.push_str(&self.by_bucket.lt_1k.count.to_string());
+        s.push_str(" sum_components=");
+        s.push_str(&self.by_bucket.lt_1k.sum_components.to_string());
+        s.push_str(" sum_articulations=");
+        s.push_str(&self.by_bucket.lt_1k.sum_articulations.to_string());
+        s.push_str(" sum_largest_block=");
+        s.push_str(&self.by_bucket.lt_1k.sum_largest_block.to_string());
+        s.push_str(" sum_isolated=");
+        s.push_str(&self.by_bucket.lt_1k.sum_isolated.to_string());
+        s.push('\n');
+        s.push_str("  1k_10k:   count=");
+        s.push_str(&self.by_bucket.k_1k_10k.count.to_string());
+        s.push_str(" sum_components=");
+        s.push_str(&self.by_bucket.k_1k_10k.sum_components.to_string());
+        s.push_str(" sum_articulations=");
+        s.push_str(&self.by_bucket.k_1k_10k.sum_articulations.to_string());
+        s.push_str(" sum_largest_block=");
+        s.push_str(&self.by_bucket.k_1k_10k.sum_largest_block.to_string());
+        s.push_str(" sum_isolated=");
+        s.push_str(&self.by_bucket.k_1k_10k.sum_isolated.to_string());
+        s.push('\n');
+        s.push_str("  gt_10k:   count=");
+        s.push_str(&self.by_bucket.gt_10k.count.to_string());
+        s.push_str(" sum_components=");
+        s.push_str(&self.by_bucket.gt_10k.sum_components.to_string());
+        s.push_str(" sum_articulations=");
+        s.push_str(&self.by_bucket.gt_10k.sum_articulations.to_string());
+        s.push_str(" sum_largest_block=");
+        s.push_str(&self.by_bucket.gt_10k.sum_largest_block.to_string());
+        s.push_str(" sum_isolated=");
+        s.push_str(&self.by_bucket.gt_10k.sum_isolated.to_string());
+        s.push('\n');
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

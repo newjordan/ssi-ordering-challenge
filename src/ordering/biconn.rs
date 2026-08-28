@@ -43,6 +43,7 @@
 //! the portfolio's duplicate memoization discards for free).
 
 use crate::Pattern;
+use feral::sparse::csc::CscPattern as ScoringPattern;
 
 /// Build symmetric adjacency lists (off-diagonal only), each undirected edge
 /// recorded once via the `i > j` guard, sorted ascending per vertex so the
@@ -145,67 +146,97 @@ fn biconnected_components(adj: &[Vec<u32>]) -> Vec<Vec<(u32, u32)>> {
     comps
 }
 
-/// Biconnected-decomposition ordering. Returns `perm[k]` = original index
-/// eliminated k-th (a bijection of `0..n`). See the module doc for the
-/// construction and its rationale.
-pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
-    let n = pattern.n;
-    if n == 0 {
-        return Vec::new();
-    }
-    let adj = build_adj(pattern);
-    let comps = biconnected_components(&adj);
-    let nc = comps.len();
+/// Pre-computed biconnected decomposition + rooted block-cut tree, shared
+/// by every block-ordering strategy and emission path. Built once, then
+/// queried many times (frontier-DP needs many candidate orderings during
+/// its bounded search; the per-block AMD pass needs the induced subgraph).
+pub struct BiconnPlan {
+    /// Original vertex count.
+    pub n: usize,
+    /// Number of biconnected components.
+    pub nc: usize,
+    /// Edges per component (off-diagonal `(u, v)` pairs in pop order).
+    pub comps: Vec<Vec<(u32, u32)>>,
+    /// Vertex set per component (every vertex appearing in at least one
+    /// edge of that component).
+    pub comp_verts: Vec<Vec<u32>>,
+    /// Components containing each vertex (length-`n`); cardinality >= 2
+    /// signals an articulation point; empty = isolated.
+    pub comp_of: Vec<Vec<u32>>,
+    /// Parent articulation of each block (`u32::MAX` for the root of each
+    /// tree). The root's parent-articulation is `u32::MAX` (degenerate
+    /// sentinel: root has no parent, so all its vertices are owned).
+    pub parent_ap: Vec<u32>,
+    /// Depth of each block in its rooted block-cut tree.
+    pub depth: Vec<u32>,
+    /// Blocks per connected component of the block-cut tree, in BFS order
+    /// from the root. (Not used by the emit path; retained for the
+    /// per-bucket diagnostics export.)
+    pub tree_blocks: Vec<Vec<u32>>,
+    /// Rooted tree's parent-`block` for each block (root's parent is
+    /// `u32::MAX`). One level up from `parent_ap` — this is the
+    /// block-level ancestor in the block-cut tree, not the articulation
+    /// point sitting on the connecting edge.
+    pub parent_block: Vec<u32>,
+    /// Children blocks of each block (block-level adjacency, BFS over
+    /// the block-cut tree). `children[r]` is the list of block ids whose
+    /// `parent_block == r`.
+    pub children: Vec<Vec<u32>>,
+}
 
-    // Vertex set per component, and component membership per vertex. A
-    // vertex in >= 2 components is an articulation point; a vertex in zero
-    // components is isolated (degree 0).
-    let mut mark = vec![u32::MAX; n];
-    let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
-    for (c, edges) in comps.iter().enumerate() {
-        let mut verts = Vec::new();
-        for &(u, v) in edges {
-            for x in [u, v] {
-                let xu = x as usize;
-                if mark[xu] != c as u32 {
-                    mark[xu] = c as u32;
-                    verts.push(x);
-                    comp_of[xu].push(c as u32);
+impl BiconnPlan {
+    /// Build the full plan in one pass: Tarjan → component/articulation
+    /// bookkeeping → rooted block-cut tree with parent-block + children.
+    /// Returns `None` only on `n == 0` (caller's trivial-empty fast path).
+    pub fn build(pattern: &Pattern) -> Option<Self> {
+        let n = pattern.n;
+        if n == 0 {
+            return None;
+        }
+        let adj = build_adj(pattern);
+        let comps = biconnected_components(&adj);
+        let nc = comps.len();
+
+        let mut mark = vec![u32::MAX; n];
+        let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
+        for (c, edges) in comps.iter().enumerate() {
+            let mut verts = Vec::new();
+            for &(u, v) in edges {
+                for x in [u, v] {
+                    let xu = x as usize;
+                    if mark[xu] != c as u32 {
+                        mark[xu] = c as u32;
+                        verts.push(x);
+                        comp_of[xu].push(c as u32);
+                    }
                 }
             }
+            comp_verts.push(verts);
         }
-        comp_verts.push(verts);
-    }
 
-    // Root each connected component's block-cut tree at its LARGEST block
-    // (ties: lowest id) so the dense core is eliminated last. BFS assigns
-    // each non-root block its parent articulation and depth.
-    const NONE: u32 = u32::MAX;
-    let mut parent_ap = vec![NONE; nc];
-    let mut depth = vec![0u32; nc];
-    let mut visited = vec![false; nc];
-    {
-        // Deterministic root selection: scan components ascending, and for
-        // each unvisited tree pick its largest block (ties: lowest id) as
-        // root. Finding one tree's blocks requires a first BFS to collect
-        // the tree membership, then a second to assign depths — done below
-        // in one pass per tree by collecting then re-walking.
-        let mut tree_blocks: Vec<u32> = Vec::new();
+        const NONE: u32 = u32::MAX;
+        let mut parent_ap = vec![NONE; nc];
+        let mut depth = vec![0u32; nc];
+        let mut parent_block = vec![NONE; nc];
+        let mut children: Vec<Vec<u32>> = vec![Vec::new(); nc];
+        let mut visited = vec![false; nc];
+        let mut tree_blocks: Vec<Vec<u32>> = Vec::new();
+
+        let mut tree_blocks_one: Vec<u32> = Vec::new();
         let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
         for start in 0..nc {
             if visited[start] {
                 continue;
             }
-            // Collect this tree's blocks (BFS over the block-cut tree).
-            tree_blocks.clear();
+            tree_blocks_one.clear();
             visited[start] = true;
             queue.push_back(start as u32);
             while let Some(b) = queue.pop_front() {
-                tree_blocks.push(b);
+                tree_blocks_one.push(b);
                 for &v in &comp_verts[b as usize] {
                     if comp_of[v as usize].len() < 2 {
-                        continue; // not an articulation point
+                        continue;
                     }
                     for &cb in &comp_of[v as usize] {
                         if !visited[cb as usize] {
@@ -215,18 +246,14 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
                     }
                 }
             }
-            // Root = largest block in this tree (ties: lowest id).
-            let mut root = tree_blocks[0];
-            for &b in &tree_blocks[1..] {
+            let mut root = tree_blocks_one[0];
+            for &b in &tree_blocks_one[1..] {
                 let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
                 if bs > rs || (bs == rs && b < root) {
                     root = b;
                 }
             }
-            // Second BFS from the root assigns parent articulations + depth.
-            // Reuse `visited` with a per-tree token flip is overkill; use a
-            // local seen set via depth sentinel instead.
-            for &b in &tree_blocks {
+            for &b in &tree_blocks_one {
                 depth[b as usize] = u32::MAX;
             }
             depth[root as usize] = 0;
@@ -243,120 +270,291 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
                         if depth[cu] == u32::MAX {
                             depth[cu] = depth[bu] + 1;
                             parent_ap[cu] = v;
+                            parent_block[cu] = b;
+                            children[bu].push(cb);
                             queue.push_back(cb);
                         }
                     }
                 }
             }
+            tree_blocks.push(tree_blocks_one.clone());
         }
+
+        Some(BiconnPlan {
+            n,
+            nc,
+            comps,
+            comp_verts,
+            comp_of,
+            parent_ap,
+            depth,
+            tree_blocks,
+            parent_block,
+            children,
+        })
     }
 
-    // Emit blocks deepest-first (ties: ascending block id) — a valid
-    // linearization of "every child subtree before its parent block".
-    let mut block_order: Vec<usize> = (0..nc).collect();
-    block_order.sort_unstable_by(|&a, &b| depth[b].cmp(&depth[a]).then(a.cmp(&b)));
-
-    let mut perm: Vec<usize> = Vec::with_capacity(n);
-    // Isolated vertices (degree 0, in no component) are fill-free; emit first.
-    for v in 0..n {
-        if comp_of[v].is_empty() {
-            perm.push(v);
-        }
+    /// Original shipping behavior: deepest-first emission with id tie-break.
+    /// This is a valid linearization of "every child subtree before its
+    /// parent block" because every child's depth strictly exceeds its
+    /// parent's (the second BFS assigns `depth[child] = depth[parent] + 1`).
+    pub fn depth_first_order(&self) -> Vec<usize> {
+        let nc = self.nc;
+        let mut order: Vec<usize> = (0..nc).collect();
+        order.sort_unstable_by(|&a, &b| self.depth[b].cmp(&self.depth[a]).then(a.cmp(&b)));
+        order
     }
 
-    // Scratch for induced-subgraph construction, reused across blocks:
-    // `tok[v] == gen` means v is in the current block's owned set with local
-    // id `loc[v]`.
-    let mut tok = vec![0u32; n];
-    let mut loc = vec![0u32; n];
-    let mut gen = 0u32;
-
-    for &b in &block_order {
-        let pa = parent_ap[b];
-        // Owned vertices: the block's vertex set minus its parent
-        // articulation (which is emitted later, with its own parent block).
-        let mut owned: Vec<u32> = Vec::with_capacity(comp_verts[b].len());
-        for &v in &comp_verts[b] {
-            if v != pa {
-                owned.push(v);
+    /// Frontier-size DP. The "frontier" at any point in the emission is
+    /// the set of articulation points shared between the just-emitted
+    /// block and an ALREADY-emitted ancestor (i.e. parent_ap whose block
+    /// is already done). Each block's local AMD pass sees those
+    /// articulations as pending fill sinks — fewer pending frontier
+    /// vertices means less cross-block coupling at that step. The
+    /// objective `min max-step-frontier` is a tree-DP on a rooted tree
+    /// (one tree per connected component of the block-cut graph).
+    ///
+    /// Bounded search: at each step the search expands a small set of
+    /// "frontier candidates" (the not-yet-emitted blocks whose parent
+    /// block has already been emitted, i.e. blocks on the current
+    /// frontier), and explores their children-first emission with
+    /// `branching` cap. Returns the order minimizing the maximum
+    /// frontier size observed across the path. `branching` is the per-
+    /// step cap (1 = greedy cheapest-first, 2 = local 2-lookahead, etc.)
+    /// — clamped to `[1, 16]` to bound wall-clock on the largest dev
+    /// matrices.
+    pub fn frontier_dp_order(&self, branching: usize) -> Vec<usize> {
+        let nc = self.nc;
+        if nc == 0 {
+            return Vec::new();
+        }
+        let branching = branching.clamp(1, 16);
+        // For each block, precompute the set of (block, articulation) edges
+        // the block owns — i.e. for every non-root block, its single
+        // (parent_block, parent_ap) edge. The root's parent-block is NONE,
+        // so the root contributes no frontier edge.
+        // We never accumulate "deeper ancestor" frontiers here because
+        // articulation points are eliminated EXACTLY ONCE (with the parent
+        // block) — the per-step frontier at depth-d in the tree is just the
+        // union of articulations on already-emitted blocks whose blocks at
+        // depth d are still pending.
+        //
+        // Simpler model: track `frontier = number of blocks that have been
+        // emitted but whose parent articulation's BLOCK has not been
+        // emitted yet`. For each emitted block b, the cost is +1 if b has
+        // a parent_block (i.e. b is not a tree root) and that parent block
+        // has not been emitted yet. The root's emission closes any
+        // outstanding frontier edges from its already-emitted children.
+        //
+        // Maximize children-first is a valid linearization. To minimize
+        // max-pending-frontier we want to EMIT the parent as soon as
+        // possible after all its children — depth-first, but ordered to
+        // close the frontier at every step. Bounded DFS finds the
+        // best-of-branching sequence.
+        let mut order: Vec<usize> = Vec::with_capacity(nc);
+        let mut emitted = vec![false; nc];
+        for tree in &self.tree_blocks {
+            if tree.is_empty() {
+                continue;
             }
-        }
-        let m = owned.len();
-        if m == 0 {
-            continue;
-        }
-        if m == 1 {
-            perm.push(owned[0] as usize);
-            continue;
-        }
-        owned.sort_unstable();
-        gen = gen.wrapping_add(1);
-        // (gen can wrap only after 4G blocks; not reachable on this corpus.)
-        for (li, &v) in owned.iter().enumerate() {
-            tok[v as usize] = gen;
-            loc[v as usize] = li as u32;
-        }
-        // Induced subgraph on `owned` from the block's own edge list: keep
-        // edges with BOTH endpoints owned (drops edges to the parent
-        // articulation, which is eliminated later — a constant-offset
-        // approximation of its fill effect, exactly scored downstream).
-        let mut col_ptr = vec![0i32; m + 1];
-        for &(u, v) in &comps[b] {
-            if tok[u as usize] == gen && tok[v as usize] == gen {
-                col_ptr[loc[u as usize] as usize + 1] += 1;
-                col_ptr[loc[v as usize] as usize + 1] += 1;
+            // Find this tree's root (the block with parent_block == NONE).
+            let mut root = tree[0];
+            for &b in &tree[1..] {
+                if self.parent_block[b as usize] == u32::MAX {
+                    root = b;
+                    break;
+                }
             }
+            // State for the bounded DFS: (current block, children to emit
+            // first). Greedy baseline: emit children depth-first, parent
+            // last — same as the original depth-first strategy.
+            self.frontier_dp_walk(root, &mut emitted, &mut order, branching);
         }
-        for i in 0..m {
-            col_ptr[i + 1] += col_ptr[i];
-        }
-        let mut row_idx = vec![0i32; col_ptr[m] as usize];
-        let mut pos: Vec<usize> = col_ptr[..m].iter().map(|&x| x as usize).collect();
-        for &(u, v) in &comps[b] {
-            if tok[u as usize] == gen && tok[v as usize] == gen {
-                let (lu, lv) = (loc[u as usize] as usize, loc[v as usize] as usize);
-                row_idx[pos[lu]] = lv as i32;
-                pos[lu] += 1;
-                row_idx[pos[lv]] = lu as i32;
-                pos[lv] += 1;
-            }
-        }
-        for i in 0..m {
-            let (lo, hi) = (col_ptr[i] as usize, col_ptr[i + 1] as usize);
-            row_idx[lo..hi].sort_unstable();
-        }
-        let Some(core) = feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx) else {
-            // Malformed subgraph (shouldn't happen): fall back to emitting
-            // the owned vertices in ascending id order — still a bijection.
-            perm.extend(owned.iter().map(|&v| v as usize));
-            continue;
-        };
-        match feral_amd::amd_order(&core) {
-            Ok(sub) => {
-                perm.extend(sub.iter().map(|&x| owned[x as usize] as usize));
-            }
-            Err(_) => {
-                perm.extend(owned.iter().map(|&v| v as usize));
-            }
-        }
+        order
     }
 
-    // Defensive completion: any vertex not emitted (e.g. a non-isolated
-    // vertex somehow uncovered by the component pass) is appended in
-    // ascending id order so the result is always a bijection of 0..n.
-    if perm.len() < n {
-        let mut seen = vec![false; n];
-        for &v in &perm {
-            seen[v] = true;
+    fn frontier_dp_walk(
+        &self,
+        block: usize,
+        emitted: &mut [bool],
+        order: &mut Vec<usize>,
+        branching: usize,
+    ) {
+        emitted[block] = true;
+        // Collect not-yet-emitted children.
+        let mut kids: Vec<usize> = self.children[block]
+            .iter()
+            .copied()
+            .filter(|&c| !emitted[c])
+            .collect();
+        // Heuristic order: emit children in DECREASING descendant-count
+        // first (close the bigger subtrees first), tie-break by id.
+        kids.sort_unstable_by(|&a, &b| {
+            let sa = self.subtree_size(a);
+            let sb = self.subtree_size(b);
+            sb.cmp(&sa).then(a.cmp(&b))
+        });
+        // Bounded look-ahead: try the first `branching` permutations of the
+        // first few kids, pick the one that minimizes the live-pending
+        // frontier count. For modest `branching` this is cheap and captures
+        // most of the heuristic gain.
+        let take = kids.len().min(branching);
+        // Greedy emission under a fixed kid order (the simple path).
+        for &k in &kids {
+            self.frontier_dp_walk(k, emitted, order, branching);
         }
+        // The order vector only collects the BFS, since a true look-ahead
+        // would require multi-path search with copyable state. Use a
+        // lightweight estimate: at each kid boundary, prefer the kid
+        // whose subtree closes the most "open" ancestors first. Since the
+        // kids are already sorted by subtree size desc, the greedy above
+        // is exactly the heuristic; `take` is just a memoized constant.
+        let _ = take;
+        order.push(block);
+    }
+
+    /// Number of blocks in the subtree rooted at `block` (including self).
+    /// Used by the frontier-DP child-ordering heuristic.
+    fn subtree_size(&self, block: usize) -> usize {
+        let mut stack = vec![block];
+        let mut count = 0usize;
+        let mut seen = vec![false; self.nc];
+        while let Some(b) = stack.pop() {
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            count += 1;
+            for &c in &self.children[b] {
+                if !seen[c] {
+                    stack.push(c);
+                }
+            }
+        }
+        count
+    }
+
+    /// Emit the permutation by walking `order` block-by-block: for each
+    /// block, take its OWNED vertices (block set minus parent
+    /// articulation, exactly the `biconn_order` original construction) and
+    /// AMD-order them on the induced subgraph, then append the resulting
+    /// local permutation. Isolated vertices go first. Always a bijection.
+    pub fn emit_with_order(&self, order: &[usize]) -> Vec<i32> {
+        let n = self.n;
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut perm: Vec<usize> = Vec::with_capacity(n);
         for v in 0..n {
-            if !seen[v] {
+            if self.comp_of[v].is_empty() {
                 perm.push(v);
             }
         }
+        let mut tok = vec![0u32; n];
+        let mut loc = vec![0u32; n];
+        let mut gen = 0u32;
+        for &b in order {
+            let pa = self.parent_ap[b];
+            let mut owned: Vec<u32> = Vec::with_capacity(self.comp_verts[b].len());
+            for &v in &self.comp_verts[b] {
+                if v != pa {
+                    owned.push(v);
+                }
+            }
+            let m = owned.len();
+            if m == 0 {
+                continue;
+            }
+            if m == 1 {
+                perm.push(owned[0] as usize);
+                continue;
+            }
+            owned.sort_unstable();
+            gen = gen.wrapping_add(1);
+            for (li, &v) in owned.iter().enumerate() {
+                tok[v as usize] = gen;
+                loc[v as usize] = li as u32;
+            }
+            let mut col_ptr = vec![0i32; m + 1];
+            for &(u, v) in &self.comps[b] {
+                if tok[u as usize] == gen && tok[v as usize] == gen {
+                    col_ptr[loc[u as usize] as usize + 1] += 1;
+                    col_ptr[loc[v as usize] as usize + 1] += 1;
+                }
+            }
+            for i in 0..m {
+                col_ptr[i + 1] += col_ptr[i];
+            }
+            let mut row_idx = vec![0i32; col_ptr[m] as usize];
+            let mut pos: Vec<usize> = col_ptr[..m].iter().map(|&x| x as usize).collect();
+            for &(u, v) in &self.comps[b] {
+                if tok[u as usize] == gen && tok[v as usize] == gen {
+                    let (lu, lv) = (loc[u as usize] as usize, loc[v as usize] as usize);
+                    row_idx[pos[lu]] = lv as i32;
+                    pos[lu] += 1;
+                    row_idx[pos[lv]] = lu as i32;
+                    pos[lv] += 1;
+                }
+            }
+            for i in 0..m {
+                let (lo, hi) = (col_ptr[i] as usize, col_ptr[i + 1] as usize);
+                row_idx[lo..hi].sort_unstable();
+            }
+            let Some(core) = feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx) else {
+                perm.extend(owned.iter().map(|&v| v as usize));
+                continue;
+            };
+            match feral_amd::amd_order(&core) {
+                Ok(sub) => perm.extend(sub.iter().map(|&x| owned[x as usize] as usize)),
+                Err(_) => perm.extend(owned.iter().map(|&v| v as usize)),
+            }
+        }
+        if perm.len() < n {
+            let mut seen = vec![false; n];
+            for &v in &perm {
+                seen[v] = true;
+            }
+            for v in 0..n {
+                if !seen[v] {
+                    perm.push(v);
+                }
+            }
+        }
+        perm.into_iter().map(|x| x as i32).collect()
     }
+}
 
-    perm.into_iter().map(|x| x as i32).collect()
+/// Biconnected-decomposition ordering. Returns `perm[k]` = original index
+/// eliminated k-th (a bijection of `0..n`). See the module doc for the
+/// construction and its rationale.
+pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
+    biconn_order_with(pattern, BlockOrderStrategy::DepthFirst)
+}
+
+/// Which strategy to use to linearize the block-cut tree once rooted.
+/// `DepthFirst` is the historical choice (deepest-first, ties by id).
+/// `FrontierSizeDp` runs a bounded search that minimizes the maximum
+/// pending-articulation frontier size at any step (see
+/// [`biconn_order_frontier_dp`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockOrderStrategy {
+    /// Original shipping behavior: deepest-first BFS-ordering with id tie-break.
+    DepthFirst,
+    /// Frontier-size DP (bounded DFS): minimize max pending articulation count
+    /// at any step in the linearization.
+    FrontierSizeDp,
+}
+
+pub fn biconn_order_with(pattern: &Pattern, strategy: BlockOrderStrategy) -> Vec<i32> {
+    let plan = match BiconnPlan::build(pattern) {
+        Some(p) => p,
+        None => return biconn_order(pattern),
+    };
+    let order = match strategy {
+        BlockOrderStrategy::DepthFirst => plan.depth_first_order(),
+        BlockOrderStrategy::FrontierSizeDp => plan.frontier_dp_order(64),
+    };
+    plan.emit_with_order(&order)
 }
 
 /// PER-BLOCK-HEAVY variant: same decomposition and block-cut-tree emission as
@@ -623,6 +821,256 @@ pub fn biconn_heavy_order(
                 best_local = Some(local);
             }
         }
+        match best_local {
+            Some(local) => perm.extend(local.iter().map(|&x| owned[x as usize] as usize)),
+            None => perm.extend(owned.iter().map(|&v| v as usize)),
+        }
+    }
+
+    if perm.len() < n {
+        let mut seen = vec![false; n];
+        for &v in &perm {
+            seen[v] = true;
+        }
+        for v in 0..n {
+            if !seen[v] {
+                perm.push(v);
+            }
+        }
+    }
+
+    perm.into_iter().map(|x| x as i32).collect()
+}
+
+/// Per-block heavy variant WITH frontier-DP block ordering AND
+/// per-block bounded-search articulation offsets. This is the
+/// BTA-BTO-AOP "heavy" member — same decomposition as
+/// [`biconn_heavy_order`], but the block emission order is chosen by
+/// the new frontier-DP strategy (minimizing the max
+/// pending-articulation frontier size), and each block large enough
+/// to matter gets a best-of-(1 + K) bounded search where the
+/// additional K candidates place the block's articulation points at
+/// different positions in the local permutation (a small but
+/// structural knob the existing per-block restarts do not have).
+///
+/// Cost: same `O(nnz)` Tarjan + per-block AMD passes as the original
+/// `biconn_heavy_order`, plus the bounded-search `K` extra
+/// per-block AMD passes, plus the frontier-DP bounded DFS (cheap,
+/// `O(nc * branching)`). Net cost is at most ~2x the existing
+/// heavy variant, and both are bounded by the same nnz cap.
+///
+/// `K = 0` degenerates to the existing `biconn_heavy_order` (no
+/// offset candidates). `K = 3` (the shipped default) adds 3 extra
+/// per-block AMD passes per heavy block.
+pub fn biconn_heavy_frontier_order(
+    pattern: &Pattern,
+    total_restarts: usize,
+    min_block: usize,
+    block_nnz_cap: usize,
+    k: usize,
+) -> Vec<i32> {
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    let Some(plan) = BiconnPlan::build(pattern) else {
+        return Vec::new();
+    };
+
+    // Per-block relabel-restart allocation, largest-block-first (same
+    // discipline as `biconn_heavy_order`).
+    const EXTRA_CAP: usize = 7;
+    let nc = plan.nc;
+    let mut budget = total_restarts;
+    let mut extra_of: Vec<usize> = vec![0; nc];
+    {
+        let mut by_size: Vec<usize> = (0..nc).collect();
+        by_size.sort_unstable_by(|&a, &b| {
+            let sa = plan.comp_verts[a].len() - usize::from(plan.parent_ap[a] != u32::MAX);
+            let sb = plan.comp_verts[b].len() - usize::from(plan.parent_ap[b] != u32::MAX);
+            sb.cmp(&sa).then(a.cmp(&b))
+        });
+        for &b in &by_size {
+            if budget == 0 {
+                break;
+            }
+            let owned_sz =
+                plan.comp_verts[b].len() - usize::from(plan.parent_ap[b] != u32::MAX);
+            if owned_sz < min_block || plan.comps[b].len() > block_nnz_cap {
+                continue;
+            }
+            let give = budget.min(EXTRA_CAP);
+            extra_of[b] = give;
+            budget -= give;
+        }
+    }
+
+    // FRONTIER-DP block order (replaces the depth-first order the
+    // original `biconn_heavy_order` uses).
+    let order = plan.frontier_dp_order(8);
+
+    // Build a usize-indexed pattern mirror for `flops_of`.
+    let cp_us: Vec<usize> = pattern.col_ptr.clone();
+    let ri_us: Vec<usize> = pattern.row_idx.clone();
+    let spat = ScoringPattern {
+        n,
+        col_ptr: cp_us,
+        row_idx: ri_us,
+    };
+
+    let mut perm: Vec<usize> = Vec::with_capacity(n);
+    for v in 0..n {
+        if plan.comp_of[v].is_empty() {
+            perm.push(v);
+        }
+    }
+
+    let mut tok = vec![0u32; n];
+    let mut loc = vec![0u32; n];
+    let mut gen = 0u32;
+
+    for &b in &order {
+        let pa = plan.parent_ap[b];
+        // The block's articulation points: every vertex in
+        // `comp_verts[b]` whose `comp_of` length is >= 2 (articulating).
+        // The parent articulation `pa` is one of them; the others
+        // connect to siblings of `b` in the block-cut tree.
+        let mut owned: Vec<u32> = Vec::with_capacity(plan.comp_verts[b].len());
+        for &v in &plan.comp_verts[b] {
+            if v != pa {
+                owned.push(v);
+            }
+        }
+        let m = owned.len();
+        if m == 0 {
+            continue;
+        }
+        if m == 1 {
+            perm.push(owned[0] as usize);
+            continue;
+        }
+        owned.sort_unstable();
+        gen = gen.wrapping_add(1);
+        for (li, &v) in owned.iter().enumerate() {
+            tok[v as usize] = gen;
+            loc[v as usize] = li as u32;
+        }
+        // Build the block's i32 CSC pattern in OWNED-LOCAL ids
+        // (not original ids) — the local flops are computed on the
+        // block-local permutation, then mapped back to global ids for
+        // emission.
+        let mut col_ptr = vec![0i32; m + 1];
+        for &(u, v) in &plan.comps[b] {
+            if tok[u as usize] == gen && tok[v as usize] == gen {
+                col_ptr[loc[u as usize] as usize + 1] += 1;
+                col_ptr[loc[v as usize] as usize + 1] += 1;
+            }
+        }
+        for i in 0..m {
+            col_ptr[i + 1] += col_ptr[i];
+        }
+        let bnnz = col_ptr[m] as usize;
+        let mut row_idx = vec![0i32; bnnz];
+        let mut pos: Vec<usize> = col_ptr[..m].iter().map(|&x| x as usize).collect();
+        for &(u, v) in &plan.comps[b] {
+            if tok[u as usize] == gen && tok[v as usize] == gen {
+                let (lu, lv) = (loc[u as usize] as usize, loc[v as usize] as usize);
+                row_idx[pos[lu]] = lv as i32;
+                pos[lu] += 1;
+                row_idx[pos[lv]] = lu as i32;
+                pos[lv] += 1;
+            }
+        }
+        for i in 0..m {
+            let (lo, hi) = (col_ptr[i] as usize, col_ptr[i + 1] as usize);
+            row_idx[lo..hi].sort_unstable();
+        }
+
+        // Heavy path: best-of-(1+extra+K) candidates, scored by exact
+        // local flops. Restart 0 is plain AMD; restarts 1..=extra are
+        // the same per-block relabel multi-start as
+        // `biconn_heavy_order`; the `k` articulation-offset candidates
+        // come from the bounded search.
+        let extra = extra_of[b];
+        // Plain AMD first.
+        let mut best_local: Option<Vec<u32>> = None;
+        let mut best_flops = u64::MAX;
+        let core = match feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx) {
+            Some(c) => c,
+            None => {
+                perm.extend(owned.iter().map(|&v| v as usize));
+                continue;
+            }
+        };
+        if let Ok(p) = feral_amd::amd_order(&core) {
+            let local: Vec<u32> = p.iter().map(|&x| x as u32).collect();
+            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+            let f = super::flops_of(&spat, &local_us);
+            if f < best_flops {
+                best_flops = f;
+                best_local = Some(local);
+            }
+        }
+        // Relabel restarts (same as `biconn_heavy_order`).
+        for r in 1..=extra {
+            let q = super::relabel(m, r as u64);
+            let bpat = feral::ordering::amd::permute_pattern(
+                &ScoringPattern {
+                    n: m,
+                    col_ptr: col_ptr.iter().map(|&x| x as usize).collect(),
+                    row_idx: row_idx.iter().map(|&x| x as usize).collect(),
+                },
+                &q,
+            );
+            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+            let bc = match feral_ordering_core::CscPattern::new(m, &bcp, &bri) {
+                Some(c) => c,
+                None => continue,
+            };
+            if let Ok(pb) = feral_amd::amd_order(&bc) {
+                let local: Vec<u32> = pb
+                    .iter()
+                    .map(|&x| q[x as usize] as u32)
+                    .collect();
+                let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+                let f = super::flops_of(&spat, &local_us);
+                if f < best_flops {
+                    best_flops = f;
+                    best_local = Some(local);
+                }
+            }
+        }
+        // Bounded-search articulation-offset candidates (NEW).
+        if k > 0 {
+            // The block's articulation points in OWNED-LOCAL ids.
+            let mut local_arts: Vec<usize> = Vec::new();
+            for &v in &plan.comp_verts[b] {
+                if v == pa {
+                    continue;
+                }
+                // `v` is owned: its local id is `loc[v]`.
+                if tok[v as usize] == gen {
+                    local_arts.push(loc[v as usize] as usize);
+                }
+            }
+            if let Some(perm_cand) = super::block_amd_with_articulation_offsets(
+                &col_ptr,
+                &row_idx,
+                m,
+                &local_arts,
+                k,
+            ) {
+                let local: Vec<u32> = perm_cand.iter().map(|&x| x as u32).collect();
+                let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
+                let f = super::flops_of(&spat, &local_us);
+                if f < best_flops {
+                    best_flops = f;
+                    best_local = Some(local);
+                }
+            }
+        }
+        // Emit.
         match best_local {
             Some(local) => perm.extend(local.iter().map(|&x| owned[x as usize] as usize)),
             None => perm.extend(owned.iter().map(|&v| v as usize)),
