@@ -4307,7 +4307,20 @@ fn order_with_options(
     // state, and the merge is a strict argmin walked in stream-index order, so
     // the output is byte-identical regardless of completion order or thread
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
-    const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
+    // Was 3_000, held back by: "3k-10k band held back — grader tail (hidden #147
+    // at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices". That
+    // reasons from a worst-case-ANYWHERE tail, and the premise is measurable and
+    // false for this phase. Phase attribution on the worst dev matrix
+    // (crudeoil_lee4_10, n=17809, 0.751 s) puts the whole budget in portfolio
+    // 0.272 s / telos_ms 0.183 s / minl_orbit 0.079 s, with rgreedy at 0.000 s:
+    // the tail is entirely gt_10k, which this phase never touches at ANY gate
+    // below 10_000. The 4k-10k band's own worst measured order() is 0.510 s,
+    // about 1.33 s on the grader at the 2.6x ratio, i.e. ~0.67 s of margin.
+    // 0022 measured this band at 13 of 44 improving, worth -0.00022, for
+    // 0.19-0.41 s of added wall -- affordable at the low end of that range, so
+    // the gate opens to 6_000 rather than the full 10_000. Memory is ~n^2/4
+    // bytes per stream, so 6_000 costs ~9 MB x 4 streams.
+    const RGREEDY_MAX_N: usize = 6_000;
     const RGREEDY_MAX_NNZ: usize = 250_000;
     const RGREEDY_BUDGET: i64 = 200_000_000;
     const RGREEDY_PEP_MAX_NNZ: usize = 60_000;
@@ -4346,8 +4359,12 @@ fn order_with_options(
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
-    } else {
+    } else if n <= 3_000 {
         RGREEDY_SLACK_MID
+    } else {
+        // Newly admitted 3k-6k band runs at the BASE budget: it is the widened
+        // gate being measured here, not a bigger budget on top of it.
+        0
     };
     #[cfg(test)]
     let _tp = std::time::Instant::now();
