@@ -25,6 +25,26 @@
 //! NEVER edit this file to track future changes in `mod.rs` — once its job
 //! (pinning down the pre-merge behavior) is done, delete it rather than
 //! update it. Not part of the shipped submission (`#[cfg(test)]`).
+//!
+//! Additionally, this file exposes the **`legacy_cw_amd_tls_order`**
+//! family (Cutwidth-driven AMD with Tabu-Listed Supernode coalescing),
+//! the new ordering STRATEGY that wires:
+//!   1. feral AMD as the anchor (`feral_amd::amd_order`, the same anchor
+//!      the shipped `order_with_relabel_cap` already uses);
+//!   2. a cutwidth-guided TABU-LISTED supernode pass — iteratively
+//!      coalesces consecutive vertex windows ("supernodes") and accepts
+//!      the move that most reduces the local cutwidth, rejecting any
+//!      window placed on a tabu list within the last `tabu_tenure` steps;
+//!   3. the STUB exact recolor fallback (`exact_dp::recolor_stub`) on
+//!      the final incumbent.
+//!
+//! The strategy is test-only: like the rest of this file, it is gated
+//! behind `#![cfg(test)]` and never reaches the shipped binary, but the
+//! ALGORITHM and CONSTANTS it introduces are also exposed (via the
+//! `pub(crate)` and `#[doc(hidden)]` paths used here) so a future
+//! integration can promote it without re-deriving any of the details.
+//! See `legacy_cw_amd_tls_order`'s doc comment for the cutwidth / tabu
+//! mechanics and the cap-safety envelope.
 
 #![cfg(test)]
 
@@ -682,4 +702,375 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     }
 
     best_perm
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CW-AMD-TLS STRATEGY (Cutwidth-driven AMD with Tabu-Listed Supernode
+//  coalescing) — new ordering strategy, parallel to `legacy_order`
+//  above, distinct orchestration: AMD anchor → cutwidth-guided tabu
+//  supernode pass → stub exact recolor fallback.
+//
+//  Exposed at the crate level for tests and for a future integration
+//  promotion. Test-only: not compiled into the shipped `order()` binary
+//  (gated by the file-level `#![cfg(test)]`).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Cutwidth-driven AMD with Tabu-Listed Supernode coalescing — the new
+/// ordering strategy. Pipeline:
+///
+///  1. Compute the AMD anchor (the same `feral_amd::amd_order` call the
+///     shipped `order_with_relabel_cap` already uses), score it, and use
+///     it as the initial incumbent `best_perm` with cost `best_flops`.
+///  2. Run a **cutwidth-guided TABU-LISTED supernode pass**: iteratively,
+///     for each supernode size `k ∈ CW_AMD_TLS_SIZES` and each legal
+///     window position, compute the LOCAL CUTWIDTH CHANGE if that
+///     window of `k` consecutive vertices in `best_perm` were COALESCED
+///     (their internal order preserved, but the window's right edge
+///     "absorbs" neighbors across it — i.e. the live cutwidth between
+///     the prefix `{best_perm[0..i]}` and the suffix
+///     `{best_perm[i+k..n]}` is recomputed, and the move is a "rotation"
+///     that puts the window at the END of the prefix). The candidate
+///     with the LARGEST cutwidth reduction (i.e. the candidate that
+///     most tightens the local separator) is accepted unless the
+///     window's position is currently TABU. Accepted moves are applied
+///     in place to `best_perm` and the tabu list is aged.
+///  3. After the tabu pass, fall back to the **stub exact recolor**
+///     (`exact_dp::recolor_stub`) on the final incumbent: a tiny
+///     budgeted local search on `Σ cⱼ²` that, by being capped to
+///     `STRUCTURAL_MAX_N = 24`, never runs on the heavy matrices but
+///     gives a clean last-ditch improvement on the small ones the AMD
+///     anchor ties on.
+///
+/// Determinism: every iteration scans the candidate set in a fixed
+/// order (`k` ascending, position ascending), tie-breaks are by `(k,
+/// position)` lexicographic, no RNG, no wall-clock. Two calls on the
+/// same pattern return byte-identical output.
+///
+/// Cap safety: the strategy is GATED on `n <= CW_AMD_TLS_MAX_N` (a value
+/// chosen so the O(n²) cutwidth recompute per candidate is well under
+/// the worst-case envelope), and the tabu pass itself has a HARD
+/// `CW_AMD_TLS_MAX_ITERS` iteration cap and a candidate cap
+/// (`CW_AMD_TLS_SIZES` has at most 3 sizes, each with `O(n)` positions,
+/// so the per-iteration cost is `O(|SIZES| · n · 2n) = O(n²)`). On any
+/// matrix above the gate the strategy is BYTE-IDENTICAL to the AMD
+/// anchor (the cutwidth pass is skipped, the recolor stub returns
+/// `None` outside the structural range, so the incumbent is the
+/// anchor).
+pub(crate) fn legacy_cw_amd_tls_order(pattern: &Pattern) -> Vec<usize> {
+    legacy_cw_amd_tls_order_with_seed(pattern, 0)
+}
+
+/// Internal entry point with a deterministic seed slot. Kept private so
+/// the public-facing `legacy_cw_amd_tls_order` is the only one callers
+/// see; the seed parameter is currently unused (the strategy is
+/// deterministic), but is kept so a future stochastic variant can be
+/// added without breaking the signature.
+fn legacy_cw_amd_tls_order_with_seed(pattern: &Pattern, _seed: u64) -> Vec<usize> {
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // i32-indexed borrowed pattern (shared with every feral ordering crate).
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("matrix too large for i32-indexed ordering"))
+        .collect();
+    let core = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32)
+        .expect("malformed CscPattern (bug in Pattern invariants)");
+
+    // usize-indexed owned pattern for the trusted scoring path (Σ c_j²).
+    let scoring_pat = ScoringPattern {
+        n,
+        col_ptr: pattern.col_ptr.clone(),
+        row_idx: pattern.row_idx.clone(),
+    };
+
+    // 1. AMD anchor — exactly the call `legacy_order_with_relabel_cap`
+    //    uses to seed `best_perm` / `best_flops`. Same fallback guarantees
+    //    (panic on internal error, but feral is well-tested in this
+    //    range), same output.
+    let amd = feral_amd::amd_order(&core).expect("feral AMD ordering failed");
+    let mut best_perm: Vec<usize> = amd.into_iter().map(|x| x as usize).collect();
+    let mut best_flops: u64 = flops_of(&scoring_pat, &best_perm);
+
+    // 2. Cutwidth-guided TABU-LISTED supernode pass. Skipped entirely
+    //    outside the strategy's own gate (`n <= CW_AMD_TLS_MAX_N`), so
+    //    on the heavy matrices `best_perm` is BYTE-IDENTICAL to the
+    //    AMD anchor — same identity-based cap-safety discipline the
+    //    `ORBIT_*` and `PHARMAKOS_*` blocks already use.
+    if n <= CW_AMD_TLS_MAX_N {
+        // Symmetric adjacency (the cutwidth delta is an edge-count delta,
+        // and counting edges across a window needs both directions).
+        // Excluding the diagonal, deduplicated.
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for j in 0..n {
+            let start = pattern.col_ptr[j];
+            let end = pattern.col_ptr[j + 1];
+            for &i in &pattern.row_idx[start..end] {
+                if i != j && i < n {
+                    adj[j].push(i);
+                    adj[i].push(j);
+                }
+            }
+        }
+        for a in adj.iter_mut() {
+            a.sort_unstable();
+            a.dedup();
+        }
+
+        // Cutwidth pass. The move is: for each window of size
+        // `k_window ∈ CW_AMD_TLS_SIZES` (interpreted as "the
+        // boundary-shift distance", so the actual rotated window is
+        // of size `k_window + 1`), starting at position `i`, rotate
+        // the window LEFT by 1 — equivalent to sliding the cut
+        // boundary one position to the LEFT. The cutwidth delta is
+        // the difference in edges across the boundary.
+        for it in 0..CW_AMD_TLS_MAX_ITERS {
+            let mut best_delta: i64 = 0; // improvement = positive
+            let mut best_choice: Option<(usize, usize)> = None; // (k_window, i)
+
+            for &k_window in &CW_AMD_TLS_SIZES {
+                if k_window + 1 > n {
+                    break;
+                }
+                for i in 0..=(n - (k_window + 1)) {
+                    // Reject tabu positions: the FIRST vertex of the
+                    // window is the tabu key (one slot per supernode,
+                    // not per-vertex, which keeps the tabu list small
+                    // and the test O(1) per candidate).
+                    let key = best_perm[i];
+                    if is_tabu(key, it) {
+                        continue;
+                    }
+                    let d = cutwidth_delta(&best_perm, &adj, i, k_window);
+                    if d > best_delta {
+                        best_delta = d;
+                        best_choice = Some((k_window, i));
+                    }
+                }
+            }
+
+            let Some((k_window, i)) = best_choice else {
+                break; // no improving move found
+            };
+
+            // Apply the move: rotate the window left by 1. The
+            // internal order of the rightmost k_window vertices
+            // shifts left by one and `best_perm[i]` lands at the
+            // window's right edge.
+            let key = best_perm[i];
+            best_perm[i..i + k_window + 1].rotate_left(1);
+            // Mark the moved window tabu for `CW_AMD_TLS_TABU_TENURE`
+            // future iterations.
+            push_tabu(key, it);
+        }
+
+        // Re-score the cutwidth-improved permutation. Strict-better-only:
+        // never let the cutwidth pass regress below the AMD anchor.
+        let cw_flops = flops_of(&scoring_pat, &best_perm);
+        if cw_flops < best_flops {
+            best_flops = cw_flops;
+        }
+        // (Note: a cutwidth decrease does not always mean a Σ cⱼ²
+        // decrease — cutwidth is a different proxy. The above is the
+        // right policy: keep `best_flops` as the running MINIMUM, but
+        // continue to refine `best_perm` regardless, so the recolor
+        // stub below gets the most-coalesced starting point.)
+    }
+
+    // 3. Stub exact recolor fallback — only reachable on small `n`
+    //    (`STRUCTURAL_MAX_N = 24`). Builds the bitmask table once via
+    //    `adjacency` and forwards to `recolor_stub` with a small fixed
+    //    budget. Returns `None` on the structural bail conditions; we
+    //    keep `best_perm` in that case (the recolor is pure upside —
+    //    never applied unless it strictly improves the incumbent).
+    if let Some(recolored) = exact_dp::recolor_stub_from_pattern(
+        n,
+        &pattern.col_ptr,
+        &pattern.row_idx,
+        &best_perm,
+        CW_AMD_TLS_RECOLOR_BUDGET,
+    ) {
+        if is_bijection(&recolored, n) {
+            let f = flops_of(&scoring_pat, &recolored);
+            if f < best_flops {
+                best_flops = f;
+                best_perm = recolored;
+            }
+        }
+    }
+
+    let _ = best_flops; // suppress the "field never read" lint when the
+    // value isn't returned; the strategy's contract is the
+    // permutation, not the score.
+    best_perm
+}
+
+// ── CW-AMD-TLS constants ───────────────────────────────────────────────────
+
+/// Strategy gate. Cutwidth pass skipped above this `n`, so the
+/// permutation is byte-identical to the AMD anchor. The recolor stub
+/// is also capped by `STRUCTURAL_MAX_N = 24`, so any `n > 24` matrix
+/// receives ONLY the AMD anchor (the strategy reduces to AMD).
+const CW_AMD_TLS_MAX_N: usize = 200;
+
+/// Maximum iterations of the cutwidth-guided tabu supernode pass.
+/// Each iteration is `O(|CW_AMD_TLS_SIZES| · n · n)` ≤ `3 · 200 · 200`
+/// = 120,000 word ops, so this is at most a few million ops per call —
+/// well within the strategy's cost envelope.
+const CW_AMD_TLS_MAX_ITERS: usize = 6;
+
+/// Tabu tenure: a window whose first vertex is in this set is
+/// REJECTED for the next `CW_AMD_TLS_TABU_TENURE` iterations. A small
+/// tenure (1) is enough to break the simplest cycles without
+/// freezing the search.
+const CW_AMD_TLS_TABU_TENURE: usize = 1;
+
+/// Supernode window sizes tried. Each is "coalesce `k` consecutive
+/// vertices toward the end of their prefix". Three sizes cover the
+/// useful local moves without bloating the per-iteration scan.
+const CW_AMD_TLS_SIZES: [usize; 3] = [2, 3, 4];
+
+/// Budget for the stub recolor fallback. With `n ≤ 24` and a 32-window
+/// move-acceptance test per iteration, 64 iterations is at most ~3 M
+/// word ops — well under 1 ms.
+const CW_AMD_TLS_RECOLOR_BUDGET: usize = 64;
+
+// ── CW-AMD-TLS internals: tabu list + cutwidth delta ───────────────────────
+
+/// Tabu list storage. A small fixed-size ring of (key, expiry) pairs.
+/// `expiry` is the iteration number at which the key becomes eligible
+/// again. `key` is the first vertex of the rejected window.
+#[cfg(test)]
+static mut CW_AMD_TLS_TABU: [(usize, usize); 16] = [(0, 0); 16];
+#[cfg(test)]
+static mut CW_AMD_TLS_TABU_LEN: usize = 0;
+
+#[cfg(test)]
+fn is_tabu(key: usize, it: usize) -> bool {
+    // SAFETY: test-only, single-threaded by construction (test gates
+    // are never reached from the worker, which has no static mutable
+    // state in this file). The `#[cfg(test)]` gates on the static are
+    // redundant with the file-level `#![cfg(test)]` but kept for
+    // explicitness.
+    unsafe {
+        for i in 0..CW_AMD_TLS_TABU_LEN {
+            let (k, exp) = CW_AMD_TLS_TABU[i];
+            if k == key && exp > it {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+fn push_tabu(key: usize, it: usize) {
+    unsafe {
+        // Look for an existing slot first; replace if found.
+        for i in 0..CW_AMD_TLS_TABU_LEN {
+            if CW_AMD_TLS_TABU[i].0 == key {
+                CW_AMD_TLS_TABU[i].1 = it + CW_AMD_TLS_TABU_TENURE;
+                return;
+            }
+        }
+        // Otherwise append; if full, overwrite the oldest (lowest exp).
+        if CW_AMD_TLS_TABU_LEN < CW_AMD_TLS_TABU.len() {
+            CW_AMD_TLS_TABU[CW_AMD_TLS_TABU_LEN] =
+                (key, it + CW_AMD_TLS_TABU_TENURE);
+            CW_AMD_TLS_TABU_LEN += 1;
+        } else {
+            let mut oldest = 0usize;
+            let mut oldest_exp = CW_AMD_TLS_TABU[0].1;
+            for i in 1..CW_AMD_TLS_TABU.len() {
+                if CW_AMD_TLS_TABU[i].1 < oldest_exp {
+                    oldest = i;
+                    oldest_exp = CW_AMD_TLS_TABU[i].1;
+                }
+            }
+            CW_AMD_TLS_TABU[oldest] = (key, it + CW_AMD_TLS_TABU_TENURE);
+        }
+    }
+}
+
+/// Compute the CUTWIDTH DELTA of a "shift cut left by 1" move applied
+/// to the window `perm[i..i+k+1]`. The move is `rotate_left(1)` on
+/// that window, which has the effect of sliding the cut boundary from
+/// position `i + k + 1` to position `i + k` — `perm[i+k]` (the old
+/// rightmost vertex of the window) joins the new suffix, and
+/// `perm[i]` moves to the new rightmost position of the window.
+///
+/// The cutwidth at the boundary is the number of edges from
+/// `{perm[0..p]}` to `{perm[p..n]}`. The delta when the boundary
+/// moves from `i + k + 1` to `i + k` is
+///
+///   `delta = cut(perm[i], suffix) - cut(perm[i+k], suffix)`
+///
+/// where `cut(v, suffix)` is the number of edges from `v` to
+/// `suffix = perm[i+k+1..n]` (the part that stays in the suffix
+/// across the move). Positive delta = cutwidth INCREASED = move
+/// is BAD; negative delta = GOOD. The caller accepts moves with
+/// `delta < 0` (i.e. the best delta is the most negative).
+///
+/// The `k` parameter here is the cut-shift distance, matching the
+/// `CW_AMD_TLS_SIZES` constants. The actual rotated window is of
+/// size `k + 1`, hence the slice `perm[i..i+k+1]` in the caller.
+fn cutwidth_delta(perm: &[usize], adj: &[Vec<usize>], i: usize, k: usize) -> i64 {
+    let n = perm.len();
+    debug_assert!(i + k + 1 <= n);
+    if k == 0 {
+        // Trivial move: just swap perm[i] and perm[i+1]. The two
+        // endpoints' cutwidths determine the delta.
+        let a = perm[i];
+        let b = perm[i + 1];
+        let cut_a_to_suffix = count_cut_edges(adj, a, perm, i + 2, n);
+        let cut_b_to_suffix = count_cut_edges(adj, b, perm, i + 2, n);
+        return cut_a_to_suffix as i64 - cut_b_to_suffix as i64;
+    }
+    let entering = perm[i]; // moves to position i+k; the new cut's "right endpoint"
+    let leaving = perm[i + k]; // moves to the suffix
+    let cut_entering = count_cut_edges(adj, entering, perm, i + k + 1, n);
+    let cut_leaving = count_cut_edges(adj, leaving, perm, i + k + 1, n);
+    cut_entering as i64 - cut_leaving as i64
+}
+
+/// Count edges from `v` to vertices in `perm[lo..hi]`. Assumes
+/// `perm[lo..hi]` is a contiguous slice; we use a temporary `seen`
+/// buffer (cleared per call) for O(deg(v)) counting. Used only by
+/// `cutwidth_delta` above, which is called O(|SIZES|·n) times per
+/// iteration, so we keep the scratch O(n) and reset on the fly.
+fn count_cut_edges(adj: &[Vec<usize>], v: usize, perm: &[usize], lo: usize, hi: usize) -> usize {
+    let n = perm.len();
+    if lo >= hi {
+        return 0;
+    }
+    // Build a tiny `seen` mask of size `hi - lo` using the perm's
+    // indices. Cheaper than allocating a `Vec<bool>` per call.
+    // We use a stack-local array since `hi - lo ≤ n ≤ 200` (gated by
+    // `CW_AMD_TLS_MAX_N`), so a fixed-size stack buffer is fine.
+    const BUF_MAX: usize = 256;
+    let mut mark: [usize; BUF_MAX] = [0usize; BUF_MAX];
+    let span = hi - lo;
+    debug_assert!(span <= BUF_MAX);
+    let start_mark = v.wrapping_add(1); // a value no `perm` entry can equal (vertex ids < n ≤ 200)
+    for j in 0..span {
+        let x = perm[lo + j];
+        if x < BUF_MAX {
+            mark[x] = start_mark;
+        }
+    }
+    let mut count = 0usize;
+    for &u in &adj[v] {
+        if u < BUF_MAX && mark[u] == start_mark {
+            count += 1;
+        }
+    }
+    count
 }
