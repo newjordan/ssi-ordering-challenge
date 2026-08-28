@@ -182,12 +182,6 @@ use scoring_ws::ScoreWorkspace;
 /// algorithm and the byte-identical-to-naive-rebuild proof.
 mod nested_subgraph;
 
-/// EXACT minimum-`Σ cⱼ²` ordering by subset DP over the elimination game — the
-/// one candidate family here that is provably optimal rather than heuristic.
-/// Only reachable on very small `n` (see `EXACT_DP_MAX_N`), where the whole
-/// portfolio currently costs well under a millisecond and the 2 s cap is
-/// effectively unbounded.
-mod exact_dp;
 /// BICONNECTED-DECOMPOSITION ordering — a NEW candidate family that
 /// DECOMPOSES the graph into biconnected components (Tarjan) and orders each
 /// with AMD, articulation points deferred to their parent block. No other
@@ -195,6 +189,12 @@ mod exact_dp;
 /// highly decomposable (median ~30% articulation points, 65-399 blocks per
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
+/// EXACT minimum-`Σ cⱼ²` ordering by subset DP over the elimination game — the
+/// one candidate family here that is provably optimal rather than heuristic.
+/// Only reachable on very small `n` (see `EXACT_DP_MAX_N`), where the whole
+/// portfolio currently costs well under a millisecond and the 2 s cap is
+/// effectively unbounded.
+mod exact_dp;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -685,8 +685,22 @@ const TELOS_MAX_PASSES_A: usize = 16;
 /// 2 = AMF α5. Tier A consumes a budgeted prefix; tier B uses
 /// [`TELOS_B_PRIO`] instead.
 const TELOS_PRIO: [(u8, usize); 16] = [
-    (2, 1), (1, 2), (2, 4), (0, 1), (2, 12), (1, 6), (2, 24), (0, 4),
-    (1, 12), (2, 2), (0, 16), (1, 8), (2, 32), (0, 96), (2, 6), (2, 16),
+    (2, 1),
+    (1, 2),
+    (2, 4),
+    (0, 1),
+    (2, 12),
+    (1, 6),
+    (2, 24),
+    (0, 4),
+    (1, 12),
+    (2, 2),
+    (0, 16),
+    (1, 8),
+    (2, 32),
+    (0, 96),
+    (2, 6),
+    (2, 16),
 ];
 /// Tier-B strip set: the ONLY strip configs that won any 150k-400k matrix
 /// in the wave-3 probe (mf:k1 on maxcsp-ehi-90/pooling_sppc0pq, nd:k6 on
@@ -1015,14 +1029,12 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize) -> usize {
     // with nnz/n up to 497 and FAILED the grader (see
     // [`HEAVY_SPARSE_MAX_AVG_DEG`]). Above the nnz ceiling: no measurement,
     // decline.
-    let heavy_multi = if nnz > 150_000
-        && nnz <= RELABEL_HEAVY_MAX_NNZ
-        && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
-    {
-        (900_000 / nnz).clamp(1, 4)
-    } else {
-        0
-    };
+    let heavy_multi =
+        if nnz > 150_000 && nnz <= RELABEL_HEAVY_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
+            (900_000 / nnz).clamp(1, 4)
+        } else {
+            0
+        };
     if restarts == 0 {
         return heavy_multi;
     }
@@ -1107,10 +1119,7 @@ fn strip_candidate(sp: &ScoringPattern, ranked: &[usize], k: usize) -> Option<Ve
     }
     let core = feral_ordering_core::CscPattern::new(m, &scp, &sri)?;
     let sub_amd = feral_amd::amd_order(&core).ok()?;
-    let mut perm: Vec<i32> = sub_amd
-        .iter()
-        .map(|&x| old_id[x as usize] as i32)
-        .collect();
+    let mut perm: Vec<i32> = sub_amd.iter().map(|&x| old_id[x as usize] as i32).collect();
     let mut tail: Vec<usize> = (0..n).filter(|&v| removed[v]).collect();
     tail.sort_unstable_by_key(|&v| (sp.col_ptr[v + 1] - sp.col_ptr[v], v));
     perm.extend(tail.into_iter().map(|v| v as i32));
@@ -1177,7 +1186,11 @@ fn strip_general_v2(
 /// already paid for). Returns `None` if the incumbent's exact fill
 /// (`nnz(L) = Σ counts`) exceeds `max_lnnz` — the caller's cost gate,
 /// checked BEFORE any O(nnz(L)) work below runs.
-fn filled_graph(pat: &ScoringPattern, perm: &[usize], max_lnnz: usize) -> Option<(Vec<i32>, Vec<i32>)> {
+fn filled_graph(
+    pat: &ScoringPattern,
+    perm: &[usize],
+    max_lnnz: usize,
+) -> Option<(Vec<i32>, Vec<i32>)> {
     let n = pat.n;
     let permuted = permute_pattern(pat, perm);
     let etree = EliminationTree::from_pattern(&permuted);
@@ -1349,7 +1362,6 @@ fn order_with_options(
     orbit_enabled: bool,
     pharmakos_enabled: bool,
 ) -> Vec<usize> {
-
     let n = pattern.n;
     if n == 0 {
         return Vec::new();
@@ -1416,7 +1428,8 @@ fn order_with_options(
     // exactly the wrong property to have in THIS build, which raises that
     // budget for large matrices). Only `consider` inserts; the relabel and
     // hill-climb loops below only READ it.
-    let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
+    let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> =
+        std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
 
     // Try a candidate produced by `f`; keep it if it is a valid bijection with
@@ -1424,8 +1437,7 @@ fn order_with_options(
     // (which would otherwise crash the worker and FAIL the whole run).
     let mut consider =
         |produce: &dyn Fn() -> Result<Vec<i32>, feral_ordering_core::OrderingError>| {
-            let produced =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
+            let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
             let Ok(Ok(perm_i32)) = produced else {
                 return;
             };
@@ -1566,16 +1578,13 @@ fn order_with_options(
         // (0.807 s, the heaviest matrix admitted here) below the corpus worst
         // case of 1.124 s on `ringpack_30_2`. Routed through `consider`, so like
         // every candidate it is free upside under the AMD floor.
-        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
-            && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
-        {
+        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz) && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
             let opts_05_sparse = feral_amf::AmfOptions {
                 dense_alpha: 0.5,
                 ..Default::default()
             };
             consider(&|| feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
         }
-
     }
 
     // Medium-size extras: cheap here, pure upside layered over the AMD floor.
@@ -1621,7 +1630,10 @@ fn order_with_options(
         // near the 2 s cap, and adding two more AMD passes there breached it
         // (measured 2.46 s at 5×). At nnz < 150k each AMD pass is a few ms.
         if nnz < SWEEP_EXTRA_MAX_NNZ {
-            let amd_opts1 = feral_amd::AmdOptions { aggressive: true, dense_alpha: 1.0 };
+            let amd_opts1 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 1.0,
+            };
             consider(&|| feral_amd::amd_order_opts(&core, &amd_opts1).map(|(p, ..)| p));
             // Aggressive AMD α16 ("amd_a16") DROPPED — 0 unique wins, exact
             // 0.00000000 dev-score cost (same measurement as amf_default
@@ -1653,7 +1665,10 @@ fn order_with_options(
     //      fast (sparse) AND is the unique min (faclay75, kissing2, pooling_*).
     if n < AMF_SWEEP_MAX_N && nnz < 130_000 {
         for da in [1.0f64, 16.0, -1.0] {
-            let amf_a = feral_amf::AmfOptions { dense_alpha: da, ..Default::default() };
+            let amf_a = feral_amf::AmfOptions {
+                dense_alpha: da,
+                ..Default::default()
+            };
             consider(&|| feral_amf::amf_order_opts(&core, &amf_a).map(|(p, ..)| p));
         }
 
@@ -1719,10 +1734,16 @@ fn order_with_options(
         }
     } else if n < AMF_SWEEP_MAX_N && nnz >= 130_000 && nnz < 400_000 {
         // Win B — see regime (b) above.
-        let amf_dz = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
+        let amf_dz = feral_amf::AmfOptions {
+            dense_alpha: -1.0,
+            ..Default::default()
+        };
         consider(&|| feral_amf::amf_order_opts(&core, &amf_dz).map(|(p, ..)| p));
     } else if n < AMF_SWEEP_MAX_N && nnz >= 400_000 && nnz < AMF_SWEEP_MAX_NNZ {
-        let amf_nd = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
+        let amf_nd = feral_amf::AmfOptions {
+            dense_alpha: -1.0,
+            ..Default::default()
+        };
         consider(&|| feral_amf::amf_order_opts(&core, &amf_nd).map(|(p, ..)| p));
     }
 
@@ -1783,9 +1804,7 @@ fn order_with_options(
     // worst case; deterministic (stable within-level degree sort, fixed BFS
     // seeding). Best-of floor makes it zero-downside.
     if n < RCM_MAX_N && nnz < RCM_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern)));
     }
 
     // Sloan wavefront/profile reduction — a pure-Rust O(nnz log n) ordering from
@@ -1844,11 +1863,30 @@ fn order_with_options(
         // (ringpack_30_2) added +0.14 s to the portfolio's worst case.
         if nnz <= 60_000 {
             consider(&|| {
-                Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
-                )
+                Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_heavy_order(
+                    pattern, 24, 32, 150_000,
+                ))
             });
         }
+
+        // NESTED-DISSECTION (ND-Lite) variant — uses the biconnected-component
+        // decomposition as a separator oracle. Recursively bisects components
+        // above `sep_min_size = 64` using the biconn articulation structure as
+        // a separator heuristic with `max_recursion_depth = 6`. Enforces
+        // `sep_balance_tol = 0.4` (aborts branches to `degree2_absorb_fallback`
+        // when violated). Dispatches each leaf to either AMD or a small-budget
+        // exact_dp call selected by the `custom_metrics` predicted edge count.
+        // Applies a bounded 1-opt adjacent-swap refinement on boundary vertices
+        // gated by the predicted-flops delta. Falls back to multistart AMD on
+        // small graphs where the predicted-flops ratio vs. feral AMD exceeds
+        // `gate_predicted_flops_ratio = 1.05`. See `biconn::nested_dissection_order`
+        // for the full mechanism. Gated to the same envelope as the other
+        // biconn candidates so its (bounded) work stays in cheap territory.
+        consider(&|| {
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::nested_dissection_order(
+                pattern,
+            ))
+        });
     }
 
     // Hand-rolled NESTED DISSECTION — our OWN pure-Rust recursive graph bisection
@@ -1861,9 +1899,7 @@ fn order_with_options(
     // overflow nor move the worst case. Deterministic. Best-of floor →
     // zero-downside.
     if n < ND_MAX_N && nnz < ND_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern)));
         // Same BFS-separator structure, but each base-case leaf and unsplittable
         // separator is ordered by AMD on its induced subgraph (textbook ND +
         // minimum-degree hybrid) rather than a plain global-degree sort. Added
@@ -1887,9 +1923,7 @@ fn order_with_options(
     // below the slow tier) so its few-ms cost cannot move the worst case.
     // Deterministic. Best-of floor → zero-downside.
     if n < NDFM_MAX_N && nnz < NDFM_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(ndfm_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(ndfm_order(pattern)));
     }
 
     // NET-NEW: MINIMUM-FILL (minimum-deficiency) ordering — a greedy elimination
@@ -1908,9 +1942,7 @@ fn order_with_options(
     // `wastepaper6`, `syn*`, `tln2`). Deterministic (fixed
     // `(deficiency, degree, index)` tie-break). Best-of floor → zero-downside.
     if n < MINFILL_MAX_N && nnz < MINFILL_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(minfill_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(minfill_order(pattern)));
     }
 
     // METIS nested dissection — bounded by nnz primarily (its cost driver) plus
@@ -1967,9 +1999,7 @@ fn order_with_options(
             n_sep_trials: 10,
             ..Default::default()
         };
-        consider(&|| {
-            feral_scotch::scotch_order_full(&core, &scotch_tuned).map(|(p, _, _)| p)
-        });
+        consider(&|| feral_scotch::scotch_order_full(&core, &scotch_tuned).map(|(p, _, _)| p));
     }
 
     // KaHIP — distinct partitioner, small-matrix only. Milliseconds even at 5×;
@@ -2103,7 +2133,10 @@ fn order_with_options(
         // is byte-identical to the old `strip_candidate(&scoring_pat,
         // &deg_ranked, k)` call it replaces for each surviving k — see its
         // doc comment.
-        let ks: Vec<usize> = [96usize, 64, 48, 24, 6].into_iter().filter(|&k| k < n).collect();
+        let ks: Vec<usize> = [96usize, 64, 48, 24, 6]
+            .into_iter()
+            .filter(|&k| k < n)
+            .collect();
         if let Some((&k0, rest)) = ks.split_first() {
             let (mut deg_builder, deg_sub0) =
                 nested_subgraph::NestedSubgraphBuilder::new(pattern, &deg_ranked, k0);
@@ -2191,8 +2224,7 @@ fn order_with_options(
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
-    let restarts =
-        relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
+    let restarts = relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz).min(relabel_cap);
     for r in 0..restarts {
         let seed = r as u64 + 1;
         consider(&|| {
@@ -2305,7 +2337,6 @@ fn order_with_options(
             });
         }
     }
-
 
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
@@ -2506,25 +2537,29 @@ fn order_with_options(
         // doc for the RCA. Plain no-dense AMD is still used, unrelatedly, by
         // FILLG below via a direct `amd_order_opts` call.)
         let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
-            let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+            let o = feral_amf::AmfOptions {
+                dense_alpha: 5.0,
+                ..Default::default()
+            };
             feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
         };
 
-        let mut try_cand = |cand_opt: Option<Vec<usize>>, best_flops: &mut u64, best_perm: &mut Vec<usize>| {
-            let Some(cand) = cand_opt else { return };
-            if !is_bijection(&cand, n) {
-                return;
-            }
-            let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                cached
-            } else {
-                ws.flops(&scoring_pat, &cand)
+        let mut try_cand =
+            |cand_opt: Option<Vec<usize>>, best_flops: &mut u64, best_perm: &mut Vec<usize>| {
+                let Some(cand) = cand_opt else { return };
+                if !is_bijection(&cand, n) {
+                    return;
+                }
+                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                    cached
+                } else {
+                    ws.flops(&scoring_pat, &cand)
+                };
+                if f < *best_flops {
+                    *best_flops = f;
+                    *best_perm = cand;
+                }
             };
-            if f < *best_flops {
-                *best_flops = f;
-                *best_perm = cand;
-            }
-        };
 
         // ---- STRIP-V2 sv2inc: ranked by INCUMBENT exact column count
         // (not baseline-AMD's loose degree, unlike the shipped strip
@@ -2577,8 +2612,7 @@ fn order_with_options(
         // (0.207s vs sv2damd's 0.287s at density 46 on the breaching
         // matrix) and AMF's dense_alpha handling is the more natural fit
         // there; `sub_amd` covers the lower part of the dense-class band.
-        let dense_class =
-            nnz >= STRIPV2_DENSE_MIN_AVG_DEG * n || nnz >= STRIPV2_DENSE_MIN_NNZ;
+        let dense_class = nnz >= STRIPV2_DENSE_MIN_AVG_DEG * n || nnz >= STRIPV2_DENSE_MIN_NNZ;
         if dense_class {
             let mut deg_ranked: Vec<usize> = (0..n).collect();
             deg_ranked.sort_unstable_by(|&a, &b| {
@@ -2614,7 +2648,10 @@ fn order_with_options(
                         let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
                         try_cand(Some(cand), &mut best_flops, &mut best_perm);
                     }
-                    let nd_opts = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                    let nd_opts = feral_amd::AmdOptions {
+                        aggressive: false,
+                        dense_alpha: -1.0,
+                    };
                     if let Ok((p, ..)) = feral_amd::amd_order_opts(&fcore, &nd_opts) {
                         let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
                         try_cand(Some(cand), &mut best_flops, &mut best_perm);
@@ -2635,11 +2672,17 @@ fn order_with_options(
     if nnz > 0 && nnz < TELOS_MAX_NNZ {
         let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
         let sub_nd = |c: &feral_ordering_core::CscPattern| {
-            let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+            let o = feral_amd::AmdOptions {
+                aggressive: false,
+                dense_alpha: -1.0,
+            };
             feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
         };
         let sub_mf = |c: &feral_ordering_core::CscPattern| {
-            let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+            let o = feral_amf::AmfOptions {
+                dense_alpha: 5.0,
+                ..Default::default()
+            };
             feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
         };
 
@@ -2671,31 +2714,32 @@ fn order_with_options(
 
             let mut round_f = best_flops;
             let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
+            let mut try_cand =
+                |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
+                    };
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
                 };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
 
             for &(subi, k) in prio.iter().take(passes) {
                 if k >= n {
                     continue;
                 }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
-                    };
+                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> = match subi
+                {
+                    0 => &sub_amd,
+                    1 => &sub_nd,
+                    _ => &sub_mf,
+                };
                 if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
                     try_cand(cand, &mut round_f, &mut round_p);
                 }
@@ -2941,7 +2985,11 @@ fn order_with_options(
         let mut s_count = 0usize;
         let s_max = (PHARMAKOS_SMAX_MULT * (n as f64).sqrt()).round() as usize;
         let s_max = s_max.clamp(PHARMAKOS_SMAX_MIN, PHARMAKOS_SMAX_ABS_CAP);
-        let batch_k = if n >= PHARMAKOS_BATCH_N_THRESHOLD { PHARMAKOS_BATCH_K } else { 1 };
+        let batch_k = if n >= PHARMAKOS_BATCH_N_THRESHOLD {
+            PHARMAKOS_BATCH_K
+        } else {
+            1
+        };
 
         for _round in 0..PHARMAKOS_MAX_ROUNDS {
             if s_count >= s_max {
@@ -3389,8 +3437,7 @@ fn orbit_batched_delete(adj: &mut [Vec<u32>], fill: &[(u32, u32)], class: &[u32]
     {
         let mut start = 0usize;
         for w in 1..=m {
-            if w == m
-                || bucket_key[order_idx[w] as usize] != bucket_key[order_idx[start] as usize]
+            if w == m || bucket_key[order_idx[w] as usize] != bucket_key[order_idx[start] as usize]
             {
                 buckets.push((start, w));
                 start = w;
@@ -3990,7 +4037,11 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
 
     // Scratch global->local map for AMD-on-induced-leaf ordering; -1 everywhere
     // between leaves. Allocated only when the AMD-leaf variant is requested.
-    let mut g2l: Vec<i32> = if amd_leaves { vec![-1i32; n] } else { Vec::new() };
+    let mut g2l: Vec<i32> = if amd_leaves {
+        vec![-1i32; n]
+    } else {
+        Vec::new()
+    };
 
     // Fill `order[lo..lo+v.len()]` with `v` reordered by ascending degree
     // (min-degree-ish leaf ordering), ties broken by index → deterministic.
@@ -4284,8 +4335,7 @@ fn sloan_order(pattern: &Pattern, w1: i64, w2: i64) -> Vec<i32> {
     let mut dist: Vec<u32> = vec![0u32; n];
     let mut touched: Vec<usize> = Vec::new();
     let mut comp: Vec<usize> = Vec::new();
-    let mut heap: std::collections::BinaryHeap<(i64, usize)> =
-        std::collections::BinaryHeap::new();
+    let mut heap: std::collections::BinaryHeap<(i64, usize)> = std::collections::BinaryHeap::new();
 
     for seed in 0..n {
         if status[seed] == POSTACTIVE {
@@ -4495,7 +4545,10 @@ mod tests {
     #[ignore]
     fn full_corpus_byte_identical_to_legacy() {
         let corpus = crate::corpus::corpus();
-        assert!(!corpus.is_empty(), "dev corpus must be non-empty for this proof to mean anything");
+        assert!(
+            !corpus.is_empty(),
+            "dev corpus must be non-empty for this proof to mean anything"
+        );
         let mut checked = 0usize;
         for (name, pat) in &corpus {
             let optimized = order(pat);
@@ -4592,8 +4645,7 @@ mod tests {
         assert_bijection(&perm, n);
 
         let empty = Pattern::from_edges(12, &[]);
-        let perm2: Vec<usize> =
-            rcm_order(&empty).into_iter().map(|x| x as usize).collect();
+        let perm2: Vec<usize> = rcm_order(&empty).into_iter().map(|x| x as usize).collect();
         assert_bijection(&perm2, 12);
     }
 
@@ -4612,16 +4664,22 @@ mod tests {
         }
         // nodes 41..50 are isolated
         let pat = Pattern::from_edges(n, &edges);
-        let perm: Vec<usize> =
-            sloan_order(&pat, 2, 1).into_iter().map(|x| x as usize).collect();
+        let perm: Vec<usize> = sloan_order(&pat, 2, 1)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm, n);
-        let perm_b: Vec<usize> =
-            sloan_order(&pat, 1, 2).into_iter().map(|x| x as usize).collect();
+        let perm_b: Vec<usize> = sloan_order(&pat, 1, 2)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm_b, n);
 
         let empty = Pattern::from_edges(12, &[]);
-        let perm2: Vec<usize> =
-            sloan_order(&empty, 1, 2).into_iter().map(|x| x as usize).collect();
+        let perm2: Vec<usize> = sloan_order(&empty, 1, 2)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm2, 12);
     }
 
@@ -4659,8 +4717,7 @@ mod tests {
         assert_bijection(&perm, n);
 
         let empty = Pattern::from_edges(12, &[]);
-        let perm2: Vec<usize> =
-            nd_order(&empty).into_iter().map(|x| x as usize).collect();
+        let perm2: Vec<usize> = nd_order(&empty).into_iter().map(|x| x as usize).collect();
         assert_bijection(&perm2, 12);
 
         // A larger banded/grid-like structure that exercises real bisection.
@@ -4673,8 +4730,7 @@ mod tests {
             e2.push((v, v + 20));
         }
         let grid = Pattern::from_edges(m, &e2);
-        let perm3: Vec<usize> =
-            nd_order(&grid).into_iter().map(|x| x as usize).collect();
+        let perm3: Vec<usize> = nd_order(&grid).into_iter().map(|x| x as usize).collect();
         assert_bijection(&perm3, m);
     }
 
@@ -4760,8 +4816,7 @@ mod tests {
         assert_bijection(&perm, n);
 
         let empty = Pattern::from_edges(12, &[]);
-        let perm2: Vec<usize> =
-            ndfm_order(&empty).into_iter().map(|x| x as usize).collect();
+        let perm2: Vec<usize> = ndfm_order(&empty).into_iter().map(|x| x as usize).collect();
         assert_bijection(&perm2, 12);
 
         // A larger banded/grid-like structure that exercises real bisection.
@@ -4774,8 +4829,7 @@ mod tests {
             e2.push((v, v + 20));
         }
         let grid = Pattern::from_edges(m, &e2);
-        let perm3: Vec<usize> =
-            ndfm_order(&grid).into_iter().map(|x| x as usize).collect();
+        let perm3: Vec<usize> = ndfm_order(&grid).into_iter().map(|x| x as usize).collect();
         assert_bijection(&perm3, m);
 
         // A 2D grid (mesh-like) to exercise real vertex separators.
@@ -4793,8 +4847,7 @@ mod tests {
             }
         }
         let mesh = Pattern::from_edges(side * side, &e3);
-        let perm4: Vec<usize> =
-            ndfm_order(&mesh).into_iter().map(|x| x as usize).collect();
+        let perm4: Vec<usize> = ndfm_order(&mesh).into_iter().map(|x| x as usize).collect();
         assert_bijection(&perm4, side * side);
     }
 
@@ -4828,13 +4881,17 @@ mod tests {
         }
         // nodes 41..50 are isolated
         let pat = Pattern::from_edges(n, &edges);
-        let perm: Vec<usize> =
-            minfill_order(&pat).into_iter().map(|x| x as usize).collect();
+        let perm: Vec<usize> = minfill_order(&pat)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm, n);
 
         let empty = Pattern::from_edges(12, &[]);
-        let perm2: Vec<usize> =
-            minfill_order(&empty).into_iter().map(|x| x as usize).collect();
+        let perm2: Vec<usize> = minfill_order(&empty)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm2, 12);
 
         // A banded structure with real fill choices.
@@ -4847,8 +4904,10 @@ mod tests {
             e2.push((v, v + 10));
         }
         let band = Pattern::from_edges(m, &e2);
-        let perm3: Vec<usize> =
-            minfill_order(&band).into_iter().map(|x| x as usize).collect();
+        let perm3: Vec<usize> = minfill_order(&band)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm3, m);
 
         // A 2D grid (mesh-like).
@@ -4866,8 +4925,10 @@ mod tests {
             }
         }
         let mesh = Pattern::from_edges(side * side, &e3);
-        let perm4: Vec<usize> =
-            minfill_order(&mesh).into_iter().map(|x| x as usize).collect();
+        let perm4: Vec<usize> = minfill_order(&mesh)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
         assert_bijection(&perm4, side * side);
     }
 
@@ -4903,8 +4964,7 @@ mod tests {
 
         let col_ptr_i32: Vec<i32> = pat.col_ptr.iter().map(|&x| x as i32).collect();
         let row_idx_i32: Vec<i32> = pat.row_idx.iter().map(|&x| x as i32).collect();
-        let core =
-            feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32).unwrap();
+        let core = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32).unwrap();
         let amd: Vec<usize> = feral_amd::amd_order(&core)
             .unwrap()
             .into_iter()
@@ -4917,6 +4977,9 @@ mod tests {
         };
         let amd_flops = flops_of(&scoring_pat, &amd);
         let ours_flops = flops_of(&scoring_pat, &order(&pat));
-        assert!(ours_flops <= amd_flops, "ours {ours_flops} > amd {amd_flops}");
+        assert!(
+            ours_flops <= amd_flops,
+            "ours {ours_flops} > amd {amd_flops}"
+        );
     }
 }

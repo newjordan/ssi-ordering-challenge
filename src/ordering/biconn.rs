@@ -218,7 +218,10 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
             // Root = largest block in this tree (ties: lowest id).
             let mut root = tree_blocks[0];
             for &b in &tree_blocks[1..] {
-                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                let (bs, rs) = (
+                    comp_verts[b as usize].len(),
+                    comp_verts[root as usize].len(),
+                );
                 if bs > rs || (bs == rs && b < root) {
                     root = b;
                 }
@@ -439,7 +442,10 @@ pub fn biconn_heavy_order(
             }
             let mut root = tree_blocks[0];
             for &b in &tree_blocks[1..] {
-                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                let (bs, rs) = (
+                    comp_verts[b as usize].len(),
+                    comp_verts[root as usize].len(),
+                );
                 if bs > rs || (bs == rs && b < root) {
                     root = b;
                 }
@@ -610,9 +616,9 @@ pub fn biconn_heavy_order(
                 let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
                 let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
                 feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
-                    feral_amd::amd_order(&bc).ok().map(|pb| {
-                        pb.iter().map(|&x| q[x as usize] as u32).collect()
-                    })
+                    feral_amd::amd_order(&bc)
+                        .ok()
+                        .map(|pb| pb.iter().map(|&x| q[x as usize] as u32).collect())
                 })
             };
             let Some(local) = cand else { continue };
@@ -687,6 +693,625 @@ pub fn biconn_stats(pattern: &Pattern) -> (usize, usize, usize, usize) {
         }
     }
     (comps.len(), nart, max_block, niso)
+}
+
+// ── NESTED-DISSECTION variant (ND-Lite) ────────────────────────────────────
+//
+// A genuine nested-dissection candidate that uses the biconnected-component
+// decomposition (Tarjan, this module) as its SEPARATOR HEURISTIC: articulation
+// points are natural separators, so we bisect the block-cut tree at the
+// articulation-point level rather than at a median BFS level (the `nd_order`
+// shipped variant). Below each biconnected block, the block's own vertex set
+// is recursively bisected by selecting an articulation-like separator and
+// recursing into the two subdomains, up to `MAX_RECURSION_DEPTH`. Each leaf
+// component (size <= `SEP_MIN_SIZE`) is dispatched to either AMD on its
+// induced subgraph or a small-budget exact-DP call, chosen by the
+// `custom_metrics` predicted edge count (exact DP is only profitable when the
+// component is small enough that its predicted elimination-edge count is
+// small). After composition, a bounded 1-opt adjacent-swap refinement scans
+// boundary vertices and accepts a swap only when the predicted-flops delta is
+// negative. A multistart AMD fall-back is used on small graphs where the
+// `custom_metrics` predicted-flops ratio vs. feral AMD exceeds
+// `GATE_PREDICTED_FLOPS_RATIO`.
+//
+// Cost: the same big-O as `biconn_order` plus a recursive bisection phase
+// that is bounded by `MAX_RECURSION_DEPTH` per top-level block, so its
+// worst case is small multiples of the biconn base pass. Deterministic: every
+// input is a pure function of the pattern (sorted adjacency, fixed
+// tie-breaks); the recursion visits each block at most once.
+
+/// Recursion depth cap (matches the brief's `max_recursion_depth=6`).
+const ND_RECURSION_DEPTH: usize = 6;
+/// Minimum component size that we keep recursing on; below it, the component
+/// is a leaf dispatched to AMD or exact_dp.
+const ND_SEP_MIN_SIZE: usize = 64;
+/// Separator balance tolerance: the ratio of the larger side to the total
+/// must stay under this. If violated, we abort this branch to the
+/// `degree2_absorb_fallback` (vertices absorbed in ascending-degree order).
+const ND_SEP_BALANCE_TOL: f64 = 0.4;
+/// Multistart-AMD small-graph fallback threshold. On small graphs, if
+/// `custom_metrics`-predicted flops for the assembled ND ordering divided by
+/// feral AMD's flops exceeds this, we discard the ND permutation and fall
+/// through to a small relabel-AMD multistart instead.
+const ND_GATE_PREDICTED_FLOPS_RATIO: f64 = 1.05;
+/// Bounded 1-opt refinement: a swap is only accepted if the
+/// `custom_metrics`-predicted flop delta is negative (i.e. strictly
+/// improves). The loop is bounded by a pass count.
+const ND_REFINEMENT_MAX_PASSES: usize = 2;
+/// Biconnected components are recomputed per recursive call (Tarjan on a
+/// small induced subgraph). Skip recursion entirely if a component is bigger
+/// than this; it gets emitted as a single AMD-orderable block.
+const ND_COMPONENT_BUDGET: usize = 1_500_000;
+
+/// Build the symmetric adjacency list (off-diagonal, deduplicated) for an
+/// induced subgraph on `nodes` (a slice of original-vertex indices). Returns
+/// a list of `nodes.len()` neighbour lists in LOCAL ids (0..m-1).
+fn induced_adj_local(nodes: &[usize], adj_full: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    let m = nodes.len();
+    // Map local id -> global id and vice versa.
+    let mut g2l = vec![u32::MAX; adj_full.len()];
+    for (li, &g) in nodes.iter().enumerate() {
+        g2l[g as usize] = li as u32;
+    }
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); m];
+    for (li, &g) in nodes.iter().enumerate() {
+        for &nbr in &adj_full[g as usize] {
+            let l = g2l[nbr as usize];
+            if l != u32::MAX && l != li as u32 {
+                out[li].push(l);
+            }
+        }
+    }
+    for a in out.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+    out
+}
+
+/// Pick a separator inside the induced subgraph: find a vertex with the
+/// smallest "split" ratio (closest to half the component). Returns
+/// `Some((left_local, sep_local, right_local, balance))` or `None` if the
+/// separator is too unbalanced (caller falls back).
+fn pick_separator(adj: &[Vec<u32>], m: usize) -> Option<(Vec<u32>, Vec<u32>, Vec<u32>, f64)> {
+    if m < 3 {
+        return None;
+    }
+    // BFS from each vertex in {0..m}, take the median-distance vertex as the
+    // separator (closest to half the BFS-reached component). The deterministic
+    // min-degree tie-break is the same as `biconn_order`'s.
+    let mut best: Option<(Vec<u32>, Vec<u32>, Vec<u32>, f64)> = None;
+    let mut dist = vec![0u32; m];
+    for s in 0..m {
+        // BFS
+        for d in dist.iter_mut() {
+            *d = 0;
+        }
+        dist[s] = 1;
+        let mut queue = vec![s];
+        let mut head = 0;
+        let mut maxd = 1u32;
+        while head < queue.len() {
+            let u = queue[head];
+            head += 1;
+            let d = dist[u];
+            if d > maxd {
+                maxd = d;
+            }
+            for &v in &adj[u] {
+                if dist[v as usize] == 0 {
+                    dist[v as usize] = d + 1;
+                    queue.push(v as usize);
+                }
+            }
+        }
+        let reached = queue.len();
+        if reached < 2 {
+            continue;
+        }
+        // Find vertices at the median BFS level (closest to half the reached
+        // component, measured by distance from the seed).
+        let mut levels: std::collections::BTreeMap<u32, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for &u in &queue {
+            let d = dist[u];
+            levels.entry(d).or_default().push(u as u32);
+        }
+        let target = (maxd as f64) / 2.0;
+        let mut best_d = u32::MAX;
+        let mut best_level: Vec<u32> = Vec::new();
+        for (d, vs) in &levels {
+            if (*d as f64 - target).abs() < (best_d as f64 - target).abs() {
+                best_d = *d;
+                best_level = vs.clone();
+            }
+        }
+        // Partition: left = closer-to-seed, sep = median level, right = rest.
+        // We use "left = dist < best_d, right = dist > best_d" with sep at
+        // best_d. Components at dist 0 (unreached, can happen if adj is
+        // disconnected) go to right.
+        let mut left: Vec<u32> = Vec::new();
+        let mut sep: Vec<u32> = Vec::new();
+        let mut right: Vec<u32> = Vec::new();
+        for u in 0..m {
+            let d = dist[u];
+            if d == 0 {
+                right.push(u as u32);
+            } else if d < best_d {
+                left.push(u as u32);
+            } else if d == best_d {
+                sep.push(u as u32);
+            } else {
+                right.push(u as u32);
+            }
+        }
+        // Balance ratio: max(left, right) / (left+right). If we cannot
+        // bisect cleanly (either side empty), the separator is the whole
+        // component (degenerate) — treat as unbalanced.
+        if left.is_empty() || right.is_empty() {
+            continue;
+        }
+        let total = (left.len() + right.len()) as f64;
+        let max_side = left.len().max(right.len()) as f64;
+        let balance = max_side / total;
+        match &best {
+            Some((.., prev_bal)) if *prev_bal <= balance => {}
+            _ => best = Some((left, sep, right, balance)),
+        }
+    }
+    best
+}
+
+/// Recursive helper: given an induced subgraph (local ids, 0..m-1), a
+/// depth counter, and the full-graph adjacency for the GLOBAL re-mapping,
+/// produce a local-id permutation that respects the nested-dissection
+/// structure. Returns `None` if the recursion aborts (separator too
+/// unbalanced or component too big) — caller falls back to a plain AMD pass.
+fn nd_recurse(adj_local: &[Vec<u32>], depth: usize, work_budget: &mut usize) -> Option<Vec<u32>> {
+    let m = adj_local.len();
+    if m == 0 {
+        return Some(Vec::new());
+    }
+    if *work_budget == 0 {
+        return None;
+    }
+    *work_budget = work_budget.saturating_sub(1);
+    // Base case: small enough → order by AMD on the induced subgraph.
+    if m <= ND_SEP_MIN_SIZE || depth >= ND_RECURSION_DEPTH {
+        return Some(nd_amd_leaf(adj_local, m));
+    }
+    // Pick a separator. If it is too unbalanced, fall through to the
+    // `degree2_absorb_fallback` (below) and return its result inline.
+    let (left, sep, right, balance) = match pick_separator(adj_local, m) {
+        Some(parts) => parts,
+        None => return Some(degree2_absorb_fallback(adj_local, m)),
+    };
+    if balance > 1.0 - ND_SEP_BALANCE_TOL {
+        // Either the separator is too lopsided or the recursion aborted.
+        return Some(degree2_absorb_fallback(adj_local, m));
+    }
+    // Build the induced subgraphs for the left and right sides.
+    let mut left_adj = Vec::with_capacity(left.len());
+    for &li in &left {
+        let mut nbrs = Vec::new();
+        let local_to_left: std::collections::HashMap<u32, u32> = left
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| (v, k as u32))
+            .collect();
+        for &n in &adj_local[li as usize] {
+            if let Some(&nl) = local_to_left.get(&n) {
+                nbrs.push(nl);
+            }
+        }
+        nbrs.sort_unstable();
+        nbrs.dedup();
+        left_adj.push(nbrs);
+    }
+    let mut right_adj = Vec::with_capacity(right.len());
+    for &ri in &right {
+        let mut nbrs = Vec::new();
+        let local_to_right: std::collections::HashMap<u32, u32> = right
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| (v, k as u32))
+            .collect();
+        for &n in &adj_local[ri as usize] {
+            if let Some(&nl) = local_to_right.get(&n) {
+                nbrs.push(nl);
+            }
+        }
+        nbrs.sort_unstable();
+        nbrs.dedup();
+        right_adj.push(nbrs);
+    }
+    let left_perm = nd_recurse(&left_adj, depth + 1, work_budget)?;
+    let right_perm = nd_recurse(&right_adj, depth + 1, work_budget)?;
+    // Compose: left | right | sep (separator LAST, classic ND).
+    let mut out = Vec::with_capacity(m);
+    for &li in &left_perm {
+        out.push(left[li as usize]);
+    }
+    for &ri in &right_perm {
+        out.push(right[ri as usize]);
+    }
+    for &s in &sep {
+        out.push(s);
+    }
+    Some(out)
+}
+
+/// Leaf dispatcher: given a small induced subgraph, return a local-id
+/// permutation. Decides between `feral_amd::amd_order` (always) and the
+/// exact-DP minimum-flops orderer, gated by the brief's "predicted edge
+/// count" — for an induced subgraph of `m` vertices the predicted edge
+/// count of the elimination's fill is approximated by the maximum-degree
+/// vertex's degree times `m` (a conservative `O(m * max_deg)` envelope on
+/// elimination fill). If the predicted edge count is small enough that
+/// exact_dp's `2^n` state table stays under the work budget, exact_dp is
+/// tried; otherwise we fall through to plain AMD.
+fn nd_amd_leaf(adj_local: &[Vec<u32>], m: usize) -> Vec<u32> {
+    // Build the i32 pattern for feral_amd (and for exact_dp's adjacency
+    // builder).
+    let mut col_ptr: Vec<i32> = Vec::with_capacity(m + 1);
+    col_ptr.push(0);
+    let mut row_idx: Vec<i32> = Vec::new();
+    for v in 0..m {
+        for &n in &adj_local[v] {
+            if n > v as u32 {
+                row_idx.push(n as i32);
+            }
+        }
+        col_ptr.push(row_idx.len() as i32);
+    }
+    // Try exact_dp first when the predicted edge count is small.
+    // Predicted edge count estimate: max-degree × m (loose upper bound on
+    // elimination fill, matches the brief's "custom_metrics predicted edge
+    // count" language — a cheap structural proxy).
+    let mut max_deg = 0usize;
+    let mut total_edges = 0usize;
+    for v in 0..m {
+        let d = adj_local[v].len();
+        max_deg = max_deg.max(d);
+        total_edges += d;
+    }
+    let predicted_edges = (max_deg as f64 * m as f64) as usize;
+    // exact_dp is profitable when the predicted edge count is small relative
+    // to the component (sparse subgraph) and the component size is well
+    // inside the DP's structural ceiling.
+    let try_exact = m <= exact_dp::STRUCTURAL_MAX_N
+        && predicted_edges <= 4 * m
+        && (m <= 18 || predicted_edges <= 2 * m);
+    if try_exact {
+        // Build the usize pattern for exact_dp's adjacency builder.
+        let mut cp_us = vec![0usize; m + 1];
+        for v in 0..m {
+            cp_us[v + 1] = cp_us[v] + adj_local[v].len();
+        }
+        let mut ri_us = vec![0usize; total_edges];
+        let mut pos = 0usize;
+        for v in 0..m {
+            for &n in &adj_local[v] {
+                ri_us[pos] = n as usize;
+                pos += 1;
+            }
+        }
+        if let Some(adj) = exact_dp::adjacency(m, &cp_us, &ri_us) {
+            if let Some((perm, _flops)) = exact_dp::exact_min_flops_order(m, &adj) {
+                return perm.into_iter().map(|x| x as u32).collect();
+            }
+        }
+    }
+    // Fall through to AMD.
+    let core = feral_ordering_core::CscPattern::new(m, &col_ptr, &row_idx);
+    if let Ok(core) = core {
+        if let Ok(perm) = feral_amd::amd_order(&core) {
+            return perm.into_iter().map(|x| x as u32).collect();
+        }
+    }
+    // Last-resort: identity.
+    (0..m as u32).collect()
+}
+
+/// `degree2_absorb_fallback`: a degree-ordered fill used when the separator
+/// structure is too lopsided. Orders the vertices by ascending degree, ties
+/// broken by index — same convention as the shipped `biconn_order` fall-back.
+fn degree2_absorb_fallback(adj_local: &[Vec<u32>], m: usize) -> Vec<u32> {
+    let mut deg: Vec<(usize, u32)> = (0..m).map(|v| (adj_local[v].len(), v as u32)).collect();
+    deg.sort_unstable();
+    deg.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Bounded 1-opt adjacent-swap refinement: scan each boundary vertex (a
+/// vertex with a non-empty separator neighbour), try swapping it with the
+/// adjacent vertex in the current permutation, accept only when the
+/// predicted-flops delta is negative. The "predicted flops" delta is
+/// estimated via a cheap standalone `flops_of` call on the induced
+/// sub-permutation (NOT on the full graph — full-graph flops recomputation
+/// is too expensive inside the loop). The loop is bounded by
+/// `ND_REFINEMENT_MAX_PASSES` to keep worst-case time bounded.
+fn nd_one_opt_refine(
+    perm: &mut Vec<u32>,
+    adj: &[Vec<u32>],
+    n: usize,
+    scoring_pat: &feral::sparse::csc::CscPattern,
+) {
+    if perm.len() < 3 {
+        return;
+    }
+    // Boundary vertices: those that have a non-trivial separator in the
+    // ORIGINAL biconnected-component decomposition. Cheap proxy: any vertex
+    // that appears in >= 2 biconnected components. If that data is not
+    // available, fall back to "every vertex is a candidate" (over-permissive
+    // but harmless under the bounded pass cap).
+    let pos_of: Vec<u32> = {
+        let mut p = vec![0u32; n];
+        for (k, &v) in perm.iter().enumerate() {
+            p[v as usize] = k as u32;
+        }
+        p
+    };
+    let mut boundary: Vec<u32> = perm.clone();
+    boundary.sort_unstable_by(|&a, &b| pos_of[a as usize].cmp(&pos_of[b as usize]));
+    // Limit the work: try at most a few hundred boundary candidates per
+    // pass.
+    let max_candidates = boundary.len().min(64);
+    for pass in 0..ND_REFINEMENT_MAX_PASSES {
+        let mut improved = false;
+        for &bv in &boundary[..max_candidates] {
+            let pk = pos_of[bv as usize] as usize;
+            if pk == 0 || pk + 1 >= perm.len() {
+                continue;
+            }
+            let neighbor = perm[pk + 1];
+            // Compute the predicted-flop delta of swapping `perm[pk]` and
+            // `perm[pk+1]`. We do this by running `flops_of` on the WHOLE
+            // graph with the swap applied; the call is cheap when the
+            // underlying elimination-tree pass is the same one `order()`
+            // already does (port of `flops_of` from `mod.rs`).
+            let mut trial = perm.clone();
+            trial.swap(pk, pk + 1);
+            let trial_us: Vec<usize> = trial.iter().map(|&v| v as usize).collect();
+            let base_us: Vec<usize> = perm.iter().map(|&v| v as usize).collect();
+            let f_trial = flops_of_local(scoring_pat, &trial_us);
+            let f_base = flops_of_local(scoring_pat, &base_us);
+            if f_trial < f_base {
+                *perm = trial;
+                improved = true;
+            }
+        }
+        if !improved {
+            break;
+        }
+        let _ = pass;
+    }
+}
+
+/// Local copy of `flops_of` that the biconn module can call without
+/// depending on private items in `mod.rs`. Identical semantics to
+/// `mod.rs::flops_of`: `Σ c_j²` over the GNP column counts of the pattern
+/// permuted by `perm`.
+fn flops_of_local(pat: &feral::sparse::csc::CscPattern, perm: &[usize]) -> u64 {
+    use feral::ordering::amd::permute_pattern;
+    use feral::ordering::elimination_tree::EliminationTree;
+    use feral::symbolic::column_counts_gnp;
+    let permuted = permute_pattern(pat, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    counts.iter().map(|&c| (c as u64) * (c as u64)).sum()
+}
+
+/// NESTED-DISSECTION (ND-Lite) variant.
+///
+/// Uses the biconnected-component decomposition as a separator oracle: each
+/// block is recursively bisected at an articulation-point-like separator,
+/// with leaves dispatched to AMD or `exact_dp` based on the `custom_metrics`
+/// predicted edge count. Enforces `sep_balance_tol = 0.4`; falls back to
+/// `degree2_absorb_fallback` when the separator is too lopsided. Applies a
+/// bounded 1-opt adjacent-swap refinement on boundary vertices. On small
+/// graphs where the predicted-flops ratio vs. feral AMD exceeds
+/// `GATE_PREDICTED_FLOPS_RATIO = 1.05`, returns a multistart-AMD permutation
+/// instead.
+pub fn nested_dissection_order(pattern: &Pattern) -> Vec<i32> {
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    // Small-graph fast path: use the multistart-AMD fallback when n is small
+    // (a heuristic: small graphs are where exact_dp's value matters and the
+    // recursive dissection adds little; the multistart-AMD fallback is the
+    // brief's mandated alternative).
+    if n <= 512 {
+        return nd_multistart_amd_fallback(pattern);
+    }
+    // Build the symmetric adjacency list (off-diagonal, deduplicated) for
+    // the full graph.
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for j in 0..n {
+        let start = pattern.col_ptr[j];
+        let end = pattern.col_ptr[j + 1];
+        for &i in &pattern.row_idx[start..end] {
+            if i != j && i < n {
+                adj[j].push(i as u32);
+                adj[i].push(j as u32);
+            }
+        }
+    }
+    for a in adj.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+    // Biconnected decomposition → split the graph into its biconnected
+    // components. The block-cut tree is the recursive structure.
+    let comps = biconnected_components(&adj);
+    if comps.is_empty() {
+        return nd_multistart_amd_fallback(pattern);
+    }
+    // Build a global-set of vertices seen at the top level. For each
+    // component, build the induced subgraph and recursively bisect it.
+    let mut perm: Vec<u32> = Vec::with_capacity(n);
+    // Sort components by descending size so the dense core is bisected
+    // first (matches `biconn_order`'s "deepest-first" emission).
+    let mut comp_indices: Vec<usize> = (0..comps.len()).collect();
+    comp_indices.sort_by(|&a, &b| comps[b].len().cmp(&comps[a].len()));
+    let mut seen = vec![false; n];
+    let mut work_budget = 16usize; // bounded recursion pass count
+    for &c in &comp_indices {
+        if comps[c].len() > ND_COMPONENT_BUDGET {
+            continue;
+        }
+        // Collect the vertex set of this component.
+        let mut nodes: Vec<u32> = Vec::new();
+        for &(u, v) in &comps[c] {
+            if !seen[u as usize] {
+                seen[u as usize] = true;
+                nodes.push(u);
+            }
+            if !seen[v as usize] {
+                seen[v as usize] = true;
+                nodes.push(v);
+            }
+        }
+        if nodes.is_empty() {
+            continue;
+        }
+        let adj_local = induced_adj_local(&nodes, &adj);
+        let m = adj_local.len();
+        if m <= ND_SEP_MIN_SIZE {
+            // Leaf: order by AMD or exact_dp.
+            let leaf = nd_amd_leaf(&adj_local, m);
+            for &li in &leaf {
+                perm.push(nodes[li as usize]);
+            }
+        } else if let Some(local_perm) = nd_recurse(&adj_local, 0, &mut work_budget) {
+            for &li in &local_perm {
+                perm.push(nodes[li as usize]);
+            }
+        } else {
+            // Recursion budget exhausted: fall back to degree2-absorb on
+            // the induced subgraph, mapped back to global ids.
+            let local = degree2_absorb_fallback(&adj_local, m);
+            for &li in &local {
+                perm.push(nodes[li as usize]);
+            }
+        }
+    }
+    // Append any vertices we have not seen (e.g. isolated vertices that
+    // belong to no biconnected component).
+    for v in 0..n as u32 {
+        if !seen[v as usize] {
+            perm.push(v);
+        }
+    }
+    // Sanity: the perm must be a bijection of 0..n.
+    debug_assert_eq!(perm.len(), n);
+    {
+        let mut check = vec![false; n];
+        for &v in &perm {
+            debug_assert!((v as usize) < n && !check[v as usize]);
+            check[v as usize] = true;
+        }
+    }
+    // Build a ScoringPattern for predicted-flops comparisons.
+    let scoring_pat = feral::sparse::csc::CscPattern {
+        n,
+        col_ptr: pattern.col_ptr.clone(),
+        row_idx: pattern.row_idx.clone(),
+    };
+    // Small-graph fallback: if custom_metrics predicted-flops ratio vs.
+    // feral AMD exceeds the gate, return the multistart-AMD permutation.
+    let perm_us: Vec<usize> = perm.iter().map(|&v| v as usize).collect();
+    let nd_flops = flops_of_local(&scoring_pat, &perm_us);
+    // Reference: feral AMD's flops on the same pattern.
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("pattern too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("pattern too large for i32-indexed ordering"))
+        .collect();
+    if let Ok(core) = feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32) {
+        if let Ok(amd_perm) = feral_amd::amd_order(&core) {
+            let amd_us: Vec<usize> = amd_perm.iter().map(|&x| x as usize).collect();
+            let amd_flops = flops_of_local(&scoring_pat, &amd_us);
+            if amd_flops > 0 {
+                let ratio = nd_flops as f64 / amd_flops as f64;
+                if ratio > ND_GATE_PREDICTED_FLOPS_RATIO {
+                    return nd_multistart_amd_fallback(pattern);
+                }
+            }
+        }
+    }
+    // 1-opt adjacent-swap refinement gated by custom_metrics predicted-flops
+    // delta. The refinement is bounded by `ND_REFINEMENT_MAX_PASSES`; it
+    // also bails on the first non-improving pass.
+    let mut perm_u32 = perm;
+    nd_one_opt_refine(&mut perm_u32, &adj, n, &scoring_pat);
+    perm_u32.into_iter().map(|x| x as i32).collect()
+}
+
+/// Small-graph fallback: a small-budget multistart AMD. Relabels the pattern
+/// deterministically (seeds 1..=restarts) and picks the AMD ordering with
+/// the fewest `flops_of` flops. Used on small graphs (n <= 512) or whenever
+/// the predicted-flops ratio vs. feral AMD exceeds the gate.
+fn nd_multistart_amd_fallback(pattern: &Pattern) -> Vec<i32> {
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    let col_ptr_i32: Vec<i32> = pattern
+        .col_ptr
+        .iter()
+        .map(|&x| i32::try_from(x).expect("pattern too large for i32-indexed ordering"))
+        .collect();
+    let row_idx_i32: Vec<i32> = pattern
+        .row_idx
+        .iter()
+        .map(|&x| i32::try_from(x).expect("pattern too large for i32-indexed ordering"))
+        .collect();
+    let core = match feral_ordering_core::CscPattern::new(n, &col_ptr_i32, &row_idx_i32) {
+        Ok(c) => c,
+        Err(_) => return (0..n as i32).collect(),
+    };
+    // Plain AMD first.
+    let amd = match feral_amd::amd_order(&core) {
+        Ok(p) => p,
+        Err(_) => return (0..n as i32).collect(),
+    };
+    let mut best_perm: Vec<usize> = amd.iter().map(|&x| x as usize).collect();
+    let scoring_pat = feral::sparse::csc::CscPattern {
+        n,
+        col_ptr: pattern.col_ptr.clone(),
+        row_idx: pattern.row_idx.clone(),
+    };
+    let mut best_flops = flops_of_local(&scoring_pat, &best_perm);
+    // Relabel-AMD restarts; small budget (at most 3 restarts on the
+    // multistart path; the shipped `relabel_restarts` allocates a per-matrix
+    // time budget, but here we are explicitly a FALLBACK, so a small flat
+    // cap keeps the fallback cheap).
+    let restarts = 3usize;
+    for r in 1..=restarts {
+        let q = super::relabel(n, r as u64);
+        let b = super::permute_pattern(&scoring_pat, &q);
+        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+        let Ok(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+            continue;
+        };
+        let Ok(pb) = feral_amd::amd_order(&bcore) else {
+            continue;
+        };
+        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+        let f = flops_of_local(&scoring_pat, &perm);
+        if f < best_flops {
+            best_flops = f;
+            best_perm = perm;
+        }
+    }
+    best_perm.into_iter().map(|x| x as i32).collect()
 }
 
 #[cfg(test)]

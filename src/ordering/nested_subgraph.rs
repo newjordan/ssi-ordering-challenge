@@ -99,7 +99,11 @@ impl<'a> NestedSubgraphBuilder<'a> {
     /// `ranking[0..k_max]` (the `k_max` highest-ranked / densest vertices).
     /// `ranking` must be the SAME slice passed to every later `advance_to`
     /// call. Returns the builder plus that first induced subgraph.
-    pub(crate) fn new(pattern: &'a Pattern, ranking: &[usize], k_max: usize) -> (Self, InducedSubgraph) {
+    pub(crate) fn new(
+        pattern: &'a Pattern,
+        ranking: &[usize],
+        k_max: usize,
+    ) -> (Self, InducedSubgraph) {
         let n = pattern.n;
         let mut removed = vec![false; n];
         for &v in &ranking[..k_max] {
@@ -121,7 +125,12 @@ impl<'a> NestedSubgraphBuilder<'a> {
                 }
             }
         }
-        let b = NestedSubgraphBuilder { pattern, n, removed, adj };
+        let b = NestedSubgraphBuilder {
+            pattern,
+            n,
+            removed,
+            adj,
+        };
         let sub = b.emit();
         (b, sub)
     }
@@ -131,8 +140,16 @@ impl<'a> NestedSubgraphBuilder<'a> {
     /// previous call's `k` thereafter): restore `ranking[k..k_prev]` into the
     /// graph and emit the resulting induced subgraph. `ranking` must be the
     /// same slice used in [`new`](Self::new).
-    pub(crate) fn advance_to(&mut self, ranking: &[usize], k: usize, k_prev: usize) -> InducedSubgraph {
-        debug_assert!(k < k_prev, "advance_to requires a strictly smaller k (nesting downward)");
+    pub(crate) fn advance_to(
+        &mut self,
+        ranking: &[usize],
+        k: usize,
+        k_prev: usize,
+    ) -> InducedSubgraph {
+        debug_assert!(
+            k < k_prev,
+            "advance_to requires a strictly smaller k (nesting downward)"
+        );
         for &v in &ranking[k..k_prev] {
             self.removed[v] = false;
             // Record v's edges to every neighbor ALREADY kept (either kept
@@ -176,7 +193,11 @@ impl<'a> NestedSubgraphBuilder<'a> {
             }
             row_idx[start..start + deg].sort_unstable();
         }
-        InducedSubgraph { col_ptr, row_idx, local_to_global }
+        InducedSubgraph {
+            col_ptr,
+            row_idx,
+            local_to_global,
+        }
     }
 }
 
@@ -219,7 +240,11 @@ fn naive_induced(pattern: &Pattern, ranking: &[usize], k: usize) -> InducedSubgr
         }
         row_idx[start..start + adj[i].len()].sort_unstable();
     }
-    InducedSubgraph { col_ptr, row_idx, local_to_global }
+    InducedSubgraph {
+        col_ptr,
+        row_idx,
+        local_to_global,
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +252,10 @@ mod tests {
     use super::*;
 
     fn assert_subgraph_eq(a: &InducedSubgraph, b: &InducedSubgraph, ctx: &str) {
-        assert_eq!(a.local_to_global, b.local_to_global, "{ctx}: local_to_global mismatch");
+        assert_eq!(
+            a.local_to_global, b.local_to_global,
+            "{ctx}: local_to_global mismatch"
+        );
         assert_eq!(a.col_ptr, b.col_ptr, "{ctx}: col_ptr mismatch");
         assert_eq!(a.row_idx, b.row_idx, "{ctx}: row_idx mismatch");
     }
@@ -235,10 +263,17 @@ mod tests {
     /// Run the shipped strip-k schedule (descending) against the naive
     /// rebuild at every step, on one pattern/ranking.
     fn check_schedule(pattern: &Pattern, ranking: &[usize], ks: &[usize]) {
-        assert!(ks.windows(2).all(|w| w[0] > w[1]), "ks must be strictly descending");
+        assert!(
+            ks.windows(2).all(|w| w[0] > w[1]),
+            "ks must be strictly descending"
+        );
         let k_max = ks[0];
         let (mut builder, first) = NestedSubgraphBuilder::new(pattern, ranking, k_max);
-        assert_subgraph_eq(&first, &naive_induced(pattern, ranking, k_max), &format!("k={k_max}"));
+        assert_subgraph_eq(
+            &first,
+            &naive_induced(pattern, ranking, k_max),
+            &format!("k={k_max}"),
+        );
         let mut k_prev = k_max;
         for &k in &ks[1..] {
             let sub = builder.advance_to(ranking, k, k_prev);
@@ -334,7 +369,12 @@ mod tests {
     fn nested_subgraph_alloc_reduction() {
         let corpus = crate::corpus::corpus();
         let ks = [96usize, 64, 48, 24, 6, 0];
-        let mut tot_naive = super::super::alloc_probe::AllocStats { calls: 0, bytes: 0, deallocs: 0, reallocs: 0 };
+        let mut tot_naive = super::super::alloc_probe::AllocStats {
+            calls: 0,
+            bytes: 0,
+            deallocs: 0,
+            reallocs: 0,
+        };
         let mut tot_incr = tot_naive;
         let mut checked = 0usize;
 
@@ -371,8 +411,14 @@ mod tests {
 
         println!("\n--- nested_subgraph: naive (6x independent) vs incremental ---");
         println!("matrices checked: {checked}");
-        println!("naive:       {} calls, {} bytes", tot_naive.calls, tot_naive.bytes);
-        println!("incremental: {} calls, {} bytes", tot_incr.calls, tot_incr.bytes);
+        println!(
+            "naive:       {} calls, {} bytes",
+            tot_naive.calls, tot_naive.bytes
+        );
+        println!(
+            "incremental: {} calls, {} bytes",
+            tot_incr.calls, tot_incr.bytes
+        );
         println!(
             "reduction: {:.1}% fewer allocator calls, {:.1}% fewer bytes allocated",
             100.0 * (1.0 - tot_incr.calls as f64 / tot_naive.calls as f64),
