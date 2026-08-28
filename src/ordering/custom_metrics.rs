@@ -91,10 +91,10 @@ use feral_ordering_core::{CscPattern, OrderingError};
 ///   - `DegSqrt` = `deg^0.5`
 ///   - `DegP075` = `deg^0.75`
 ///   - `DegP125` = `deg^1.25`
-///   - `DegDivNvSqrtWf` = `deg/(nv+1) + 0.5 * sign(wf)*|wf|^0.5`
-///   - `DegDivNvWfP15` = `deg/(nv+1) + 0.1 * sign(wf)*|wf|^1.5`
-///   - `DegPlusDegme` = `deg + 1.0 * degme/(nv+1)`
-///   - `DegDivNvDegme` = `deg/(nv+1) + 0.5 * degme/(nv+1)`
+///   - `DegDivNvSqrtWf` = `deg/(nv+1) + 0.25 * sign(wf)*|wf|^0.5`
+///   - `DegDivNvWfP15` = `deg/(nv+1) + 0.05 * sign(wf)*|wf|^1.5`
+///   - `DegPlusDegme` = `deg + 1.5 * degme/(nv+1)`
+///   - `DegDivNvDegme` = `deg/(nv+1) + 0.75 * degme/(nv+1)`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScoreVariant {
     SqDiv,
@@ -145,7 +145,7 @@ fn score_bucket_of(score: i64, n: usize) -> usize {
     if s <= n {
         return s;
     }
-    let pas = (n / 8).max(1);
+    let pas = (n / 16).max(1);
     let nbbuck = 2 * n;
     ((s - n) / pas + n).min(nbbuck)
 }
@@ -435,16 +435,19 @@ fn finalize_step_variant(
                 ScoreVariant::DegDivNvSqrtWf => {
                     let a = wf_f.abs().sqrt();
                     let wf_signed = if wf_f < 0.0 { -a } else { a };
-                    raw_deg / (nvi_i as f64 + 1.0) + 0.5 * wf_signed
+                    raw_deg / (nvi_i as f64 + 1.0) + 0.25 * wf_signed
                 }
                 ScoreVariant::DegDivNvWfP15 => {
                     let a = wf_f.abs().powf(1.5);
                     let wf_signed = if wf_f < 0.0 { -a } else { a };
-                    raw_deg / (nvi_i as f64 + 1.0) + 0.1 * wf_signed
+                    raw_deg / (nvi_i as f64 + 1.0) + 0.05 * wf_signed
                 }
-                ScoreVariant::DegPlusDegme => raw_deg + (degme_i as f64) / (nvi_i as f64 + 1.0),
+                ScoreVariant::DegPlusDegme => {
+                    raw_deg + 1.5 * (degme_i as f64) / (nvi_i as f64 + 1.0)
+                }
                 ScoreVariant::DegDivNvDegme => {
-                    raw_deg / (nvi_i as f64 + 1.0) + 0.5 * (degme_i as f64) / (nvi_i as f64 + 1.0)
+                    raw_deg / (nvi_i as f64 + 1.0)
+                        + 0.75 * (degme_i as f64) / (nvi_i as f64 + 1.0)
                 }
             };
 

@@ -13,7 +13,7 @@
 //! and the raw-degree write-back path is the same one `custom_metrics::SqDiv`
 //! /`SqPure` already ship). Only the re-insertion score formula is
 //! parameterized by [`MetricSpec`] instead of hard-coded per variant, and the
-//! bucket stride is also parameterizable (default matches the shipped `/8`
+//! bucket stride is also parameterizable (default matches the shipped `/16`
 //! convention exactly; only a small, separately-reported sub-sweep varies it).
 //!
 //! This module exists to answer the open question in
@@ -66,12 +66,13 @@ pub struct MetricSpec {
     /// perverse "prefer high-degree, worst-first" pivot rule.
     pub perverse: bool,
     /// Bucket coarse-region stride divisor (`pas = max(n / bucket_div, 1)`).
-    /// `8` reproduces the shipped convention exactly. Only varied in the
-    /// dedicated tie-break sub-sweep, never crossed with the main grid.
+    /// `16` is the shipped coarse stride (finer than the vendor AMF `/8`
+    /// convention). Only varied in the dedicated tie-break sub-sweep, never
+    /// crossed with the main grid.
     pub bucket_div: usize,
 }
 
-const DEFAULT_BUCKET_DIV: usize = 8;
+const DEFAULT_BUCKET_DIV: usize = 16;
 
 /// Saturation cap mirroring `algo::AMF_DUMMY_I32` — identical convention to
 /// `custom_metrics::SCORE_DUMMY_I32`, copied rather than shared (private to
@@ -79,8 +80,7 @@ const DEFAULT_BUCKET_DIV: usize = 8;
 const SCORE_DUMMY_I32: i32 = i32::MAX - 1;
 
 /// Quantize an `i64` score into a bucket index, generalized over the coarse
-/// stride divisor. `bucket_div = 8` is byte-identical to
-/// `custom_metrics::score_bucket_of` / the vendor AMF convention.
+/// stride divisor. `bucket_div = 16` matches `custom_metrics::score_bucket_of`.
 #[inline(always)]
 fn score_bucket_of_generic(score: i64, n: usize, bucket_div: usize) -> usize {
     if score <= 0 {
@@ -465,20 +465,20 @@ pub fn order_generic(
 /// branch responsible for the `AmindNorm` cost cliff).
 pub const EXTRA_METRICS: &[MetricSpec] = &[
     MetricSpec { name: "extra_deg3_div_nv", deg_pow: 3.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_wf002", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.02, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_plus_wf", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 1.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_plus_wf01", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg2_div_nv_wf002", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.01, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg_plus_wf", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg_plus_wf01", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.05, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
     MetricSpec { name: "extra_deg_p15", deg_pow: 1.50, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
     MetricSpec { name: "extra_deg_div_nv_p05", deg_pow: 1.00, nv_pow: 0.50, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_degme05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.50, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg2_div_nv_degme05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.75, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
     MetricSpec { name: "extra_deg15_div_nv", deg_pow: 1.50, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf05", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_wf05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg_div_nv_wf05", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.25, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg2_div_nv_wf05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.25, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
     MetricSpec { name: "extra_deg_mul_nv", deg_pow: 1.00, nv_pow: -1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
     MetricSpec { name: "extra_deg_p175", deg_pow: 1.75, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_degme2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 2.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf01", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 2.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg_div_nv_degme2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 1.50, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg_div_nv_wf01", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.05, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg_div_nv_wf2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 1.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
 ];
 
 #[cfg(test)]

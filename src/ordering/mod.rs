@@ -776,18 +776,16 @@ const STRIPV2_DENSE_SPLIT_AVG_DEG: f64 = 35.0;
 /// 1 GNP + 2 passes + 5 evals). Flagged for isolated timing before
 /// submission.
 const TELOS_MAX_NNZ: usize = 400_000;
-const TELOS_TIER_A_MAX_NNZ: usize = 150_000;
+const TELOS_TIER_A_MAX_NNZ: usize = 100_000;
+const TELOS_TIER_TINY_MAX_NNZ: usize = 25_000;
 /// Tier-A sub-orderer pass budget per round: passes = clamp(this/nnz,
-/// TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A). 700k (vs the probe's 1M) leans
-/// cap-safe at the top of tier A; the cap of 16 (not 12) is deliberate —
-/// the deepest-priority winners (arki0010 mf:k32, carton9 mf:k16,
-/// chimera_k64ising mf:k6) all sit at nnz < 30k where clamp gives 16 and a
-/// pass is milliseconds. (A coordinator trial at 250k/8 did NOT move the
-/// measured worst-case — the worst matrix is eval-bound, see above — so
-/// the full-value budget is restored.)
-const TELOS_BUDGET_A: usize = 700_000;
-const TELOS_MIN_PASSES_A: usize = 3;
-const TELOS_MAX_PASSES_A: usize = 16;
+/// TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A). 850k spends extra on the
+/// remaining A band (nnz < 100k) after shrinking TIER_A; tiny nnz still
+/// hits MAX_PASSES_A. Do not raise TELOS_MAX_NNZ — eval-bound mid-tier
+/// already SIGKILLs if the peel grid is widened.
+const TELOS_BUDGET_A: usize = 850_000;
+const TELOS_MIN_PASSES_A: usize = 4;
+const TELOS_MAX_PASSES_A: usize = 18;
 /// Strip-candidate priority list, best-first from the wave-2/3 winner
 /// histograms: (sub-orderer, k) with 0 = plain AMD, 1 = no-dense AMD,
 /// 2 = AMF α5. Tier A consumes a budgeted prefix; tier B uses
@@ -870,15 +868,12 @@ const TELOS_MS_PLAN: [(u8, u8); 14] = [
 /// (`procurement1large`), 6.1e5 → 0.120 s (`pooling_sppa9tp`).
 /// `TELOS_MS_WORK_BUDGET / est` descents therefore adds ~constant time
 /// everywhere at once, which is the property a hard per-matrix cap needs.
-const TELOS_MS_WORK_BUDGET: usize = 1_500_000;
+const TELOS_MS_WORK_BUDGET: usize = 1_200_000;
 /// Hard ceiling on the proxy: above it even ONE extra descent is too much.
-/// Sized to keep every matrix whose `order()` already exceeds ~0.5 s out of
-/// the phase entirely — `crudeoil_lee4_06/09/10`, `crudeoil_lee2_06`,
-/// `chp_shorttermplan2d`, `gams05`, `nuclear104`, `procurement1large`,
-/// `pooling_sppa9tp`, `edgecross24-115`, `ringpack_20_2`, `mpbp_35` all price
-/// above 500 000 on the proxy. Measured effect: the largest per-matrix time
-/// increase the phase causes drops from +0.099 s to ≤ +0.05 s.
-const TELOS_MS_MAX_WORK: usize = 1_000_000;
+/// Tightened (1M → 800k) so mid-A `est = passes*nnz` does not buy extra
+/// descents on matrices already near the cap. Tiny nnz uses a separate
+/// budget inside `telos_ms_count`; this constant is the mid-A default.
+const TELOS_MS_MAX_WORK: usize = 800_000;
 /// HUB GUARD, load-bearing, and the same discriminator `relabel_restarts`'s
 /// mid band uses for the same reason. `ringpack_30_2` (n=17999, nnz=121458,
 /// max_deg=1632) carries the corpus worst-case `order()` and its per-descent
@@ -907,19 +902,24 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     }
     let (_rounds, _prio, passes, _peel) = telos_schedule(nnz);
     let est = passes.saturating_mul(nnz).max(1);
-    if est > TELOS_MS_MAX_WORK {
+    // Per-nnz-tier MS work budget. Extra descents only where `est` is cheap;
+    // do not raise the heavy max_work gate (already SIGKILL-adjacent).
+    let (work_budget, max_work) = if nnz < TELOS_TIER_TINY_MAX_NNZ {
+        (2_400_000, 600_000)
+    } else if nnz < TELOS_TIER_A_MAX_NNZ {
+        (TELOS_MS_WORK_BUDGET, TELOS_MS_MAX_WORK)
+    } else {
+        // B: keep nuclear104-class (est ≈ 2·nnz ≈ 500k) inside the gate;
+        // do not raise past the crown 1M MAX_WORK.
+        (1_000_000, 700_000)
+    };
+    if est > max_work {
         return 0;
     }
-    (TELOS_MS_WORK_BUDGET / est)
+    (work_budget / est)
         .clamp(1, TELOS_MS_MAX_DESCENTS)
         .min(cap)
 }
-
-const PAIR_DESCENT_MIN_N: usize = 1_000;
-const PAIR_DESCENT_MAX_N: usize = 4_000;
-const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-const PAIR_DESCENT_SWEEPS: usize = 2;
-const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -1470,7 +1470,15 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // returns that -0.0006 of bucket is comparable to an entire win, so it is worth
     // claiming rather than ignoring.
     let small_multi = if nnz <= 20_000 {
-        (3_000_000 / nnz).clamp(1, 800)
+        (600_000 / nnz).clamp(1, 200)
+    } else {
+        0
+    };
+    // Extra seeds on n<2000 only. Applied after `.min(cap)` like `small_multi`
+    // so the 24-restart cap does not nullify it. Mid/heavy n keep the
+    // existing floors — this must not inflate those bands.
+    let tiny_n_multi = if n < 2_000 {
+        (1_200_000 / nnz).clamp(1, 360)
     } else {
         0
     };
@@ -1528,13 +1536,14 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // here would make the regime a no-op. Its own `clamp(1, 800)` is the bound instead,
     // and it is sized against measured time rather than inherited from the cap.
     if restarts == 0 {
-        return heavy_multi.max(mid_multi).max(small_multi);
+        return heavy_multi.max(mid_multi).max(small_multi).max(tiny_n_multi);
     }
     restarts
         .max(heavy_multi)
         .max(mid_multi)
         .min(cap)
         .max(small_multi)
+        .max(tiny_n_multi)
 }
 
 /// STRIP TRANSFORM envelope. Delete the k densest (or highest-L-column-count)
@@ -1994,15 +2003,22 @@ fn telos_descend(
 /// had, factored out so every descent (the shipped one and every multi-start
 /// one) reads it from one place. Pure function of `nnz`.
 fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static [usize]) {
-    if nnz < TELOS_TIER_A_MAX_NNZ {
+    if nnz < TELOS_TIER_TINY_MAX_NNZ {
         (
             2,
             &TELOS_PRIO[..],
             (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A),
             &TELOS_PEEL_A[..],
         )
+    } else if nnz < TELOS_TIER_A_MAX_NNZ {
+        (
+            2,
+            &TELOS_PRIO[..],
+            (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A.min(10)),
+            &TELOS_PEEL_A[..],
+        )
     } else {
-        // Tier B (150k..TELOS_MAX_NNZ): eval-bound class — ONE round,
+        // Tier B (TIER_A..TELOS_MAX_NNZ): eval-bound class — ONE round,
         // minimal eval count. See the cap-calibration re-gate note on
         // the `TELOS_*` constants.
         (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
@@ -2441,13 +2457,13 @@ fn order_with_options(
         // trio above — see its doc for the measured gate-wall exclusion.
         if nnz < WINF_MAX_NNZ {
             for variant in [
-                custom_metrics::ScoreVariant::DegDivNvSqrtWf,
-                custom_metrics::ScoreVariant::DegDivNvWfP15,
-                custom_metrics::ScoreVariant::DegP075,
-                custom_metrics::ScoreVariant::DegP125,
                 custom_metrics::ScoreVariant::DegPlusDegme,
                 custom_metrics::ScoreVariant::DegDivNvDegme,
                 custom_metrics::ScoreVariant::DegSqrt,
+                custom_metrics::ScoreVariant::DegP075,
+                custom_metrics::ScoreVariant::DegP125,
+                custom_metrics::ScoreVariant::DegDivNvSqrtWf,
+                custom_metrics::ScoreVariant::DegDivNvWfP15,
             ] {
                 consider!(move || custom_metrics::order_variant(&core, 10.0, true, variant));
             }
@@ -3506,7 +3522,7 @@ fn order_with_options(
         for j in 0..wave {
             let rr = r + j;
             let seed = (rr as u64 + 1).wrapping_mul(0x9E37);
-            let swaps = if rr % 2 == 0 { n / 16 } else { n / 4 };
+            let swaps = 8usize;
             htasks.push(Box::new(move || {
                 let q = perturb(base, seed, swaps);
                 let b = permute_pattern(scoring_pat, &q);
@@ -3728,7 +3744,7 @@ fn order_with_options(
         let ranked = &ranked;
         let deg_ranked_v2 = &deg_ranked_v2;
         let mut vtasks: Vec<parallel::PermFn> = Vec::new();
-        for &k in &[24usize, 96] {
+        for &k in &[12usize, 24, 48] {
             if k >= n {
                 break;
             }
@@ -3762,7 +3778,7 @@ fn order_with_options(
         // there; `sub_amd` covers the lower part of the dense-class band.
         if dense_class {
             let use_amf5 = nnz as f64 / n as f64 >= STRIPV2_DENSE_SPLIT_AVG_DEG;
-            for &k in &[8usize, 32, 64] {
+            for &k in &[12usize, 24, 48] {
                 if k >= n {
                     break;
                 }
@@ -3826,27 +3842,14 @@ fn order_with_options(
     // and only a strict improvement is ever kept (AMD floor intact).
 #[cfg(test)]
     let _tp5 = std::time::Instant::now();
-    let amd_seed_one_round = (3_000..=6_000).contains(&n)
-        && (9_000..=18_000).contains(&nnz)
-        && max_deg <= n / 50
-        && (n <= 3_600 || nnz >= 15_000);
     if nnz > 0 && nnz < TELOS_MAX_NNZ {
         let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
-        // The AMD anchor exposes a different TELOS basin on this measured
-        // sparse, low-hub band. Replace, rather than add to, the established
-        // descent: the gated path runs exactly one round and keeps the current
-        // pre-TELOS incumbent as a strict fallback.
-        let (seed_perm, seed_flops, rounds) = if amd_seed_one_round {
-            (&amd_perm[..], anchor_flops, 1)
-        } else {
-            (&best_perm[..], best_flops, max_rounds)
-        };
         let (p, f) = telos_descend(
             scoring_pat,
             nnz,
-            seed_perm,
-            seed_flops,
-            rounds,
+            &best_perm,
+            best_flops,
+            max_rounds,
             prio,
             passes,
             peel_grid,
@@ -4356,9 +4359,9 @@ fn order_with_options(
         let slots: [(u64, &[usize]); 2] =
             [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
         // `telos_end_flops` is where the shipped TELOS phase came to rest under
-        // mode 0. On the AMD-seed gate this only suppresses a re-walk from the
-        // one-round endpoint; slot 1 below is keyed by `anchor_flops`, so its
-        // full AMD mode-0 continuation remains available.
+        // the SHIPPED ranking (mode 0); re-descending mode 0 from a seed at
+        // that exact value would re-walk a descent already known to be
+        // exhausted, so it is pre-marked done.
         let mut done: Vec<(u64, u8)> = vec![(telos_end_flops, 0)];
         let mut used = 0usize;
         // WHICH descents run is decided ENTIRELY UP FRONT (arm/parallel): the
@@ -4491,31 +4494,6 @@ fn order_with_options(
                 }
             } else {
                 break;
-            }
-        }
-    }
-
-    // Strict terminal complement to RGSUB: locally orient adjacent pivots by
-    // exact current degree, then admit only through the trusted global scorer.
-    if n >= PAIR_DESCENT_MIN_N
-        && n <= PAIR_DESCENT_MAX_N
-        && nnz > 0
-        && nnz <= PAIR_DESCENT_MAX_NNZ
-    {
-        if let Some(cand) = rgreedy::adjacent_pair_descent(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            PAIR_DESCENT_SWEEPS,
-            PAIR_DESCENT_OPS_BUDGET,
-        ) {
-            if is_bijection(&cand, n) {
-                let f = ws.flops(&scoring_pat, &cand);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = cand;
-                }
             }
         }
     }
