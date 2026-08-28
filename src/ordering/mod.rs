@@ -1678,8 +1678,8 @@ fn order_with_options(
     let mut best_perm: Vec<usize> = amd_perm.clone();
     let mut best_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
 
-    // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
-    // the pattern's maximum column length — see `relabel_restarts`, where a hub is
+    // Candidate set gated by (n, nnz) plus the pattern's maximum column length
+    // for hub-sensitive relabel policies — see `relabel_restarts`, where a hub is
     // what makes a restart expensive and is the only thing distinguishing
     // `ringpack_30_2` from its (n, nnz)-twin `crudeoil_lee4_10`. Still a pure
     // deterministic function of the pattern, so both required runs agree.
@@ -2513,13 +2513,14 @@ fn order_with_options(
     //
     // Restart count comes from a per-matrix TIME BUDGET, not a flat count: a flat
     // 24 restarts is unshippable (1.444 s on nuclear10a alone), while
-    // `RELABEL_BUDGET / nnz` spends the same bounded slice everywhere and lets the
-    // cheap small matrices take many more passes than the heavy ones. See
+    // `relabel_budget / nnz` spends a bounded slice and lets cheap small matrices
+    // take more passes than heavy ones; pronounced hubs use the smaller slice below. See
     // `relabel_restarts` for the cost model and the budget sweep.
     //
     // Deterministic: `relabel` is a pure function of `(n, seed)` with seeds fixed
-    // at 1..=restarts, and `restarts` is a pure function of nnz. Best-of floor →
-    // zero-downside, and each candidate is bijection-checked before it can win.
+    // at 1..=restarts, and `restarts` is a pure function of `(n, nnz, max_deg)`.
+    // Best-of floor → zero-downside, and each candidate is bijection-checked
+    // before it can win.
     //
     // WIN C DISABLED in this build (the conservative fallback): the coordinator's
     // own doc comment on `RELABEL_BUDGET_LARGE` already flags it as "the single
@@ -2532,7 +2533,16 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
+    // Hub-heavy quotient graphs make each relabel pass disproportionately costly.
+    // On that complementary side of the promoted mid-band hub gate, use a shorter
+    // deterministic prefix. The stricter n/30 threshold keeps this work deletion
+    // focused on pronounced hubs; the low-nnz floor still dominates where applicable.
+    let relabel_budget = if nnz <= 150_000 && max_deg > n / 30 {
+        150_000
+    } else {
+        RELABEL_BUDGET
+    };
+    let relabel_cap_bucket = RELABEL_MAX_RESTARTS;
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
@@ -2567,8 +2577,8 @@ fn order_with_options(
     // α-sweep), so this is gated well below that class at `nnz <= 130_000` (the
     // ND/RCM/Sloan envelope, where isolated cost is small and the timing probe
     // shows large headroom — most such matrices run <0.1s total), and the
-    // restart count comes from the SAME per-matrix time budget as the AMD
-    // multistart (`RELABEL_BUDGET/nnz`, capped), which bounds added cost at
+    // restart count comes from the SAME selected per-matrix time budget as the AMD
+    // multistart (`relabel_budget/nnz`, capped), which bounds added cost at
     // every point at once (nnz=130k → 2 passes ≈0.08s; tiny nnz → 24 trivial
     // passes). Same `relabel(n, seed)` seeds as the AMD loop by design: AMF on
     // the identical relabelled graph is a genuinely different candidate, and
@@ -2580,7 +2590,7 @@ fn order_with_options(
             ..Default::default()
         };
         let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+            relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
             // Cloned per restart: each queued closure is a `move` closure and
@@ -2710,8 +2720,8 @@ fn order_with_options(
     // class (`ringpack_30_2` nnz=121458, `crudeoil_lee4_09/10`) that carries the
     // global worst `order()`. The measured worst `order()` inside this gate is
     // ~0.55 s, so this cannot move the worst case — the only number the enforced
-    // time-cap test reads. The restart count comes from the SAME per-matrix
-    // budget as the two multistarts above (`RELABEL_BUDGET/nnz`, cap 24), which
+    // time-cap test reads. The restart count comes from the SAME selected per-matrix
+    // budget as the two multistarts above (`relabel_budget/nnz`, cap 24), which
     // bounds added cost at `RELABEL_BUDGET * k` everywhere at once rather than
     // per-matrix: ~0.06 s typical, ~0.17 s worst. Same `relabel(n, seed)` seeds
     // by design — a different AMD option set on the identical relabelled graph is
@@ -2724,7 +2734,7 @@ fn order_with_options(
             dense_alpha: -1.0,
         };
         let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
+            relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
             // Cloned per restart — see the relabelled-AMF loop above.
