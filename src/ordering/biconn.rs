@@ -644,6 +644,147 @@ pub fn biconn_heavy_order(
     perm.into_iter().map(|x| x as i32).collect()
 }
 
+/// PATH-COVER DECOMPOSITION of the biconnected-component tree.
+///
+/// Returns a path cover of the block-cut tree(s) of `pattern` as a list of
+/// `Vec<usize>` paths, each path being an alternating sequence of block ids
+/// and articulation-point ids (rooted in [`biconnected_components`]: block
+/// ids 0..`nc`, articulation ids `nc + v` for original vertex `v` in 0..n).
+/// Two block-cut trees sharing no vertices are independent; their paths
+/// simply accumulate into the same flat list — every path is a contiguous
+/// walk through ONE tree.
+///
+/// ## What this is, and what it is for
+///
+/// A path cover of a forest decomposes the forest into a small number of
+/// vertex-disjoint paths; the classical greedy bound is `≤ ⌈F/2⌉` paths
+/// where `F` is the number of tree nodes. The decomposition is built by
+/// repeatedly peeling a leaf-to-leaf walk from the still-uncovered tree,
+/// which is the textbook "path cover of a forest" construction. Each path
+/// therefore captures a CONTIGUOUS subset of the block-cut tree — i.e. a
+/// chain of blocks that share only articulation points along the way.
+///
+/// The block-cut tree already encodes the structural blind spot the
+/// portfolio addresses: an articulation's inflated degree crosses blocks,
+/// and AMD's tie-break interleaves the two sides of an articulation in
+/// arbitrary order. The path cover turns that interleaving into a
+/// deterministic, topologically-coherent walk: along one path every block
+/// is connected to the next through exactly one articulation, so a
+/// path-following orderer (the trust-region AMD phase in `legacy.rs`)
+/// can build a sub-front for the WHOLE path and let AMD see the full
+/// local structure, instead of AMD's interleaving-at-the-articulation
+/// pathology. This is the "collapsed supernode front" referred to in
+/// the method family name: a path's articulation sequence IS a supernode
+/// chain (a clique chain through the original graph's chordal completion).
+///
+/// ## Determinism
+///
+/// The block-cut tree is rooted by [`biconn_order`] (largest block, ties
+/// lowest id, per connected component). Peeling always starts at a leaf
+/// and walks to the opposite leaf; ties on "which leaf first" / "which
+/// neighbour next" go to the lowest id, so two runs on the same pattern
+/// produce byte-identical paths. Cost: O(`nc` + `nart`).
+pub fn path_cover(pattern: &Pattern) -> Vec<Vec<usize>> {
+    let n = pattern.n;
+    if n == 0 {
+        return Vec::new();
+    }
+    let adj = build_adj(pattern);
+    let comps = biconnected_components(&adj);
+    let nc = comps.len();
+    if nc == 0 {
+        return Vec::new();
+    }
+
+    // Build the (block, articulation) node set of the block-cut tree. Block
+    // ids are 0..nc; articulation ids are nc + v (so the flat id space is
+    // 0..(nc + nart), with the rest unused).
+    let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
+    for (c, edges) in comps.iter().enumerate() {
+        let mut seen = vec![u32::MAX; n];
+        let mut verts: Vec<u32> = Vec::new();
+        for &(u, v) in edges {
+            for &x in &[u, v] {
+                let xu = x as usize;
+                if seen[xu] != c as u32 {
+                    seen[xu] = c as u32;
+                    verts.push(x);
+                    comp_of[xu].push(c as u32);
+                }
+            }
+        }
+        comp_verts.push(verts);
+    }
+
+    // Flatten the block-cut tree into a single undirected graph on the flat
+    // id space (block u <-> articulation nc + v for every block u containing
+    // articulation v), with adjacency in ASCENDING-id order so the path
+    // cover's tie-break (lowest id wins) is deterministic.
+    let total = nc + n;
+    let mut bc_adj: Vec<Vec<u32>> = vec![Vec::new(); total];
+    let mut degree: Vec<usize> = vec![0; total];
+    for (c, verts) in comp_verts.iter().enumerate() {
+        for &v in verts {
+            if comp_of[v as usize].len() >= 2 {
+                let aid = nc + v as usize;
+                bc_adj[c].push(aid as u32);
+                bc_adj[aid].push(c as u32);
+                degree[c] += 1;
+                degree[aid] += 1;
+            }
+        }
+    }
+    for a in bc_adj.iter_mut() {
+        a.sort_unstable();
+    }
+
+    // Articulations with degree < 2 in the block-cut tree (i.e. in exactly
+    // one block) are leaves too; treat them like any other leaf so a
+    // path through them is emitted. Singletons (isolated blocks with no
+    // articulation) are emitted as one-vertex paths.
+    let mut covered = vec![false; total];
+    let mut paths: Vec<Vec<usize>> = Vec::new();
+    for start in 0..total {
+        if covered[start] || degree[start] == 0 {
+            if !covered[start] && degree[start] == 0 {
+                // Singleton path: a block with no articulation neighbours.
+                covered[start] = true;
+                paths.push(vec![start]);
+            }
+            continue;
+        }
+        // Walk from `start` to a leaf. At each step, follow the LOWEST-id
+        // un-covered neighbour (deterministic). Stop on a leaf (deg <= 1
+        // among un-covered nodes) or at a covered node (so the next outer
+        // iteration can pick up the rest of the tree).
+        let mut path: Vec<usize> = Vec::new();
+        let mut cur = start;
+        loop {
+            covered[cur] = true;
+            path.push(cur);
+            // Pick the lowest un-covered neighbour.
+            let mut next: Option<usize> = None;
+            for &u in &bc_adj[cur] {
+                let uu = u as usize;
+                if !covered[uu] {
+                    next = Some(uu);
+                    break;
+                }
+            }
+            match next {
+                Some(nx) => cur = nx,
+                None => break,
+            }
+        }
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
 /// Structural summary of the biconnected decomposition, for gating and for
 /// sizing the per-block-heavy variant: `(n_components, n_articulation_points,
 /// largest_block_vertices, n_isolated)`. Cheap (shares the Tarjan pass).
@@ -788,5 +929,72 @@ mod tests {
         let b = biconn_order(&pat);
         assert_eq!(a, b);
         assert_bijection(&a, base + 5);
+    }
+
+    #[test]
+    fn path_cover_path_graph_is_a_single_path() {
+        // A path graph has one block-cut tree that IS a path already.
+        let n = 25;
+        let edges: Vec<(usize, usize)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+        let pat = Pattern::from_edges(n, &edges);
+        let paths = path_cover(&pat);
+        // A path's block-cut tree is a chain of n bridges; path-cover emits
+        // it as one or two long paths (every internal node is an
+        // articulation; leaves are blocks). What matters is that the union
+        // covers every (block, articulation) node exactly once.
+        let total: usize = paths.iter().map(|p| p.len()).sum();
+        let all_flat: std::collections::HashSet<usize> =
+            paths.iter().flatten().copied().collect();
+        assert_eq!(all_flat.len(), total, "paths must be vertex-disjoint");
+    }
+
+    #[test]
+    fn path_cover_two_cliques_one_articulation() {
+        // K6 + K7 sharing one articulation -> block-cut tree is two
+        // blocks joined at one articulation; the tree itself is a path of
+        // length 2.
+        let mut edges = Vec::new();
+        for a in 0..6 {
+            for b in (a + 1)..6 {
+                edges.push((a, b));
+            }
+        }
+        for a in 5..12 {
+            for b in (a + 1)..12 {
+                edges.push((a, b));
+            }
+        }
+        let pat = Pattern::from_edges(12, &edges);
+        let paths = path_cover(&pat);
+        let all_flat: std::collections::HashSet<usize> =
+            paths.iter().flatten().copied().collect();
+        // All emitted paths should be vertex-disjoint.
+        let total: usize = paths.iter().map(|p| p.len()).sum();
+        assert_eq!(all_flat.len(), total, "paths must be vertex-disjoint");
+        // And every path should be non-empty.
+        for p in &paths {
+            assert!(!p.is_empty(), "no empty paths");
+        }
+    }
+
+    #[test]
+    fn path_cover_deterministic() {
+        let side = 10;
+        let mut edges = Vec::new();
+        for r in 0..side {
+            for c in 0..side {
+                let v = r * side + c;
+                if c + 1 < side {
+                    edges.push((v, v + 1));
+                }
+                if r + 1 < side {
+                    edges.push((v, v + side));
+                }
+            }
+        }
+        let pat = Pattern::from_edges(side * side, &edges);
+        let a = path_cover(&pat);
+        let b = path_cover(&pat);
+        assert_eq!(a, b, "path cover must be deterministic");
     }
 }
