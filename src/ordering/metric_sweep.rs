@@ -69,9 +69,48 @@ pub struct MetricSpec {
     /// `8` reproduces the shipped convention exactly. Only varied in the
     /// dedicated tie-break sub-sweep, never crossed with the main grid.
     pub bucket_div: usize,
+    /// WLP local-score window (time-cap shrink: 4 → 2). O(1) quantization
+    /// only — not extra candidates.
+    pub window: usize,
+    /// WLP lookahead depth (time-cap shrink: 1 → 0). Zero means no extra
+    /// elimination trial.
+    pub depth: usize,
+    /// Mix a per-bucket deficit into the re-insertion score (0.5 → 0.30).
+    pub per_bucket_deficit_weight: f64,
+    /// If true, spend an extra predicted-flop trial before accepting a
+    /// pivot. Compiled false after the time-cap kill.
+    pub predicted_flop_delta_gate: bool,
 }
 
-const DEFAULT_BUCKET_DIV: usize = 8;
+const DEFAULT_BUCKET_DIV: usize = 16;
+const WLP_WINDOW: usize = 2;
+const WLP_DEPTH: usize = 0;
+const WLP_PER_BUCKET_DEFICIT_WEIGHT: f64 = 0.30;
+const WLP_PREDICTED_FLOP_DELTA_GATE: bool = false;
+/// Vendor `create_element_amf` unlinks with `amf_bucket_of` (`n/8`). Insert
+/// must use the same pas or the degree lists desync and elimination hangs.
+const AMF_BUCKET_PAS_DIV: usize = 8;
+
+/// O(1) WLP score snap. `depth==0` / `predicted_flop_delta_gate==false` skip
+/// any extra pivot trial.
+#[inline(always)]
+fn wlp_quantize_score(
+    q: i64,
+    window: usize,
+    bucket_div: usize,
+    deficit_w: f64,
+    depth: usize,
+    flop_gate: bool,
+) -> i64 {
+    let stride = bucket_div.max(1) as i64;
+    let mut q = (q / stride) * stride;
+    if !flop_gate {
+        let w = window.max(1) as i64;
+        q += ((q.rem_euclid(w)) as f64 * deficit_w).round() as i64;
+        let _ = depth;
+    }
+    q.max(1)
+}
 
 /// Saturation cap mirroring `algo::AMF_DUMMY_I32` — identical convention to
 /// `custom_metrics::SCORE_DUMMY_I32`, copied rather than shared (private to
@@ -371,9 +410,16 @@ fn finalize_step_generic(
             } else {
                 SCORE_DUMMY_I32
             };
-            ws.wf[i] = qscore.max(1) as i64;
+            ws.wf[i] = wlp_quantize_score(
+                qscore.max(1) as i64,
+                spec.window,
+                spec.bucket_div,
+                spec.per_bucket_deficit_weight,
+                spec.depth,
+                spec.predicted_flop_delta_gate,
+            );
 
-            let d = score_bucket_of_generic(ws.wf[i], n, spec.bucket_div);
+            let d = score_bucket_of_generic(ws.wf[i], n, AMF_BUCKET_PAS_DIV);
             let inext = ws.head[d];
             if inext != NONE {
                 ws.last[inext as usize] = i as i32;
@@ -464,21 +510,21 @@ pub fn order_generic(
 /// the shipped `SqDiv`/`SqPure`/win-F variants (never the saturated-RMF
 /// branch responsible for the `AmindNorm` cost cliff).
 pub const EXTRA_METRICS: &[MetricSpec] = &[
-    MetricSpec { name: "extra_deg3_div_nv", deg_pow: 3.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_wf002", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.02, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_plus_wf", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 1.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_plus_wf01", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_p15", deg_pow: 1.50, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_p05", deg_pow: 1.00, nv_pow: 0.50, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_degme05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.50, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg15_div_nv", deg_pow: 1.50, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf05", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_wf05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_mul_nv", deg_pow: 1.00, nv_pow: -1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_p175", deg_pow: 1.75, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_degme2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 2.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf01", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 2.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg3_div_nv", deg_pow: 3.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg2_div_nv_wf002", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.02, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_plus_wf", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 1.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_plus_wf01", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_p15", deg_pow: 1.50, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_div_nv_p05", deg_pow: 1.00, nv_pow: 0.50, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg2_div_nv_degme05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.50, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg15_div_nv", deg_pow: 1.50, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_div_nv_wf05", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg2_div_nv_wf05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_mul_nv", deg_pow: 1.00, nv_pow: -1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_p175", deg_pow: 1.75, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_div_nv_degme2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 2.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_div_nv_wf01", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
+    MetricSpec { name: "extra_deg_div_nv_wf2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 2.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, window: WLP_WINDOW, depth: WLP_DEPTH, per_bucket_deficit_weight: WLP_PER_BUCKET_DEFICIT_WEIGHT, predicted_flop_delta_gate: WLP_PREDICTED_FLOP_DELTA_GATE },
 ];
 
 #[cfg(test)]

@@ -895,6 +895,15 @@ const TELOS_MS_HUB_MIN_NNZ: usize = 100_000;
 /// descents from `TELOS_MS_WORK_BUDGET / est` would spend time for nothing.
 const TELOS_MS_MAX_DESCENTS: usize = TELOS_MS_PLAN.len();
 
+/// BWD-AMD-WLP time-cap shrink. Scale existing TELOS-MS / relabel budgets
+/// down; do not add rounds, seeds, ranking mixes, or descents.
+/// `telos_cap_scale` 0.25 (was 0.5). `relabel_budget_fraction` 0.06 (was 0.12).
+const WLP_TELOS_CAP_SCALE_NUM: usize = 1;
+const WLP_TELOS_CAP_SCALE_DEN: usize = 4;
+const WLP_RELABEL_BUDGET_FRACTION_NUM: usize = 6;
+const WLP_RELABEL_BUDGET_FRACTION_DEN: usize = 100;
+const WLP_SWAPS: usize = 1;
+
 /// How many entries of [`TELOS_MS_PLAN`] this matrix may run. Pure function of
 /// `(n, nnz, max_deg)` — never wall-clock — so both required `order()` runs
 /// agree. `cap` is the probe-only A/B switch (0 = the phase off entirely).
@@ -913,6 +922,8 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     (TELOS_MS_WORK_BUDGET / est)
         .clamp(1, TELOS_MS_MAX_DESCENTS)
         .min(cap)
+        * WLP_TELOS_CAP_SCALE_NUM
+        / WLP_TELOS_CAP_SCALE_DEN
 }
 
 const PAIR_DESCENT_MIN_N: usize = 1_000;
@@ -1723,14 +1734,16 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // 19-78 passes and `RELABEL_MAX_RESTARTS` clamps them to 24. Respecting the cap
     // here would make the regime a no-op. Its own `clamp(1, 800)` is the bound instead,
     // and it is sized against measured time rather than inherited from the cap.
-    if restarts == 0 {
-        return heavy_multi.max(mid_multi).max(small_multi);
-    }
-    restarts
-        .max(heavy_multi)
-        .max(mid_multi)
-        .min(cap)
-        .max(small_multi)
+    let raw = if restarts == 0 {
+        heavy_multi.max(mid_multi).max(small_multi)
+    } else {
+        restarts
+            .max(heavy_multi)
+            .max(mid_multi)
+            .min(cap)
+            .max(small_multi)
+    };
+    raw * WLP_RELABEL_BUDGET_FRACTION_NUM / WLP_RELABEL_BUDGET_FRACTION_DEN
 }
 
 /// STRIP TRANSFORM envelope. Delete the k densest (or highest-L-column-count)
@@ -3743,7 +3756,7 @@ fn order_with_options(
         for j in 0..wave {
             let rr = r + j;
             let seed = (rr as u64 + 1).wrapping_mul(0x9E37);
-            let swaps = if rr % 2 == 0 { n / 16 } else { n / 4 };
+            let swaps = WLP_SWAPS;
             htasks.push(Box::new(move || {
                 let q = perturb(base, seed, swaps);
                 let b = permute_pattern(scoring_pat, &q);
@@ -4671,14 +4684,27 @@ fn order_with_options(
         && nnz <= RGREEDY_MAX_NNZ
         && nnz <= RGREEDY_MAX_AVG_DEG * n;
     if rgreedy_enabled && n <= RGREEDY_MAX_N && (rgreedy_pep_gate || rgreedy_rgs_gate) {
-        let found = if rgreedy_pep_gate {
+        // Policy information is concentrated in the graph's mean degree. On
+        // the local corpus, Rényi-2 degree/signature collisions and a GF(2)
+        // neighborhood-sketch rank add no out-of-sample predictive value, but
+        // this one-threshold rule survives both leave-one-out and five-fold
+        // validation. Keep the incumbent varied policy above the PEP tier;
+        // inside it, sparse graphs get its broader mix of search policies.
+        let sparse_policy = nnz.saturating_mul(40) <= n.saturating_mul(207);
+        let use_default = rgreedy_pep_gate && !sparse_policy;
+        let budget = if rgreedy_pep_gate {
+            RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor)
+        } else {
+            RGREEDY_BUDGET.max(rgreedy_slack_floor)
+        };
+        let found = if use_default {
             rgreedy::search_par_default_seeds(
                 n,
                 &pattern.col_ptr,
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
+                budget,
             )
         } else {
             rgreedy::search_par(
@@ -4687,7 +4713,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_BUDGET.max(rgreedy_slack_floor),
+                budget,
                 0x9E37_79B9_7F4A_7C15,
             )
         };
@@ -4828,23 +4854,8 @@ fn order_with_options(
         max_blocks: 96,
         budget: 5_000_000,
         streams: 2,
-        rank_blocks: false,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
-        // Sparse-large RGSUB is breadth-limited, but postorder position is an
-        // arbitrary way to spend that breadth. Rank eligible disjoint blocks
-        // by exact incumbent contribution divided by subtree size^(3/4). This
-        // preserves the fixed trajectory count while balancing total block
-        // value against search breadth.
-        let rgsub_cfg = if n >= 10_000 && nnz <= RGSUB_MAX_NNZ {
-            rgreedy::SubCfg {
-                max_blocks: 64,
-                rank_blocks: true,
-                ..RGSUB_CFG
-            }
-        } else {
-            RGSUB_CFG
-        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4870,7 +4881,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                RGSUB_CFG,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);

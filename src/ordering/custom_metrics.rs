@@ -133,6 +133,25 @@ const DEGREE_FAMILY: &[ScoreVariant] = &[
 /// quantization convention MUMPS/AMF uses: `i32::MAX - 1`).
 const SCORE_DUMMY_I32: i32 = i32::MAX - 1;
 
+/// BWD-AMD-WLP knobs mirrored from `metric_sweep::order_generic`.
+const WLP_WINDOW: usize = 2;
+const WLP_DEPTH: usize = 0;
+const WLP_BUCKET_DIV: usize = 16;
+const WLP_PER_BUCKET_DEFICIT_WEIGHT: f64 = 0.30;
+const WLP_PREDICTED_FLOP_DELTA_GATE: bool = false;
+
+#[inline(always)]
+fn wlp_quantize_score(q: i64) -> i64 {
+    let stride = WLP_BUCKET_DIV.max(1) as i64;
+    let mut q = (q / stride) * stride;
+    if !WLP_PREDICTED_FLOP_DELTA_GATE {
+        let w = WLP_WINDOW.max(1) as i64;
+        q += ((q.rem_euclid(w)) as f64 * WLP_PER_BUCKET_DEFICIT_WEIGHT).round() as i64;
+        let _ = WLP_DEPTH;
+    }
+    q.max(1)
+}
+
 /// Quantize an `i64` score into a bucket index in `[0, 2n+1]`. Identical
 /// convention to `algo::amf_bucket_of` (private there, so reimplemented here
 /// — same fine-region-then-coarse-stride scheme, not a novel idea).
@@ -462,7 +481,7 @@ fn finalize_step_variant(
             } else {
                 SCORE_DUMMY_I32
             };
-            ws.wf[i] = qscore.max(1) as i64;
+            ws.wf[i] = wlp_quantize_score(qscore.max(1) as i64);
 
             let d = score_bucket_of(ws.wf[i], n);
             let inext = ws.head[d];
