@@ -918,17 +918,13 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
 const PAIR_DESCENT_MIN_N: usize = 1_000;
 const PAIR_DESCENT_MAX_N: usize = 4_000;
 const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-// Spend the stranded per-matrix slack on the newest phase. The 2 s cap is
-// charged per matrix; the grader's own Actions log for the promoting run shows
-// 999 order() calls consuming 513.5 s of the 1998 s allowed, the fastest half
-// inside 0.390 s, and the tail entirely gt_10k. This phase is gated to
-// 1000 <= n <= 4000, a band whose worst measured order() is 0.420 s locally
-// (~1.1 s on the grader at the 2.6x ratio), so it has ~0.9 s of margin. The
-// budget is a deterministic cumulative op count, exhaustion discards, and the
-// result is admitted only through the trusted global scorer -- so more of it is
-// weakly improving and cannot change determinism.
-const PAIR_DESCENT_SWEEPS: usize = 4;
-const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
+// Post time-cap shrink of the adjacent-pair WLP (w=2, depth=1, one swap
+// decision per pair). Four even/odd cycles at 128M ops tripped the 2 s
+// per-matrix SIGKILL; one even+odd pass at half the op budget is the same
+// local-orientation rule with half the elimination-game work. Exhaustion
+// still discards; admission is still through the trusted global scorer.
+const PAIR_DESCENT_SWEEPS: usize = 2;
+const PAIR_DESCENT_OPS_BUDGET: i64 = 64_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────

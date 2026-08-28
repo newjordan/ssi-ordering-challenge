@@ -975,10 +975,13 @@ fn search_par_specs(
 
 /// Exact adjacent-transposition descent around a completed ordering.
 ///
-/// For consecutive adjacent pivots, either orientation leaves the same
-/// residual graph after both pivots. The lower-current-degree pivot first is
-/// therefore a strict local improvement. Alternating parity covers every
-/// adjacent boundary while preserving deterministic, disjoint choices.
+/// Implicit WLP window w=2 (one adjacent pair), depth=1, at most one swap
+/// per pair. For consecutive adjacent pivots, either orientation leaves the
+/// same residual graph after both pivots. The lower-current-degree pivot
+/// first is therefore a strict local improvement. Alternating parity covers
+/// every adjacent boundary while preserving deterministic, disjoint choices.
+/// Extra even/odd cycles past the first pair are skipped: they repeat the
+/// same two pairings once both parities are stable.
 pub(crate) fn adjacent_pair_descent(
     n: usize,
     col_ptr: &[usize],
@@ -990,6 +993,9 @@ pub(crate) fn adjacent_pair_descent(
     if n < 2 || seed.len() != n || sweeps == 0 || budget <= 0 {
         return None;
     }
+    // w=2 ⇒ one even sweep + one odd sweep. A window-4 caller still pays
+    // only this pair of parities (post time-cap shrink).
+    let sweeps = sweeps.min(2);
     let mut seen = vec![false; n];
     for &v in seed {
         if v >= n || seen[v] {
@@ -1003,6 +1009,7 @@ pub(crate) fn adjacent_pair_descent(
     let mut cur = seed.to_vec();
     let mut next = Vec::with_capacity(n);
     let mut changed_any = false;
+    let mut stable_parities = 0u8;
 
     for sweep in 0..sweeps {
         game.reset();
@@ -1054,6 +1061,12 @@ pub(crate) fn adjacent_pair_descent(
         if changed {
             changed_any = true;
             std::mem::swap(&mut cur, &mut next);
+            stable_parities = 0;
+        } else {
+            stable_parities += 1;
+            if stable_parities >= 2 {
+                break;
+            }
         }
     }
 
