@@ -227,7 +227,11 @@ fn run_generic(
         std::panic::catch_unwind(AssertUnwindSafe(|| eval(i, ws))).unwrap_or_default()
     };
 
-    if len == 1 || len.saturating_mul(nnz.max(1)) < PAR_MIN_WORK || force_sequential() {
+    if len == 1
+        || len.saturating_mul(nnz.max(1)) < PAR_MIN_WORK
+        || in_worker()
+        || force_sequential()
+    {
         let mut ws: Option<ScoreWorkspace> = None;
         for (i, slot) in results.iter_mut().enumerate() {
             *slot = eval(i, &mut ws);
@@ -241,6 +245,10 @@ fn run_generic(
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
                 s.spawn(|| {
+                    // Nested batches (a TELOS descent's per-round batch inside
+                    // the multi-descent batch) run sequentially — see
+                    // `IN_WORKER`.
+                    IN_WORKER.with(|c| c.set(true));
                     let mut ws: Option<ScoreWorkspace> = None;
                     let mut out: Vec<(usize, CandOut)> = Vec::new();
                     loop {
@@ -322,4 +330,42 @@ fn force_sequential() -> bool {
 #[inline(always)]
 fn force_sequential() -> bool {
     false
+}
+
+/// Set on a worker thread for as long as it is draining a batch. A batch
+/// queued from INSIDE a worker (the per-round batch of a TELOS descent that is
+/// itself one task of the multi-descent batch) then runs sequentially instead
+/// of spawning 4 more threads each: the outer batch already owns all four
+/// cores, so nesting would only oversubscribe them. Output-neutral — it only
+/// picks which of two paths computes the identical result.
+thread_local! {
+    static IN_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn in_worker() -> bool {
+    IN_WORKER.with(|c| c.get())
+}
+
+/// TEST-ONLY phase timing sink. A global `Mutex` rather than a `thread_local!`
+/// because the phases being timed now run on worker threads. Compiled out of
+/// the shipped binary (`#[cfg(test)]`), and never read by `order()` itself, so
+/// it cannot affect determinism.
+#[cfg(test)]
+pub(crate) static PHASE_SECS: std::sync::Mutex<Vec<(&'static str, f64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn phase_mark(label: &'static str, t0: std::time::Instant) {
+    if let Ok(mut v) = PHASE_SECS.lock() {
+        v.push((label, t0.elapsed().as_secs_f64()));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn phase_take() -> Vec<(&'static str, f64)> {
+    match PHASE_SECS.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
+    }
 }

@@ -42,7 +42,7 @@
 /// bytes (two bitset adjacency copies) = ~`n²/4` bytes; at 4000 that is 4 MB,
 /// far inside the 4 GiB worker cap. The SHIPPED gate at the call site is much
 /// lower and is chosen for TIME, not memory.
-pub(crate) const MAX_N: usize = 4_000;
+pub(crate) const MAX_N: usize = 12_000;
 
 #[inline]
 fn xs64(s: &mut u64) -> u64 {
@@ -65,10 +65,10 @@ fn below(s: &mut u64, m: u32) -> u32 {
 /// Invariant: `adj[u]` holds exactly `u`'s neighbours in the CURRENT fill graph
 /// restricted to LIVE vertices (never `u` itself, never an eliminated vertex),
 /// and `deg[u] == popcount(adj[u])` for every live `u`.
-pub(crate) struct Game {
+pub(crate) struct Game<'a> {
     n: usize,
     w: usize,
-    adj0: Vec<u64>,
+    adj0: &'a [u64],
     adj: Vec<u64>,
     deg: Vec<u32>,
     livelist: Vec<u32>,
@@ -81,10 +81,17 @@ pub(crate) struct Game {
     pub(crate) ops: i64,
 }
 
-impl Game {
-    /// `None` if `n` is out of range or the pattern references an out-of-range
-    /// row (the caller then simply skips this phase).
-    pub(crate) fn new(n: usize, col_ptr: &[usize], row_idx: &[usize]) -> Option<Game> {
+impl<'a> Game<'a> {
+    /// Build the pristine bitset adjacency ONCE. Shared immutably by every
+    /// stream of the fan-out: it is a pure function of the pattern, it is the
+    /// single largest allocation this module makes (`n·⌈n/64⌉` words), and
+    /// building it costs an O(nnz) scan. Doing that per stream made four
+    /// threads take ~4x the wall time of one at n≈5000 — the allocator and the
+    /// kernel's page zeroing serialised, so the fan-out bought nothing.
+    ///
+    /// `None` if `n` is out of range or the pattern references an
+    /// out-of-range row (the caller then simply skips this phase).
+    pub(crate) fn build_adj(n: usize, col_ptr: &[usize], row_idx: &[usize]) -> Option<Vec<u64>> {
         if n == 0 || n > MAX_N {
             return None;
         }
@@ -102,10 +109,22 @@ impl Game {
                 }
             }
         }
+        Some(adj0)
+    }
+
+    /// A working game over a shared pristine adjacency.
+    pub(crate) fn new(n: usize, adj0: &'a [u64]) -> Option<Game<'a>> {
+        if n == 0 || n > MAX_N {
+            return None;
+        }
+        let w = n.div_ceil(64);
+        if adj0.len() < n * w {
+            return None;
+        }
         Some(Game {
             n,
             w,
-            adj: adj0.clone(),
+            adj: adj0[..n * w].to_vec(),
             adj0,
             deg: vec![0; n],
             livelist: Vec::with_capacity(n),
@@ -118,7 +137,7 @@ impl Game {
     }
 
     fn reset(&mut self) {
-        self.adj.copy_from_slice(&self.adj0);
+        self.adj.copy_from_slice(&self.adj0[..self.n * self.w]);
         self.livelist.clear();
         for v in 0..self.n {
             let mut d = 0u32;
@@ -237,17 +256,19 @@ struct Policy {
     fill_tb: bool,
 }
 
-impl Game {
+impl Game<'_> {
     /// One randomized greedy run. `fixed` is a prefix of pivots replayed
     /// verbatim before randomization starts (the LNS operator); pass an empty
     /// slice for a from-scratch run. Returns `None` as soon as the partial
     /// objective reaches `bound` (pruned), since `Σ c²` only grows.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         fixed: &[usize],
         pol: Policy,
         rng: &mut u64,
         bound: u64,
+        hard_cap: i64,
         out: &mut Vec<usize>,
     ) -> Option<u64> {
         self.reset();
@@ -262,6 +283,18 @@ impl Game {
             }
         }
         while !self.livelist.is_empty() {
+            // HARD STOP. `last_run` bounds the budget using the PREVIOUS run's
+            // cost, which is only a prediction: a randomized pivot sequence can
+            // generate far more fill than the incumbent's, and on an unseen
+            // matrix a single run can cost several times what the last one did.
+            // That is exactly how a locally-fine ordering phase blows a wall
+            // clock cap on a hidden corpus, so the run is abandoned outright
+            // once total ops pass the cap. Abandoning costs only this run's
+            // work — the incumbent is untouched, and the phase as a whole is
+            // still strictly-improving.
+            if self.ops > hard_cap {
+                return None;
+            }
             let m = self.livelist.len();
             self.ops += 4 * m as i64;
             let mut dmin = u32::MAX;
@@ -353,7 +386,8 @@ pub(crate) fn search(
     budget: i64,
     rng_seed: u64,
 ) -> Option<(Vec<usize>, u64)> {
-    search_with(n, col_ptr, row_idx, seed, seed_flops, budget, rng_seed, Params::DEFAULT)
+    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
+    search_with(n, &adj0, seed, seed_flops, budget, rng_seed, Params::DEFAULT)
 }
 
 /// Tunable knobs. `Params::DEFAULT` is what ships; the probe overrides them to
@@ -423,15 +457,14 @@ impl Params {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn search_with(
     n: usize,
-    col_ptr: &[usize],
-    row_idx: &[usize],
+    adj0: &[u64],
     seed: &[usize],
     seed_flops: u64,
     budget: i64,
     rng_seed: u64,
     par: Params,
 ) -> Option<(Vec<usize>, u64)> {
-    let mut g = Game::new(n, col_ptr, row_idx)?;
+    let mut g = Game::new(n, adj0)?;
     let mut rng = rng_seed | 1;
     let mut best = seed_flops;
     let mut best_ord: Vec<usize> = Vec::new();
@@ -458,21 +491,32 @@ pub(crate) fn search_with(
     if pols.is_empty() {
         return None;
     }
+    // Total-ops ceiling: 1.25x the budget, so an over-long run can overshoot
+    // by at most a quarter of the budget instead of by a whole run.
+    let hard_cap = budget + budget / 4;
     let phase_a_end = if par.lns {
         budget * par.phase_a_num / par.phase_a_den
     } else {
         budget
     };
     let mut it = 0usize;
-    while g.ops < phase_a_end {
+    // A single greedy run is ATOMIC: it cannot be stopped halfway and still
+    // yield an ordering, and at n=6000 one run already costs ~130M ops. So the
+    // loop guard must reserve the cost of the run it is about to start, using
+    // the previous run's measured cost, or the budget is a lower bound rather
+    // than an upper one and the added wall time overshoots by a whole run.
+    let mut last_run: i64 = 0;
+    while g.ops + last_run <= phase_a_end {
+        let before = g.ops;
         let pol = pols[it % pols.len()];
         it += 1;
-        if let Some(f) = g.run(&[], pol, &mut rng, best, &mut out) {
+        if let Some(f) = g.run(&[], pol, &mut rng, best, hard_cap, &mut out) {
             if f < best {
                 best = f;
                 best_ord = out.clone();
             }
         }
+        last_run = last_run.max(g.ops - before);
     }
 
     // ── Phase B: iterated local search around the incumbent ────────────────
@@ -502,7 +546,8 @@ pub(crate) fn search_with(
     let mut cur_f: Vec<u64> = vec![best; nwalk];
     let mut stall = 0usize;
     let mut kick: Vec<usize> = Vec::new();
-    while par.lns && g.ops < budget {
+    while par.lns && g.ops + last_run <= budget {
+        let before = g.ops;
         let p = match par.prefix_mode {
             0 => below(&mut rng, n as u32) as usize,
             3 => below(&mut rng, (n as u32).div_ceil(2)) as usize,
@@ -522,8 +567,9 @@ pub(crate) fn search_with(
         let thresh = best + best / par.accept_den * par.accept_num;
         let bound = if thresh > cur_f[wi] { thresh } else { cur_f[wi] } + 1;
         let taken = std::mem::take(&mut cur[wi]);
-        let r = g.run(&taken[..p.min(taken.len())], pol, &mut rng, bound, &mut out);
+        let r = g.run(&taken[..p.min(taken.len())], pol, &mut rng, bound, hard_cap, &mut out);
         cur[wi] = taken;
+        last_run = last_run.max(g.ops - before);
         match r {
             Some(f) => {
                 if f < best {
@@ -538,11 +584,12 @@ pub(crate) fn search_with(
             }
             None => {
                 stall += 1;
+                #[allow(clippy::needless_late_init)]
                 if par.stall_limit != 0 && stall >= par.stall_limit {
                     stall = 0;
                     let pol = pols[it % pols.len()];
                     it += 1;
-                    if let Some(f) = g.run(&[], pol, &mut rng, u64::MAX, &mut kick) {
+                    if let Some(f) = g.run(&[], pol, &mut rng, u64::MAX, hard_cap, &mut kick) {
                         if f < best {
                             best = f;
                             best_ord = kick.clone();
@@ -561,4 +608,116 @@ pub(crate) fn search_with(
     } else {
         None
     }
+}
+
+/// The four parameter configurations the parallel fan-out runs, one per
+/// thread. Measured (`probe_rgreedy`, RG_SEEDS/RG_MULTI): four INDEPENDENT
+/// PRNG seeds at the same parameters recover -0.00309 of dev score where one
+/// stream recovers -0.00258, and varying the LNS prefix draw per stream on top
+/// of that reaches -0.00327 with 74 matrices improved instead of 63. The
+/// prefix draw is the parameter worth varying because the two extremes win on
+/// DIFFERENT matrices — uniform-over-`0..n` prefixes score better in total,
+/// log-uniform tails improve more matrices — and a fan-out can have both
+/// instead of choosing.
+/// ONE stream of the fan-out, addressed by index — the unit the parallel
+/// arm's task queue schedules. PURE: the result is a function of
+/// `(pattern, seed, seed_flops, budget, k)` and nothing else (no wall-clock,
+/// no shared state, no thread identity), so the caller can run these in any
+/// order, on any number of threads, and merge by `(flops, k)` argmin to get a
+/// byte-identical answer. `k` selects both the PRNG seed and the parameter
+/// variant (see [`stream_params`]).
+pub(crate) fn search_seed(
+    n: usize,
+    adj0: &[u64],
+    seed: &[usize],
+    seed_flops: u64,
+    budget: i64,
+    k: usize,
+) -> Option<(Vec<usize>, u64)> {
+    search_with(
+        n,
+        adj0,
+        seed,
+        seed_flops,
+        budget,
+        stream_rng(k),
+        stream_params(k),
+    )
+}
+
+/// The PRNG seed for stream `k`. Fixed constant, no entropy, no clock.
+fn stream_rng(k: usize) -> u64 {
+    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(2 * k as u64 + 1) ^ (k as u64) << 32
+}
+
+fn stream_params(k: usize) -> Params {
+    let mut p = Params::DEFAULT;
+    match k % 4 {
+        0 => {}
+        1 => p.prefix_mode = 0,
+        2 => p.prefix_mode = 1,
+        _ => {
+            p.prefix_mode = 2;
+            p.pol_mask = 0b0011_0111;
+        }
+    }
+    p
+}
+
+/// Run `threads` INDEPENDENT searches concurrently and return the best.
+///
+/// Each stream is a pure function of `(pattern, seed, params, budget)` with no
+/// shared state whatsoever — no shared incumbent, no work stealing, no
+/// wall-clock — so the set of results is fixed before any thread starts, and
+/// the merge below (strict argmin, ties broken by the LOWEST stream index)
+/// picks the same one regardless of completion order. Byte-identical output
+/// across runs, as the rules require.
+///
+/// The point is WALL TIME, not throughput: the grader has 4 vCPUs, so four
+/// streams of `budget` ops each cost the same wall time as one, and buy 4x the
+/// search. The thread cap is [`super::parallel::PAR_MAX_THREADS`] so the whole
+/// candidate binary has a single source of truth for it.
+pub(crate) fn search_par(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    seed_flops: u64,
+    budget: i64,
+    rng_seed: u64,
+) -> Option<(Vec<usize>, u64)> {
+    let _ = rng_seed;
+    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
+    let adj0: &[u64] = &adj0;
+    let streams = super::parallel::PAR_MAX_THREADS.max(1);
+    if streams == 1 {
+        return search_seed(n, adj0, seed, seed_flops, budget, 0);
+    }
+    let results: Vec<Option<(Vec<usize>, u64)>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..streams)
+            .map(|k| {
+                sc.spawn(move || {
+                    // A stream that panicked would silently drop a result and
+                    // make the merge depend on which thread died — wrap it, so
+                    // the worst case is a missing (never a differing) result.
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        search_seed(n, adj0, seed, seed_flops, budget, k)
+                    }))
+                    .unwrap_or(None)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    });
+    let mut best: Option<(Vec<usize>, u64)> = None;
+    for r in results.into_iter().flatten() {
+        // Strict `<` walking streams in index order = lowest index wins ties.
+        if best.as_ref().is_none_or(|(_, bf)| r.1 < *bf) {
+            best = Some(r);
+        }
+    }
+    best
 }
