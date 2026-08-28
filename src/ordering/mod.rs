@@ -168,6 +168,9 @@ mod alloc_probe;
 /// best-of floor.
 mod custom_metrics;
 
+mod minl_watch;
+use minl_watch::watcher_minimalize;
+
 /// Generic quotient-graph pivot-score family (shot C) — SHIPPED, not
 /// test-gated. `order_generic` drives a parameterized MetricSpec through
 /// `feral_ordering_core::quotient_graph`'s near-linear machinery, and
@@ -957,6 +960,10 @@ const MINL_MAX_LNNZ: usize = 2_400_000;
 const MINL_OPS_BUDGET: i64 = 60_000_000;
 const MINL_MAX_ROUNDS: usize = 8;
 const MINL_MAX_COMMON: usize = 2_000;
+const WATCH_MINL_MAX_N: usize = 30_000;
+const WATCH_MINL_MAX_FILL: usize = 145_000;
+const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
+const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 
 /// COMPONENT B — ORBIT-BATCHED COMPLETION-LATTICE DESCENT (Noether priming
 /// round 4, `noether.md` §2.2 "Component B"; source doc:
@@ -3749,6 +3756,65 @@ fn order_with_options(
                 removed_total += removed_this;
             }
             if removed_total == 0 {
+                return None;
+            }
+            Some(minl_mcs_peo(n, &adj))
+        }));
+
+        // Proven witness-driven sibling from the previous promoted frontier.
+        // The new four-thread carrier runs it concurrently with ordinary MINL
+        // and ORBIT, restoring its independent completion basin without adding
+        // their wall times serially.
+        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
+            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = scoring_pat.row_idx
+                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            if n > WATCH_MINL_MAX_N
+                || fill.is_empty()
+                || fill.len() > WATCH_MINL_MAX_FILL
+                || fill.len().saturating_mul(5) < fri.len()
+            {
+                return None;
+            }
+            let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
+            ids.sort_unstable_by_key(|&i| {
+                let (u, v) = fill[i as usize];
+                (adj[u as usize].len() + adj[v as usize].len(), i)
+            });
+            let result = watcher_minimalize(
+                &mut adj,
+                &fill,
+                &ids,
+                WATCH_MINL_OPS_BUDGET,
+                WATCH_MINL_MAX_COMMON,
+            );
+            if result.removed == 0 {
                 return None;
             }
             Some(minl_mcs_peo(n, &adj))
