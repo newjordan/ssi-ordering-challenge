@@ -3298,27 +3298,8 @@ fn order_with_options(
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
-    // Cycle dense thresholds inside the two cross-corpus positive density bands.
-    // This changes no restart count; outside the bands every option is the
-    // exact promoted default. Slot zero also preserves every one-restart row.
-    let relabel_alpha_cycle = (n <= 1_000 || n >= 2_000)
-        && (nnz <= n.saturating_mul(3)
-            || (nnz.saturating_mul(2) >= n.saturating_mul(7)
-                && nnz <= n.saturating_mul(4))
-            || (nnz.saturating_mul(5) >= n.saturating_mul(22)
-                && nnz <= n.saturating_mul(6)));
-    const RELABEL_AMD_ALPHAS: [f64; 4] = [10.0, 5.0, 2.0, 16.0];
     for r in 0..restarts {
         let seed = r as u64 + 1;
-        let dense_alpha = if relabel_alpha_cycle {
-            RELABEL_AMD_ALPHAS[r % RELABEL_AMD_ALPHAS.len()]
-        } else {
-            10.0
-        };
-        let amd_opts = feral_amd::AmdOptions {
-            aggressive: true,
-            dense_alpha,
-        };
         consider!(move || {
             let q = relabel(n, seed);
             let b = permute_pattern(&scoring_pat, &q);
@@ -3326,7 +3307,7 @@ fn order_with_options(
             let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
             let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_opts)?;
+            let pb = feral_amd::amd_order(&bcore)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
             Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
         });
@@ -3357,20 +3338,19 @@ fn order_with_options(
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
     if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        const RELABEL_AMF_ALPHAS: [f64; 4] = [5.0, 2.5, 10.0, 1.0];
+        let amf_opts = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
         let amf_restarts =
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
-            let dense_alpha = if relabel_alpha_cycle {
-                RELABEL_AMF_ALPHAS[r % RELABEL_AMF_ALPHAS.len()]
-            } else {
-                5.0
-            };
-            let amf_opts = feral_amf::AmfOptions {
-                dense_alpha,
-                ..Default::default()
-            };
+            // Cloned per restart: each queued closure is a `move` closure and
+            // must own its options struct (`AmfOptions` is `Clone`, not
+            // `Copy`). Same values every time, so the candidate set is
+            // unchanged.
+            let amf_opts = amf_opts.clone();
             consider!(move || {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
@@ -4677,10 +4657,20 @@ fn order_with_options(
     const RGREEDY_SLACK_MIN_N: usize = 64;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
+    const RGREEDY_SLACK_MID_NARROW: i64 = 800_000_000;
+    // Two narrow PEP density bands still have measured cap slack after the
+    // promoted small-pattern floor. Spend it without widening the phase gate:
+    // this changes only the deterministic op floor, not search policy or seed.
+    let narrow_mid_pep = nnz <= RGREEDY_PEP_MAX_NNZ
+        && (nnz <= n.saturating_mul(2)
+            || (n.saturating_mul(4) <= nnz
+                && nnz.saturating_mul(2) <= n.saturating_mul(9)));
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
+    } else if narrow_mid_pep {
+        RGREEDY_SLACK_MID_NARROW
     } else {
         RGREEDY_SLACK_MID
     };
@@ -4722,15 +4712,6 @@ fn order_with_options(
     if rgreedy_enabled
         && ((n <= RGREEDY_MAX_N && (rgreedy_pep_gate || rgreedy_rgs_gate)) || rgreedy_mid_gate)
     {
-        // Mean degree is the cross-corpus selector for the PEP stream policy.
-        // Preserve the same four streams and per-stream op budget in both arms.
-        let rgreedy_pep_varied = rgreedy_pep_gate
-            && nnz.saturating_mul(40) <= n.saturating_mul(207);
-        let rgreedy_budget = if rgreedy_pep_gate {
-            RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor)
-        } else {
-            RGREEDY_BUDGET.max(rgreedy_slack_floor)
-        };
         let found = if rgreedy_mid_gate {
             rgreedy::search_par_default_seeds(
                 n,
@@ -4740,14 +4721,14 @@ fn order_with_options(
                 best_flops,
                 RGREEDY_MID_BUDGET,
             )
-        } else if rgreedy_pep_gate && !rgreedy_pep_varied {
+        } else if rgreedy_pep_gate {
             rgreedy::search_par_default_seeds(
                 n,
                 &pattern.col_ptr,
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                rgreedy_budget,
+                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
             )
         } else {
             rgreedy::search_par(
@@ -4756,7 +4737,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                rgreedy_budget,
+                RGREEDY_BUDGET.max(rgreedy_slack_floor),
                 0x9E37_79B9_7F4A_7C15,
             )
         };
@@ -4906,6 +4887,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -4922,7 +4904,8 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        for round in 0..2 {
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -4947,7 +4930,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                round_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
