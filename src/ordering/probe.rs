@@ -5691,3 +5691,343 @@ fn probe_minl_value() {
     println!("score MINL OFF = {:.6}", aggregate(&log_off, &cnt));
     println!("total secs ON={t_on:.2} OFF={t_off:.2}   worst ON={w_on:.3} OFF={w_off:.3}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INFORMATION-THEORETIC POLICY PROBE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cheap, deterministic structural statistics. Collision probabilities are
+/// monotone transforms of Rényi-2 entropy, so no floating-point logarithm is
+/// needed in a production gate. `sig_c2` groups vertices with exactly equal
+/// external-neighborhood signatures; `rank64` is a deterministic GF(2) sketch
+/// rank that estimates how many independent neighborhood directions exist.
+fn it_features(pat: &Pattern) -> [f64; 6] {
+    let n = pat.n;
+    let mut adj = vec![Vec::<usize>::new(); n];
+    for v in 0..n {
+        for &u in &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]] {
+            if u < n && u != v {
+                adj[v].push(u);
+                adj[u].push(v);
+            }
+        }
+    }
+    for a in &mut adj {
+        a.sort_unstable();
+        a.dedup();
+    }
+
+    let mut degree_counts = std::collections::BTreeMap::<usize, usize>::new();
+    let mut signature_counts = std::collections::BTreeMap::<Vec<usize>, usize>::new();
+    let mut max_deg = 0usize;
+    for a in &adj {
+        max_deg = max_deg.max(a.len());
+        *degree_counts.entry(a.len()).or_default() += 1;
+        *signature_counts.entry(a.clone()).or_default() += 1;
+    }
+    let denom = (n.max(1) as f64).powi(2);
+    let degree_c2 = degree_counts.values().map(|&c| c * c).sum::<usize>() as f64 / denom;
+    let sig_c2 = signature_counts.values().map(|&c| c * c).sum::<usize>() as f64 / denom;
+
+    let mut seen = vec![false; n];
+    let mut stack = Vec::new();
+    let mut comp_sq = 0usize;
+    for s in 0..n {
+        if seen[s] {
+            continue;
+        }
+        seen[s] = true;
+        stack.push(s);
+        let mut size = 0usize;
+        while let Some(v) = stack.pop() {
+            size += 1;
+            for &u in &adj[v] {
+                if !seen[u] {
+                    seen[u] = true;
+                    stack.push(u);
+                }
+            }
+        }
+        comp_sq += size * size;
+    }
+    let comp_c2 = comp_sq as f64 / denom;
+
+    fn mix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+    let sketches: Vec<u64> = adj
+        .iter()
+        .map(|a| {
+            let mut s = mix64(a.len() as u64 ^ 0xA5A5_A5A5_A5A5_A5A5);
+            for &u in a {
+                s ^= mix64(u as u64);
+            }
+            s
+        })
+        .collect();
+    let mut basis = [0u64; 64];
+    let mut rank = 0usize;
+    for mut x in sketches {
+        while x != 0 {
+            let b = 63 - x.leading_zeros() as usize;
+            if basis[b] == 0 {
+                basis[b] = x;
+                rank += 1;
+                break;
+            }
+            x ^= basis[b];
+        }
+    }
+
+    [
+        pat.nnz() as f64 / n.max(1) as f64,
+        degree_c2,
+        sig_c2,
+        comp_c2,
+        rank as f64 / n.min(64).max(1) as f64,
+        max_deg as f64 / n.max(1) as f64,
+    ]
+}
+
+#[derive(Clone)]
+struct ItPolicyRow {
+    name: String,
+    n: usize,
+    nnz: usize,
+    amd: u64,
+    default: u64,
+    varied: u64,
+    features: [f64; 6],
+}
+
+fn it_policy_score(rows: &[ItPolicyRow], mut choose_default: impl FnMut(&ItPolicyRow) -> bool) -> f64 {
+    let mut logs = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    for r in rows {
+        let f = if choose_default(r) { r.default } else { r.varied };
+        let b = bucket(r.n);
+        logs[b] += (f as f64 / r.amd as f64).ln();
+        counts[b] += 1;
+    }
+    aggregate(&logs, &counts)
+}
+
+fn it_best_threshold(
+    rows: &[ItPolicyRow],
+    feature: usize,
+    include: impl Fn(&ItPolicyRow) -> bool,
+) -> Option<(f64, bool)> {
+    let train: Vec<&ItPolicyRow> = rows.iter().filter(|r| include(r)).collect();
+    if train.len() < 24 {
+        return None;
+    }
+    let mut vals: Vec<f64> = train.iter().map(|r| r.features[feature]).collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vals.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
+    let mut best = (f64::INFINITY, 0.0, false);
+    for threshold in vals {
+        for default_on_low in [false, true] {
+            let low = train.iter().filter(|r| r.features[feature] <= threshold).count();
+            if low < 10 || train.len() - low < 10 {
+                continue;
+            }
+            let mut logs = [0.0f64; 3];
+            let mut counts = [0usize; 3];
+            for r in &train {
+                let choose_default = (r.features[feature] <= threshold) == default_on_low;
+                let f = if choose_default { r.default } else { r.varied };
+                let b = bucket(r.n);
+                logs[b] += (f as f64 / r.amd as f64).ln();
+                counts[b] += 1;
+            }
+            let score = aggregate(&logs, &counts);
+            if score < best.0 {
+                best = (score, threshold, default_on_low);
+            }
+        }
+    }
+    best.0.is_finite().then_some((best.1, best.2))
+}
+
+fn it_name_hash(name: &str) -> usize {
+    name.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    }) as usize
+}
+
+fn it_quartile_mi(rows: &[ItPolicyRow], feature: usize, decisive_only: bool) -> f64 {
+    let selected: Vec<&ItPolicyRow> = rows
+        .iter()
+        .filter(|r| !decisive_only || r.default != r.varied)
+        .collect();
+    if selected.len() < 4 {
+        return 0.0;
+    }
+    let mut values: Vec<f64> = selected.iter().map(|r| r.features[feature]).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cuts = [values[values.len() / 4], values[values.len() / 2], values[3 * values.len() / 4]];
+    let mut joint = [[0usize; 3]; 4];
+    let mut by_bin = [0usize; 4];
+    let mut by_win = [0usize; 3];
+    for r in selected {
+        let x = r.features[feature];
+        let bin = usize::from(x > cuts[0]) + usize::from(x > cuts[1]) + usize::from(x > cuts[2]);
+        let win = if r.default < r.varied { 0 } else if r.varied < r.default { 1 } else { 2 };
+        joint[bin][win] += 1;
+        by_bin[bin] += 1;
+        by_win[win] += 1;
+    }
+    let total = by_bin.iter().sum::<usize>() as f64;
+    let mut mi = 0.0;
+    for b in 0..4 {
+        for w in 0..3 {
+            let c = joint[b][w] as f64;
+            if c > 0.0 {
+                mi += (c / total) * ((c * total) / (by_bin[b] * by_win[w]) as f64).log2();
+            }
+        }
+    }
+    mi
+}
+
+/// Compare the two existing four-stream rgreedy policies at the SAME operation
+/// budget through the complete ordering pipeline, then measure how much cheap
+/// Rényi-2 collision and GF(2)-rank features reveal about the winner.
+///
+/// The probe changes no production behavior. Its test-only override is read on
+/// the main thread before rgreedy starts its fixed four workers.
+#[test]
+#[ignore]
+fn probe_it_policy_information() {
+    const FEATURE_NAMES: [&str; 6] = [
+        "avg_deg", "degree_c2", "signature_c2", "component_c2", "rank64", "hub_fraction",
+    ];
+    let corpus = crate::corpus::corpus();
+    let mut rows = Vec::<ItPolicyRow>::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let in_gate = n > 0
+            && n <= 3_000
+            && nnz > 0
+            && (nnz <= 60_000 || (nnz <= 250_000 && nnz <= 100 * n));
+        if !in_gate {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let amd = flops_of(&sp, &amd_perm);
+
+        RG_POLICY_OVERRIDE.with(|c| c.set(1));
+        let default_perm = order(pat);
+        RG_POLICY_OVERRIDE.with(|c| c.set(2));
+        let varied_perm = order(pat);
+        RG_POLICY_OVERRIDE.with(|c| c.set(0));
+        let default = flops_of(&sp, &default_perm);
+        let varied = flops_of(&sp, &varied_perm);
+        rows.push(ItPolicyRow {
+            name: name.clone(),
+            n,
+            nnz,
+            amd,
+            default,
+            varied,
+            features: it_features(pat),
+        });
+    }
+    RG_POLICY_OVERRIDE.with(|c| c.set(0));
+
+    let current = it_policy_score(&rows, |r| r.nnz <= 60_000);
+    let all_default = it_policy_score(&rows, |_| true);
+    let all_varied = it_policy_score(&rows, |_| false);
+    let oracle = it_policy_score(&rows, |r| r.default <= r.varied);
+    let default_wins = rows.iter().filter(|r| r.default < r.varied).count();
+    let varied_wins = rows.iter().filter(|r| r.varied < r.default).count();
+    let ties = rows.len() - default_wins - varied_wins;
+    println!("\nIT_POLICY_SUMMARY\trows={}\tdefault_wins={}\tvaried_wins={}\tties={}",
+             rows.len(), default_wins, varied_wins, ties);
+    println!("IT_POLICY_SCORE\tcurrent={current:.9}\tall_default={all_default:.9}\tall_varied={all_varied:.9}\toracle={oracle:.9}");
+
+    println!("\nfeature\tMI_all_bits\tMI_decisive_bits\tbest_score\tthreshold\tdefault_on_low");
+    for feature in 0..FEATURE_NAMES.len() {
+        let mut vals: Vec<f64> = rows.iter().map(|r| r.features[feature]).collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        vals.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON);
+        let mut best = (f64::INFINITY, 0.0, false);
+        for &threshold in &vals {
+            for default_on_low in [false, true] {
+                let low = rows.iter().filter(|r| r.features[feature] <= threshold).count();
+                if low < 12 || rows.len() - low < 12 {
+                    continue;
+                }
+                let score = it_policy_score(&rows, |r| {
+                    let is_low = r.features[feature] <= threshold;
+                    is_low == default_on_low
+                });
+                if score < best.0 {
+                    best = (score, threshold, default_on_low);
+                }
+            }
+        }
+        println!("{}\t{:.6}\t{:.6}\t{:.9}\t{:.9}\t{}",
+            FEATURE_NAMES[feature],
+            it_quartile_mi(&rows, feature, false),
+            it_quartile_mi(&rows, feature, true),
+            best.0, best.1, best.2);
+    }
+
+    // Honest policy-selection checks. Each held-out matrix is classified by a
+    // threshold fitted without it; the five-fold variant also withholds whole
+    // deterministic partitions, which is noisier but much harder to overfit.
+    println!("\nfeature\tloo_score\tfold5_score\tloo_default\tfold5_default");
+    for feature in 0..FEATURE_NAMES.len() {
+        let mut loo_choices = Vec::with_capacity(rows.len());
+        let mut fold_choices = Vec::with_capacity(rows.len());
+        for held in &rows {
+            let loo = it_best_threshold(&rows, feature, |r| r.name != held.name)
+                .map(|(t, d)| (held.features[feature] <= t) == d)
+                .unwrap_or(true);
+            let held_fold = it_name_hash(&held.name) % 5;
+            let fold = it_best_threshold(&rows, feature, |r| it_name_hash(&r.name) % 5 != held_fold)
+                .map(|(t, d)| (held.features[feature] <= t) == d)
+                .unwrap_or(true);
+            loo_choices.push(loo);
+            fold_choices.push(fold);
+        }
+        let mut i = 0usize;
+        let loo_score = it_policy_score(&rows, |_| {
+            let v = loo_choices[i]; i += 1; v
+        });
+        i = 0;
+        let fold_score = it_policy_score(&rows, |_| {
+            let v = fold_choices[i]; i += 1; v
+        });
+        println!("{}\t{:.9}\t{:.9}\t{}\t{}", FEATURE_NAMES[feature], loo_score,
+            fold_score, loo_choices.iter().filter(|&&x| x).count(),
+            fold_choices.iter().filter(|&&x| x).count());
+    }
+
+    let mut decisive: Vec<&ItPolicyRow> = rows.iter().filter(|r| r.default != r.varied).collect();
+    decisive.sort_by(|a, b| {
+        let da = (a.default as f64 / a.varied as f64).ln().abs();
+        let db = (b.default as f64 / b.varied as f64).ln().abs();
+        db.partial_cmp(&da).unwrap()
+    });
+    println!("\nIT_POLICY_DECISIVE\tmatrix\tn\tnnz\twinner\tln_gap\tavg_deg\tdegree_c2\tsignature_c2\tcomponent_c2\trank64\thub_fraction");
+    for r in decisive {
+        let winner = if r.default < r.varied { "default" } else { "varied" };
+        let gap = (r.default as f64 / r.varied as f64).ln().abs();
+        println!("{}\t{}\t{}\t{}\t{:.9}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            r.name, r.n, r.nnz, winner, gap,
+            r.features[0], r.features[1], r.features[2], r.features[3], r.features[4], r.features[5]);
+    }
+}

@@ -1308,6 +1308,27 @@ fn minl_off() -> bool {
     false
 }
 
+// TEST-ONLY selector for information-theoretic policy probes. `0` preserves
+// production's nnz gate, `1` forces the fixed-default four-seed schedule, and
+// `2` forces the varied-policy schedule. The selected schedule keeps the
+// production gate's operation budget, isolating policy information from cost.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RG_POLICY_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[inline]
+fn rg_policy_override() -> u8 {
+    RG_POLICY_OVERRIDE.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+const fn rg_policy_override() -> u8 {
+    0
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -4356,14 +4377,31 @@ fn order_with_options(
         && nnz <= RGREEDY_MAX_NNZ
         && nnz <= RGREEDY_MAX_AVG_DEG * n;
     if rgreedy_enabled && n <= RGREEDY_MAX_N && (rgreedy_pep_gate || rgreedy_rgs_gate) {
-        let found = if rgreedy_pep_gate {
+        // Policy information is concentrated in the graph's mean degree. On
+        // the local corpus, Rényi-2 degree/signature collisions and a GF(2)
+        // neighborhood-sketch rank add no out-of-sample predictive value, but
+        // this one-threshold rule survives both leave-one-out and five-fold
+        // validation. Keep the incumbent varied policy above the PEP tier;
+        // inside it, sparse graphs get its broader mix of search policies.
+        let sparse_policy = nnz.saturating_mul(40) <= n.saturating_mul(207);
+        let use_default = match rg_policy_override() {
+            1 => true,
+            2 => false,
+            _ => rgreedy_pep_gate && !sparse_policy,
+        };
+        let budget = if rgreedy_pep_gate {
+            RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor)
+        } else {
+            RGREEDY_BUDGET.max(rgreedy_slack_floor)
+        };
+        let found = if use_default {
             rgreedy::search_par_default_seeds(
                 n,
                 &pattern.col_ptr,
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
+                budget,
             )
         } else {
             rgreedy::search_par(
@@ -4372,7 +4410,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_BUDGET.max(rgreedy_slack_floor),
+                budget,
                 0x9E37_79B9_7F4A_7C15,
             )
         };
