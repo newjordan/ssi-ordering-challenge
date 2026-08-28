@@ -168,9 +168,6 @@ mod alloc_probe;
 /// best-of floor.
 mod custom_metrics;
 
-mod minl_watch;
-use minl_watch::watcher_minimalize;
-
 /// Generic quotient-graph pivot-score family (shot C) — SHIPPED, not
 /// test-gated. `order_generic` drives a parameterized MetricSpec through
 /// `feral_ordering_core::quotient_graph`'s near-linear machinery, and
@@ -209,18 +206,6 @@ mod exact_dp;
 /// highly decomposable (median ~30% articulation points, 65-399 blocks per
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
-/// RANDOMIZED GREEDY ELIMINATION-GAME SEARCH — a new candidate family for the
-/// small tier. Maintains the EXACT fill graph as bitsets and runs thousands of
-/// randomized exact-minimum-degree eliminations, accumulating `Σ c_j²` for free
-/// as it goes (the elimination-game identity `exact_dp` is built on), with
-/// partial-sum pruning and a prefix-freezing LNS phase. Distinct from the
-/// relabelled-AMD/AMF multi-start, which can only perturb an APPROXIMATE
-/// minimum-degree code's internal tie-breaks. See its module doc.
-mod rgreedy;
-/// Bounded (max 4-thread) OUTPUT-IDENTICAL parallelism for the candidate
-/// portfolio and the post-hoc phases' independent candidate batches. See its
-/// module doc for the argument that thread completion order decides nothing.
-mod parallel;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -342,23 +327,7 @@ const NDFM_MAX_NNZ: usize = 180_000;
 /// worst-scoring small buckets' tied-at-AMD combinatorial/network graphs
 /// (`wastewater*`, `wastepaper6`, `syn*`, `tln2`). Deterministic. Best-of floor
 /// → zero-downside.
-///
-/// GATE-WALL RAISE (arm/midband, `probe_minfill_wall`). `MINFILL_MAX_N` was the
-/// tightest gate in the portfolio, and MinFill is the ONLY generator in the
-/// 58-variant `probe_mid_sweep` that beat the shipped `order()` anywhere in the
-/// 1k_10k / light-gt_10k band — on `rsyn0815m02hfsg`, n = 3054, eighteen
-/// vertices past the wall (0.96357 -> 0.94263). A whole-corpus measurement of
-/// MinFill at every n <= 40_000 bounds what raising it can buy and what it
-/// costs: MinFill's own cost inside `n < 4_000 && nnz < 12_000` peaks at
-/// 0.030 s (`rsyn0840m02m`), every matrix in that window runs `order()` in
-/// 0.19-0.31 s against the 2.0 s cap, and the pair-check budget inside
-/// `minfill_order` bounds the time regardless of structure. 4_000 is deliberate
-/// and not larger: above it MinFill is in budget-fallback on essentially every
-/// dev matrix (ratios 1.4-45, i.e. never the argmin) so a wider gate is pure
-/// cost, and the `n*n` membership matrix is 16 MB at n = 4_000 against the
-/// grader's 4 GiB RLIMIT_AS (it would be 1.6 GB at n = 40_000 — do not raise
-/// this gate far without switching that matrix to a bitset first).
-const MINFILL_MAX_N: usize = 4_000;
+const MINFILL_MAX_N: usize = 3_000;
 const MINFILL_MAX_NNZ: usize = 12_000;
 
 /// METIS runtime is structure-dependent and can explode on large/dense patterns
@@ -466,7 +435,7 @@ const KAHIP_MAX_NNZ: usize = 50_000;
 /// 1.019 s worst case measured on the previous revision — a revision that passed
 /// the grader. So this ships a worst case no larger than one already known to
 /// clear the 2 s cap in the real environment.
-const RELABEL_BUDGET: usize = 300_000;
+const RELABEL_BUDGET: usize = 150_000;
 const RELABEL_MAX_RESTARTS: usize = 24;
 
 /// BUCKET-WEIGHTED budget for `n >= 10_000` (win C): `gt_10k` carries weight
@@ -518,72 +487,6 @@ const RELABEL_MAX_RESTARTS_LARGE: usize = 150;
 /// Pays for itself on `acopf_case9241pegase_qcqp` (n=313068, nnz=1292408), which
 /// otherwise receives *only* the baseline AMD pass: 1.0000 -> 0.9737.
 const RELABEL_HEAVY_MAX_NNZ: usize = 1_500_000;
-
-/// ── MID-BAND RELABEL DIVERSITY EXTENSION (see the block in
-/// `order_with_options` for the measurement that motivates it).
-///
-/// SIZED TWICE, BY A GRADER FAILURE AND THEN BY THE PARALLEL QUEUE. History
-/// matters here because the numbers moved a long way in both directions.
-///
-/// The first sequential version (`MIDX_AMDND_MAX_NNZ` 130_000, budget
-/// 1_600_000, cap 12) scored 0.841441 on dev and was KILLED by the grader's 2 s
-/// cap. Its only material cost was `crudeoil_lee4_10`: 0.964 s -> 1.24 s, which
-/// is INSIDE the then-frontier's own local worst of 1.225 s (`ringpack_30_2`)
-/// and still a FAIL — the grader is ~1.65x this box on AMD-style work. It was
-/// re-cut to 95_000 / 400_000 / 4, which dropped `crudeoil_lee4_10` and
-/// `crudeoil_lee4_09` (the only two matrices in the band already at 0.92-0.96 s
-/// sequentially) and kept three of the four wins, because they are all seed-1
-/// or seed-2 wins.
-///
-/// With the 4-thread candidate queue (`parallel.rs`) `crudeoil_lee4_10` runs at
-/// **0.423 s** and the corpus worst is 0.687 s (`acopf_case9241pegase_qcqp`),
-/// so the original window is restored. That matrix is the reason the window
-/// reaches 130_000 at all: its census curve is 0.7833 / 0.7758 / 0.7628 /
-/// 0.7416 / 0.6858 at 1 / 2 / 4 / 8 / 16 seeds — nothing before seed 10, and
-/// the exact winning seed is 10 — so a cap below 12 buys literally nothing
-/// there while a cap of 12 is worth 0.7271 -> 0.6858. Each of these seeds is an
-/// independent queue task, so the 12 passes cost far less than 12x one pass in
-/// wall time.
-/// `MIDX_AMF_MAX_NNZ` = 180_000, just above the one win up there (`arki0013`,
-/// nnz 160_172, found at seed 2); the cap is 6 rather than 2 purely because the
-/// queue makes the slack free.
-/// `MIDX_HUB_DIV`: hub guard — admitted only when `max_deg <= n / MIDX_HUB_DIV`.
-/// 50 is the divisor `relabel_restarts`'s mid band uses, chosen there because it
-/// is the ONLY covariate separating `ringpack_30_2` from its (n, nnz)-twin
-/// `crudeoil_lee4_10`.
-/// `MIDX_MAX_AVG_DEG`: density guard, `nnz <= MIDX_MAX_AVG_DEG * n`. The heavy
-/// and mid tiers use `HEAVY_SPARSE_MAX_AVG_DEG` (6) because that is what the
-/// `telecomsp_metro` grader FAIL (density ~53) forced; 8 keeps a 6x margin under
-/// that class and is what excludes `nuclear10a` (density 9.4), measured at
-/// +0.61 s sequential for zero gain.
-const MIDX_AMDND_MAX_NNZ: usize = 130_000;
-const MIDX_AMF_MAX_NNZ: usize = 180_000;
-const MIDX_HUB_DIV: usize = 50;
-const MIDX_MAX_AVG_DEG: usize = 8;
-const MIDX_BUDGET: usize = 1_600_000;
-const MIDX_MAX_RESTARTS: usize = 12;
-const MIDX_LOWSEED_MAX_NNZ: usize = 95_000;
-const MIDX_LOWSEED_RESTARTS: usize = 4;
-const MIDX_AMF_BUDGET: usize = 800_000;
-const MIDX_AMF_MAX_RESTARTS: usize = 6;
-
-/// ── RELABELLED AMF alpha=0.5, TWO SEEDS. The portfolio relabels three
-/// objectives (AMD default, AMF alpha5, no-dense AMD). `probe_mid_obj` ran nine
-/// MORE `amd_order_opts`/`amf_order_opts` settings through the same relabel
-/// trick, at each matrix's SHIPPED restart count, over every matrix in the
-/// 1k_10k / light-gt_10k band: exactly one beat the shipped `order()`
-/// (`crudeoil_pooling_ct3` 0.73916 -> 0.72182), and it did so at SEED 2. That
-/// is a real but narrow result, so this ships at the narrowest affordable size
-/// — two seeds, not the shipped restart count — which is the whole reason it is
-/// cap-safe: two AMF passes cost ~0.04 s at the nnz ceiling and ~0.004 s where
-/// the win actually is. alpha 0.5 is not arbitrary: the non-relabelled AMF
-/// alpha-0.5 pass is already a shipped candidate (WIN D), so this is relabel
-/// diversity applied to an objective the portfolio already values, not a new
-/// family. Ceiling matches the shipped relabelled-AMF block's own.
-const MIDX_AMF05_MAX_NNZ: usize = 40_000;
-const MIDX_AMF05_RESTARTS: usize = 2;
-
-
 
 /// SPARSITY GUARD for both heavy-tier additions, learned from a FAILED eval
 /// submission (2026-07-26, submission 0cbb4def).
@@ -807,125 +710,6 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
 
-/// ── TELOS MULTI-START / MULTI-MOVE-SET (descent arm, 2026-08) ────────────
-/// EXTRA `telos_descend` runs, beyond the one the shipped TELOS phase already
-/// performs, appended at the very END of the pipeline where they are monotone
-/// (`best_flops = min(best_flops, descents)`).
-///
-/// TWO axes of diversity, both measured:
-///
-/// * MOVE SET (`rank_mode`, the bigger of the two). Every TELOS move — the
-///   `strip_general_v2` deletions and the peel splices — reads ONE ranking of
-///   the vertices, "fattest first by exact incumbent column count". That
-///   ranking IS the move set: it decides which subset each `k` names. A sweep
-///   of four alternative keys over the whole corpus (`probe_rank_modes`, each
-///   descending from the shipped incumbent; value in dev-score units):
-///     mode 0 `cnt`             4 wins   -0.000440   (the shipped key)
-///     mode 1 `deg`             8 wins   -0.000207
-///     mode 2 `cnt*deg`         6 wins   -0.000918
-///     mode 3 `cnt-deg`         6 wins   -0.000470
-///     `cnt` ASCENDING          0 wins    0          (dropped, dead end)
-///     best-of those five                -0.001554
-///   A second sweep, run against an incumbent that ALREADY carried modes 0-3,
-///   found four more keys and one of them is the single largest per-matrix
-///   result this arm has produced:
-///     mode 4 `cnt`, ties by `deg` desc   3 wins   -0.000063
-///     mode 5 `cnt²/(deg+1)`              2 wins   -0.000022
-///     mode 6 `cnt+deg`                   5 wins   -0.000158
-///     mode 7 ELIMINATION POSITION,
-///            last-eliminated first       6 wins   -0.001161
-///   Mode 7 references the counts not at all — it strips/peels the TOP of the
-///   incumbent's elimination tree (the big supernodes) rather than its fattest
-///   columns — and it takes `nuclear104` (n=39098, nnz=257806) from a perfect
-///   AMD tie at 1.0000 to 0.8456, which is that whole -0.001161 by itself.
-///   The keys are near-disjoint in WHICH matrices they win, which is why the
-///   best-of is worth more than three times its best single member
-///   (`procurement1large` 0.6323 → 0.5645 belongs to mode 2 alone, `arki0013`
-///   0.6262 → 0.5887 to modes 0/3, `wastewater05m1` 0.8107 → 0.7542 to mode
-///   1). Mode 4 is a measured dead end — peeling the THINNEST columns never
-///   helps — and is not in the plan.
-///
-/// * SEED (experiment 0020's measured seed sensitivity: TELOS reached a
-///   BETTER basin from a WORSE incumbent). Slot 0 is the final incumbent —
-///   which the shipped TELOS phase has never seen, since it runs before
-///   MINL/ORBIT/PHARMAKOS/rgreedy — and slot 1 is the AMD anchor, maximally
-///   distinct from the polished incumbent.
-///
-/// PLACEMENT: after EVERY other phase, rgreedy included. The obvious
-/// alternative (before rgreedy, since rgreedy only ever improves on its own
-/// seed) was measured and is WRONG: rgreedy is seeded from `best_perm` and is
-/// seed-sensitive exactly as TELOS is, so descending first cost 6 losses on
-/// the rgreedy tier against 0 losses when the descents run last.
-const TELOS_MS_PLAN: [(u8, u8); 14] = [
-    (0, 7), (1, 2), (1, 7), (0, 2), (1, 0), (0, 6), (1, 3),
-    (0, 3), (0, 0), (1, 6), (0, 1), (1, 5), (0, 4), (0, 5),
-];
-
-/// Per-descent work proxy and its budget. One descent costs `passes`
-/// subgraph-AMD strip candidates plus `|peel grid|` exact evaluations, all
-/// roughly linear in `nnz`, so `passes(nnz) * nnz` orders descent cost across
-/// the corpus. Measured SEQUENTIAL per-descent seconds against that proxy on
-/// this box (`probe_rank_modes`): 8.6e3 → 0.002 s (`wastewater05m1`),
-/// 9.6e4 → 0.012 s (`ndcc12`), 3.2e5 → 0.044 s (`arki0013`), 6.6e5 → 0.105 s
-/// (`procurement1large`), 6.1e5 → 0.120 s (`pooling_sppa9tp`).
-/// `TELOS_MS_WORK_BUDGET / est` descents therefore adds ~constant time
-/// everywhere at once, which is the property a hard per-matrix cap needs.
-const TELOS_MS_WORK_BUDGET: usize = 1_500_000;
-/// Hard ceiling on the proxy: above it even ONE extra descent is too much.
-/// Sized to keep every matrix whose `order()` already exceeds ~0.5 s out of
-/// the phase entirely — `crudeoil_lee4_06/09/10`, `crudeoil_lee2_06`,
-/// `chp_shorttermplan2d`, `gams05`, `nuclear104`, `procurement1large`,
-/// `pooling_sppa9tp`, `edgecross24-115`, `ringpack_20_2`, `mpbp_35` all price
-/// above 500 000 on the proxy. Measured effect: the largest per-matrix time
-/// increase the phase causes drops from +0.099 s to ≤ +0.05 s.
-const TELOS_MS_MAX_WORK: usize = 1_000_000;
-/// HUB GUARD, load-bearing, and the same discriminator `relabel_restarts`'s
-/// mid band uses for the same reason. `ringpack_30_2` (n=17999, nnz=121458,
-/// max_deg=1632) carries the corpus worst-case `order()` and its per-descent
-/// cost is 0.21 s — twice what the work proxy predicts — precisely because of
-/// that hub. Its (n, nnz)-TWIN `crudeoil_lee4_10` (17809/120632, max_deg 168)
-/// costs half as much, so no (n, nnz) rule separates them and max degree does.
-/// Applied only above `TELOS_MS_HUB_MIN_NNZ`: below it the whole pattern is
-/// small enough that cost is bounded by `nnz` alone whatever the structure
-/// (`chimera_lga-01` is max_deg 1119 of n=1120 and costs 0.01 s a descent).
-const TELOS_MS_HUB_DIV: usize = 50;
-const TELOS_MS_HUB_MIN_NNZ: usize = 100_000;
-/// Cap on descents per matrix regardless of how cheap they are: past the
-/// plan's move-set entries the marginal collapses, so a tiny matrix buying 16
-/// descents from `TELOS_MS_WORK_BUDGET / est` would spend time for nothing.
-const TELOS_MS_MAX_DESCENTS: usize = TELOS_MS_PLAN.len();
-
-/// How many entries of [`TELOS_MS_PLAN`] this matrix may run. Pure function of
-/// `(n, nnz, max_deg)` — never wall-clock — so both required `order()` runs
-/// agree. `cap` is the probe-only A/B switch (0 = the phase off entirely).
-fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
-    if cap == 0 || nnz == 0 || nnz >= TELOS_MAX_NNZ {
-        return 0;
-    }
-    if nnz > TELOS_MS_HUB_MIN_NNZ && max_deg > n / TELOS_MS_HUB_DIV {
-        return 0;
-    }
-    let (_rounds, _prio, passes, _peel) = telos_schedule(nnz);
-    let est = passes.saturating_mul(nnz).max(1);
-    if est > TELOS_MS_MAX_WORK {
-        return 0;
-    }
-    (TELOS_MS_WORK_BUDGET / est)
-        .clamp(1, TELOS_MS_MAX_DESCENTS)
-        .min(cap)
-}
-
-/// Final exact adjacent-transposition descent. This intentionally targets only
-/// the `1k_10k` bucket: the `n < 1000` near-AMD mass is measured floor-limited,
-/// while the exact bitset replay's cost grows as `n * ceil(n / 64)` per pivot.
-/// The hard operation budget is cumulative across both parity sweeps and makes
-/// dense-fill or adversarial seeds fail closed before trusted scoring.
-const PAIR_DESCENT_MIN_N: usize = 1_000;
-const PAIR_DESCENT_MAX_N: usize = 4_000;
-const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
-const PAIR_DESCENT_SWEEPS: usize = 2;
-const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
-
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -977,40 +761,10 @@ const PAIR_DESCENT_OPS_BUDGET: i64 = 32_000_000;
 /// watercontamination0202 needs 45M ops / ~150 ms — the budget is sized
 /// to keep it. FLAGGED FOR ISOLATED TIMING before submission, as with
 /// every phase in this file.
-/// nnz(A) ceiling on the completion-lattice descent (arm/parallel, 2026-08-28).
-///
-/// MINL is the ONLY post-hoc phase that survives above `nnz = 700_000` — PEEL/
-/// COUNT-RELABEL, SHOT-3 and TELOS are all gated out below it, ORBIT is capped
-/// at `n <= 30_000`, PHARMAKOS at `nnz < 60_000` and rgreedy at `n <= 3_000` —
-/// so on the giant tier it runs alone, as a single unparallelizable task, and
-/// it sets the corpus worst case. `probe_phase_attrib` measures it at 0.267 s
-/// of `acopf_case9241pegase_qcqp`'s 0.629 s (filled graph 0.108 s, adjacency +
-/// fill-edge build 0.032 s, deletion rounds 0.110 s).
-///
-/// `probe_minl_value` prices the phase by running the full portfolio with it on
-/// and off on every dev matrix: it is worth **-0.002528** of score (0.841061 ->
-/// 0.838533) and changes the answer on 22 matrices — but **every one of those
-/// 22 has `nnz <= 277_562`**, and 21 of them `nnz <= 75_636`. Above 400k the
-/// phase spends 0.03-0.27 s and removes ZERO fill edges (no `minl.mcs_peo`
-/// mark is ever emitted there): the deletion scan exhausts `MINL_OPS_BUDGET`
-/// before a single edge in a completion that large turns out to be removable.
-///
-/// Ceiling set at 700_000 — the same value [`HEAVY_AMDND_MAX_NNZ`] /
-/// [`PEEL_CNTREL_MAX_NNZ`] already use for "the heavy class this file stops
-/// paying for" — which is 2.5x above the largest measured win, so no dev win
-/// is anywhere near the boundary, and it cuts only the class measured to gain
-/// nothing. Gated on nnz(A) rather than on the completion size because nnz(A)
-/// is known before `filled_graph` runs, and `filled_graph` is itself 40% of the
-/// phase's cost.
-const MINL_MAX_NNZ: usize = 700_000;
 const MINL_MAX_LNNZ: usize = 2_400_000;
 const MINL_OPS_BUDGET: i64 = 60_000_000;
 const MINL_MAX_ROUNDS: usize = 8;
 const MINL_MAX_COMMON: usize = 2_000;
-const WATCH_MINL_MAX_N: usize = 30_000;
-const WATCH_MINL_MAX_FILL: usize = 145_000;
-const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
-const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 
 /// COMPONENT B — ORBIT-BATCHED COMPLETION-LATTICE DESCENT (Noether priming
 /// round 4, `noether.md` §2.2 "Component B"; source doc:
@@ -1182,100 +936,6 @@ const PHARMAKOS_BATCH_K: usize = 8;
 thread_local! {
     pub(crate) static BEST_NON_ANCHOR: std::cell::Cell<u64> =
         const { std::cell::Cell::new(u64::MAX) };
-}
-
-/// HEAVY-TIER RELABELLED-AMF MULTISTART envelope (arm/heavy). See the block in
-/// `order_with_options` that reads these for the measurement table and the
-/// reason the dense sub-tier has an nnz FLOOR rather than only a ceiling.
-///
-/// `HEAVY_RELABEL_AMF_BUDGET / nnz` restarts, clamped, so the ADDED time is
-/// ~constant across the tier (per-pass cost measured at ~1e-7 s/nnz): 2.4e6
-/// buys ~0.24 s per matrix. The ceilings keep the two heaviest classes out
-/// entirely — `unitcommit_200_100_1_mod_8` (nnz=476332, 0.081 s/pass on a
-/// matrix already at 0.758 s) and everything above 1M nnz (faclay75 at
-/// 0.35 s/pass), neither of which showed any gain at 8 seeds.
-/// HEAVY-TIER pivot-metric envelope (arm/heavy). See the block in
-/// `order_with_options` that reads these for the measurement table and for why
-/// each cap is where it is.
-const HEAVY_METRIC_MIN_NNZ: usize = 130_000;
-const HEAVY_METRIC_MAX_NNZ: usize = 1_200_000;
-const HEAVY_METRIC_BUDGET: usize = 2_800_000;
-const HEAVY_METRIC_MAX_VARIANTS: usize = 4;
-const HEAVY_METRIC_WF2_MAX_NNZ: usize = 400_000;
-/// Heavy-tier metric variants as `(spec, dense_alpha)`, in descending MEASURED
-/// marginal value (`probe_heavy_metrics`, `probe_heavy_metrics2`);
-/// `HEAVY_METRIC_BUDGET / nnz` takes a prefix. `cm_*` name a
-/// `custom_metrics::ScoreVariant`, everything else names a
-/// `metric_sweep::EXTRA_METRICS` spec.
-///
-/// `dense_alpha` IS load-bearing here and the same spec appears twice at two
-/// α values on purpose. The first census swept α ∈ {10, 5, -1} on the 15
-/// heavy targets, found all three identical on every one of them, and
-/// concluded α was inert — wrong, as `probe_heavy_metrics2` (α ∈ {10, 5, 2.5,
-/// 2, 1, 0.5, -1} over the whole in-band set) then showed:
-///   crudeoil_pooling_dt3  SqPure  α=10 → 0.8932  but  α=5   → 0.7538
-///   pooling_sppc3pq       ..wf05  α=10 → 0.5338  but  α=2.5 → 0.4846
-/// The α that matters is below the 5..10 range the first census sampled,
-/// which is exactly where AMD's own dense threshold `max(16, α√n)` starts
-/// deferring real hub classes on these patterns.
-const HEAVY_METRIC_ORDER: [(&str, f64); 4] = [
-    ("extra_deg2_div_nv_wf05", 10.0),
-    ("cm_sqpure", 5.0),
-    ("extra_deg2_div_nv_wf05", 2.5),
-    ("extra_deg2_div_nv_wf002", 10.0),
-];
-
-/// VERY-HEAVY no-dense-AMD extension (arm/heavy): nnz ceiling and the hub
-/// divisor that keeps the expensive hub-heavy patterns out. See the block in
-/// `order_with_options` for the measurements.
-const VHEAVY_AMDND_MAX_NNZ: usize = 1_500_000;
-const VHEAVY_AMDND_HUB_DIV: usize = 2_000;
-
-const HEAVY_RELABEL_AMF_SPARSE_MAX_NNZ: usize = 400_000;
-const HEAVY_RELABEL_AMF_DENSE_MIN_NNZ: usize = 400_000;
-const HEAVY_RELABEL_AMF_DENSE_MAX_NNZ: usize = 1_000_000;
-const HEAVY_RELABEL_AMF_BUDGET: usize = 1_500_000;
-const HEAVY_RELABEL_AMF_MAX_PASSES: usize = 4;
-
-/// TEST-ONLY A/B switch for the heavy-tier relabelled-AMF block, so one probe
-/// run can measure the variant and the unchanged frontier back to back on the
-/// same matrices under the same machine load (timings on this box carry ~1.6x
-/// run-to-run variance, so cross-run comparisons are not usable). Always
-/// `true` in the shipped build — the `cfg(not(test))` arm is a `const fn`
-/// returning `true`, so the gate compiles out entirely.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static HEAVY_ARM: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(true) };
-}
-#[cfg(test)]
-fn heavy_arm_enabled() -> bool {
-    HEAVY_ARM.with(|c| c.get())
-}
-#[cfg(not(test))]
-const fn heavy_arm_enabled() -> bool {
-    true
-}
-
-/// TEST-ONLY switch (never compiled into the shipped binary) that suppresses
-/// the completion-lattice descent (MINL), so a probe can price the phase on
-/// the same corpus in the same process. Read only on the main thread, where
-/// the task is queued.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static MINL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-#[inline]
-fn minl_off() -> bool {
-    MINL_OFF.with(|c| c.get())
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn minl_off() -> bool {
-    false
 }
 
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
@@ -1806,188 +1466,6 @@ fn strip_from_induced(
     Some(perm)
 }
 
-/// ── TELOS-GRADIENT DESCENT, extracted (descent arm, 2026-08) ─────────────
-/// One TELOS descent from an arbitrary seed `(start_perm, start_flops)`,
-/// returning the descended `(perm, flops)` (the seed itself if nothing
-/// strictly improves). Byte-identical to the inlined block it replaces when
-/// called with `(best_perm, best_flops, rank_mode = 0)`: same schedule, same
-/// task order, the same `parallel::run_perms` / `parallel::accept` pair, same
-/// strict-`<` acceptance, same total-order tie-breaks. Extracted so the phase
-/// can be run from MORE THAN ONE seed and under MORE THAN ONE move set — see
-/// [`TELOS_MS_PLAN`].
-///
-/// Pure function of `(sp, start_perm, schedule, rank_mode)`; `flops_cache` is
-/// unused here (the parallel scorer owns evaluation) and `ws` is not needed
-/// for the same reason, so determinism is unaffected.
-#[allow(clippy::too_many_arguments)]
-fn telos_descend(
-    sp: &ScoringPattern,
-    nnz: usize,
-    start_perm: &[usize],
-    start_flops: u64,
-    max_rounds: usize,
-    prio: &[(u8, usize)],
-    passes: usize,
-    peel_grid: &[usize],
-    rank_mode: u8,
-) -> (Vec<usize>, u64) {
-    let n = sp.n;
-    let mut cur_perm: Vec<usize> = start_perm.to_vec();
-    let mut cur_flops = start_flops;
-
-    for _round in 0..max_rounds {
-        let permuted = permute_pattern(sp, &cur_perm);
-        let etree = EliminationTree::from_pattern(&permuted);
-        let counts = column_counts_gnp(&permuted, &etree);
-        let mut cnt = vec![0usize; n];
-        for (pos, &v) in cur_perm.iter().enumerate() {
-            cnt[v] = counts[pos];
-        }
-        // RANKING = MOVE SET. Mode 0 is the shipped key (exact incumbent
-        // column count, descending, ties by ascending id). The alternatives
-        // hand `strip_general_v2` and the peel splice a different subset for
-        // the same `k` at no extra cost per pass. All are total orders, so
-        // every mode is deterministic.
-        let mut ranked: Vec<usize> = (0..n).collect();
-        match rank_mode {
-            1 => ranked.sort_unstable_by(|&a, &b| {
-                let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
-                let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
-                db.cmp(&da).then(a.cmp(&b))
-            }),
-            2 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = (cnt[a] as u64) * ((sp.col_ptr[a + 1] - sp.col_ptr[a]) as u64);
-                let kb = (cnt[b] as u64) * ((sp.col_ptr[b + 1] - sp.col_ptr[b]) as u64);
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            3 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = cnt[a] as i64 - (sp.col_ptr[a + 1] - sp.col_ptr[a]) as i64;
-                let kb = cnt[b] as i64 - (sp.col_ptr[b + 1] - sp.col_ptr[b]) as i64;
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            4 => ranked.sort_unstable_by(|&a, &b| {
-                let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
-                let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
-                cnt[b].cmp(&cnt[a]).then(db.cmp(&da)).then(a.cmp(&b))
-            }),
-            5 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = (cnt[a] as u64) * (cnt[a] as u64)
-                    / ((sp.col_ptr[a + 1] - sp.col_ptr[a]) as u64 + 1);
-                let kb = (cnt[b] as u64) * (cnt[b] as u64)
-                    / ((sp.col_ptr[b + 1] - sp.col_ptr[b]) as u64 + 1);
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            6 => ranked.sort_unstable_by(|&a, &b| {
-                let ka = cnt[a] + (sp.col_ptr[a + 1] - sp.col_ptr[a]);
-                let kb = cnt[b] + (sp.col_ptr[b + 1] - sp.col_ptr[b]);
-                kb.cmp(&ka).then(a.cmp(&b))
-            }),
-            7 => {
-                // Elimination POSITION, last-eliminated first: a move set with
-                // no reference to the counts at all.
-                let mut pos = vec![0usize; n];
-                for (i, &v) in cur_perm.iter().enumerate() {
-                    pos[v] = i;
-                }
-                ranked.sort_unstable_by(|&a, &b| pos[b].cmp(&pos[a]));
-            }
-            _ => ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b))),
-        }
-
-        // PARALLEL WITHIN THE ROUND. Every candidate of one round is built
-        // from the SAME two round-start snapshots (`ranked`, and the
-        // incumbent permutation) and compared against `round_f`, which the
-        // sequential version seeded from the incumbent and only ever lowered —
-        // a running minimum whose result is the earliest strict argmin,
-        // exactly what `parallel::accept` reproduces. Rounds stay sequential
-        // (round r+1's `ranked` reads round r's winner).
-        let base_perm = cur_perm.clone();
-        let ranked = &ranked;
-        let base_perm = &base_perm;
-        let mut rtasks: Vec<parallel::PermFn> = Vec::new();
-
-        for &(subi, k) in prio.iter().take(passes) {
-            if k >= n {
-                continue;
-            }
-            rtasks.push(Box::new(move || {
-                // The three sub-orderers are rebuilt per task rather than
-                // shared: `strip_general_v2` takes a `&dyn Fn` which is not
-                // `Sync`, and these closures are stateless anyway.
-                let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
-                let sub_nd = |c: &feral_ordering_core::CscPattern| {
-                    let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
-                    feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
-                };
-                let sub_mf = |c: &feral_ordering_core::CscPattern| {
-                    let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
-                    feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
-                };
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> = match subi
-                {
-                    0 => &sub_amd,
-                    1 => &sub_nd,
-                    _ => &sub_mf,
-                };
-                strip_general_v2(sp, ranked, k, sub)
-            }));
-        }
-
-        for &k in peel_grid {
-            if k >= n {
-                continue;
-            }
-            rtasks.push(Box::new(move || {
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in base_perm {
-                    if !fat[v] {
-                        cand.push(v);
-                    }
-                }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (sp.col_ptr[v + 1] - sp.col_ptr[v], v));
-                cand.extend(tail);
-                Some(cand)
-            }));
-        }
-
-        let mut res = parallel::run_perms(&rtasks, sp, n, nnz, cur_flops);
-        let mut round_f = cur_flops;
-        let mut round_p: Vec<usize> = Vec::new();
-        if parallel::accept(&mut res, &mut round_f, &mut round_p, |_| {}) {
-            cur_flops = round_f;
-            cur_perm = round_p;
-        } else {
-            break;
-        }
-    }
-
-    (cur_perm, cur_flops)
-}
-
-/// TELOS schedule for a given `nnz` — the tier split the shipped block always
-/// had, factored out so every descent (the shipped one and every multi-start
-/// one) reads it from one place. Pure function of `nnz`.
-fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static [usize]) {
-    if nnz < TELOS_TIER_A_MAX_NNZ {
-        (
-            2,
-            &TELOS_PRIO[..],
-            (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A),
-            &TELOS_PEEL_A[..],
-        )
-    } else {
-        // Tier B (150k..TELOS_MAX_NNZ): eval-bound class — ONE round,
-        // minimal eval count. See the cap-calibration re-gate note on
-        // the `TELOS_*` constants.
-        (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
-    }
-}
-
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     order_with_relabel_cap(pattern, usize::MAX)
@@ -2003,7 +1481,7 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
 /// `order()` and every probe that already knew this name — is untouched by
 /// the PHARMAKOS phase's addition.
 fn order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
-    order_with_options(pattern, relabel_cap, true, true, true, true, usize::MAX)
+    order_with_options(pattern, relabel_cap, true, true)
 }
 
 /// Same portfolio, with Component B (ORBIT) and the PHARMAKOS phase each
@@ -2012,14 +1490,26 @@ fn order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
 /// isolated before/after attribution (mirrors how `relabel_cap` already
 /// isolates the relabel multi-start). Both default to `true` via
 /// `order_with_relabel_cap`, matching shipped behavior.
+#[inline]
+fn insert_top_seed(top_seeds: &mut Vec<(u64, Vec<usize>)>, f: u64, perm: &[usize], max_k: usize) {
+    if top_seeds.len() < max_k || f < top_seeds.last().unwrap().0 {
+        if !top_seeds.iter().any(|(_, p)| p.as_slice() == perm) {
+            if top_seeds.len() < max_k {
+                top_seeds.push((f, perm.to_vec()));
+            } else {
+                top_seeds.pop();
+                top_seeds.push((f, perm.to_vec()));
+            }
+            top_seeds.sort_unstable_by_key(|&(score, _)| score);
+        }
+    }
+}
+
 fn order_with_options(
     pattern: &Pattern,
     relabel_cap: usize,
     orbit_enabled: bool,
     pharmakos_enabled: bool,
-    midx_enabled: bool,
-    rgreedy_enabled: bool,
-    telos_ms: usize,
 ) -> Vec<usize> {
 
     let n = pattern.n;
@@ -2042,21 +1532,11 @@ fn order_with_options(
         .expect("malformed CscPattern (bug in Pattern invariants)");
 
     // usize-indexed owned pattern for the trusted scoring path (Σ c_j²).
-    //
-    // Bound as an owned value plus a REFERENCE SHADOW: every deferred
-    // candidate closure below is a `move` closure (it must be, because the
-    // loop-local `seed`/`k`/options it captures do not outlive the loop
-    // iteration that built it), and a `move` closure capturing
-    // `scoring_pat` by value would consume it on the first candidate. With
-    // the shadow, `scoring_pat` is a `&ScoringPattern`, which is `Copy`, so
-    // every closure gets its own copy of the reference and every existing
-    // `&scoring_pat` argument deref-coerces unchanged.
-    let scoring_pat_owned = ScoringPattern {
+    let scoring_pat = ScoringPattern {
         n,
         col_ptr: pattern.col_ptr.clone(),
         row_idx: pattern.row_idx.clone(),
     };
-    let scoring_pat: &ScoringPattern = &scoring_pat_owned;
 
     // ── The FLOOR: the grader's exact baseline ordering ──────────────────────
     // `amd_order` with library-default options IS the grader's baseline, so
@@ -2076,9 +1556,6 @@ fn order_with_options(
     let amd_counts = column_counts_gnp(&amd_permuted, &amd_etree);
     let mut best_perm: Vec<usize> = amd_perm.clone();
     let mut best_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
-    // Seed for the descent-arm multi-start (see `TELOS_MS_PLAN`): the anchor's
-    // own flops, before any candidate can lower `best_flops`.
-    let anchor_flops = best_flops;
 
     // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
     // the pattern's maximum column length — see `relabel_restarts`, where a hub is
@@ -2112,57 +1589,41 @@ fn order_with_options(
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
 
-    // STRIP-TRANSFORM RANKINGS, hoisted above the task queue. Their gate is
-    // unchanged (identical condition to the STRIP TRANSFORM block below, which
-    // now only queues candidates); they must be declared BEFORE `tasks`
-    // because the queued strip closures borrow them and locals drop in
-    // reverse declaration order.
-    let strip_gate =
-        n > 0 && n < STRIP_MAX_N && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG + 1) * n;
-    let (deg_ranked_owned, lcnt_ranked_owned): (Vec<usize>, Vec<usize>) = if strip_gate {
-        let mut deg_ranked: Vec<usize> = (0..n).collect();
-        deg_ranked.sort_unstable_by(|&a, &b| {
-            let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
-            let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
-            db.cmp(&da).then(a.cmp(&b))
-        });
-        let mut lcnt = vec![0usize; n];
-        for (pos, &v) in amd_perm.iter().enumerate() {
-            lcnt[v] = amd_counts[pos];
-        }
-        let mut lcnt_ranked: Vec<usize> = (0..n).collect();
-        lcnt_ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
-        (deg_ranked, lcnt_ranked)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    let deg_ranked: &Vec<usize> = &deg_ranked_owned;
-    let lcnt_ranked: &Vec<usize> = &lcnt_ranked_owned;
+    let max_telos_seeds = if nnz <= 25_000 || (nnz <= 60_000 && max_deg <= n / 50) { 2 } else { 1 };
+    let mut top_seeds: Vec<(u64, Vec<usize>)> = Vec::with_capacity(max_telos_seeds);
+    top_seeds.push((best_flops, best_perm.clone()));
 
-    // ── DEFERRED CANDIDATE PORTFOLIO ────────────────────────────────────────
-    // `consider!` no longer RUNS a candidate; it queues its producer closure.
-    // Every producer below is a pure function of the pattern (nothing in the
-    // portfolio or the relabel multi-starts reads `best_perm`/`best_flops`),
-    // so the whole queue can be generated and scored on up to
-    // `parallel::PAR_MAX_THREADS` threads and the acceptance decision applied
-    // afterwards, sequentially, in this same source order. See
-    // `parallel`'s module doc for why that is byte-identical to the old
-    // running-minimum `consider` closure rather than merely equivalent in
-    // spirit. `catch_unwind` still guards each producer (it moved into
-    // `parallel::run_candidates`), and each candidate is still
-    // bijection-checked before it can win.
-    //
-    // The queued closures are `move` closures over `Copy` captures (`core`
-    // and `scoring_pat` are references or `Copy` structs; `seed`/`k`/`n` are
-    // scalars; each per-candidate options struct is moved into the single
-    // closure that uses it) so that a candidate built inside a `for` loop
-    // outlives that iteration.
-    let mut tasks: Vec<parallel::CandFn> = Vec::new();
-    macro_rules! consider {
-        ($f:expr) => {
-            tasks.push(Box::new($f))
+    // Try a candidate produced by `f`; keep it if it is a valid bijection with
+    // strictly fewer flops. `catch_unwind` guards against a candidate panicking
+    // (which would otherwise crash the worker and FAIL the whole run).
+    let mut consider =
+        |produce: &dyn Fn() -> Result<Vec<i32>, feral_ordering_core::OrderingError>| {
+            let produced =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
+            let Ok(Ok(perm_i32)) = produced else {
+                return;
+            };
+            let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
+            if !is_bijection(&perm, n) {
+                return;
+            }
+            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                cached
+            } else {
+                let v = ws.flops(&scoring_pat, &perm);
+                flops_cache.insert(perm.clone(), v);
+                v
+            };
+            // TEST-ONLY: record the best flops over `consider` candidates alone
+            // (excludes the AMD anchor), for the runner-up-margin census.
+            #[cfg(test)]
+            BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+            insert_top_seed(&mut top_seeds, f, &perm, max_telos_seeds);
+            if f < best_flops {
+                best_flops = f;
+                best_perm = perm;
+            }
         };
-    }
 
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
@@ -2172,7 +1633,7 @@ fn order_with_options(
             dense_alpha: 5.0,
             ..Default::default()
         };
-        consider!(move || feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p));
+        consider(&|| feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p));
 
         // EXTRA AMF α VALUES (win D): a fine sweep around the existing α5/α10
         // points found two more per-matrix wins INSIDE this already-paid-for
@@ -2204,12 +1665,12 @@ fn order_with_options(
                 dense_alpha: 2.5,
                 ..Default::default()
             };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
+            consider(&|| feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
             let opts_05 = feral_amf::AmfOptions {
                 dense_alpha: 0.5,
                 ..Default::default()
             };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
+            consider(&|| feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
         }
 
         // D WIDE-REACH RECOVERY (RCA follow-up, `probe_win_d_map`): the flat
@@ -2255,12 +1716,12 @@ fn order_with_options(
                 dense_alpha: 2.5,
                 ..Default::default()
             };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
+            consider(&|| feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
             let opts_05 = feral_amf::AmfOptions {
                 dense_alpha: 0.5,
                 ..Default::default()
             };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
+            consider(&|| feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
         }
 
         // D_WIDE, SPARSE ARM. The α0.5 pass is documented above as taking
@@ -2287,7 +1748,7 @@ fn order_with_options(
                 dense_alpha: 0.5,
                 ..Default::default()
             };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
+            consider(&|| feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
         }
 
     }
@@ -2300,7 +1761,7 @@ fn order_with_options(
             aggressive: true,
             dense_alpha: 5.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_opts5).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_opts5).map(|(p, ..)| p));
 
         // Even tighter dense handling — catches dense-ish mediums the α5/α10
         // variants miss. Trivially cheap in this size regime.
@@ -2308,7 +1769,7 @@ fn order_with_options(
             aggressive: true,
             dense_alpha: 2.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
         // session, `probe_variant_drop_score_cost`): measured 0 unique wins
@@ -2326,7 +1787,7 @@ fn order_with_options(
             dense_alpha: 2.0,
             ..Default::default()
         };
-        consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        consider(&|| feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
         // add unique wins beyond the existing α{-1,2,5,10} set. Gated to genuinely
@@ -2336,7 +1797,7 @@ fn order_with_options(
         // (measured 2.46 s at 5×). At nnz < 150k each AMD pass is a few ms.
         if nnz < SWEEP_EXTRA_MAX_NNZ {
             let amd_opts1 = feral_amd::AmdOptions { aggressive: true, dense_alpha: 1.0 };
-            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts1).map(|(p, ..)| p));
+            consider(&|| feral_amd::amd_order_opts(&core, &amd_opts1).map(|(p, ..)| p));
             // Aggressive AMD α16 ("amd_a16") DROPPED — 0 unique wins, exact
             // 0.00000000 dev-score cost (same measurement as amf_default
             // above). Combined with amf_default this frees a full extra
@@ -2368,7 +1829,7 @@ fn order_with_options(
     if n < AMF_SWEEP_MAX_N && nnz < 130_000 {
         for da in [1.0f64, 16.0, -1.0] {
             let amf_a = feral_amf::AmfOptions { dense_alpha: da, ..Default::default() };
-            consider!(move || feral_amf::amf_order_opts(&core, &amf_a).map(|(p, ..)| p));
+            consider(&|| feral_amf::amf_order_opts(&core, &amf_a).map(|(p, ..)| p));
         }
 
         // CUSTOM QUOTIENT-GRAPH METRICS (win E, `custom_metrics.rs`): alternative
@@ -2406,7 +1867,7 @@ fn order_with_options(
             custom_metrics::ScoreVariant::SqPure,
             custom_metrics::ScoreVariant::Ammf,
         ] {
-            consider!(move || custom_metrics::order_variant(&core, 10.0, true, variant));
+            consider(&|| custom_metrics::order_variant(&core, 10.0, true, variant));
         }
 
         // WIN F: top-7 of the `metric_sweep.rs` MetricSpec sweep
@@ -2428,7 +1889,7 @@ fn order_with_options(
                 custom_metrics::ScoreVariant::DegDivNvDegme,
                 custom_metrics::ScoreVariant::DegSqrt,
             ] {
-                consider!(move || custom_metrics::order_variant(&core, 10.0, true, variant));
+                consider(&|| custom_metrics::order_variant(&core, 10.0, true, variant));
             }
         }
 
@@ -2449,7 +1910,7 @@ fn order_with_options(
         // zero downside.
         if nnz < WINF_MAX_NNZ {
             for spec in metric_sweep::EXTRA_METRICS.iter() {
-                consider!(move || {
+                consider(&|| {
                     metric_sweep::order_generic(&core, 10.0, true, spec)
                 });
             }
@@ -2457,10 +1918,10 @@ fn order_with_options(
     } else if n < AMF_SWEEP_MAX_N && nnz >= 130_000 && nnz < 400_000 {
         // Win B — see regime (b) above.
         let amf_dz = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
-        consider!(move || feral_amf::amf_order_opts(&core, &amf_dz).map(|(p, ..)| p));
+        consider(&|| feral_amf::amf_order_opts(&core, &amf_dz).map(|(p, ..)| p));
     } else if n < AMF_SWEEP_MAX_N && nnz >= 400_000 && nnz < AMF_SWEEP_MAX_NNZ {
         let amf_nd = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
-        consider!(move || feral_amf::amf_order_opts(&core, &amf_nd).map(|(p, ..)| p));
+        consider(&|| feral_amf::amf_order_opts(&core, &amf_nd).map(|(p, ..)| p));
     }
 
     // NON-AGGRESSIVE AMD — a genuinely DIFFERENT elimination order from every
@@ -2475,7 +1936,7 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: 10.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_robust).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_robust).map(|(p, ..)| p));
 
         // Non-aggressive α5 ("amd_robust_a5") DROPPED — 0 unique wins, exact
         // 0.00000000 dev-score cost (same measurement as amf_default/amd_a16
@@ -2490,7 +1951,7 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: 2.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_robust2).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_robust2).map(|(p, ..)| p));
 
         // Dense-detection FULLY DISABLED (dense_alpha < 0): AMD treats no row as
         // "dense", so it never defers high-degree coupling rows. On the KKT/saddle
@@ -2504,12 +1965,12 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: -1.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_nodense).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_nodense).map(|(p, ..)| p));
         let amd_nodense_agg = feral_amd::AmdOptions {
             aggressive: true,
             dense_alpha: -1.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_nodense_agg).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_nodense_agg).map(|(p, ..)| p));
     }
 
     // Reverse Cuthill–McKee — a pure-Rust, O(nnz) ordering from a family
@@ -2520,7 +1981,7 @@ fn order_with_options(
     // worst case; deterministic (stable within-level degree sort, fixed BFS
     // seeding). Best-of floor makes it zero-downside.
     if n < RCM_MAX_N && nnz < RCM_MAX_NNZ {
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
         });
     }
@@ -2536,10 +1997,10 @@ fn order_with_options(
     // priorities-only monotone max-heap with a fixed tie-break). Best-of floor →
     // zero downside.
     if n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ {
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 2, 1))
         });
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 1, 2))
         });
     }
@@ -2561,7 +2022,7 @@ fn order_with_options(
     // only (cost tracks nnz, not n) just above the dev-corpus maximum so the
     // big gated-out ties are reached. Best-of floor -> zero downside.
     if nnz < BICONN_MAX_NNZ && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_order(pattern))
         });
 
@@ -2580,7 +2041,7 @@ fn order_with_options(
         // and per-block relabel restarts on the hot 100k+ gate-wall class
         // (ringpack_30_2) added +0.14 s to the portfolio's worst case.
         if nnz <= 60_000 {
-            consider!(move || {
+            consider(&|| {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
                     biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
                 )
@@ -2598,7 +2059,7 @@ fn order_with_options(
     // overflow nor move the worst case. Deterministic. Best-of floor →
     // zero-downside.
     if n < ND_MAX_N && nnz < ND_MAX_NNZ {
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern))
         });
         // Same BFS-separator structure, but each base-case leaf and unsplittable
@@ -2607,7 +2068,7 @@ fn order_with_options(
         // as a DISTINCT candidate, so the best-of floor keeps it zero-downside
         // on score; identical gate; deterministic; extra cost is ≈ one more ND
         // pass plus O(nnz) induced-graph work, all below the slow tier.
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order_impl(pattern, true))
         });
     }
@@ -2624,7 +2085,7 @@ fn order_with_options(
     // below the slow tier) so its few-ms cost cannot move the worst case.
     // Deterministic. Best-of floor → zero-downside.
     if n < NDFM_MAX_N && nnz < NDFM_MAX_NNZ {
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(ndfm_order(pattern))
         });
     }
@@ -2645,7 +2106,7 @@ fn order_with_options(
     // `wastepaper6`, `syn*`, `tln2`). Deterministic (fixed
     // `(deficiency, degree, index)` tie-break). Best-of floor → zero-downside.
     if n < MINFILL_MAX_N && nnz < MINFILL_MAX_NNZ {
-        consider!(move || {
+        consider(&|| {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(minfill_order(pattern))
         });
     }
@@ -2654,7 +2115,7 @@ fn order_with_options(
     // an n cap; `seed = 1` (via default) keeps it deterministic. Gate held fixed
     // so the worst-case time does not move.
     if n < METIS_MAX_N && nnz < METIS_MAX_NNZ {
-        consider!(move || {
+        consider(&|| {
             feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default())
                 .map(|(p, _, _)| p)
         });
@@ -2672,7 +2133,7 @@ fn order_with_options(
             fm_passes: 20,
             ..Default::default()
         };
-        consider!(move || feral_metis::metis_order_full(&core, &metis_tuned).map(|(p, _, _)| p));
+        consider(&|| feral_metis::metis_order_full(&core, &metis_tuned).map(|(p, _, _)| p));
     }
 
     // A third, HIGH-TRIAL METIS on tiny/small matrices only — many initial
@@ -2686,14 +2147,14 @@ fn order_with_options(
             fm_passes: 30,
             ..Default::default()
         };
-        consider!(move || feral_metis::metis_order_full(&core, &metis_hitrial).map(|(p, _, _)| p));
+        consider(&|| feral_metis::metis_order_full(&core, &metis_hitrial).map(|(p, _, _)| p));
     }
 
     // Scotch — extra candidate on small/medium matrices (time-trivial there),
     // covering the whole 1k_10k bucket to break more ties. Fixed seed via default
     // keeps it deterministic.
     if n < SCOTCH_MAX_N && nnz < SCOTCH_MAX_NNZ {
-        consider!(move || feral_scotch::scotch_order(&core));
+        consider(&|| feral_scotch::scotch_order(&core));
     }
 
     // A second, TUNED Scotch (more separator trials), widened to cover more of
@@ -2704,7 +2165,7 @@ fn order_with_options(
             n_sep_trials: 10,
             ..Default::default()
         };
-        consider!(move || {
+        consider(&|| {
             feral_scotch::scotch_order_full(&core, &scotch_tuned).map(|(p, _, _)| p)
         });
     }
@@ -2713,7 +2174,7 @@ fn order_with_options(
     // widened in n to target the large count of lt_1k / lower-1k_10k ties (incl.
     // dense tiny like qap) while nnz stays tight. `seed = 1` (default) deterministic.
     if n < KAHIP_MAX_N && nnz < KAHIP_MAX_NNZ {
-        consider!(move || feral_kahip::kahip_order(&core));
+        consider(&|| feral_kahip::kahip_order(&core));
     }
 
     // METIS PARAMETER variants. Every METIS candidate above varies only the
@@ -2745,20 +2206,20 @@ fn order_with_options(
                 max_imbalance: imb,
                 ..Default::default()
             };
-            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p));
+            consider(&|| feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p));
         }
         for sw in [100u32, 400] {
             let opts = feral_metis::MetisOptions {
                 nd_to_amd_switch: sw,
                 ..Default::default()
             };
-            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p));
+            consider(&|| feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p));
         }
         let opts_seed = feral_metis::MetisOptions {
             seed: 21,
             ..Default::default()
         };
-        consider!(move || feral_metis::metis_order_full(&core, &opts_seed).map(|(p, _, _)| p));
+        consider(&|| feral_metis::metis_order_full(&core, &opts_seed).map(|(p, _, _)| p));
     }
 
     // STRONGER KaHIP: a second seed and the Eco quality mode. KaHIP's default
@@ -2779,13 +2240,13 @@ fn order_with_options(
             seed: 2,
             ..Default::default()
         };
-        consider!(move || feral_kahip::kahip_order_full(&core, &kahip_seed2).map(|(p, _, _)| p));
+        consider(&|| feral_kahip::kahip_order_full(&core, &kahip_seed2).map(|(p, _, _)| p));
 
         let kahip_eco = feral_kahip::KahipOptions {
             mode: feral_kahip::KahipMode::Eco,
             ..Default::default()
         };
-        consider!(move || feral_kahip::kahip_order_full(&core, &kahip_eco).map(|(p, _, _)| p));
+        consider(&|| feral_kahip::kahip_order_full(&core, &kahip_eco).map(|(p, _, _)| p));
     }
 
     // STRIP TRANSFORM — delete the k densest (or highest-L-column-count under
@@ -2808,9 +2269,20 @@ fn order_with_options(
     // for the measurement that set this boundary. Best-of floor →
     // zero-downside; cost envelope is analytic only (see [`STRIP_MAX_NNZ`]),
     // flagged for isolated timing.
-    if strip_gate {
-        // (`deg_ranked` / `lcnt_ranked` are computed under this same gate,
-        // hoisted above the task queue — see there.)
+    if n > 0 && n < STRIP_MAX_N && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG + 1) * n {
+        let mut deg_ranked: Vec<usize> = (0..n).collect();
+        deg_ranked.sort_unstable_by(|&a, &b| {
+            let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
+            let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
+            db.cmp(&da).then(a.cmp(&b))
+        });
+
+        let mut lcnt = vec![0usize; n];
+        for (pos, &v) in amd_perm.iter().enumerate() {
+            lcnt[v] = amd_counts[pos];
+        }
+        let mut lcnt_ranked: Vec<usize> = (0..n).collect();
+        lcnt_ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
 
         // INCREMENTAL degree-ranked strip family (`nested_subgraph`, merged
         // in from the cost-reduction session specifically for this): builds
@@ -2833,14 +2305,14 @@ fn order_with_options(
         if let Some((&k0, rest)) = ks.split_first() {
             let (mut deg_builder, deg_sub0) =
                 nested_subgraph::NestedSubgraphBuilder::new(pattern, &deg_ranked, k0);
-            consider!(move || {
+            consider(&|| {
                 strip_from_induced(&scoring_pat, &deg_sub0, &deg_ranked[..k0])
                     .ok_or(feral_ordering_core::OrderingError::MalformedInput)
             });
             let mut k_prev = k0;
             for &k in rest {
                 let deg_sub = deg_builder.advance_to(&deg_ranked, k, k_prev);
-                consider!(move || {
+                consider(&|| {
                     strip_from_induced(&scoring_pat, &deg_sub, &deg_ranked[..k])
                         .ok_or(feral_ordering_core::OrderingError::MalformedInput)
                 });
@@ -2851,7 +2323,7 @@ fn order_with_options(
         // L-column-count-ranked candidate: a DIFFERENT ranking, single k —
         // no incremental benefit for one subgraph, so it keeps the original
         // from-scratch builder.
-        consider!(move || {
+        consider(&|| {
             strip_candidate(&scoring_pat, &lcnt_ranked, 64)
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)
         });
@@ -2865,114 +2337,15 @@ fn order_with_options(
     // heuristic it replaces. Window and rationale: [`HEAVY_AMDND_MIN_NNZ`].
     // Measured cost inside the window is ≤0.346 s; deterministic (fixed options);
     // best-of floor → zero-downside.
-    // ── HEAVY-TIER QUOTIENT-GRAPH PIVOT METRICS (arm/heavy) ─────────────────
-    //
-    // `custom_metrics::ScoreVariant` and `metric_sweep::EXTRA_METRICS` are the
-    // largest candidate family in this file (22 orderings) and BOTH are gated
-    // at `nnz < 130_000` — a bound inherited from the sweep that selected them
-    // (`sbx-metrics2` ran its greedy forward-selection on `nnz<130_000`-gated
-    // matrices ONLY), never a measurement that they are useless or unaffordable
-    // above it. Censused alone on the heavy tier (`probe_heavy_metrics`,
-    // arm/heavy) they turn out to be the single largest source of heavy-tier
-    // headroom found anywhere in this arm, incumbent → this candidate:
-    //   pooling_sppc3pq (nnz=893724)  0.6736 → 0.5338  extra_deg2_div_nv_wf05
-    //   faclay35        (nnz=132380)  0.9997 → 0.9523  extra_deg_div_nv_wf2
-    //   cont6-qq        (nnz=557994)  0.8484 → 0.7983  extra_deg2_div_nv_wf002
-    //   gabriel10       (nnz=1148210) 0.9756 → 0.9480  extra_deg2_div_nv_wf05
-    //   pooling_sppb5pq (nnz=674470)  0.4100 → 0.4077  SqDiv / ..._wf002
-    // (`faclay75` moves 1.0000 → 0.9999 on Ammf and nothing else; `kissing2`,
-    // `nuclear104`, `acopf`, `gams05`, both `transswitch` and `unitcommit` are
-    // unmoved by all 22.)
-    //
-    // The variants are ordered by MEASURED heavy-tier marginal value and a
-    // `budget / nnz` count truncates the list, so the added time is ~constant
-    // across the tier (~one AMD pass each, measured 5e-8 to 1e-7 s/nnz):
-    // 2e6 buys ~0.2 s. `dense_alpha` is NOT swept — all three
-    // `ScoreVariant`s returned byte-identical rows at α ∈ {10, 5, -1} on
-    // every one of the 15 heavy matrices, so the extra passes would be pure
-    // cost.
-    //
-    // TWO CAPS, both measured rather than assumed:
-    //   * `HEAVY_METRIC_MAX_NNZ` = 1.2M excludes exactly `faclay75`
-    //     (nnz=1379706, 0.889 s) and `acopf_case9241pegase_qcqp`
-    //     (nnz=1292408, 0.830 s) — the two slowest `order()` calls in the
-    //     whole heavy tier, and the two on which no metric variant improves
-    //     anything (best 0.9999 and 0.9851 respectively, the latter behind its
-    //     0.9737 incumbent). Paying 0.06-0.14 s per variant there would be
-    //     pure cost on exactly the matrices with the least slack.
-    //   * `extra_deg_div_nv_wf2` gets its OWN nnz cap. It is the one spec in
-    //     the list whose cost does not track the others: 0.245 s at nnz=674470
-    //     and 0.149 s at 1.38M (≈3.6e-7 s/nnz) against 5e-8-1e-7 for
-    //     everything else — the same wide-dynamic-range bucket-crowding
-    //     behaviour that got `AmindNorm` dropped (memory/experiments/0011).
-    //     Its only heavy win is at nnz=132380, so it is admitted only up to
-    //     400k where its measured cost is ≤0.06 s.
-    //
-    // Deterministic (fixed spec list, count a pure function of nnz) and
-    // bijection-checked through `consider`, so best-of makes it zero-downside.
-    if nnz >= HEAVY_METRIC_MIN_NNZ && nnz <= HEAVY_METRIC_MAX_NNZ && heavy_arm_enabled() {
-        let k = (HEAVY_METRIC_BUDGET / nnz).clamp(1, HEAVY_METRIC_MAX_VARIANTS);
-        for &(name, alpha) in HEAVY_METRIC_ORDER.iter().take(k) {
-            match name {
-                "cm_sqdiv" => consider!(move || custom_metrics::order_variant(
-                    &core,
-                    alpha,
-                    true,
-                    custom_metrics::ScoreVariant::SqDiv,
-                )),
-                "cm_sqpure" => consider!(move || custom_metrics::order_variant(
-                    &core,
-                    alpha,
-                    true,
-                    custom_metrics::ScoreVariant::SqPure,
-                )),
-                spec_name => {
-                    if let Some(spec) =
-                        metric_sweep::EXTRA_METRICS.iter().find(|s| s.name == spec_name)
-                    {
-                        consider!(move || metric_sweep::order_generic(&core, alpha, true, spec));
-                    }
-                }
-            }
-        }
-        if nnz <= HEAVY_METRIC_WF2_MAX_NNZ {
-            if let Some(spec) = metric_sweep::EXTRA_METRICS
-                .iter()
-                .find(|s| s.name == "extra_deg_div_nv_wf2")
-            {
-                consider!(move || metric_sweep::order_generic(&core, 10.0, true, spec));
-            }
-        }
-    }
-
-    // VERY-HEAVY EXTENSION (arm/heavy). The `nnz < 700_000` ceiling above left
-    // the three biggest sparse matrices in the corpus with no no-dense AMD pass
-    // at all, and a census of every AMD option variant on them
-    // (`probe_heavy_census`) found one of them moving on exactly this one:
-    //   gabriel10 (n=244056, nnz=1148210)  0.9793 -> 0.9756, isolated cost 0.070 s.
-    // (faclay75 1.0000 -> 1.0019 and acopf 1.0000 -> >1 — no loss, best-of floor.)
-    //
-    // THE HUB GATE IS THE COST GATE, and is the reason this is not simply a
-    // raised ceiling. `aggressive = false, dense_alpha = -1` puts hub vertices
-    // back into the ordinary min-degree flow instead of deferring them, so its
-    // cost is set by the largest hub, not by nnz: measured 0.070 s on gabriel10
-    // (max_deg 54) against 0.330 s on faclay75 (max_deg 2777) at a SMALLER nnz
-    // per vertex. `max_deg <= n / 500` admits gabriel10 (54 <= 488) and
-    // acopf_case9241pegase_qcqp (175 <= 626) and rejects faclay75
-    // (2777 > 545) — which is also the only one of the three that gains
-    // nothing. Same discriminator, and same mechanism, as the `max_deg <= n/50`
-    // gate on `mid_multi` in `relabel_restarts`.
-    let heavy_amdnd_window = (nnz >= HEAVY_AMDND_MIN_NNZ && nnz < HEAVY_AMDND_MAX_NNZ)
-        || (nnz >= HEAVY_AMDND_MAX_NNZ
-            && nnz <= VHEAVY_AMDND_MAX_NNZ
-            && max_deg * VHEAVY_AMDND_HUB_DIV <= n
-            && heavy_arm_enabled());
-    if heavy_amdnd_window && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n {
+    if nnz >= HEAVY_AMDND_MIN_NNZ
+        && nnz < HEAVY_AMDND_MAX_NNZ
+        && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
+    {
         let amd_heavy_nodense = feral_amd::AmdOptions {
             aggressive: false,
             dense_alpha: -1.0,
         };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_heavy_nodense).map(|(p, ..)| p));
+        consider(&|| feral_amd::amd_order_opts(&core, &amd_heavy_nodense).map(|(p, ..)| p));
     }
 
     // RELABELLED-AMD MULTI-START — a randomized-restart minimum degree, for free.
@@ -3020,7 +2393,7 @@ fn order_with_options(
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     for r in 0..restarts {
         let seed = r as u64 + 1;
-        consider!(move || {
+        consider(&|| {
             let q = relabel(n, seed);
             let b = permute_pattern(&scoring_pat, &q);
             let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
@@ -3066,12 +2439,7 @@ fn order_with_options(
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
-            // Cloned per restart: each queued closure is a `move` closure and
-            // must own its options struct (`AmfOptions` is `Clone`, not
-            // `Copy`). Same values every time, so the candidate set is
-            // unchanged.
-            let amf_opts = amf_opts.clone();
-            consider!(move || {
+            consider(&|| {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
                 let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
@@ -3082,94 +2450,6 @@ fn order_with_options(
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
             });
-        }
-    }
-
-    // ── HEAVY-TIER RELABELLED-AMF MULTISTART (arm/heavy) ────────────────────
-    //
-    // The block above stops at `nnz <= 130_000`, and NOTHING else in this file
-    // gives a heavy matrix a randomized restart of any kind above it unless it
-    // is sparse enough for `heavy_multi` (`nnz <= HEAVY_SPARSE_MAX_AVG_DEG*n`,
-    // AMD only). So the whole nnz>130k tier gets at most 1-4 relabelled *AMD*
-    // passes and, for the dense part of it, ZERO restarts at all — while AMF is
-    // precisely the family that WINS there (every `pooling_*` matrix's incumbent
-    // is an AMF variant). This block closes that gap: relabelled AMF is
-    // diversity drawn from the winning family, exactly the "look for variation
-    // WITHIN a winning family before adding another" thesis.
-    //
-    // MEASURED per-candidate census (`probe_heavy_census`, `probe_heavy_amf_multistart`,
-    // arm/heavy, 2026-08-28), ratio vs the grader's AMD baseline, incumbent → best
-    // relabelled-AMF over the seeds this gate admits:
-    //   transswitch2736spr (n=69651, nnz=331010)  0.9886 → 0.9249  (seed 2, α5)
-    //   pooling_sppc1pq    (n=14100, nnz=477680)  0.3084 → 0.3037  (seed 1, α2.5)
-    //   pooling_sppc3pq    (n=23173, nnz=893724)  0.6818 → 0.6736  (seed 4, α2.5)
-    // Non-movers inside the gate (recorded so nobody re-runs them): faclay35,
-    // transswitch2383wpr, kissing2, pooling_sppb5pq — every seed ≥ incumbent.
-    //
-    // TWO SUB-TIERS, because the α that wins and the time available differ:
-    //   * SPARSE (`nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n`), 130k < nnz <= 400k.
-    //     α = 5.0, the same α the block above ships. Admits exactly 5 dev
-    //     matrices (faclay35, crudeoil_pooling_dt3, arki0013, transswitch2383wpr,
-    //     transswitch2736spr), all measured at 0.43-0.61 s of `order()` today,
-    //     and per-pass cost 0.011-0.014 s.
-    //   * DENSE (`nnz > HEAVY_SPARSE_MAX_AVG_DEG * n`), nnz >= 400k. α = 2.5:
-    //     on the dense tier α5 and the α<0 "no-dense" mode collapse to the same
-    //     ordering, and where they differ (pooling_sppc3pq) α2.5 is strictly
-    //     better (0.6736 vs 0.6712 at k4, 0.6642 vs 0.6698 at k8). The 400k
-    //     FLOOR is a cap-safety gate, not a quality one: it is exactly where the
-    //     rest of the portfolio has dropped out. Below it the dense band still
-    //     carries a full stack and the least slack of anything here
-    //     (`nuclear104` nnz=257806 runs 0.752 s, `gams05` nnz=252910 runs
-    //     0.793 s); at or above it every dense matrix is idle (`kissing2` 0.422 s,
-    //     `pooling_sppc1pq` 0.340 s, `pooling_sppb5pq` 0.452 s,
-    //     `pooling_sppc3pq` 0.340 s). Neither of the two loaded matrices gains
-    //     anything from this candidate anyway (nuclear104 ≥ 1.277 at every seed,
-    //     gams05 0.8123 against an incumbent of 0.6075), so the floor costs no
-    //     score.
-    //
-    // Cost: one AMF pass + one permute + one exact eval per restart, all ~linear
-    // in nnz at ~1e-7 s/nnz measured across the tier, so a `budget / nnz` restart
-    // count bounds the ADDED time at `budget * 1e-7` ≈ 0.24 s on every matrix in
-    // the gate at once — the same cost-model shape (and the same reasoning) as
-    // [`RELABEL_BUDGET`]. Worst measured addition inside the gate: 0.42 s
-    // (pooling_sppc3pq, 4 passes at 0.075 s + eval), landing it at ~0.76 s,
-    // comfortably below the frontier's own 1.225 s worst case.
-    //
-    // Deterministic: seeds are 1..=passes, `passes` is a pure function of
-    // `(n, nnz)`, and every result is bijection-checked by `consider`, so the
-    // best-of floor makes this zero-downside on score.
-    if nnz > RELABEL_AMF_MAX_NNZ && relabel_cap > 0 && heavy_arm_enabled() {
-        let sparse = nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n;
-        let admitted = if sparse {
-            nnz <= HEAVY_RELABEL_AMF_SPARSE_MAX_NNZ
-        } else {
-            nnz >= HEAVY_RELABEL_AMF_DENSE_MIN_NNZ && nnz <= HEAVY_RELABEL_AMF_DENSE_MAX_NNZ
-        };
-        if admitted {
-            let alpha = if sparse { 5.0 } else { 2.5 };
-            let amf_h = feral_amf::AmfOptions {
-                dense_alpha: alpha,
-                ..Default::default()
-            };
-            let passes = (HEAVY_RELABEL_AMF_BUDGET / nnz)
-                .clamp(1, HEAVY_RELABEL_AMF_MAX_PASSES)
-                .min(relabel_cap);
-            for r in 0..passes {
-                let seed = r as u64 + 1;
-                // Cloned per pass: each queued closure is a `move` closure and
-                // must own its options struct.
-                let amf_h = amf_h.clone();
-                consider!(move || {
-                    let q = relabel(n, seed);
-                    let b = permute_pattern(&scoring_pat, &q);
-                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_h)?;
-                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-                });
-            }
         }
     }
 
@@ -3210,9 +2490,7 @@ fn order_with_options(
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
-            // Cloned per restart — see the relabelled-AMF loop above.
-            let amd_nd_opts = amd_nd_opts.clone();
-            consider!(move || {
+            consider(&|| {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
                 let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
@@ -3227,177 +2505,6 @@ fn order_with_options(
     }
 
 
-    // ── MID-BAND RELABEL DIVERSITY EXTENSION (arm/midband, `probe_mid_census`).
-    //
-    // WHY THIS AND NOT ANOTHER CANDIDATE FAMILY. A 58-variant sweep of every
-    // option every feral generator exposes (AMD aggressive/dense_alpha, AMF
-    // dense_alpha 0.5..20, METIS seed/imbalance/nd_to_amd_switch/niparts/
-    // coarsen_floor/two_hop/dense_quotient, Scotch seed/trials/amd_switch/
-    // coarsen_floor/imbalance/compress/FM, KaHIP seed/Eco/Strong, MinFill), run
-    // against the SHIPPED `order()` on all 71 in-scope matrices left at ratio
-    // >= 0.94, improved exactly ONE of them (`rsyn0815m02hfsg`, by MinFill 18
-    // vertices past `MINFILL_MAX_N`). Every partitioner family scores 1.7-2.8x
-    // WORSE than the incumbent on this class in geomean; the AMD-family
-    // variants are the closest at 1.5-4.5% worse. Generator-option tuning in
-    // this band is finished — see `probe_mid_sweep`.
-    //
-    // What is NOT finished is the reach of the three relabel multistarts. A
-    // deep flops-only census (`probe_mid_census`: up to 300 seeds x {AMD,
-    // AMF alpha5, no-dense AMD} on every in-scope matrix) finds real gains that
-    // the SHIPPED gates simply cannot see, and they are concentrated in the two
-    // objectives with the TIGHTEST nnz ceilings:
-    //
-    //   * `RELABEL_AMDND_MAX_NNZ` = 60_000 — `crudeoil_lee4_10` (nnz 120632)
-    //     reaches 0.6858 vs the shipped 0.7271, `mpbp_48` (91016) 0.4938 vs
-    //     0.5069 at seed 2, `nd_netgen-3000-1-1-b-b-ns_7` (90000) 0.9673 vs
-    //     0.9797.
-    //   * `RELABEL_AMF_MAX_NNZ` = 130_000 — `arki0013` (nnz 160172) reaches
-    //     0.6159 vs the shipped 0.6262 at seed 2.
-    //
-    // Both ceilings were sized when their blocks were introduced against a
-    // whole-corpus cost argument, not against this band, which the timing
-    // profile shows running at 0.2-0.9 s of the 2.0 s cap.
-    //
-    // THE HUB GUARD IS LOAD-BEARING, exactly as in `relabel_restarts`'s mid
-    // band. `ringpack_30_2` (n=17999, nnz=121458) holds the corpus worst case
-    // and is an (n, nnz)-twin of `crudeoil_lee4_10` (17809/120632); only max
-    // degree separates them (1632 vs 168), and a hub that size is *why* each of
-    // its passes is expensive. `max_deg <= n / MIDX_HUB_DIV` excludes ringpack
-    // (1632 > 359) and admits crudeoil_lee4_10 (168 <= 356). The same guard
-    // keeps the dense KKT class this file has FAILED the grader on once
-    // (`telecomsp_metro`, nnz/n ~ 53) out by construction, and it is combined
-    // with a density guard of the same shape the heavy and mid tiers use
-    // (`MIDX_MAX_AVG_DEG`, 8 rather than 6 — see its doc comment).
-    //
-    // Zero score risk (every candidate goes through `consider`, which keeps it
-    // only on strict improvement over the AMD anchor); the whole cost is time,
-    // which is why the envelope is an nnz WINDOW opening only above each
-    // block's existing ceiling — inside those ceilings nothing changes at all.
-    if midx_enabled
-        && nnz > 0
-        && relabel_cap > 0
-        && nnz <= MIDX_MAX_AVG_DEG * n
-        && max_deg <= n / MIDX_HUB_DIV
-    {
-        if nnz > RELABEL_AMDND_MAX_NNZ && nnz <= MIDX_AMDND_MAX_NNZ {
-            // Two caps, not one. EVERY measured win in the lower half of this
-            // window is found at seed 1 or 2 (`nd_netgen-3000-1-1-b-b-ns_7` at
-            // 1, `mpbp_48` at 2), so four passes there carry all of them with
-            // slack; the deep cap exists solely for `crudeoil_lee4_10`
-            // (nnz 120_632), whose win first appears at seed 10. Splitting them
-            // is worth ~8 passes each on `gabriel09` and `gasprod_sarawak81`,
-            // the two matrices in the window the census shows can never win
-            // (every relabelled objective lands >= 0.986 against a shipped
-            // 0.9327 / 0.9979).
-            let cap = if nnz <= MIDX_LOWSEED_MAX_NNZ {
-                MIDX_LOWSEED_RESTARTS
-            } else {
-                MIDX_MAX_RESTARTS
-            };
-            let midx_restarts = (MIDX_BUDGET / nnz).clamp(1, cap).min(relabel_cap);
-            let amd_nd_opts = feral_amd::AmdOptions {
-                aggressive: false,
-                dense_alpha: -1.0,
-            };
-            for r in 0..midx_restarts {
-                let seed = r as u64 + 1;
-                // Cloned per restart: each queued closure is a `move` closure
-                // and must own its options struct.
-                let amd_nd_opts = amd_nd_opts.clone();
-                consider!(move || {
-                    let q = relabel(n, seed);
-                    let b = permute_pattern(&scoring_pat, &q);
-                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                    let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
-                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-                });
-            }
-        }
-
-        if nnz > RELABEL_AMF_MAX_NNZ && nnz <= MIDX_AMF_MAX_NNZ {
-            let midx_restarts = (MIDX_AMF_BUDGET / nnz)
-                .clamp(1, MIDX_AMF_MAX_RESTARTS)
-                .min(relabel_cap);
-            let amf_opts = feral_amf::AmfOptions {
-                dense_alpha: 5.0,
-                ..Default::default()
-            };
-            for r in 0..midx_restarts {
-                let seed = r as u64 + 1;
-                // Cloned per restart — see the no-dense loop above.
-                let amf_opts = amf_opts.clone();
-                consider!(move || {
-                    let q = relabel(n, seed);
-                    let b = permute_pattern(&scoring_pat, &q);
-                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-                });
-            }
-        }
-    }
-    // ── RELABELLED AMF alpha=0.5 — see `MIDX_AMF05_*`.
-    if midx_enabled && relabel_cap > 0 && nnz > 0 && nnz <= MIDX_AMF05_MAX_NNZ {
-        let amf05 = feral_amf::AmfOptions {
-            dense_alpha: 0.5,
-            ..Default::default()
-        };
-        for r in 0..MIDX_AMF05_RESTARTS.min(relabel_cap) {
-            let seed = r as u64 + 1;
-            // Cloned per restart — each queued task owns its options.
-            let amf05 = amf05.clone();
-            consider!(move || {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf05)?;
-                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
-        }
-    }
-
-
-    #[cfg(test)]
-    let _tp1 = std::time::Instant::now();
-    // ── RUN THE QUEUED PORTFOLIO ────────────────────────────────────────────
-    // Everything queued above (portfolio candidates, the relabelled-AMD /
-    // -AMF / -no-dense-AMD multi-starts) is generated and scored here on up
-    // to `parallel::PAR_MAX_THREADS` threads, then accepted SEQUENTIALLY in
-    // task-index order — the same order the old `consider` closure ran them
-    // in — so `best_perm`/`best_flops` end up byte-identical to the
-    // single-threaded portfolio. Nothing below this point may be queued: from
-    // the hill-climb phase onwards every phase reads the incumbent.
-    {
-        let mut results =
-            parallel::run_candidates(&tasks, scoring_pat, n, nnz, best_flops);
-        let won = parallel::accept(&mut results, &mut best_flops, &mut best_perm, |_f| {
-            // TEST-ONLY: record the best flops over `consider` candidates
-            // alone (excludes the AMD anchor), for the runner-up-margin
-            // census. Invoked in task-index order for every candidate that
-            // scored, exactly as the sequential closure did.
-            #[cfg(test)]
-            BEST_NON_ANCHOR.with(|c| c.set(c.get().min(_f)));
-        });
-        if won {
-            // Keep the portfolio winner in the memo table the post-hoc phases
-            // read (they only ever LOOK UP, never insert — see the
-            // `flops_cache` declaration).
-            flops_cache.insert(best_perm.clone(), best_flops);
-        }
-    }
-    drop(tasks);
-
-#[cfg(test)]
-    parallel::phase_mark("1.portfolio", _tp1);
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
     // every other candidate so the incumbent it perturbs is the portfolio's
@@ -3416,63 +2523,43 @@ fn order_with_options(
     } else {
         0
     };
-    //
-    // SPECULATIVE WAVES (arm/parallel). This phase is a genuine CHAIN — restart
-    // r+1 perturbs whatever restart r left as the incumbent — so it cannot be
-    // batched the way the portfolio is. It is parallelized by SPECULATION
-    // instead: compute the next up-to-4 restarts from the CURRENT incumbent at
-    // once, then walk them in restart order and accept the FIRST one that
-    // improves (not the wave's argmin — the sequential loop would have
-    // re-perturbed the new incumbent immediately, so every later candidate of
-    // the wave is void and is simply recomputed from the new incumbent in the
-    // next wave). Improvements are rare here, so most waves are accepted whole
-    // and the speculation almost never wastes work; either way the accepted
-    // sequence of incumbents is exactly the sequential one.
-#[cfg(test)]
-    let _tp2 = std::time::Instant::now();
-    let mut r = 0usize;
-    while r < hc_r {
-        let wave = parallel::PAR_MAX_THREADS.min(hc_r - r);
-        let base = best_perm.clone();
-        let base = &base;
-        let mut htasks: Vec<parallel::PermFn> = Vec::new();
-        for j in 0..wave {
-            let rr = r + j;
-            let seed = (rr as u64 + 1).wrapping_mul(0x9E37);
-            let swaps = if rr % 2 == 0 { n / 16 } else { n / 4 };
-            htasks.push(Box::new(move || {
-                let q = perturb(base, seed, swaps);
-                let b = permute_pattern(scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
-                let pb = feral_amd::amd_order(&bcore).ok()?;
-                Some(pb.iter().map(|&x| q[x as usize]).collect())
-            }));
-        }
-        // `keep_all`: the first improver need not be the wave minimum, so the
-        // argmin-only retention rule does not apply here.
-        let mut hres =
-            parallel::run_perms_keep_all(&htasks, scoring_pat, n, nnz, best_flops);
-        let mut advanced = wave;
-        for (j, res) in hres.iter_mut().enumerate() {
-            let Some(f) = res.flops else { continue };
+    for r in 0..hc_r {
+        let seed = (r as u64 + 1).wrapping_mul(0x9E37);
+        let swaps = if r % 2 == 0 { n / 16 } else { n / 4 };
+        let q = perturb(&best_perm, seed, swaps);
+        let b = permute_pattern(&scoring_pat, &q);
+        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+        let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+            continue;
+        };
+        let Ok(pb) = feral_amd::amd_order(&bcore) else {
+            continue;
+        };
+        let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+        if is_bijection(&perm, n) {
+            // READ-ONLY cache lookup (no insert) — see the `flops_cache`
+            // declaration's comment: the relabel/hill-climb phases measured
+            // near-0% within-phase duplicate rates in the `sbx-perf` cost
+            // session, so inserting here buys nothing and would make the
+            // table's size scale with the (now much larger, win-C) restart
+            // budget. Still routes through the reused workspace (`ws.flops`
+            // allocates nothing after the first call) even on a miss.
+            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                cached
+            } else {
+                ws.flops(&scoring_pat, &perm)
+            };
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+            insert_top_seed(&mut top_seeds, f, &perm, max_telos_seeds);
             if f < best_flops {
-                if let Some(p) = res.perm.take() {
-                    best_flops = f;
-                    best_perm = p;
-                }
-                advanced = j + 1;
-                break;
+                best_flops = f;
+                best_perm = perm;
             }
         }
-        r += advanced;
     }
 
-#[cfg(test)]
-    parallel::phase_mark("2.hillclimb", _tp2);
     // ── POST-HOC blind-spot families (`sbx-families2`): operate on the
     // PORTFOLIO'S OWN best incumbent (`best_perm`/`best_flops` as left by
     // every candidate + relabel-restart + hill-climb above), not on the raw
@@ -3487,8 +2574,6 @@ fn order_with_options(
     // (`cnt_by_v`) — the same near-linear-in-nnz(A) computation
     // `column_counts_gnp` already does for the anchor above, just re-run
     // once here on the FINAL incumbent instead of the AMD anchor.
-#[cfg(test)]
-    let _tp3 = std::time::Instant::now();
     if nnz > 0 && nnz < PEEL_CNTREL_MAX_NNZ {
         let permuted = permute_pattern(&scoring_pat, &best_perm);
         let etree = EliminationTree::from_pattern(&permuted);
@@ -3515,33 +2600,21 @@ fn order_with_options(
         // All candidates are built from the SAME `best_perm` snapshot taken
         // at entry (matching the probe's fixed-per-round semantics); only
         // the winning candidate (if any) becomes the new incumbent.
-        //
-        // PARALLELIZED (arm/parallel): PEEL's 16 candidates and COUNT-RELABEL's
-        // 2 are ALL pure functions of the block-entry snapshots (`base_perm`,
-        // `cnt_by_v`) — none of them reads the incumbent as it moves — and the
-        // sequential code compared each in turn against a `best_flops` that
-        // only ever fell. So the two families form ONE running-minimum chain in
-        // this exact source order, and the earliest strict argmin over the
-        // combined 18-task list reproduces it exactly.
-        let base_perm = best_perm.clone();
-        let mut ranked_by_cnt: Vec<usize> = (0..n).collect();
-        ranked_by_cnt.sort_unstable_by(|&a, &b| cnt_by_v[b].cmp(&cnt_by_v[a]).then(a.cmp(&b)));
-        let base_perm = &base_perm;
-        let ranked_by_cnt = &ranked_by_cnt;
-        let cnt_by_v = &cnt_by_v;
-        let mut ptasks: Vec<parallel::PermFn> = Vec::new();
-        for &t in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
-            if t >= n {
-                break;
-            }
-            for tail_by_deg in [true, false] {
-                ptasks.push(Box::new(move || {
-                    let mut fat = vec![false; n];
-                    for &v in &ranked_by_cnt[..t] {
-                        fat[v] = true;
-                    }
+        {
+            let base_perm = best_perm.clone();
+            let mut ranked_by_cnt: Vec<usize> = (0..n).collect();
+            ranked_by_cnt.sort_unstable_by(|&a, &b| cnt_by_v[b].cmp(&cnt_by_v[a]).then(a.cmp(&b)));
+            for &t in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
+                if t >= n {
+                    break;
+                }
+                let mut fat = vec![false; n];
+                for &v in &ranked_by_cnt[..t] {
+                    fat[v] = true;
+                }
+                for tail_by_deg in [true, false] {
                     let mut cand: Vec<usize> = Vec::with_capacity(n);
-                    for &v in base_perm {
+                    for &v in &base_perm {
                         if !fat[v] {
                             cand.push(v);
                         }
@@ -3555,8 +2628,19 @@ fn order_with_options(
                         tail.sort_unstable_by_key(|&v| (cnt_by_v[v], v));
                     }
                     cand.extend(tail);
-                    Some(cand)
-                }));
+                    if is_bijection(&cand, n) {
+                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            cached
+                        } else {
+                            ws.flops(&scoring_pat, &cand)
+                        };
+                        insert_top_seed(&mut top_seeds, f, &cand, max_telos_seeds);
+                        if f < best_flops {
+                            best_flops = f;
+                            best_perm = cand;
+                        }
+                    }
+                }
             }
         }
 
@@ -3568,28 +2652,37 @@ fn order_with_options(
         // find (that phase relabels RANDOMLY; this relabels by an objective
         // signal).
         for desc in [false, true] {
-            ptasks.push(Box::new(move || {
-                let mut q: Vec<usize> = (0..n).collect();
-                if desc {
-                    q.sort_unstable_by(|&a, &b| cnt_by_v[b].cmp(&cnt_by_v[a]).then(a.cmp(&b)));
+            let mut q: Vec<usize> = (0..n).collect();
+            if desc {
+                q.sort_unstable_by(|&a, &b| cnt_by_v[b].cmp(&cnt_by_v[a]).then(a.cmp(&b)));
+            } else {
+                q.sort_unstable_by(|&a, &b| cnt_by_v[a].cmp(&cnt_by_v[b]).then(a.cmp(&b)));
+            }
+            let bpat = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+            let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+                continue;
+            };
+            let Ok(pb) = feral_amd::amd_order(&bcore) else {
+                continue;
+            };
+            let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+            if is_bijection(&cand, n) {
+                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                    cached
                 } else {
-                    q.sort_unstable_by(|&a, &b| cnt_by_v[a].cmp(&cnt_by_v[b]).then(a.cmp(&b)));
+                    ws.flops(&scoring_pat, &cand)
+                };
+                insert_top_seed(&mut top_seeds, f, &cand, max_telos_seeds);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
                 }
-                let bpat = permute_pattern(scoring_pat, &q);
-                let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
-                let pb = feral_amd::amd_order(&bcore).ok()?;
-                Some(pb.iter().map(|&x| q[x as usize]).collect())
-            }));
+            }
         }
-
-        let mut res = parallel::run_perms(&ptasks, scoring_pat, n, nnz, best_flops);
-        parallel::accept(&mut res, &mut best_flops, &mut best_perm, |_| {});
     }
 
-#[cfg(test)]
-    parallel::phase_mark("3.peel_cntrel", _tp3);
     // ── SHOT-3-ONLY: FILLED-GRAPH REORDER + STRIP-V2 (`sbx-families2`) ──
     // Same hand-rolled discipline as the PEEL/COUNT-RELABEL block above
     // (reads `best_perm` directly, so cannot route through `consider`).
@@ -3599,8 +2692,6 @@ fn order_with_options(
     // its own. Gated `nnz < FILLG_STRIPV2_MAX_NNZ` — see that constant's doc
     // for why it deliberately reuses the tighter PEEL/COUNT-RELABEL ceiling
     // rather than either family's own wider probed gate.
-#[cfg(test)]
-    let _tp4 = std::time::Instant::now();
     if nnz > 0 && nnz < FILLG_STRIPV2_MAX_NNZ {
         let permuted2 = permute_pattern(&scoring_pat, &best_perm);
         let etree2 = EliminationTree::from_pattern(&permuted2);
@@ -3611,19 +2702,31 @@ fn order_with_options(
             cnt_by_v2[v] = counts2[pos];
         }
 
+        let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
         // (`sub_amd_nd` / sv2dnd DROPPED — see `STRIPV2_DENSE_SPLIT_AVG_DEG`'s
         // doc for the RCA. Plain no-dense AMD is still used, unrelatedly, by
-        // FILLG below via a direct `amd_order_opts` call. The surviving
-        // sub-orderers are now built inside each parallel task: they are
-        // stateless, and `strip_general_v2` takes a non-`Sync` `&dyn Fn`.)
-        //
-        // PARALLELIZED (arm/parallel): sv2inc's 2 candidates and the
-        // dense-class's 3 are all pure functions of the block-entry snapshots
-        // (`cnt_by_v2`, the pattern) — none reads the incumbent as it moves —
-        // so the two families form one running-minimum chain in this source
-        // order and reduce to the earliest strict argmin over the combined
-        // list. FILLG is NOT in that list: it reads `best_perm` AFTER these
-        // may have replaced it, so it runs after, in its own 2-task batch.
+        // FILLG below via a direct `amd_order_opts` call.)
+        let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
+            let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+            feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+        };
+
+        let mut try_cand = |cand_opt: Option<Vec<usize>>, best_flops: &mut u64, best_perm: &mut Vec<usize>, top_seeds: &mut Vec<(u64, Vec<usize>)>| {
+            let Some(cand) = cand_opt else { return };
+            if !is_bijection(&cand, n) {
+                return;
+            }
+            let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                cached
+            } else {
+                ws.flops(&scoring_pat, &cand)
+            };
+            insert_top_seed(top_seeds, f, &cand, max_telos_seeds);
+            if f < *best_flops {
+                *best_flops = f;
+                *best_perm = cand;
+            }
+        };
 
         // ---- STRIP-V2 sv2inc: ranked by INCUMBENT exact column count
         // (not baseline-AMD's loose degree, unlike the shipped strip
@@ -3642,33 +2745,16 @@ fn order_with_options(
         // shipped strip transform's own precedent of keeping a small subset
         // that captures most of a k-sweep's value) — roughly halves this
         // family's cost for a small, not-yet-isolated loss of diversity.
-        // Both rankings and the dense-class decision are computed BEFORE the
-        // task vector so they outlive it (locals drop in reverse declaration
-        // order, and the queued closures borrow them).
-        let mut ranked: Vec<usize> = (0..n).collect();
-        ranked.sort_unstable_by(|&a, &b| cnt_by_v2[b].cmp(&cnt_by_v2[a]).then(a.cmp(&b)));
-        let dense_class =
-            nnz >= STRIPV2_DENSE_MIN_AVG_DEG * n || nnz >= STRIPV2_DENSE_MIN_NNZ;
-        let mut deg_ranked_v2: Vec<usize> = Vec::new();
-        if dense_class {
-            deg_ranked_v2 = (0..n).collect();
-            deg_ranked_v2.sort_unstable_by(|&a, &b| {
-                let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
-                let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
-                db.cmp(&da).then(a.cmp(&b))
-            });
-        }
-        let ranked = &ranked;
-        let deg_ranked_v2 = &deg_ranked_v2;
-        let mut vtasks: Vec<parallel::PermFn> = Vec::new();
-        for &k in &[24usize, 96] {
-            if k >= n {
-                break;
+        {
+            let mut ranked: Vec<usize> = (0..n).collect();
+            ranked.sort_unstable_by(|&a, &b| cnt_by_v2[b].cmp(&cnt_by_v2[a]).then(a.cmp(&b)));
+            for &k in &[24usize, 96] {
+                if k >= n {
+                    break;
+                }
+                let cand = strip_general_v2(&scoring_pat, &ranked, k, &sub_amd);
+                try_cand(cand, &mut best_flops, &mut best_perm, &mut top_seeds);
             }
-            vtasks.push(Box::new(move || {
-                let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
-                strip_general_v2(scoring_pat, ranked, k, &sub_amd)
-            }));
         }
 
         // ---- STRIP-V2 dense-class: ranked by TRUE degree, gated to the
@@ -3693,29 +2779,30 @@ fn order_with_options(
         // (0.207s vs sv2damd's 0.287s at density 46 on the breaching
         // matrix) and AMF's dense_alpha handling is the more natural fit
         // there; `sub_amd` covers the lower part of the dense-class band.
+        let dense_class =
+            nnz >= STRIPV2_DENSE_MIN_AVG_DEG * n || nnz >= STRIPV2_DENSE_MIN_NNZ;
         if dense_class {
-            let use_amf5 = nnz as f64 / n as f64 >= STRIPV2_DENSE_SPLIT_AVG_DEG;
+            let mut deg_ranked: Vec<usize> = (0..n).collect();
+            deg_ranked.sort_unstable_by(|&a, &b| {
+                let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
+                let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
+                db.cmp(&da).then(a.cmp(&b))
+            });
+            let avg_deg = nnz as f64 / n as f64;
+            let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                if avg_deg >= STRIPV2_DENSE_SPLIT_AVG_DEG {
+                    &sub_amf5
+                } else {
+                    &sub_amd
+                };
             for &k in &[8usize, 32, 64] {
                 if k >= n {
                     break;
                 }
-                vtasks.push(Box::new(move || {
-                    let sub_amd =
-                        |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
-                    let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
-                        let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
-                        feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
-                    };
-                    let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                        if use_amf5 { &sub_amf5 } else { &sub_amd };
-                    strip_general_v2(scoring_pat, deg_ranked_v2, k, sub)
-                }));
+                let cand = strip_general_v2(&scoring_pat, &deg_ranked, k, sub);
+                try_cand(cand, &mut best_flops, &mut best_perm, &mut top_seeds);
             }
         }
-
-        let mut vres = parallel::run_perms(&vtasks, scoring_pat, n, nnz, best_flops);
-        parallel::accept(&mut vres, &mut best_flops, &mut best_perm, |_| {});
-        drop(vtasks);
 
         // ---- FILLED-GRAPH REORDER: gated on the incumbent's OWN exact
         // fill (`lnnz`, already computed above), independent of nnz(A).
@@ -3724,31 +2811,21 @@ fn order_with_options(
         // motivated both this and the tighter gate.
         if lnnz <= FILLG_MAX_LNNZ {
             if let Some((fcp, fri)) = filled_graph(&scoring_pat, &best_perm, FILLG_MAX_LNNZ) {
-                // The two orderings of the SAME filled graph are independent of
-                // each other and were compared in this order against a running
-                // minimum, so they batch cleanly.
-                let (fcp, fri) = (&fcp, &fri);
-                let mut ftasks: Vec<parallel::PermFn> = Vec::new();
-                ftasks.push(Box::new(move || {
-                    let fcore = feral_ordering_core::CscPattern::new(n, fcp, fri)?;
-                    let p = feral_amd::amd_order(&fcore).ok()?;
-                    Some(p.into_iter().map(|x| x as usize).collect())
-                }));
-                ftasks.push(Box::new(move || {
-                    let fcore = feral_ordering_core::CscPattern::new(n, fcp, fri)?;
-                    let nd_opts =
-                        feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
-                    let (p, ..) = feral_amd::amd_order_opts(&fcore, &nd_opts).ok()?;
-                    Some(p.into_iter().map(|x| x as usize).collect())
-                }));
-                let mut fres = parallel::run_perms(&ftasks, scoring_pat, n, nnz, best_flops);
-                parallel::accept(&mut fres, &mut best_flops, &mut best_perm, |_| {});
+                if let Some(fcore) = feral_ordering_core::CscPattern::new(n, &fcp, &fri) {
+                    if let Ok(p) = feral_amd::amd_order(&fcore) {
+                        let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                        try_cand(Some(cand), &mut best_flops, &mut best_perm, &mut top_seeds);
+                    }
+                    let nd_opts = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                    if let Ok((p, ..)) = feral_amd::amd_order_opts(&fcore, &nd_opts) {
+                        let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                        try_cand(Some(cand), &mut best_flops, &mut best_perm, &mut top_seeds);
+                    }
+                }
             }
         }
     }
 
-#[cfg(test)]
-    parallel::phase_mark("4.shot3", _tp4);
     // ── TELOS-GRADIENT DESCENT — see the `TELOS_*` constants' doc comment
     // for the rationale, the measured per-bucket marginal, and the cost
     // model. Runs LAST so the counts it descends on are the final
@@ -3757,30 +2834,119 @@ fn order_with_options(
     // through the reused workspace). Deterministic: every candidate is a
     // pure function of (`best_perm`, pattern) with total-order tie-breaks,
     // and only a strict improvement is ever kept (AMD floor intact).
-#[cfg(test)]
-    let _tp5 = std::time::Instant::now();
     if nnz > 0 && nnz < TELOS_MAX_NNZ {
-        let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
-        let (p, f) = telos_descend(
-            scoring_pat,
-            nnz,
-            &best_perm,
-            best_flops,
-            max_rounds,
-            prio,
-            passes,
-            peel_grid,
-            0,
-        );
-        if f < best_flops {
-            best_flops = f;
-            best_perm = p;
+        let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+        let sub_nd = |c: &feral_ordering_core::CscPattern| {
+            let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+            feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
+        };
+        let sub_mf = |c: &feral_ordering_core::CscPattern| {
+            let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+            feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+        };
+
+        let (max_rounds, prio, passes, peel_grid): (usize, &[(u8, usize)], usize, &[usize]) =
+            if nnz < TELOS_TIER_A_MAX_NNZ {
+                (
+                    2,
+                    &TELOS_PRIO[..],
+                    (TELOS_BUDGET_A / nnz).clamp(TELOS_MIN_PASSES_A, TELOS_MAX_PASSES_A),
+                    &TELOS_PEEL_A[..],
+                )
+            } else {
+                // Tier B (150k..TELOS_MAX_NNZ): eval-bound class — ONE round,
+                // minimal eval count. See the cap-calibration re-gate note on
+                // the `TELOS_*` constants.
+                (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
+            };
+
+        let seeds_to_run = std::mem::take(&mut top_seeds);
+        for (seed_idx, (seed_f, seed_p)) in seeds_to_run.into_iter().enumerate() {
+            if seed_idx > 0 && seed_f > best_flops.saturating_mul(110) / 100 {
+                continue;
+            }
+            let rounds_for_seed = if seed_idx == 0 { max_rounds } else { 1 };
+            let mut cur_perm = seed_p;
+            let mut cur_flops = ws.flops(&scoring_pat, &cur_perm);
+            for _round in 0..rounds_for_seed {
+                let permuted = permute_pattern(&scoring_pat, &cur_perm);
+                let etree = EliminationTree::from_pattern(&permuted);
+                let counts = column_counts_gnp(&permuted, &etree);
+                let mut cnt = vec![0usize; n];
+                for (pos, &v) in cur_perm.iter().enumerate() {
+                    cnt[v] = counts[pos];
+                }
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+
+                let mut round_f = cur_flops;
+                let mut round_p: Option<Vec<usize>> = None;
+                let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
+                    };
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
+                };
+
+                for &(subi, k) in prio.iter().take(passes) {
+                    if k >= n {
+                        continue;
+                    }
+                    let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                        match subi {
+                            0 => &sub_amd,
+                            1 => &sub_nd,
+                            _ => &sub_mf,
+                        };
+                    if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
+                        try_cand(cand, &mut round_f, &mut round_p);
+                    }
+                }
+
+                for &k in peel_grid {
+                    if k >= n {
+                        continue;
+                    }
+                    let mut fat = vec![false; n];
+                    for &v in &ranked[..k] {
+                        fat[v] = true;
+                    }
+                    let mut cand: Vec<usize> = Vec::with_capacity(n);
+                    for &v in &cur_perm {
+                        if !fat[v] {
+                            cand.push(v);
+                        }
+                    }
+                    let mut tail: Vec<usize> = ranked[..k].to_vec();
+                    tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+                    cand.extend(tail);
+                    try_cand(cand, &mut round_f, &mut round_p);
+                }
+
+                match round_p {
+                    Some(p) if round_f < cur_flops => {
+                        cur_flops = round_f;
+                        cur_perm = p;
+                    }
+                    _ => break,
+                }
+            }
+
+            if cur_flops < best_flops {
+                best_flops = cur_flops;
+                best_perm = cur_perm;
+            }
         }
     }
-    let telos_end_flops = best_flops;
 
-#[cfg(test)]
-    parallel::phase_mark("5.telos", _tp5);
     // Snapshot of the incumbent BEFORE either completion-lattice descent
     // phase runs. The MINL block below may update `best_perm` in place;
     // Component B (further below) deliberately starts from THIS pre-descent
@@ -3796,28 +2962,8 @@ fn order_with_options(
     // Runs LAST (after telos) so it minimalizes the FINAL incumbent's
     // completion. Deterministic: fixed scan order, all budgets pure
     // functions of the pattern, strictly-better-only keep.
-    //
-    // PARALLEL SIBLINGS (arm/parallel): MINL and Component B/ORBIT are the two
-    // most expensive post-hoc phases and they are INDEPENDENT of each other —
-    // ORBIT was already written to start from `pre_orbit_perm`, the incumbent
-    // snapshot taken above, and MINL's own `best_perm` at this point IS that
-    // same permutation (nothing between the snapshot and here writes it). So
-    // both descend the same starting completion and neither reads the other's
-    // result; queueing them as a 2-task batch and accepting the earliest strict
-    // argmin (MINL first, ORBIT second — the sequential order) is exact.
-#[cfg(test)]
-    let _tp6 = std::time::Instant::now();
-    let base_desc = &pre_orbit_perm;
-    let mut dtasks: Vec<parallel::PermFn> = Vec::new();
-    if nnz > 0 && nnz < MINL_MAX_NNZ && !minl_off() {
-        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
-            #[cfg(test)]
-            parallel::phase_mark("minl.filled_graph", _t);
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
+    if nnz > 0 {
+        if let Some((fcp, fri)) = filled_graph(&scoring_pat, &best_perm, MINL_MAX_LNNZ) {
             // Filled-graph adjacency (sorted, original ids) and sorted
             // A-adjacency for fill-edge classification.
             let mut adj: Vec<Vec<u32>> = (0..n)
@@ -3856,10 +3002,6 @@ fn order_with_options(
             // front — measured: id-order lost the gams03/gams04/arki0009
             // wins to exactly that drain). Counting sort by degree-sum:
             // exact, stable (ties keep (u,v) id order), O(E + n).
-            #[cfg(test)]
-            parallel::phase_mark("minl.build_adj_fill", _t);
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
             let scan_order: Vec<u32> = {
                 let mut keys: Vec<usize> = Vec::with_capacity(fill.len());
                 let mut maxk = 0usize;
@@ -3882,10 +3024,6 @@ fn order_with_options(
                 }
                 out
             };
-            #[cfg(test)]
-            parallel::phase_mark("minl.scan_order", _t);
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
             let mut ops = MINL_OPS_BUDGET;
             let mut alive = vec![true; fill.len()];
             let mut removed_total = 0usize;
@@ -3911,77 +3049,21 @@ fn order_with_options(
                 }
                 removed_total += removed_this;
             }
-            #[cfg(test)]
-            parallel::phase_mark("minl.delete_rounds", _t);
-            if removed_total == 0 {
-                return None;
-            }
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            let peo = minl_mcs_peo(n, &adj);
-            #[cfg(test)]
-            parallel::phase_mark("minl.mcs_peo", _t);
-            Some(peo)
-        }));
-
-        // Proven witness-driven sibling from the previous promoted frontier.
-        // The new four-thread carrier runs it concurrently with ordinary MINL
-        // and ORBIT, restoring its independent completion basin without adding
-        // their wall times serially.
-        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
-            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
-            let mut adj: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    fri[fcp[v] as usize..fcp[v + 1] as usize]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .collect()
-                })
-                .collect();
-            let asort: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    let mut c: Vec<u32> = scoring_pat.row_idx
-                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .filter(|&x| x as usize != v)
-                        .collect();
-                    c.sort_unstable();
-                    c
-                })
-                .collect();
-            let mut fill: Vec<(u32, u32)> = Vec::new();
-            for u in 0..n {
-                for &wv in &adj[u] {
-                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
-                        fill.push((u as u32, wv));
+            if removed_total > 0 {
+                let cand = minl_mcs_peo(n, &adj);
+                if is_bijection(&cand, n) {
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
+                    };
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = cand;
                     }
                 }
             }
-            if n > WATCH_MINL_MAX_N
-                || fill.is_empty()
-                || fill.len() > WATCH_MINL_MAX_FILL
-                || fill.len().saturating_mul(5) < fri.len()
-            {
-                return None;
-            }
-            let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
-            ids.sort_unstable_by_key(|&i| {
-                let (u, v) = fill[i as usize];
-                (adj[u as usize].len() + adj[v as usize].len(), i)
-            });
-            let result = watcher_minimalize(
-                &mut adj,
-                &fill,
-                &ids,
-                WATCH_MINL_OPS_BUDGET,
-                WATCH_MINL_MAX_COMMON,
-            );
-            if result.removed == 0 {
-                return None;
-            }
-            Some(minl_mcs_peo(n, &adj))
-        }));
+        }
     }
 
     // ── COMPONENT B: ORBIT-BATCHED COMPLETION-LATTICE DESCENT — see the
@@ -3999,8 +3081,7 @@ fn order_with_options(
     // cap breach on the giants (gams04, watercontamination0202/0303,
     // transswitch2736spp) in the first submission of this build.
     if orbit_enabled && nnz > 0 && n <= ORBIT_MAX_N {
-        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
-            let (fcp, fri) = filled_graph(scoring_pat, base_desc, ORBIT_MAX_LNNZ)?;
+        if let Some((fcp, fri)) = filled_graph(&scoring_pat, &pre_orbit_perm, ORBIT_MAX_LNNZ) {
             let mut adj: Vec<Vec<u32>> = (0..n)
                 .map(|v| {
                     fri[fcp[v] as usize..fcp[v + 1] as usize]
@@ -4029,30 +3110,32 @@ fn order_with_options(
                     }
                 }
             }
-            if fill.is_empty() {
-                return None;
-            }
-            // Step 0 (detect): 1-WL color refinement on the PATTERN
-            // graph (never the filled graph — see the doc comment).
-            let (class, _num_classes) = orbit_wl_classes(n, &asort, ORBIT_WL_MAX_ROUNDS);
+            let m = fill.len();
+            if m > 0 {
+                // Step 0 (detect): 1-WL color refinement on the PATTERN
+                // graph (never the filled graph — see the doc comment).
+                let (class, _num_classes) = orbit_wl_classes(n, &asort, ORBIT_WL_MAX_ROUNDS);
 
-            // Steps 1-3 (orbit-index, prioritize, batched delete).
-            let removed_total = orbit_batched_delete(&mut adj, &fill, &class);
-            if removed_total == 0 {
-                return None;
+                // Steps 1-3 (orbit-index, prioritize, batched delete).
+                let removed_total = orbit_batched_delete(&mut adj, &fill, &class);
+                if removed_total > 0 {
+                    let cand = minl_mcs_peo(n, &adj);
+                    if is_bijection(&cand, n) {
+                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            cached
+                        } else {
+                            ws.flops(&scoring_pat, &cand)
+                        };
+                        if f < best_flops {
+                            best_flops = f;
+                            best_perm = cand;
+                        }
+                    }
+                }
             }
-            Some(minl_mcs_peo(n, &adj))
-        }));
+        }
     }
 
-    {
-        let mut dres = parallel::run_perms(&dtasks, scoring_pat, n, nnz, best_flops);
-        parallel::accept(&mut dres, &mut best_flops, &mut best_perm, |_| {});
-    }
-    drop(dtasks);
-
-#[cfg(test)]
-    parallel::phase_mark("6.minl_orbit", _tp6);
     // ── PHARMAKOS ORDERING — see the `PHARMAKOS_*` constants' doc comment
     // for the theorem, the CAMD stand-in, and the batch simplification.
     // Runs LAST (after MINL and Component B/ORBIT) so blame is computed on
@@ -4066,8 +3149,6 @@ fn order_with_options(
     // intact transitively). Disjoint gate from ORBIT (`PHARMAKOS_MAX_NNZ` vs
     // `ORBIT_MAX_N`/`ORBIT_MAX_LNNZ`) — each phase's cap-safety identity
     // argument holds independent of whether the other phase ran.
-#[cfg(test)]
-    let _tp7 = std::time::Instant::now();
     if pharmakos_enabled && nnz > 0 && nnz < PHARMAKOS_MAX_NNZ {
         let mut arena_perm = best_perm.clone();
         let mut arena_flops = best_flops;
@@ -4156,209 +3237,6 @@ fn order_with_options(
         }
     }
 
-#[cfg(test)]
-    parallel::phase_mark("7.pharmakos", _tp7);
-    // ── RGREEDY — randomized exact elimination-game search (small tier) ─────
-    // A genuinely NEW candidate family, not another separator/relabel variant:
-    // it maintains the EXACT fill graph as bitsets and runs tens of thousands
-    // of randomized exact-minimum-degree eliminations, accumulating `Σ c_j²`
-    // for free from the elimination-game identity (so there is no per-candidate
-    // scoring pass and a partial sum that already reaches the incumbent aborts
-    // the run mid-flight), then spends ~15/16 of its budget on a prefix-freezing
-    // LNS around the incumbent. See `rgreedy.rs`.
-    //
-    // Runs LAST, strictly-improving over whatever the whole pipeline produced,
-    // so it is monotone by construction: it cannot perturb any earlier phase's
-    // seed incumbent (the non-monotonicity trap this repo has hit with TELOS),
-    // and the measured per-matrix deltas are exactly what `probe_rgreedy`
-    // predicts against the shipped `order()`.
-    //
-    // GATES. `RGREEDY_MAX_N` = 3000: memory is ~n²/4 bytes (two bitset
-    // adjacency copies), but the binding constraint is TIME GRANULARITY, not
-    // memory — a single randomized greedy run is atomic (it must eliminate all
-    // n vertices to yield an ordering), and its cost grows as
-    // `O(n² + nnz(L)·⌈n/64⌉)`. Measured added WALL time on 4 threads at
-    // 200M ops/stream: p50 0.071 s / p90 0.086 s / MAX 0.107 s for n <= 3000,
-    // but 0.19-0.41 s for 3000 < n <= 10000, where two or three runs already
-    // exhaust the budget. That band was measured separately (13 of 44 dev
-    // matrices improve, worth -0.00022) and is deliberately NOT shipped: the
-    // value is a tenth of the small tier's and the cost is four times as
-    // large.
-    //
-    // `RGREEDY_MAX_NNZ` = 250_000. Density is NOT a cost driver for this phase
-    // — the bitset word count is `⌈n/64⌉` regardless of nnz, so
-    // `maxcsp-ehi-85-297-71` (n=2372, nnz=207_996) costs 0.049 s and `qapw`
-    // (n=705, nnz=87_496) 0.066 s, both cheaper than sparse matrices half
-    // their size. The earlier 60_000 ceiling was a proxy for "the frontier is
-    // already slow here", which the parallel portfolio has since fixed.
-    //
-    // `RGREEDY_BUDGET` is a PER-STREAM budget in WORD-OPERATIONS, never
-    // wall-clock: determinism requires the stopping rule be a pure function of
-    // the pattern, and the grader's clock is ~2.6x slower than this box on
-    // bitset work, so a wall-clock rule tuned locally would silently overrun
-    // there. Two mechanisms keep the ops budget an upper bound on work rather
-    // than a lower one: the loop reserves the previous run's measured cost
-    // before starting another (a run cannot be stopped halfway and still yield
-    // an ordering), and `Game::run` hard-stops at 1.25x the budget so an
-    // unseen matrix whose randomized fill explodes cannot overshoot by a whole
-    // run. Without the first of these the same budget cost 0.32 s instead of
-    // 0.08 s at n≈5000.
-    //
-    // FOUR STREAMS instead of one. The grader has 4 vCPUs, so four independent
-    // searches cost the same wall time as one and buy 4x the search. Measured
-    // A/B: one stream at 300M ops scores -0.00197 with p50 0.076 s / MAX
-    // 0.144 s added; four streams at 200M each score -0.00236 with p50
-    // 0.071 s / MAX 0.107 s — better on BOTH axes. Each stream is a pure
-    // function of `(pattern, incumbent, budget, stream index)` with no shared
-    // state, and the merge is a strict argmin walked in stream-index order, so
-    // the output is byte-identical regardless of completion order or thread
-    // count (`rgreedy::search_seed` is the unit a task queue can schedule).
-    const RGREEDY_MAX_N: usize = 3_000;
-    const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
-    #[cfg(test)]
-    let _tp = std::time::Instant::now();
-    if rgreedy_enabled && n <= RGREEDY_MAX_N && nnz <= RGREEDY_MAX_NNZ && nnz > 0 {
-        if let Some((cand, _)) = rgreedy::search_par(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            best_flops,
-            RGREEDY_BUDGET,
-            0x9E37_79B9_7F4A_7C15,
-        ) {
-            // Never trust the elimination-game accumulator: re-score through
-            // the same trusted path every other candidate goes through, and
-            // keep the result only on a STRICT improvement.
-            if is_bijection(&cand, n) {
-                let f = ws.flops(&scoring_pat, &cand);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = cand;
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    parallel::phase_mark("8.rgreedy", _tp);
-
-    #[cfg(test)]
-    let _tp9 = std::time::Instant::now();
-    // ── TELOS MULTI-START / MULTI-MOVE-SET (descent arm) ────────────────────
-    // See the `TELOS_MS_*` constants for the measured move-set table, the seed
-    // sensitivity this exploits, the work-proxy budget and the hub guard.
-    // Runs after EVERY other phase (rgreedy included — measured: 6 losses when
-    // placed before it, 0 after), so its only effect is
-    // `best_flops = min(best_flops, descents)` and it cannot regress the
-    // score; the whole cost is time.
-    //
-    // Deterministic: the plan, the descent count, the seed list and the dedup
-    // key are all pure functions of the pattern, and `telos_descend` accepts
-    // only bijections that strictly improve.
-    let telos_ms = telos_ms_count(telos_ms, n, nnz, max_deg);
-    if telos_ms > 0 {
-        let (max_rounds, prio, passes, peel_grid) = telos_schedule(nnz);
-        // Seed slots, in `TELOS_MS_PLAN`'s numbering.
-        // Snapshot the incumbent: the queued descents borrow their seed for as
-        // long as the batch lives, and the acceptance below writes
-        // `best_perm`.
-        let seed_perm = best_perm.clone();
-        let slots: [(u64, &[usize]); 2] =
-            [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
-        // `telos_end_flops` is where the shipped TELOS phase came to rest under
-        // the SHIPPED ranking (mode 0); re-descending mode 0 from a seed at
-        // that exact value would re-walk a descent already known to be
-        // exhausted, so it is pre-marked done.
-        let mut done: Vec<(u64, u8)> = vec![(telos_end_flops, 0)];
-        let mut used = 0usize;
-        // WHICH descents run is decided ENTIRELY UP FRONT (arm/parallel): the
-        // plan, the seed slots, the dedup key `(seed flops, mode)` and the
-        // budget are all pure functions of the pattern — no entry's
-        // admission depends on any earlier descent's RESULT. So the selection
-        // walk below produces the same list whether or not the descents have
-        // run, and the descents themselves can all run concurrently. The
-        // sequential version then took `winner` = the first entry, in plan
-        // order, attaining the strict minimum below `best_flops` — exactly
-        // `parallel::accept` over the plan-ordered task list.
-        let mut plan: Vec<(usize, u8)> = Vec::new();
-        for &(slot, mode) in TELOS_MS_PLAN.iter() {
-            if used >= telos_ms {
-                break;
-            }
-            let (sf, _) = slots[slot as usize];
-            let key = (sf, mode);
-            if done.contains(&key) {
-                continue;
-            }
-            done.push(key);
-            used += 1;
-            plan.push((slot as usize, mode));
-        }
-        let mut mtasks: Vec<parallel::PermFn> = Vec::new();
-        for &(slot, mode) in plan.iter() {
-            let (sf, sperm) = slots[slot];
-            mtasks.push(Box::new(move || {
-                let (p, _f) = telos_descend(
-                    scoring_pat,
-                    nnz,
-                    sperm,
-                    sf,
-                    max_rounds,
-                    prio,
-                    passes,
-                    peel_grid,
-                    mode,
-                );
-                Some(p)
-            }));
-        }
-        let mut mres = parallel::run_perms(&mtasks, scoring_pat, n, nnz, best_flops);
-        parallel::accept(&mut mres, &mut best_flops, &mut best_perm, |_| {});
-    }
-
-    #[cfg(test)]
-    parallel::phase_mark("9.telos_ms", _tp9);
-
-    #[cfg(test)]
-    let _tp10 = std::time::Instant::now();
-    // ── FINAL EXACT ADJACENT-PAIR DESCENT ─────────────────────────────────
-    // Independent sibling after final TELOS: replay the exact elimination
-    // graph and locally orient disjoint adjacent pivot pairs by current degree.
-    // For an adjacent pair, both orientations have the same second-pivot
-    // degree and leave the same residual graph, so lower-degree-first is an
-    // exact strict improvement; alternating parity covers every boundary.
-    //
-    // The theorem and internal accumulator are not trusted for admission:
-    // malformed input, a hard-op-budget exit, or no swap returns None; any
-    // candidate must still be a bijection and beat the existing FINAL score
-    // through the shared exact scorer. No downstream phase consumes it.
-    if n >= PAIR_DESCENT_MIN_N
-        && n <= PAIR_DESCENT_MAX_N
-        && nnz > 0
-        && nnz <= PAIR_DESCENT_MAX_NNZ
-    {
-        if let Some(cand) = rgreedy::adjacent_pair_descent(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            PAIR_DESCENT_SWEEPS,
-            PAIR_DESCENT_OPS_BUDGET,
-        ) {
-            if is_bijection(&cand, n) {
-                let f = ws.flops(scoring_pat, &cand);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = cand;
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-    parallel::phase_mark("10.pair_descent", _tp10);
     let _ = best_flops;
 
     best_perm
