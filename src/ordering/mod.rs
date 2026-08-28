@@ -4513,8 +4513,23 @@ fn order_with_options(
         max_blocks: 96,
         budget: 5_000_000,
         streams: 2,
+        rank_blocks: false,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        // Sparse-large RGSUB is breadth-limited, but postorder position is an
+        // arbitrary way to spend that breadth. Rank eligible disjoint blocks
+        // by their exact incumbent contribution and search the top 64. Against
+        // the promoted 96-block selector this cuts block-search work by one
+        // third while improving the exact dev score (2 wins, 2 losses).
+        let rgsub_cfg = if n >= 10_000 && nnz <= RGSUB_MAX_NNZ {
+            rgreedy::SubCfg {
+                max_blocks: 64,
+                rank_blocks: true,
+                ..RGSUB_CFG
+            }
+        } else {
+            RGSUB_CFG
+        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4540,7 +4555,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);

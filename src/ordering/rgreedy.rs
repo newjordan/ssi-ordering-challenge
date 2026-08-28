@@ -1098,9 +1098,31 @@ pub(crate) fn subtree_refine(
             *c = true;
         }
         blocks.push((a, j));
-        if blocks.len() >= cfg.max_blocks {
+        if !cfg.rank_blocks && blocks.len() >= cfg.max_blocks {
             break;
         }
+    }
+    if cfg.rank_blocks {
+        let mut ranked: Vec<(usize, usize, u64)> = blocks
+            .drain(..)
+            .map(|(a, b)| {
+                let contribution = counts[a..=b]
+                    .iter()
+                    .map(|&c| {
+                        let c = c as u64;
+                        c * c
+                    })
+                    .sum();
+                (a, b, contribution)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+        blocks.extend(
+            ranked
+                .into_iter()
+                .take(cfg.max_blocks)
+                .map(|(a, b, _)| (a, b)),
+        );
     }
     if blocks.is_empty() {
         return 0;
@@ -1187,6 +1209,14 @@ pub(crate) fn subtree_refine(
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         for k in 0..cfg.streams.max(1) {
+                            // Keep the same two searches and uniform-prefix
+                            // stream-1 policy, but use PEP's promoted second
+                            // seed to sample an independent subtree basin.
+                            let rng_seed = if n >= 10_000 && k == 1 {
+                                0xD1B5_4A32_D192_ED03
+                            } else {
+                                stream_rng(k)
+                            };
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1194,7 +1224,7 @@ pub(crate) fn subtree_refine(
                                 &seed,
                                 seed_flops,
                                 cfg.budget,
-                                stream_rng(k),
+                                rng_seed,
                                 stream_params(k),
                             );
                             if let Some((o, f)) = r {
@@ -1246,4 +1276,7 @@ pub(crate) struct SubCfg {
     /// Streams per block (sequential here; the caller parallelises over
     /// blocks, which is the coarser and cheaper axis).
     pub(crate) streams: usize,
+    /// Select blocks by exact incumbent objective contribution instead of
+    /// postorder position before applying `max_blocks`.
+    pub(crate) rank_blocks: bool,
 }
