@@ -217,6 +217,10 @@ mod biconn;
 /// relabelled-AMD/AMF multi-start, which can only perturb an APPROXIMATE
 /// minimum-degree code's internal tie-breaks. See its module doc.
 mod rgreedy;
+/// EXACT-BIPARTITE SCHUR-SIDE SIBLINGS — stable-filter the final incumbent
+/// into either colour class first. Connected two-colourable inputs only; each
+/// direction is independently bounded by its first-side pair work.
+mod bipartite_schur;
 /// Bounded (max 4-thread) OUTPUT-IDENTICAL parallelism for the candidate
 /// portfolio and the post-hoc phases' independent candidate batches. See its
 /// module doc for the argument that thread completion order decides nothing.
@@ -894,6 +898,21 @@ const TELOS_MS_HUB_MIN_NNZ: usize = 100_000;
 /// plan's move-set entries the marginal collapses, so a tiny matrix buying 16
 /// descents from `TELOS_MS_WORK_BUDGET / est` would spend time for nothing.
 const TELOS_MS_MAX_DESCENTS: usize = TELOS_MS_PLAN.len();
+
+/// Final exact-bipartite Schur-side siblings. The structural pass is linear in
+/// `n + nnz`; at most two stable-filter candidates reach the trusted scorer.
+/// `sum choose(degree, 2)` bounds the first-side Schur pair generation in each
+/// direction independently, so a hub-heavy side can fail closed without
+/// suppressing the cheap reverse direction.
+const BIPARTITE_SCHUR_MAX_N: usize = 10_000;
+const BIPARTITE_SCHUR_MAX_NNZ: usize = 60_000;
+const BIPARTITE_SCHUR_PAIR_WORK_BUDGET: u64 = 250_000;
+
+#[cfg(test)]
+thread_local! {
+    static RGSUB_DEFAULT_PATH_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// How many entries of [`TELOS_MS_PLAN`] this matrix may run. Pure function of
 /// `(n, nnz, max_deg)` — never wall-clock — so both required `order()` runs
@@ -4435,6 +4454,9 @@ fn order_with_options(
         streams: 2,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        #[cfg(test)]
+        RGSUB_DEFAULT_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
+
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4472,6 +4494,38 @@ fn order_with_options(
                 }
             } else {
                 break;
+            }
+        }
+    }
+
+    // ── FINAL EXACT-BIPARTITE SCHUR-SIDE SIBLINGS ─────────────────────────
+    // This strict sibling consumes the post-RGSUB incumbent, so both promoted
+    // RGSUB rounds retain their exact input and behavior. On a connected
+    // exact-bipartite graph, stable-filter that incumbent into U||V and V||U.
+    // Each direction has its own hard `sum C(degree,2)` admission gate; an
+    // expensive side does not suppress the cheap reverse sibling.
+    //
+    // The structural theorem is not an admission oracle: every emitted order
+    // is still bijection-checked and trusted-score compared with strict `<`.
+    if n <= BIPARTITE_SCHUR_MAX_N && nnz > 0 && nnz <= BIPARTITE_SCHUR_MAX_NNZ {
+        if let Some(siblings) = bipartite_schur::stable_schur_siblings(
+            pattern,
+            &best_perm,
+            BIPARTITE_SCHUR_PAIR_WORK_BUDGET,
+        ) {
+            for cand in siblings.into_iter().flatten() {
+                // Stable filtering often reproduces an already side-separated
+                // incumbent; skip its redundant trusted scoring pass.
+                if cand == best_perm {
+                    continue;
+                }
+                if is_bijection(&cand, n) {
+                    let f = ws.flops(scoring_pat, &cand);
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = cand;
+                    }
+                }
             }
         }
     }
@@ -6025,6 +6079,31 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(order(&pat), order(&pat));
+    }
+
+    #[test]
+    fn rgsub_still_runs_before_final_bipartite_sibling() {
+        // K4,496 sits exactly on the promoted RGSUB n>=500 lower boundary and
+        // remains inside the final bipartite gate. The two test-only counters
+        // prove both phases are reached, in source order, by one ordinary
+        // public `order()` call after the new two-round RGSUB promotion.
+        let n = 500;
+        let mut edges = Vec::new();
+        for u in 0..4 {
+            for v in 4..n {
+                edges.push((u, v));
+            }
+        }
+        let pattern = Pattern::from_edges(n, &edges);
+        assert_eq!(pattern.nnz(), 3_968);
+        RGSUB_DEFAULT_PATH_CALLS.with(|calls| calls.set(0));
+        bipartite_schur::BIPARTITE_SCHUR_CALLS.with(|calls| calls.set(0));
+
+        let perm = order(&pattern);
+
+        RGSUB_DEFAULT_PATH_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        bipartite_schur::BIPARTITE_SCHUR_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert_bijection(&perm, n);
     }
 
     /// RCM must always return a valid bijection, including on a disconnected
