@@ -435,6 +435,16 @@ const KAHIP_MAX_NNZ: usize = 50_000;
 /// 1.019 s worst case measured on the previous revision — a revision that passed
 /// the grader. So this ships a worst case no larger than one already known to
 /// clear the 2 s cap in the real environment.
+///
+/// DO NOT HALVE TO 150_000 ANY MORE (experiment 0021): index.md's "ready to
+/// ship" free rider (from 0017's 8-policy sweep, measured score-identical at
+/// 0.842722) is STALE after the 0019 restart floors — re-measured on top of
+/// them, the halving moves the full dev score 0.842223 → 0.842457 (1k_10k
+/// 0.8753 → 0.8756, gt_10k 0.7745 → 0.7749). Mechanism: 0019's floors only
+/// cover nnz ≤ 20k (`small_multi`) and the un-hubbed 30k-150k band
+/// (`mid_multi`), so the halving now really cuts restarts in the uncovered
+/// 20k-30k band and on hub-gated mid-band matrices — under 0017's pre-floor
+/// config those seeds were redundant; under 0019's they are not.
 const RELABEL_BUDGET: usize = 300_000;
 const RELABEL_MAX_RESTARTS: usize = 24;
 
@@ -709,6 +719,44 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 /// under the eval-bound cap ceiling — see the re-gate note above.
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
+/// TOP-K (K=2) MULTI-SEED DESCENT GATE (experiments 0022 + 0025).
+/// Experiment 0020 proved TELOS's outcome is sharply seed-sensitive (~18%
+/// on `chp_shorttermplan2d`: from the WORSE incumbent it reaches
+/// 1_975_321, from the better one only 2_104_445) — a better incumbent can
+/// seed a worse basin, which is what made "more restarts cannot hurt"
+/// false. The fix named there: descend from the top-K incumbents and keep
+/// the best. K=2: every accept site retains the runner-up (best DISTINCT
+/// second-place permutation, `accept_top2`), and TELOS runs a second,
+/// independent descent from it when `nnz <= TELOS_TOPK_MAX_NNZ` AND the
+/// runner-up is genuinely a different point (see `TELOS_TOPK_GAP_MIN`).
+/// The second descent's result is adopted only if it STRICTLY beats the
+/// first's, so no matrix can regress by construction. Gate rationale: the
+/// second descent costs approximately one more full TELOS run, and 0013
+/// refuted the "130k nnz is cheap" premise — 100_000 keeps the cap-wall
+/// class (`ringpack_30_2` nnz=121_458, `crudeoil_lee4_09/10` ~130k) at
+/// exactly one descent, while covering `chp_shorttermplan2d` (nnz=15_707)
+/// and the whole small band where a tier-A descent is milliseconds.
+const TELOS_TOPK_MAX_NNZ: usize = 100_000;
+/// DISTINCTNESS GATE (experiment 0025), the refinement 0022's kill taught:
+/// top-2-by-flops often degenerates to a same-basin near-duplicate — the
+/// runner-up slot ends up holding the immediately-pre-improvement version
+/// of the incumbent (consecutive points on ONE improvement path), and the
+/// second descent then accepts ZERO moves, pure waste (~0.1–0.25 s in the
+/// 40–90 k nnz band). The second descent runs only when the relative flops
+/// gap `(second - best) / best` at TELOS entry is strictly above this
+/// threshold. Measured gaps (0025 probe): the true near-duplicates sit two
+/// orders of magnitude below it (`mpbp_48` 0.000049, `chimera_lga-01`
+/// 0.000276 — both unmoved in 0022) and are skipped; the ONE measured
+/// cross-basin winner passes (`procurement1large` 0.003542, runner-up
+/// 0.636532 → 0.584669 while the best seed was stuck at 0.634285; final
+/// 0.581426, a −0.0529 single-matrix ratio win). KNOWN LIMIT: gap size is
+/// distinctness, not basin-difference — `chp_shorttermplan2d` (gap
+/// 0.014545, LARGER than procurement's) passes the gate yet its runner-up
+/// descent accepts zero moves (0022: consecutive points on one improvement
+/// path can be 1.5% apart). No gap value excludes it without excluding the
+/// winner, so its ~0.1 s no-move descent is accepted as the price;
+/// strict-keep means it cannot cost score.
+const TELOS_TOPK_GAP_MIN: f64 = 0.001;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -938,6 +986,55 @@ thread_local! {
         const { std::cell::Cell::new(u64::MAX) };
 }
 
+/// TEST-ONLY: one `(entry_flops, final_flops)` pair per TELOS descent seed
+/// executed during `order()` calls since the probe last cleared it — index 0
+/// is the best-incumbent seed, index 1 (when present) the runner-up seed.
+/// Probes clear it before the call and read it after, to attribute which
+/// basin produced the final result (experiment 0022).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TELOS_SEED_RESULTS: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// TEST-ONLY: the distinctness-gate inputs of the most recent TELOS phase —
+/// `(best_flops, second_flops, gate_passed)` at descent-loop entry
+/// (`second_flops == u64::MAX` when no runner-up exists). Lets the 0025
+/// probe report the relative gap and the gate verdict per matrix.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TELOS_TOPK_GATE: std::cell::Cell<(u64, u64, bool)> =
+        const { std::cell::Cell::new((0, 0, false)) };
+}
+
+/// Top-2 incumbent update (experiment 0022): exactly the strict `<` best-of
+/// acceptance every accept site has always performed, extended to ALSO retain
+/// the runner-up — the best permutation seen so far that is DISTINCT from the
+/// current best. Score-path-identical to the old `if f < best_flops` update
+/// by construction: `best_perm`/`best_flops` take precisely the same values
+/// in precisely the same order; the runner-up is pure extra bookkeeping, read
+/// only by the TELOS top-K descent. Invariant: `second_perm`, when `Some`,
+/// never equals `best_perm` (a demoted best is replaced by a STRICTLY better
+/// perm; the runner-up branch checks distinctness explicitly, which also
+/// rejects the exact-duplicate candidates the `flops_cache` produces).
+fn accept_top2(
+    cand: Vec<usize>,
+    f: u64,
+    best_flops: &mut u64,
+    best_perm: &mut Vec<usize>,
+    second_flops: &mut u64,
+    second_perm: &mut Option<Vec<usize>>,
+) {
+    if f < *best_flops {
+        *second_flops = *best_flops;
+        *second_perm = Some(std::mem::replace(best_perm, cand));
+        *best_flops = f;
+    } else if f < *second_flops && cand != *best_perm {
+        *second_flops = f;
+        *second_perm = Some(cand);
+    }
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -1156,10 +1253,13 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // So this is a BETWEEN-CONFIG effect that no bookkeeping inside one run can see: a
     // run seeded at the better incumbent has no access to the basin only the worse
     // incumbent reaches. Improving a seed is not free, and no amount of extra restart
-    // budget repairs it. The fix, if it is ever worth its time, is to run TELOS from
-    // more than the single best incumbent (retain the top-K and descend from each) —
-    // which costs exactly the resource that binds here. Until then: do not widen these
-    // gates on the assumption that more restarts cannot hurt.
+    // budget repairs it. The named fix — run TELOS from more than the single best
+    // incumbent (retain the top-K and descend from each) — LANDED as experiment 0022
+    // (`accept_top2` runner-up tracking + the TELOS top-K descent, gated
+    // `TELOS_TOPK_MAX_NNZ`), which mitigates but does not abolish the hazard: above
+    // that gate, and for basins neither the best nor the runner-up seed reaches,
+    // upstream changes remain non-monotone. Still do not widen these gates on the
+    // assumption that more restarts cannot hurt.
     //
     // `small_multi` is applied AFTER `.min(cap)`, unlike the other two floors, because
     // for that class the cap IS the binding constraint — `budget / nnz` already allows
@@ -1541,6 +1641,12 @@ fn order_with_options(
     let amd_counts = column_counts_gnp(&amd_permuted, &amd_etree);
     let mut best_perm: Vec<usize> = amd_perm.clone();
     let mut best_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+    // RUNNER-UP incumbent (experiment 0022): the best permutation seen that is
+    // distinct from `best_perm`, maintained by `accept_top2` at every accept
+    // site (consider + the hand-rolled hill-climb/PEEL/CNTREL/SHOT-3 updates)
+    // and consumed ONLY by the TELOS top-K descent — see `TELOS_TOPK_MAX_NNZ`.
+    let mut second_perm: Option<Vec<usize>> = None;
+    let mut second_flops: u64 = u64::MAX;
 
     // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
     // the pattern's maximum column length — see `relabel_restarts`, where a hub is
@@ -1599,10 +1705,14 @@ fn order_with_options(
             // (excludes the AMD anchor), for the runner-up-margin census.
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
-            if f < best_flops {
-                best_flops = f;
-                best_perm = perm;
-            }
+            accept_top2(
+                perm,
+                f,
+                &mut best_flops,
+                &mut best_perm,
+                &mut second_flops,
+                &mut second_perm,
+            );
         };
 
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
@@ -2371,15 +2481,36 @@ fn order_with_options(
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
+
+    // ZERO-ALLOC RELABEL PERMUTATION (experiment 0021): every relabel/HC loop
+    // below used to call vendor `permute_pattern` (4 fresh Vecs, two O(nnz))
+    // plus two fresh `Vec<i32>` casts PER RESTART. They now route through
+    // `ScoreWorkspace::permute_i32_into` (vendor-match test:
+    // `permute_i32_matches_vendor` in `scoring_ws.rs`), which reuses one set
+    // of buffers — byte-identical candidates by construction, only the
+    // allocation strategy changes. The three `consider`-routed multistart
+    // loops need a SECOND workspace because `consider` holds an exclusive
+    // borrow of `ws` for its whole lifetime; it is created lazily so matrices
+    // whose gates yield zero restarts pay nothing. The hand-rolled
+    // hill-climb / count-relabel loops run after `consider`'s last use and
+    // reuse `ws` itself. The permutation (pure and panic-free on any
+    // bijection — the same port `ws.flops` already runs OUTSIDE `consider`'s
+    // catch_unwind for every candidate scored) is hoisted out of the
+    // `consider` closures so each closure only reads the finished i32
+    // buffers.
+    let mut permute_ws: Option<ScoreWorkspace> = None;
+    let mut relabel_cp_i32: Vec<i32> = Vec::new();
+    let mut relabel_ri_i32: Vec<i32> = Vec::new();
+
     for r in 0..restarts {
         let seed = r as u64 + 1;
+        let q = relabel(n, seed);
+        let pws = permute_ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
+        pws.permute_i32_into(&scoring_pat, &q, &mut relabel_cp_i32, &mut relabel_ri_i32);
         consider(&|| {
-            let q = relabel(n, seed);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let bcore =
+                feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
             let pb = feral_amd::amd_order(&bcore)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
             Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
@@ -2419,13 +2550,13 @@ fn order_with_options(
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
+            let q = relabel(n, seed);
+            let pws = permute_ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
+            pws.permute_i32_into(&scoring_pat, &q, &mut relabel_cp_i32, &mut relabel_ri_i32);
             consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let bcore =
+                    feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                 let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
@@ -2470,13 +2601,13 @@ fn order_with_options(
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amdnd_restarts {
             let seed = r as u64 + 1;
+            let q = relabel(n, seed);
+            let pws = permute_ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
+            pws.permute_i32_into(&scoring_pat, &q, &mut relabel_cp_i32, &mut relabel_ri_i32);
             consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let bcore =
+                    feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                 let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
@@ -2507,10 +2638,12 @@ fn order_with_options(
         let seed = (r as u64 + 1).wrapping_mul(0x9E37);
         let swaps = if r % 2 == 0 { n / 16 } else { n / 4 };
         let q = perturb(&best_perm, seed, swaps);
-        let b = permute_pattern(&scoring_pat, &q);
-        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-        let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+        // `consider`'s last call is above, so its exclusive borrow of `ws` has
+        // ended — the hand-rolled phases reuse `ws` directly (0021).
+        ws.permute_i32_into(&scoring_pat, &q, &mut relabel_cp_i32, &mut relabel_ri_i32);
+        let Some(bcore) =
+            feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+        else {
             continue;
         };
         let Ok(pb) = feral_amd::amd_order(&bcore) else {
@@ -2532,10 +2665,14 @@ fn order_with_options(
             };
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
-            if f < best_flops {
-                best_flops = f;
-                best_perm = perm;
-            }
+            accept_top2(
+                perm,
+                f,
+                &mut best_flops,
+                &mut best_perm,
+                &mut second_flops,
+                &mut second_perm,
+            );
         }
     }
 
@@ -2613,10 +2750,14 @@ fn order_with_options(
                         } else {
                             ws.flops(&scoring_pat, &cand)
                         };
-                        if f < best_flops {
-                            best_flops = f;
-                            best_perm = cand;
-                        }
+                        accept_top2(
+                            cand,
+                            f,
+                            &mut best_flops,
+                            &mut best_perm,
+                            &mut second_flops,
+                            &mut second_perm,
+                        );
                     }
                 }
             }
@@ -2636,10 +2777,10 @@ fn order_with_options(
             } else {
                 q.sort_unstable_by(|&a, &b| cnt_by_v[a].cmp(&cnt_by_v[b]).then(a.cmp(&b)));
             }
-            let bpat = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
-            let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+            ws.permute_i32_into(&scoring_pat, &q, &mut relabel_cp_i32, &mut relabel_ri_i32);
+            let Some(bcore) =
+                feral_ordering_core::CscPattern::new(n, &relabel_cp_i32, &relabel_ri_i32)
+            else {
                 continue;
             };
             let Ok(pb) = feral_amd::amd_order(&bcore) else {
@@ -2652,10 +2793,14 @@ fn order_with_options(
                 } else {
                     ws.flops(&scoring_pat, &cand)
                 };
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = cand;
-                }
+                accept_top2(
+                    cand,
+                    f,
+                    &mut best_flops,
+                    &mut best_perm,
+                    &mut second_flops,
+                    &mut second_perm,
+                );
             }
         }
     }
@@ -2688,7 +2833,11 @@ fn order_with_options(
             feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
         };
 
-        let mut try_cand = |cand_opt: Option<Vec<usize>>, best_flops: &mut u64, best_perm: &mut Vec<usize>| {
+        let mut try_cand = |cand_opt: Option<Vec<usize>>,
+                            best_flops: &mut u64,
+                            best_perm: &mut Vec<usize>,
+                            second_flops: &mut u64,
+                            second_perm: &mut Option<Vec<usize>>| {
             let Some(cand) = cand_opt else { return };
             if !is_bijection(&cand, n) {
                 return;
@@ -2698,10 +2847,7 @@ fn order_with_options(
             } else {
                 ws.flops(&scoring_pat, &cand)
             };
-            if f < *best_flops {
-                *best_flops = f;
-                *best_perm = cand;
-            }
+            accept_top2(cand, f, best_flops, best_perm, second_flops, second_perm);
         };
 
         // ---- STRIP-V2 sv2inc: ranked by INCUMBENT exact column count
@@ -2729,7 +2875,7 @@ fn order_with_options(
                     break;
                 }
                 let cand = strip_general_v2(&scoring_pat, &ranked, k, &sub_amd);
-                try_cand(cand, &mut best_flops, &mut best_perm);
+                try_cand(cand, &mut best_flops, &mut best_perm, &mut second_flops, &mut second_perm);
             }
         }
 
@@ -2776,7 +2922,7 @@ fn order_with_options(
                     break;
                 }
                 let cand = strip_general_v2(&scoring_pat, &deg_ranked, k, sub);
-                try_cand(cand, &mut best_flops, &mut best_perm);
+                try_cand(cand, &mut best_flops, &mut best_perm, &mut second_flops, &mut second_perm);
             }
         }
 
@@ -2790,12 +2936,12 @@ fn order_with_options(
                 if let Some(fcore) = feral_ordering_core::CscPattern::new(n, &fcp, &fri) {
                     if let Ok(p) = feral_amd::amd_order(&fcore) {
                         let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                        try_cand(Some(cand), &mut best_flops, &mut best_perm);
+                        try_cand(Some(cand), &mut best_flops, &mut best_perm, &mut second_flops, &mut second_perm);
                     }
                     let nd_opts = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
                     if let Ok((p, ..)) = feral_amd::amd_order_opts(&fcore, &nd_opts) {
                         let cand: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                        try_cand(Some(cand), &mut best_flops, &mut best_perm);
+                        try_cand(Some(cand), &mut best_flops, &mut best_perm, &mut second_flops, &mut second_perm);
                     }
                 }
             }
@@ -2808,8 +2954,20 @@ fn order_with_options(
     // incumbent's; same hand-rolled discipline as the other post-hoc
     // phases (reads `best_perm` directly, read-only `flops_cache`, evals
     // through the reused workspace). Deterministic: every candidate is a
-    // pure function of (`best_perm`, pattern) with total-order tie-breaks,
+    // pure function of (seed perm, pattern) with total-order tie-breaks,
     // and only a strict improvement is ever kept (AMD floor intact).
+    //
+    // TOP-K (K=2) MULTI-SEED (experiment 0022, the fix named by 0020's
+    // seed-sensitivity diagnosis — see `TELOS_TOPK_MAX_NNZ`): the descent
+    // below runs once from `best_perm` exactly as it always has, and, when
+    // the gate admits it and a runner-up exists, a second time from
+    // `second_perm`. Each descent accepts strict improvements against ITS
+    // OWN seed (a descent from the worse seed must be free to move through
+    // territory above `best_flops` to reach its basin — thresholding it at
+    // `best_flops` would degenerate it to a single extra candidate);
+    // `best_perm` is replaced only by the strictly better of the two final
+    // results, ties favoring the best-seed descent, so no matrix can
+    // regress by construction.
     if nnz > 0 && nnz < TELOS_MAX_NNZ {
         let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
         let sub_nd = |c: &feral_ordering_core::CscPattern| {
@@ -2836,76 +2994,119 @@ fn order_with_options(
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
 
-        for _round in 0..max_rounds {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut cnt = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                cnt[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
-
-            let mut round_f = best_flops;
-            let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
-                };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
+        // Distinctness gate (0025): descend from the runner-up only when it
+        // is far enough from the best to plausibly sit in a different basin
+        // — relative flops gap strictly above `TELOS_TOPK_GAP_MIN`. The
+        // invariant `second_flops >= best_flops` holds by `accept_top2`
+        // construction, so the subtraction cannot underflow; `best_flops`
+        // is > 0 whenever nnz > 0 (guarded by the enclosing TELOS gate).
+        let seed_count: usize = if nnz <= TELOS_TOPK_MAX_NNZ
+            && second_perm.is_some()
+            && (second_flops - best_flops) as f64 > TELOS_TOPK_GAP_MIN * best_flops as f64
+        {
+            2
+        } else {
+            1
+        };
+        #[cfg(test)]
+        TELOS_TOPK_GATE.with(|c| {
+            c.set((
+                best_flops,
+                if second_perm.is_some() { second_flops } else { u64::MAX },
+                seed_count == 2,
+            ))
+        });
+        let mut final_flops = best_flops;
+        let mut final_perm: Option<Vec<usize>> = None;
+        for seed_idx in 0..seed_count {
+            let (mut cur, mut f_cur) = if seed_idx == 0 {
+                (best_perm.clone(), best_flops)
+            } else {
+                (second_perm.clone().expect("gated on is_some"), second_flops)
             };
-
-            for &(subi, k) in prio.iter().take(passes) {
-                if k >= n {
-                    continue;
+            #[cfg(test)]
+            let f_entry = f_cur;
+            for _round in 0..max_rounds {
+                let permuted = permute_pattern(&scoring_pat, &cur);
+                let etree = EliminationTree::from_pattern(&permuted);
+                let counts = column_counts_gnp(&permuted, &etree);
+                let mut cnt = vec![0usize; n];
+                for (pos, &v) in cur.iter().enumerate() {
+                    cnt[v] = counts[pos];
                 }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+
+                let mut round_f = f_cur;
+                let mut round_p: Option<Vec<usize>> = None;
+                let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
+                    if !is_bijection(&cand, n) {
+                        return;
+                    }
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
                     };
-                if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
-                    try_cand(cand, &mut round_f, &mut round_p);
-                }
-            }
+                    if f < *round_f {
+                        *round_f = f;
+                        *round_p = Some(cand);
+                    }
+                };
 
-            for &k in peel_grid {
-                if k >= n {
-                    continue;
-                }
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in &best_perm {
-                    if !fat[v] {
-                        cand.push(v);
+                for &(subi, k) in prio.iter().take(passes) {
+                    if k >= n {
+                        continue;
+                    }
+                    let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
+                        match subi {
+                            0 => &sub_amd,
+                            1 => &sub_nd,
+                            _ => &sub_mf,
+                        };
+                    if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
+                        try_cand(cand, &mut round_f, &mut round_p);
                     }
                 }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
-                cand.extend(tail);
-                try_cand(cand, &mut round_f, &mut round_p);
-            }
 
-            match round_p {
-                Some(p) if round_f < best_flops => {
-                    best_flops = round_f;
-                    best_perm = p;
+                for &k in peel_grid {
+                    if k >= n {
+                        continue;
+                    }
+                    let mut fat = vec![false; n];
+                    for &v in &ranked[..k] {
+                        fat[v] = true;
+                    }
+                    let mut cand: Vec<usize> = Vec::with_capacity(n);
+                    for &v in &cur {
+                        if !fat[v] {
+                            cand.push(v);
+                        }
+                    }
+                    let mut tail: Vec<usize> = ranked[..k].to_vec();
+                    tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+                    cand.extend(tail);
+                    try_cand(cand, &mut round_f, &mut round_p);
                 }
-                _ => break,
+
+                match round_p {
+                    Some(p) if round_f < f_cur => {
+                        f_cur = round_f;
+                        cur = p;
+                    }
+                    _ => break,
+                }
             }
+            #[cfg(test)]
+            TELOS_SEED_RESULTS.with(|c| c.borrow_mut().push((f_entry, f_cur)));
+            if f_cur < final_flops {
+                final_flops = f_cur;
+                final_perm = Some(cur);
+            }
+        }
+        if let Some(p) = final_perm {
+            best_flops = final_flops;
+            best_perm = p;
         }
     }
 

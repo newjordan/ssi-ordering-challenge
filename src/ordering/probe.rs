@@ -65,6 +65,44 @@ fn core_of(pattern: &Pattern) -> (Vec<i32>, Vec<i32>) {
     )
 }
 
+/// A/B timing helper for experiment 0021 (permute_i32_into wiring): time
+/// `order()` on the cap-critical matrices only, 5 reps each, report min —
+/// small enough (~1 min) to interleave candidate/incumbent builds within
+/// minutes on a box with uncontrollable background load, where the
+/// full-corpus probe's run-to-run noise (measured up to ~1.8x) swamps a
+/// 0.03-0.15 s effect.
+#[test]
+#[ignore]
+fn probe_permute_wire_ab() {
+    let names_env = std::env::var("SSI_AB_NAMES").unwrap_or_else(|_| {
+        "ringpack_30_2,crudeoil_lee4_10,crudeoil_lee4_09,chimera_lga-01".to_string()
+    });
+    let names: Vec<&str> = names_env.split(',').map(|s| s.trim()).collect();
+    let corpus = crate::corpus::corpus();
+    for (name, pat) in &corpus {
+        if !names.contains(&name.as_str()) {
+            continue;
+        }
+        let mut best = f64::INFINITY;
+        let mut times: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let perm = order(pat);
+            let secs = t0.elapsed().as_secs_f64();
+            std::hint::black_box(&perm);
+            times.push(format!("{secs:.3}"));
+            if secs < best {
+                best = secs;
+            }
+        }
+        println!(
+            "AB {name}\tn={}\tnnz={}\tmin={best:.4}\treps={times:?}",
+            pat.n,
+            pat.nnz(),
+        );
+    }
+}
+
 /// Time `order()` on every corpus matrix and report the slowest instances plus
 /// the current per-bucket score. This is the safety probe: the number that
 /// matters is `worst`, which must stay far under the 2 s cap (the grader's
@@ -2394,6 +2432,99 @@ fn probe_telos() {
     }
 }
 
+/// TELOS TOP-K (K=2) VALIDATION PROBE (experiments 0022/0025): run the
+/// SHIPPED `order()` — which tracks the runner-up incumbent and, under
+/// `TELOS_TOPK_MAX_NNZ` + the 0025 distinctness gate `TELOS_TOPK_GAP_MIN`,
+/// descends TELOS from both seeds — on a named matrix list and report, via
+/// the test-only `TELOS_SEED_RESULTS`/`TELOS_TOPK_GATE` captures, each
+/// seed's entry and final flops as ratios against the AMD anchor plus the
+/// gate inputs (relative runner-up gap, verdict). 0025 measured outcome:
+/// `procurement1large` PASSES (gap 0.003542) and its runner-up descent
+/// reaches 0.584669 (final 0.581426); `mpbp_48` (0.000049) and
+/// `chimera_lga-01` (0.000276) are SKIPPED as pre-registered; the
+/// pre-registration's third skip, `chp_shorttermplan2d`, was WRONG — its
+/// gap is 0.014545 (larger than the winner's), so it passes and pays a
+/// ~0.1 s no-move descent; see `TELOS_TOPK_GAP_MIN` for why no threshold
+/// fixes that. Env: SSI_TELOS_TOPK_NAMES (comma-separated) overrides the
+/// matrix list; the sentinel `ALL` runs a GATE CENSUS instead — every
+/// corpus matrix under `TELOS_TOPK_MAX_NNZ`, single rep, to enumerate
+/// exactly which matrices pay a second descent. Timing is also printed
+/// (min of 3; min of 1 in census mode) for the cap ledger.
+#[test]
+#[ignore]
+fn probe_telos_topk() {
+    let names_env = std::env::var("SSI_TELOS_TOPK_NAMES")
+        .unwrap_or_else(|_| "chp_shorttermplan2d".to_string());
+    let all_mode = names_env.trim() == "ALL";
+    let names: Vec<&str> = names_env.split(',').map(|s| s.trim()).collect();
+    let reps = if all_mode { 1 } else { 3 };
+    let corpus = crate::corpus::corpus();
+    println!("TOPK\tmatrix\tn\tnnz\tseed\tentry_r\tfinal_r\tfinal_flops");
+    for (name, pat) in &corpus {
+        if !all_mode && !names.contains(&name.as_str()) {
+            continue;
+        }
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if all_mode && nnz > crate::ordering::TELOS_TOPK_MAX_NNZ {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        let mut best_secs = f64::INFINITY;
+        let mut final_ratio = f64::NAN;
+        let mut seed_rows: Vec<(u64, u64)> = Vec::new();
+        let mut gate = (0u64, 0u64, false);
+        for rep in 0..reps {
+            crate::ordering::TELOS_SEED_RESULTS.with(|c| c.borrow_mut().clear());
+            crate::ordering::TELOS_TOPK_GATE.with(|c| c.set((0, 0, false)));
+            let t0 = Instant::now();
+            let perm = order(pat);
+            let secs = t0.elapsed().as_secs_f64();
+            best_secs = best_secs.min(secs);
+            if rep == 0 {
+                final_ratio = flops_of(&sp, &perm) as f64 / base;
+                seed_rows =
+                    crate::ordering::TELOS_SEED_RESULTS.with(|c| c.borrow().clone());
+                gate = crate::ordering::TELOS_TOPK_GATE.with(|c| c.get());
+            }
+        }
+        for (i, (fe, ff)) in seed_rows.iter().enumerate() {
+            println!(
+                "TOPK\t{name}\t{n}\t{nnz}\t{}\t{:.6}\t{:.6}\t{ff}",
+                if i == 0 { "best" } else { "runner-up" },
+                *fe as f64 / base,
+                *ff as f64 / base,
+            );
+        }
+        let gap_str = if gate.1 == u64::MAX {
+            "no-runner-up".to_string()
+        } else if gate.0 == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.6}", (gate.1 - gate.0) as f64 / gate.0 as f64)
+        };
+        println!(
+            "TOPK\t{name}\t{n}\t{nnz}\tfinal\t-\t{final_ratio:.6}\t(order() min-of-3 {best_secs:.3}s, seeds_descended={}, gap={gap_str}, gate={})",
+            seed_rows.len(),
+            if gate.2 { "PASS" } else { "skip" },
+        );
+    }
+}
+
 /// PEO-INVARIANCE CHECK: for a fixed chordal completion G+ (the incumbent's
 /// filled graph), is Σ c_j² identical across DIFFERENT perfect elimination
 /// orders of G+? Theory (clique-tree residual argument) says yes — which
@@ -3775,6 +3906,259 @@ fn probe_biconn_heavy() {
     }
 }
 
+/// ULTRA-SMALL-BAND census (rank-2 candidate, experiment 0023): before adding a
+/// fourth relabel floor at `nnz <= 8_000` with budget 1_500_000 (~234 seeds on
+/// `chimera_lga-01` vs ~94 shipped), verify that the 0019 winners-census gains
+/// actually materialize by the seed count that budget buys. Replays the EXACT
+/// shipped candidate stream — for each seed the three multistart objectives
+/// (relabelled AMD, relabelled AMF a5, relabelled no-dense AMD), same
+/// `relabel(n, seed)` seeds 1..=N — and prints the running best at checkpoint
+/// seed counts plus every improvement event and the measured per-seed cost.
+///
+/// KILL CRITERION (pre-registered): if < 50% of `chimera_lga-01`'s 0.0621
+/// census gain (i.e. < 0.031 of ratio) has appeared by seed 234 relative to the
+/// CURRENT shipped final, resize (3M only if class worst time stays comfortably
+/// below the incumbent worst) or kill without paying a scored run.
+#[test]
+#[ignore]
+fn probe_ultrasmall_census() {
+    const TARGETS: [&str; 4] = [
+        "chimera_lga-01",
+        "chimera_k64ising-02",
+        "hydroenergy2",
+        "chimera_selby-c16-02",
+    ];
+    const MAX_SEEDS: usize = 800;
+    const CHECKPOINTS: [usize; 10] = [24, 94, 156, 200, 234, 275, 390, 468, 600, 800];
+
+    let corpus = crate::corpus::corpus();
+    for (name, pat) in &corpus {
+        if !TARGETS.contains(&name.as_str()) {
+            continue;
+        }
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        // Current shipped end-to-end final (the baseline the dev-score gain is
+        // measured against).
+        let t0 = Instant::now();
+        let cur_perm = order(pat);
+        let order_secs = t0.elapsed().as_secs_f64();
+        let cur = flops_of(&sp, &cur_perm) as f64 / base;
+
+        let amf_opts = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
+        let amd_nd_opts = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+
+        let mut best = f64::INFINITY;
+        let mut events: Vec<(usize, f64, &'static str)> = Vec::new();
+        let mut checkpoint_vals: Vec<(usize, f64)> = Vec::new();
+        let t1 = Instant::now();
+        for s in 1..=MAX_SEEDS {
+            let q = relabel(n, s as u64);
+            let b = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = match feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                Some(c) => c,
+                None => continue,
+            };
+            let mut try_pb = |pb: Vec<i32>, tag: &'static str| {
+                let perm: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                if !is_bijection(&perm, n) {
+                    return;
+                }
+                let f = flops_of(&sp, &perm) as f64 / base;
+                if f < best {
+                    best = f;
+                    events.push((s, f, tag));
+                }
+            };
+            if let Ok(pb) = feral_amd::amd_order(&bcore) {
+                try_pb(pb, "amd");
+            }
+            if let Ok((pb, ..)) = feral_amf::amf_order_opts(&bcore, &amf_opts) {
+                try_pb(pb, "amf");
+            }
+            if let Ok((pb, ..)) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts) {
+                try_pb(pb, "amdnd");
+            }
+            if CHECKPOINTS.contains(&s) {
+                checkpoint_vals.push((s, best));
+            }
+        }
+        let sweep_secs = t1.elapsed().as_secs_f64();
+        let per_seed = sweep_secs / MAX_SEEDS as f64;
+
+        println!("\n=== {name} n={n} nnz={nnz} ===");
+        println!(
+            "base={base:.0}  current_final_ratio={cur:.4}  order()={order_secs:.3}s  \
+             sweep={sweep_secs:.2}s  per_seed={:.2}ms (3 objectives)",
+            per_seed * 1e3
+        );
+        print!("running best:");
+        for (s, v) in &checkpoint_vals {
+            print!("  @{s}={v:.4}");
+        }
+        println!();
+        println!("improvement events (seed, ratio, objective):");
+        for (s, f, tag) in &events {
+            println!("  seed {s:>4}  {f:.4}  {tag}");
+        }
+        let at = |k: usize| -> f64 {
+            checkpoint_vals
+                .iter()
+                .filter(|(s, _)| *s <= k)
+                .map(|(_, v)| *v)
+                .fold(f64::INFINITY, f64::min)
+        };
+        println!(
+            "gain vs current: @94={:.4}  @234={:.4}  @800={:.4}   (kill line: gain@234 >= 0.031 on chimera_lga-01)",
+            cur - at(94).min(cur),
+            cur - at(234).min(cur),
+            cur - at(800).min(cur)
+        );
+    }
+}
+
 fn probe_max_deg(pat: &Pattern) -> usize {
     (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
+}
+
+/// Experiment 0024 probe (rank-4 diversity bet, PROBE-GATED): `strip_amf` —
+/// AMF (α5) sub-ordering of the SPARSE-class stripped core. The SHOT-3
+/// dense-class mutual exclusion (`STRIPV2_DENSE_SPLIT_AVG_DEG`, mod.rs) exists
+/// because AMF beat AMD on stripped cores of the DENSE class, but no
+/// sparse-class (`nnz < 25n`) stripped core has ever been offered AMF — a
+/// verified coverage hole. This probe measures, flops-only (deterministic,
+/// load-safe, NO scored run), whether that hole contains any value:
+///
+/// For every matrix inside the shipped STRIP-transform gate
+/// (`n < STRIP_MAX_N && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG+1)*n`)
+/// AND the candidate's own `nnz < 120_000` gate (mandatory — excludes both
+/// gate-wall matrices per 0013), compute:
+///   - `inc`   = flops of the full shipped `order()` (the incumbent best),
+///   - `damf`  = flops of strip k=64 deg-ranked with AMF-α5 sub-ordering,
+///   - `lamf`  = flops of strip k=64 lcnt-ranked (baseline-AMD L-column-count,
+///               identical ranking to the shipped `lcnt64` candidate) with
+///               AMF-α5 sub-ordering,
+/// using the exact shipped rankings and `strip_general_v2` (the exact shipped
+/// STRIP-V2 construction, sub-orderer swapped to the exact shipped `sub_amf5`
+/// closure). Reports per-matrix ln-advantage `ln(inc) - ln(best variant)`
+/// (positive = variant is strictly better than the whole shipped portfolio).
+///
+/// KILL CRITERION (pre-registered): zero matrices with ln-advantage >= 0.005
+/// => drop the candidate WITHOUT paying any scored run (0014/0016 precedent).
+#[test]
+#[ignore]
+fn probe_strip_amf() {
+    const GATE_MAX_NNZ: usize = 120_000;
+    const K: usize = 64;
+    let corpus = crate::corpus::corpus();
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok()
+    );
+    println!("matrix\tn\tnnz\tinc_flops\tdamf_r\tlamf_r\tln_adv\tdamf_s\tlamf_s");
+
+    let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
+        let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+        feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+    };
+
+    let mut in_gate = 0usize;
+    let mut wins: Vec<(String, f64)> = Vec::new();
+    let mut near: Vec<(String, f64)> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let in_strip_gate =
+            n > 0 && n < STRIP_MAX_N && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG + 1) * n;
+        if !in_strip_gate || nnz >= GATE_MAX_NNZ || K >= n {
+            continue;
+        }
+        in_gate += 1;
+        let sp = scoring_pattern(pat);
+        let inc = flops_of(&sp, &order(pat));
+
+        // Rankings: byte-identical to the shipped STRIP transform's own.
+        let mut deg_ranked: Vec<usize> = (0..n).collect();
+        deg_ranked.sort_unstable_by(|&a, &b| {
+            let da = pat.col_ptr[a + 1] - pat.col_ptr[a];
+            let db = pat.col_ptr[b + 1] - pat.col_ptr[b];
+            db.cmp(&da).then(a.cmp(&b))
+        });
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let amd_permuted = permute_pattern(&sp, &amd_perm);
+        let amd_etree = EliminationTree::from_pattern(&amd_permuted);
+        let amd_counts = column_counts_gnp(&amd_permuted, &amd_etree);
+        let mut lcnt = vec![0usize; n];
+        for (pos, &v) in amd_perm.iter().enumerate() {
+            lcnt[v] = amd_counts[pos];
+        }
+        let mut lcnt_ranked: Vec<usize> = (0..n).collect();
+        lcnt_ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
+
+        let eval = |ranked: &[usize]| -> (f64, f64) {
+            let t = Instant::now();
+            let f = match strip_general_v2(&sp, ranked, K, &sub_amf5) {
+                Some(cand) if is_bijection(&cand, n) => flops_of(&sp, &cand) as f64,
+                _ => f64::NAN,
+            };
+            (f, t.elapsed().as_secs_f64())
+        };
+        let (damf, damf_s) = eval(&deg_ranked);
+        let (lamf, lamf_s) = eval(&lcnt_ranked);
+
+        let best_var = damf.min(lamf); // NaN-safe: f64::min ignores NaN operand
+        let ln_adv = if best_var.is_finite() && best_var > 0.0 {
+            (inc as f64).ln() - best_var.ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+        println!(
+            "{name}\t{n}\t{nnz}\t{inc}\t{:.4}\t{:.4}\t{:+.5}\t{damf_s:.3}\t{lamf_s:.3}",
+            damf / inc as f64,
+            lamf / inc as f64,
+            ln_adv
+        );
+        if ln_adv >= 0.005 {
+            wins.push((name.clone(), ln_adv));
+        } else if ln_adv > 0.0 {
+            near.push((name.clone(), ln_adv));
+        }
+    }
+    println!("\nmatrices in gate: {in_gate}");
+    println!("WINS (ln_adv >= 0.005): {}", wins.len());
+    for (n, a) in &wins {
+        println!("  {n}  {a:+.5}");
+    }
+    println!("near-misses (0 < ln_adv < 0.005): {}", near.len());
+    for (n, a) in &near {
+        println!("  {n}  {a:+.5}");
+    }
+    println!("KILL CRITERION: wins == 0 => drop without any scored run");
 }
