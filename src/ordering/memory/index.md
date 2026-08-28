@@ -97,6 +97,7 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0024-rgsub-cap-safe-seed-transfer.md](experiments/0024-rgsub-cap-safe-seed-transfer.md) — transferred RGSUB stream-1 seed only for `n>10k`, trimmed it to 3M, and removed the dynamic second large-matrix round. Dev 0.819962 → **0.819649**; isolated Nimbus worst `order()` **0.873 s**; selected after the unrestricted 0.819409 version failed the hidden cap.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.

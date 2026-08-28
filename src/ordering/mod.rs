@@ -4515,7 +4515,12 @@ fn order_with_options(
         streams: 2,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
-        for _round in 0..2 {
+        // Large matrices get one bounded pass. Besides limiting search work to
+        // 5M + 3M, this prevents a changed first-pass basin from unlocking an
+        // extra unbudgeted permute/etree/counts/refinement pass.
+        let rounds = if n > 10_000 { 1 } else { 2 };
+        for _round in 0..rounds {
+            let rgsub_cfg = RGSUB_CFG;
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -4540,7 +4545,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
