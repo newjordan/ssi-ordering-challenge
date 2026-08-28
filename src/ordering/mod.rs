@@ -710,6 +710,41 @@ const TELOS_B_PRIO: [(u8, usize); 2] = [(2, 1), (1, 6)];
 const TELOS_PEEL_A: [usize; 15] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
 const TELOS_PEEL_B: [usize; 3] = [1, 2, 8];
 
+/// SECOND-SEED TELOS (0020's lead). 0020 proved TELOS is sharply
+/// seed-sensitive: on `chp_shorttermplan2d` it reached 1_975_321 from the
+/// WORSE incumbent and only 2_104_445 from the better one, and disabling
+/// TELOS was the only phase gating that flipped 0019's restart pair monotone.
+/// A run seeded at the better incumbent has no access to the basin only the
+/// worse incumbent reaches, so the fix is to descend from more than one point
+/// and keep the best — "retain top-K, descend from each".
+///
+/// K = 2: the portfolio runner-up (`second_perm`, the best `consider`
+/// candidate that was NOT the argmin, which is the AMD anchor itself until
+/// something beats it twice). Strictly-improving adoption only, so the
+/// AMD floor is intact and this cannot raise any ratio.
+///
+/// TIER B ONLY, and the band split is measured, not assumed. Running the
+/// second seed wherever TELOS runs scores 0.840198 (from 0.842223) but takes
+/// the corpus worst case 2.695 s → 2.859 s on the measuring box, because the
+/// cost and the benefit live in DIFFERENT nnz bands:
+///
+/// | nnz band | mats | added order() | worst | Δscore |
+/// |---|---|---|---|---|
+/// | <20k | 221 | +2.28 s | 1.282 s | −0.000096 |
+/// | 20k–150k (tier A) | 59 | **+7.61 s** | **2.859 s** (`ringpack_30_2`) | −0.000022 |
+/// | 150k–400k (tier B) | 11 | +0.82 s | 1.928 s | **−0.002489** |
+///
+/// Tier A runs up to 2 rounds × 16 passes, so a second descent there nearly
+/// doubles the phase — on `ringpack_30_2`, the matrix that holds the corpus
+/// worst case and the largest single win (0.3017), it buys +0.228 s and
+/// EXACTLY ZERO ratio. Tier B runs 1 round × 2 passes, so the same second
+/// descent is nearly free, and it is where every point of the win sits
+/// (`nuclear10a` 0.9961 → 0.7578 alone, plus `arki0013` 0.6261 → 0.6220).
+/// Restricting to tier B keeps the whole win, returns the worst case to the
+/// incumbent's, and removes both of the all-band variant's small regressions
+/// (downstream ORBIT/lattice phases are seed-sensitive the same way TELOS is).
+const TELOS_SECOND_SEED_MIN_NNZ: usize = TELOS_TIER_A_MAX_NNZ;
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -1542,6 +1577,13 @@ fn order_with_options(
     let mut best_perm: Vec<usize> = amd_perm.clone();
     let mut best_flops: u64 = amd_counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
 
+    // Portfolio RUNNER-UP, retained as TELOS's second seed — see
+    // `TELOS_SECOND_SEED_MAX_NNZ`. Maintained by `consider` only: a candidate
+    // that beats the incumbent demotes it here, and one that beats only this
+    // slot replaces it. Read exactly once, by the TELOS phase.
+    let mut second_perm: Option<Vec<usize>> = None;
+    let mut second_flops: u64 = u64::MAX;
+
     // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
     // the pattern's maximum column length — see `relabel_restarts`, where a hub is
     // what makes a restart expensive and is the only thing distinguishing
@@ -1600,8 +1642,12 @@ fn order_with_options(
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
             if f < best_flops {
+                second_flops = best_flops;
+                second_perm = Some(std::mem::replace(&mut best_perm, perm));
                 best_flops = f;
-                best_perm = perm;
+            } else if f > best_flops && f < second_flops {
+                second_flops = f;
+                second_perm = Some(perm);
             }
         };
 
@@ -2836,75 +2882,54 @@ fn order_with_options(
                 (1, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
             };
 
-        for _round in 0..max_rounds {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut cnt = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                cnt[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+        let subs: [&dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>; 3] =
+            [&sub_amd, &sub_nd, &sub_mf];
 
-            let mut round_f = best_flops;
-            let mut round_p: Option<Vec<usize>> = None;
-            let mut try_cand = |cand: Vec<usize>, round_f: &mut u64, round_p: &mut Option<Vec<usize>>| {
-                if !is_bijection(&cand, n) {
-                    return;
-                }
-                let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
-                    cached
-                } else {
-                    ws.flops(&scoring_pat, &cand)
-                };
-                if f < *round_f {
-                    *round_f = f;
-                    *round_p = Some(cand);
-                }
-            };
+        // Seed 1 — the incumbent, exactly the descent this phase always ran.
+        let (f1, p1) = telos_descend(
+            &scoring_pat,
+            &pattern.col_ptr,
+            max_rounds,
+            prio,
+            passes,
+            peel_grid,
+            &subs,
+            &mut ws,
+            &flops_cache,
+            best_perm.clone(),
+            best_flops,
+        );
+        if f1 < best_flops {
+            best_flops = f1;
+            best_perm = p1;
+        }
 
-            for &(subi, k) in prio.iter().take(passes) {
-                if k >= n {
-                    continue;
-                }
-                let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                    match subi {
-                        0 => &sub_amd,
-                        1 => &sub_nd,
-                        _ => &sub_mf,
-                    };
-                if let Some(cand) = strip_general_v2(&scoring_pat, &ranked, k, sub) {
-                    try_cand(cand, &mut round_f, &mut round_p);
-                }
-            }
-
-            for &k in peel_grid {
-                if k >= n {
-                    continue;
-                }
-                let mut fat = vec![false; n];
-                for &v in &ranked[..k] {
-                    fat[v] = true;
-                }
-                let mut cand: Vec<usize> = Vec::with_capacity(n);
-                for &v in &best_perm {
-                    if !fat[v] {
-                        cand.push(v);
+        // Seed 2 — the portfolio runner-up (0020's lead). TELOS accepts only
+        // improvements over ITS OWN seed, so a descent from a worse point can
+        // reach a basin the incumbent's descent provably cannot. Adoption is
+        // still strictly better than `best_flops`, so the AMD floor holds and
+        // no ratio can rise.
+        if nnz >= TELOS_SECOND_SEED_MIN_NNZ {
+            if let Some(seed2) = second_perm.take() {
+                if seed2 != best_perm {
+                    let (f2, p2) = telos_descend(
+                        &scoring_pat,
+                        &pattern.col_ptr,
+                        max_rounds,
+                        prio,
+                        passes,
+                        peel_grid,
+                        &subs,
+                        &mut ws,
+                        &flops_cache,
+                        seed2,
+                        second_flops,
+                    );
+                    if f2 < best_flops {
+                        best_flops = f2;
+                        best_perm = p2;
                     }
                 }
-                let mut tail: Vec<usize> = ranked[..k].to_vec();
-                tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
-                cand.extend(tail);
-                try_cand(cand, &mut round_f, &mut round_p);
-            }
-
-            match round_p {
-                Some(p) if round_f < best_flops => {
-                    best_flops = round_f;
-                    best_perm = p;
-                }
-                _ => break,
             }
         }
     }
@@ -4630,6 +4655,102 @@ fn flops_of(pat: &ScoringPattern, perm: &[usize]) -> u64 {
     let etree = EliminationTree::from_pattern(&permuted);
     let counts = column_counts_gnp(&permuted, &etree);
     counts.iter().map(|&c| (c as u64) * (c as u64)).sum()
+}
+
+/// One TELOS-GRADIENT-DESCENT run from a given seed.
+///
+/// Extracted verbatim from `order()`'s inline phase so the descent can be run
+/// from more than one starting incumbent (see `TELOS_SECOND_SEED_MAX_NNZ`).
+/// From a single seed the behaviour is unchanged: same ranked order, same
+/// candidate sequence, same cached evals, same strictly-better-only keep, same
+/// break on a round that finds nothing. Deterministic — every candidate is a
+/// pure function of `(cur_perm, sp)` with total-order tie-breaks.
+#[allow(clippy::too_many_arguments)]
+fn telos_descend(
+    sp: &ScoringPattern,
+    col_ptr: &[usize],
+    max_rounds: usize,
+    prio: &[(u8, usize)],
+    passes: usize,
+    peel_grid: &[usize],
+    subs: &[&dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>; 3],
+    ws: &mut ScoreWorkspace,
+    flops_cache: &std::collections::HashMap<Vec<usize>, u64>,
+    mut cur_perm: Vec<usize>,
+    mut cur_flops: u64,
+) -> (u64, Vec<usize>) {
+    let n = sp.n;
+    for _round in 0..max_rounds {
+        let permuted = permute_pattern(sp, &cur_perm);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let mut cnt = vec![0usize; n];
+        for (pos, &v) in cur_perm.iter().enumerate() {
+            cnt[v] = counts[pos];
+        }
+        let mut ranked: Vec<usize> = (0..n).collect();
+        ranked.sort_unstable_by(|&a, &b| cnt[b].cmp(&cnt[a]).then(a.cmp(&b)));
+
+        let mut round_f = cur_flops;
+        let mut round_p: Option<Vec<usize>> = None;
+
+        for &(subi, k) in prio.iter().take(passes) {
+            if k >= n {
+                continue;
+            }
+            let sub = subs[(subi as usize).min(2)];
+            if let Some(cand) = strip_general_v2(sp, &ranked, k, sub) {
+                if is_bijection(&cand, n) {
+                    let f = match flops_cache.get(cand.as_slice()) {
+                        Some(&cached) => cached,
+                        None => ws.flops(sp, &cand),
+                    };
+                    if f < round_f {
+                        round_f = f;
+                        round_p = Some(cand);
+                    }
+                }
+            }
+        }
+
+        for &k in peel_grid {
+            if k >= n {
+                continue;
+            }
+            let mut fat = vec![false; n];
+            for &v in &ranked[..k] {
+                fat[v] = true;
+            }
+            let mut cand: Vec<usize> = Vec::with_capacity(n);
+            for &v in &cur_perm {
+                if !fat[v] {
+                    cand.push(v);
+                }
+            }
+            let mut tail: Vec<usize> = ranked[..k].to_vec();
+            tail.sort_unstable_by_key(|&v| (col_ptr[v + 1] - col_ptr[v], v));
+            cand.extend(tail);
+            if is_bijection(&cand, n) {
+                let f = match flops_cache.get(cand.as_slice()) {
+                    Some(&cached) => cached,
+                    None => ws.flops(sp, &cand),
+                };
+                if f < round_f {
+                    round_f = f;
+                    round_p = Some(cand);
+                }
+            }
+        }
+
+        match round_p {
+            Some(p) if round_f < cur_flops => {
+                cur_flops = round_f;
+                cur_perm = p;
+            }
+            _ => break,
+        }
+    }
+    (cur_flops, cur_perm)
 }
 
 /// Whether `perm` is a bijection of `0..n` (guards a candidate before scoring).

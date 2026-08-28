@@ -10,6 +10,13 @@ their own (a submission must *strictly* beat the frontier — a 0.00% diff is re
 which is exactly the frontier holder's own recent streak). Attach the next one of
 these to the next scoring win, at zero extra measurement cost:
 
+- ⛔ **RETIRED by [0021](experiments/0021-telos-second-seed.md) — DO NOT CARRY THIS
+  BLIND.** The `RELABEL_BUDGET` 300_000 → 150_000 rider is no longer score-neutral:
+  attached to 0021 it scores **0.842412**, WORSE than the pre-0021 frontier, and
+  `gt_10k` returns to 0.7748 (the whole 0021 win disappears). Halving the restart
+  pool changes which candidate lands in `second_perm`, and since 0021 that seed is
+  load-bearing. Re-measure it against whatever the frontier is, or leave it. The
+  original, now-stale, entry follows.
 - **`RELABEL_BUDGET` 300_000 → 150_000.** Score **identical** (0.842722, every bucket
   unchanged) and worst-case `order()` **1.858 s → 1.832 s**, i.e. +0.026 s of margin
   against the 2.0 s SIGKILL. Measured in the 8-policy sweep in
@@ -19,7 +26,7 @@ these to the next scoring win, at zero extra measurement cost:
   not merely worse. One-line change; do not re-measure, just carry it.
 
 ## Current best
-- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.840301** ([0021](experiments/0021-telos-second-seed.md), TELOS second seed gated to tier B: the portfolio runner-up is retained and the descent is run from it as well; win is `nuclear10a` 0.9961→0.7578. Worst `order()` unmoved — the gate deliberately excludes tier A, where a second descent costs +0.228 s on `ringpack_30_2` for exactly zero ratio. Reproduced twice byte-identical). Previous: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -41,7 +48,11 @@ these to the next scoring win, at zero extra measurement cost:
   is strong. No candidate can make the score worse (verified: zero of 500 graded
   matrices exceed 1.000) but one breach fails the whole run — **the risk is
   asymmetric, so ship less when in doubt.**
-- Per bucket: lt_1k 0.9073 (147) · 1k_10k 0.9069 (108) · gt_10k 0.8306 (45).
+- Per bucket (dev, at [0021](experiments/0021-telos-second-seed.md)): lt_1k **0.8994** (147) ·
+  1k_10k **0.8753** (108) · gt_10k **0.7697** (45). The two small buckets are byte-identical
+  to the pre-0021 frontier — 0021's gate admits nothing below nnz 150k. The older
+  0.9073/0.9069/0.8306 triple on this line predated several rounds; re-read it from
+  `probe_timing_and_score`, never from memory.
 - **99** matrices still tied at exactly 1.000 (58 lt_1k · 24 1k_10k · 17 gt_10k);
   re-run `probe_ties` rather than trusting that number.
 - Current `src/ordering/` approach: a **best-of portfolio** in `mod.rs` — ~30

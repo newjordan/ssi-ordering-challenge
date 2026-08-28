@@ -7,6 +7,30 @@ it, rather than deleting it — a resolved question is a useful signpost.
 
 ## Active
 
+- [ ] **K > 2 for the TELOS seed, and a DIVERSE runner-up.** Opened by
+      [0021](experiments/0021-telos-second-seed.md), which shipped K = 2 and took
+      −0.001922 out of one matrix (`nuclear10a` 0.9961 → 0.7578). 0020's argument
+      does not stop at two basins and tier B's descent is cheap (1 round × 2
+      passes, +0.82 s over 11 matrices), so a third seed is affordable there.
+      Separately, `second_perm` currently holds *whatever `consider` last
+      demoted* — retaining the best runner-up from a DIFFERENT family than the
+      argmin is a strictly better use of the same slot and is untested.
+- [ ] **Tier A wants a cheaper schedule, not exclusion.** 0021 gated the second
+      seed out of tier A because the cost is the 16-pass `TELOS_PEEL_A` grid, not
+      the second seed as such (+7.61 s over 59 matrices for −0.000022, and
+      +0.228 s of the corpus worst case on `ringpack_30_2` for exactly zero
+      ratio). A second seed run with tier B's cheap schedule (`TELOS_B_PRIO`,
+      `TELOS_PEEL_B`) *inside* tier A would cost roughly what tier B's does and
+      has never been measured.
+- [ ] **Every phase downstream of a changed incumbent is seed-sensitive, not
+      just TELOS.** 0021's all-band variant REGRESSED two matrices
+      (`gasprod_sarawak81`, `nuclear25a`) despite strictly-better-only adoption,
+      because a changed `best_perm` re-seeds COMPLETION-LATTICE / ORBIT /
+      PHARMAKOS. 0020 named the effect on TELOS; it is general. Any future change
+      that moves `best_perm` upstream of those phases inherits it, and no
+      bookkeeping inside a single run can detect it. Is the same top-K trick
+      worth running on the LATTICE phases too?
+
 - [x] **Structured relabelings, not random ones.** RESOLVED by
       [0006](experiments/0006-hillclimb-phase.md): at EQUAL budget every
       hill-climb schedule loses to i.i.d. random (0.8775-0.8787 vs 0.876511).
