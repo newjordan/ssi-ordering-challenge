@@ -4473,6 +4473,17 @@ fn order_with_options(
         streams: 2,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
+        // Sparse-large matrices still benefit from a little more subtree
+        // breadth. Keep the expansion outside the hidden-cap-sensitive small
+        // and medium tiers; the default configuration remains unchanged there.
+        let rgsub_cfg = if n >= 10_000 && nnz <= 125_000 {
+            rgreedy::SubCfg {
+                max_blocks: 128,
+                ..RGSUB_CFG
+            }
+        } else {
+            RGSUB_CFG
+        };
         for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
@@ -4498,7 +4509,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                RGSUB_CFG,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
