@@ -19,7 +19,8 @@ these to the next scoring win, at zero extra measurement cost:
   not merely worse. One-line change; do not re-measure, just carry it.
 
 ## Current best
-- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.838507** ([0022](experiments/0025-rgreedy-sparse-midband.md), rgreedy-sparse quotient-graph exact game on 3k<n≤30k / nnz≤150k / hub-gated, 160M-ceiling nnz-scaled op budget; worst admitted matrix 0.77 s, corpus worst untouched). Baseline for this line is the REBASELINED dev **0.838672** synced at commit 45e651f (frontier 0xpg 0.829748) — not comparable to the 0.842-series numbers below.
+- Previous: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -97,6 +98,13 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0025-rgreedy-sparse-midband.md](experiments/0025-rgreedy-sparse-midband.md) — **WIN, dev
+  0.838672 → 0.838507** (rebaselined corpus). The bitset rgreedy exact-elimination-game family
+  carried into 3000 < n ≤ 30_000 (nnz ≤ 150k, hub gate max_deg·50 ≤ n) via a quotient graph with
+  EXACT degrees — no supervariables, avars disjoint from element boundaries, O(1) one-element degree,
+  degree buckets + reservoir sampling. Runs LAST, strict-improvement, monotone by construction.
+  nnz-decreasing op budget `clamp(160M − 1300·nnz, 80M, 160M)`; budget NOT score-monotone. The 160M
+  grader-safety cut from the probed 240M cost only 0.000046 predicted. Worst admitted 0.77 s.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
@@ -206,6 +214,17 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   a hub that size is why its restarts cost. 4 better / **1 worse** / 296 same. **NOT monotone on
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
+
+- [0024-midx-reopen-parallel.md](experiments/0024-midx-reopen-parallel.md) — **WIN, dev
+  0.834636→0.834239** (fill 0.945578→0.945302), base 91f0b60. Executed 0021-midband's parked plan
+  now that the portfolio runs candidates in parallel: second MIDX no-dense-AMD tier for
+  nnz∈(95k,130k], budget 1_600_000 / cap 12, same hub (`max_deg ≤ n/50`) + density (`nnz ≤ 8n`)
+  guards, shipped 60–95k tier byte-identical. The entire gain is `crudeoil_lee4_10` 0.7271→**0.6858**
+  (the full 16-seed census value arrives at 12 seeds) at ≈zero added wall-clock — the 12 extra
+  `consider` tasks fill idle 4-thread-carrier slots. Worst added cost: `crudeoil_lee4_09` +0.055 s on
+  a 0.69 s base. lt_1k / 1k_10k bucket geomeans bit-identical (no task added outside the window ⇒ no
+  TELOS-seed side effects). Deep-seed follow-ups (procurement1large amf@64, hydroenergy2 amf@196, …)
+  still unclaimed.
 
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
