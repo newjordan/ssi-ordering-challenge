@@ -4825,7 +4825,7 @@ fn order_with_options(
         min_s: 32,
         max_s: 700,
         max_sub: 3_500,
-        max_blocks: 96,
+        max_blocks: 128,
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
