@@ -3421,13 +3421,13 @@ fn probe_stack() {
         let full = order(pat);
         let f_full = flops_of(&sp, &full) as f64;
 
-        let no_orbit = order_with_options(pat, usize::MAX, false, true, true, true, usize::MAX);
+        let no_orbit = order_with_options(pat, usize::MAX, false, true, true, true);
         let f_no_orbit = flops_of(&sp, &no_orbit) as f64;
 
-        let no_pharmakos = order_with_options(pat, usize::MAX, true, false, true, true, usize::MAX);
+        let no_pharmakos = order_with_options(pat, usize::MAX, true, false, true, true);
         let f_no_pharmakos = flops_of(&sp, &no_pharmakos) as f64;
 
-        let neither = order_with_options(pat, usize::MAX, false, false, true, true, usize::MAX);
+        let neither = order_with_options(pat, usize::MAX, false, false, true, true);
         let f_neither = flops_of(&sp, &neither) as f64;
 
         let this_orbit_fired = f_full < f_no_orbit - 0.5;
@@ -4185,10 +4185,10 @@ fn probe_midx_ab() {
         let mut on = Vec::new();
         for _ in 0..reps.max(1) {
             let t0 = Instant::now();
-            off = order_with_options(pat, usize::MAX, true, true, false, true, usize::MAX);
+            off = order_with_options(pat, usize::MAX, true, true, false, true);
             off_s = off_s.min(t0.elapsed().as_secs_f64());
             let t1 = Instant::now();
-            on = order_with_options(pat, usize::MAX, true, true, true, true, usize::MAX);
+            on = order_with_options(pat, usize::MAX, true, true, true, true);
             on_s = on_s.min(t1.elapsed().as_secs_f64());
         }
         let off_r = flops_of(&sp, &off) as f64 / base;
@@ -5068,12 +5068,12 @@ fn probe_heavy_ab() {
         let (mut t_off, mut t_on) = (f64::INFINITY, f64::INFINITY);
         let (mut r_off, mut r_on) = (f64::NAN, f64::NAN);
         for _ in 0..2 {
-            HEAVY_ARM.with(|c| c.set(false));
+            HEAVY_AMF_ARM.with(|c| c.set(false));
             let t = Instant::now();
             let p = order(pat);
             t_off = t_off.min(t.elapsed().as_secs_f64());
             r_off = flops_of(&sp, &p) as f64 / base;
-            HEAVY_ARM.with(|c| c.set(true));
+            HEAVY_AMF_ARM.with(|c| c.set(true));
             let t = Instant::now();
             let p = order(pat);
             t_on = t_on.min(t.elapsed().as_secs_f64());
@@ -5225,274 +5225,4 @@ fn probe_parallel_speedup() {
     let worst_par = rows.iter().map(|r| r.1).fold(0.0f64, f64::max);
     println!("\nTOTAL seq={tot_seq:.3}s par={tot_par:.3}s speedup={:.2}x", tot_seq / tot_par);
     println!("WORST seq={worst_seq:.3}s par={worst_par:.3}s");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DESCENT ARM (arm/descent). Local search on the exact objective: the TELOS
-// gradient descent's move set and its seed.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// DESCENT ARM A/B: the stack (`telos_ms = 0`) vs the variant
-/// (`telos_ms = usize::MAX`) on the SAME matrices in the SAME process,
-/// alternating which side runs first per matrix so shared-box drift cannot
-/// bias one of them. Reports per-matrix ratio before/after, per-bucket
-/// geomeans, both scores, both worst-case `order()` times and the largest
-/// per-matrix time increases.
-///
-/// `SSI_MS_CAP` caps the descent count (0 = off, i.e. both sides identical);
-/// `SSI_PHASE_MIN_N` / `SSI_PHASE_MAX_N` restrict the matrix set.
-#[test]
-#[ignore]
-fn probe_descent_ab() {
-    let corpus = crate::corpus::corpus();
-    let min_n: usize = std::env::var("SSI_PHASE_MIN_N").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let max_n: usize = std::env::var("SSI_PHASE_MAX_N").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-    let ab_cap: usize = std::env::var("SSI_MS_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-
-    let mut la = [0.0f64; 3];
-    let mut lb = [0.0f64; 3];
-    let mut counts = [0usize; 3];
-    let mut secs_a = 0.0f64;
-    let mut secs_b = 0.0f64;
-    let mut worst_a = (0.0f64, String::new());
-    let mut worst_b = (0.0f64, String::new());
-    let mut rows: Vec<(String, usize, usize, f64, f64, f64, f64)> = Vec::new();
-
-    for (i, (name, pat)) in corpus.iter().enumerate() {
-        let n = pat.n;
-        if n == 0 || n < min_n || n > max_n {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
-        ) as f64;
-
-        let mut run = |ms: bool| {
-            let t = Instant::now();
-            let p = order_with_options(
-                pat,
-                usize::MAX,
-                true,
-                true,
-                true,
-                true,
-                if ms { ab_cap } else { 0 },
-            );
-            let s = t.elapsed().as_secs_f64();
-            (flops_of(&sp, &p) as f64 / base, s)
-        };
-        let ((ra, sa), (rb, sb)) = if i % 2 == 0 {
-            let a = run(false);
-            let b = run(true);
-            (a, b)
-        } else {
-            let b = run(true);
-            let a = run(false);
-            (a, b)
-        };
-
-        let bk = bucket(n);
-        la[bk] += ra.ln();
-        lb[bk] += rb.ln();
-        counts[bk] += 1;
-        secs_a += sa;
-        secs_b += sb;
-        if sa > worst_a.0 {
-            worst_a = (sa, name.clone());
-        }
-        if sb > worst_b.0 {
-            worst_b = (sb, name.clone());
-        }
-        rows.push((name.clone(), n, pat.nnz(), ra, rb, sa, sb));
-    }
-
-    println!("\n--- per-matrix changes (name n nnz before after d_secs) ---");
-    let mut wins = 0;
-    let mut losses = 0;
-    for (name, n, nnz, ra, rb, sa, sb) in rows.iter() {
-        if (rb - ra).abs() > 1e-9 {
-            if rb < ra {
-                wins += 1;
-                println!("WIN \t{name}\t{n}\t{nnz}\t{ra:.4}\t{rb:.4}\t{:+.4}", sb - sa);
-            } else {
-                losses += 1;
-                println!("LOSS\t{name}\t{n}\t{nnz}\t{ra:.4}\t{rb:.4}\t{:+.4}", sb - sa);
-            }
-        }
-    }
-    println!("wins={wins} losses={losses}");
-
-    println!("\nbucket\tcount\tbefore\tafter");
-    for b in 0..3 {
-        if counts[b] > 0 {
-            println!(
-                "{:<8}\t{}\t{:.6}\t{:.6}",
-                BUCKET_NAMES[b],
-                counts[b],
-                (la[b] / counts[b] as f64).exp(),
-                (lb[b] / counts[b] as f64).exp()
-            );
-        }
-    }
-    let sa = aggregate(&la, &counts);
-    let sbv = aggregate(&lb, &counts);
-    println!("SCORE before = {sa:.6}");
-    println!("SCORE after  = {sbv:.6}   delta = {:+.6}", sbv - sa);
-    println!("total secs   before={secs_a:.2} after={secs_b:.2}");
-    println!(
-        "worst secs   before={:.3} ({})  after={:.3} ({})",
-        worst_a.0, worst_a.1, worst_b.0, worst_b.1
-    );
-
-    let mut td: Vec<(f64, String, f64, f64)> =
-        rows.iter().map(|r| (r.6 - r.5, r.0.clone(), r.5, r.6)).collect();
-    td.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    println!("--- largest per-matrix time increases (d_secs matrix before after) ---");
-    for (d, nm, a, b) in td.iter().take(15) {
-        println!("{d:+.4}\t{nm}\t{a:.3}\t{b:.3}");
-    }
-    let mut sl: Vec<&(String, usize, usize, f64, f64, f64, f64)> = rows.iter().collect();
-    sl.sort_by(|x, y| y.6.partial_cmp(&x.6).unwrap());
-    println!("--- 30 slowest matrices under the variant (matrix before after) ---");
-    for r in sl.iter().take(30) {
-        println!("{}\t{:.3}\t{:.3}\t{:+.4}", r.0, r.5, r.6, r.6 - r.5);
-    }
-}
-
-/// RANKING / MOVE-SET SWEEP (descent arm): the TELOS strip+peel moves all read
-/// ONE ranking of the vertices ("fattest first by exact incumbent column
-/// count"). That ranking IS the move set: it decides which subset each `k`
-/// names. Measure, per matrix, what each alternative ranking buys as an extra
-/// descent from the shipped incumbent, and what it costs.
-#[test]
-#[ignore]
-fn probe_rank_modes() {
-    let corpus = crate::corpus::corpus();
-    let max_nnz: usize =
-        std::env::var("SSI_RANK_MAX_NNZ").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
-    let sens = [0.30 * 0.8994 / 147.0, 0.30 * 0.8753 / 108.0, 0.40 * 0.7745 / 45.0];
-    let mut val = [0.0f64; 4];
-    let mut secs = [0.0f64; 4];
-    let mut wins = [0usize; 4];
-    let mut worst = [0.0f64; 4];
-    let mut any_val = 0.0f64;
-    println!("matrix\tn\tnnz\tmode\tratio_before\tratio_after\tsecs");
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        let nnz = pat.nnz();
-        if n == 0 || nnz == 0 || nnz >= max_nnz {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
-        ) as f64;
-        let inc = order(pat);
-        let inc_f = flops_of(&sp, &inc);
-        let (rounds, prio, passes, peel) = telos_schedule(nnz);
-        let b = bucket(n);
-        let mut best_any = inc_f;
-        for m in 0..4u8 {
-            let t = Instant::now();
-            let (_p, f) =
-                telos_descend(&sp, nnz, &inc, inc_f, rounds, prio, passes, peel, m);
-            let s = t.elapsed().as_secs_f64();
-            secs[m as usize] += s;
-            if s > worst[m as usize] {
-                worst[m as usize] = s;
-            }
-            if f < inc_f {
-                wins[m as usize] += 1;
-                val[m as usize] += (inc_f as f64 / f as f64).ln() * sens[b];
-                println!(
-                    "{name}\t{n}\t{nnz}\t{m}\t{:.5}\t{:.5}\t{s:.4}",
-                    inc_f as f64 / base,
-                    f as f64 / base
-                );
-            }
-            best_any = best_any.min(f);
-        }
-        if best_any < inc_f {
-            any_val += (inc_f as f64 / best_any as f64).ln() * sens[b];
-        }
-    }
-    println!("\nmode\twins\tscore_value\tsecs_total\tworst_secs");
-    for m in 0..4 {
-        println!("{m}\t{}\t{:+.6}\t{:.2}\t{:.3}", wins[m], -val[m], secs[m], worst[m]);
-    }
-    println!("best-of all modes: {:+.6}", -any_val);
-}
-
-/// HEAVY-TIER DESCENT (descent arm, NEGATIVE RESULT kept so nobody re-runs
-/// it): the matrices with `nnz >= 300_000` are gated out of TELOS entirely
-/// (`TELOS_MAX_NNZ = 400_000`) yet several sit at ratio 1.000 with a second of
-/// headroom. Measured: a descent from the shipped incumbent gains NOTHING on
-/// all of them except `gabriel10` (0.9793 → 0.9747 for 0.27 s) and
-/// `acopf_case9241pegase_qcqp` (0.9737 → 0.9729 for 0.19 s).
-#[test]
-#[ignore]
-fn probe_heavy_descent() {
-    let corpus = crate::corpus::corpus();
-    let min_nnz: usize =
-        std::env::var("SSI_HEAVY_MIN_NNZ").ok().and_then(|v| v.parse().ok()).unwrap_or(300_000);
-    let peel_small: Vec<usize> = vec![1, 2, 8];
-    let peel_big: Vec<usize> = vec![1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192];
-    let prio_none: Vec<(u8, usize)> = vec![];
-    let prio_nd: Vec<(u8, usize)> = vec![(1, 1), (1, 6)];
-    let scheds: Vec<(&str, usize, &Vec<(u8, usize)>, &Vec<usize>)> = vec![
-        ("peel3", 1, &prio_none, &peel_small),
-        ("peel15", 1, &prio_none, &peel_big),
-        ("nd+peel3", 1, &prio_nd, &peel_small),
-        ("peel15x2", 2, &prio_none, &peel_big),
-    ];
-    println!("matrix\tn\tnnz\torder_s\tsched\tratio\tsecs");
-    for (name, pat) in &corpus {
-        let n = pat.n;
-        if n == 0 || pat.nnz() < min_nnz {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect::<Vec<_>>(),
-        ) as f64;
-        let t0 = Instant::now();
-        let inc = order(pat);
-        let order_s = t0.elapsed().as_secs_f64();
-        let inc_f = flops_of(&sp, &inc);
-        for (lbl, rounds, prio, peel) in scheds.iter() {
-            let t = Instant::now();
-            let (_p, f) = telos_descend(
-                &sp,
-                pat.nnz(),
-                &inc,
-                inc_f,
-                *rounds,
-                prio,
-                prio.len(),
-                peel,
-                0,
-            );
-            let s = t.elapsed().as_secs_f64();
-            println!(
-                "{name}\t{n}\t{}\t{order_s:.3}\t{lbl}\t{:.5}\t{s:.3}",
-                pat.nnz(),
-                f as f64 / base
-            );
-        }
-        println!(
-            "{name}\t{n}\t{}\t{order_s:.3}\tINCUMBENT\t{:.5}\t0",
-            pat.nnz(),
-            inc_f as f64 / base
-        );
-    }
 }
