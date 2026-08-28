@@ -162,12 +162,9 @@ impl ScoreWorkspace {
     /// `CscPattern`) plus two more fresh `Vec<i32>` casts, for a caller that
     /// builds a relabelled pattern to feed `feral_amd::amd_order`.
     ///
-    /// NOT wired into this build's relabel-multi-start/hill-climb loops (they
-    /// still use vendor `permute_pattern` directly, to keep the cap-safety
-    /// merge minimal and lower-risk under time pressure) — kept for a future
-    /// pass, and exercised directly by `permute_i32_matches_vendor` below so
-    /// it stays correct if wired in later.
-    #[allow(dead_code)]
+    /// Used by the relabel-multi-start, hill-climb, and count-relabel loops in
+    /// `mod.rs` so repeated candidates reuse the same O(n + nnz) buffers.
+    /// Correctness is pinned by `permute_i32_matches_vendor` below.
     pub(crate) fn permute_i32_into(
         &mut self,
         pat: &ScoringPattern,
