@@ -3971,6 +3971,79 @@ fn order_with_options(
             }
             Some(minl_mcs_peo(n, &adj))
         }));
+
+        // REVERSE-SCHEDULE WATCHER — the same witness machinery under the
+        // OPPOSITE deterministic deletion order (descending degree-sum, ties
+        // ascending id). The watcher's terminal completion is a function of
+        // its deletion ORDER (its own note: different valid orders reach
+        // different inclusion-minimal completions); cheapest-first spends the
+        // shared op budget where deletions are cheap, fattest-first reaches
+        // the completions behind the expensive edges first. Same starting
+        // completion, same gates, same oracle-checked strict acceptance —
+        // this fills the fourth otherwise-idle descent slot on the 4-vCPU
+        // runner, so its wall-clock hides behind the slowest sibling.
+        // The `n` gate is hoisted OUTSIDE the closure: without it the task
+        // would build the O(nnz(L)) filled-graph prelude on giant matrices
+        // only to bail at the gate (measured +0.35 s on
+        // `acopf_case9241pegase_qcqp` in the pre-hoist form).
+        if n <= WATCH_MINL_MAX_N {
+            dtasks.push(Box::new(move || -> Option<Vec<usize>> {
+                let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
+                let mut adj: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        fri[fcp[v] as usize..fcp[v + 1] as usize]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .collect()
+                    })
+                    .collect();
+                let asort: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        let mut c: Vec<u32> = scoring_pat.row_idx
+                            [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .filter(|&x| x as usize != v)
+                            .collect();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect();
+                let mut fill: Vec<(u32, u32)> = Vec::new();
+                for u in 0..n {
+                    for &wv in &adj[u] {
+                        if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                            fill.push((u as u32, wv));
+                        }
+                    }
+                }
+                if fill.is_empty()
+                    || fill.len() > WATCH_MINL_MAX_FILL
+                    || fill.len().saturating_mul(5) < fri.len()
+                {
+                    return None;
+                }
+                let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
+                ids.sort_unstable_by_key(|&i| {
+                    let (u, v) = fill[i as usize];
+                    (
+                        std::cmp::Reverse(adj[u as usize].len() + adj[v as usize].len()),
+                        i,
+                    )
+                });
+                let result = watcher_minimalize(
+                    &mut adj,
+                    &fill,
+                    &ids,
+                    WATCH_MINL_OPS_BUDGET,
+                    WATCH_MINL_MAX_COMMON,
+                );
+                if result.removed == 0 {
+                    return None;
+                }
+                Some(minl_mcs_peo(n, &adj))
+            }));
+        }
     }
 
     // ── COMPONENT B: ORBIT-BATCHED COMPLETION-LATTICE DESCENT — see the
