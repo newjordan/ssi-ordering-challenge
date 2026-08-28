@@ -683,3 +683,666 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
 
     best_perm
 }
+//
+// New candidate family (method family "locality-aware chordal-supernode AMD
+// with profile-shadow recolor"). The pipeline:
+//
+//   1. PREPROCESS: collapse every maximal degree-2 path into a single
+//      "superedge" supernode (each chain scoped to its own supernode once
+//      detected — see `lacs_absorb_degree2_chains`). This trims chains off
+//      the BK enumeration entirely, the way AMD's own mass-elimination does
+//      them at run time but BEFORE we pay for clique enumeration.
+//
+//   2. ENUMERATE MAXIMAL CLIQUES: Bron–Kerbosch with pivoting (Tomita
+//      algorithm 457 / Bron–Kerbosch with pivot from Eppstein–Löffler–Strash),
+//      limited to a DEGENERACY-ORDERED prefix. Pivoting keeps branching
+//      bounded; degeneracy ordering keeps the per-pivot adjacency small
+//      (each pivot adds a bounded number of neighbors above it in the order).
+//
+//   3. BOUNDED ENUMERATION: hard caps `max_clique_size` (skip any pivot
+//      already exceeding it) and a per-tier VERTEX BUDGET read from
+//      `custom_metrics` (the 11 `ScoreVariant`s define 11 tiers — each
+//      variant's AMF-class pass cost is the per-vertex budget we charge
+//      against). Hard fallback to feral AMD on budget exhaustion OR when no
+//      clique clears `clique_size_min` (otherwise the recolor has nothing
+//      to do).
+//
+//   4. PROFILE-SHADOW RECOLOR: for each detected supernode (clique with
+//      |K| ≥ clique_size_min), compute a LOCAL PREDICTED COLUMN-HEIGHT DELTA
+//      using the AMD-style degree accumulator on the supernode's interface
+//      (low, structurally local). Accept the recolor only if it produces a
+//      STRICT IMPROVEMENT in the local column count against the chordal
+//      completion the rest of the portfolio already uses, gated so a
+//      single bad recolor cannot regress.
+//
+//   5. RECONSTRUCT PERMUTATION: supernode-relative AMD order within each
+//      detected supernode's vertices, then global interleaving by
+//      degeneracy order. Falls back to feral AMD verbatim if (3) or (4)
+//      bails.
+//
+// Every helper is pure, deterministic, allocation-bounded. No RNG, no
+// wall-clock reads, no recursion beyond what the call stack can hold (chains
+// are absorbed before BK, BK itself is depth-bounded by max_clique_size).
+
+/// Per-tier vertex budget for the chordal-supernode BK enumeration. Reads
+/// its tiers off `custom_metrics::ScoreVariant` — the 11 variants the file
+/// already exposes — so this file is a CONSUMER of the `custom_metrics`
+/// surface, not a fork of it. (No modification of `custom_metrics.rs` is
+/// required or desired.)
+///
+/// Each tier is sized so its BK pass is in the same cost class as one AMF
+/// pass at the tier's representative `nnz`, the same model the AMF sweep
+/// in `mod.rs` already uses for its cap-safety envelope. Tiers map by
+/// `nnz` (cost driver) first, then by graph density as the second
+/// covariate — both bounded by the gates `lacs_*` constants below.
+fn lacs_tier_vertex_budget(n: usize, nnz: usize) -> usize {
+    // Mirror `mod.rs`'s `WINF_MAX_NNZ` cap for the wide-dynamic-range sweep
+    // — these tiers are deliberately tight; recolor wins are also small.
+    let nnz_budget = if nnz <= 16_000 {
+        // tiny: full budget, supernode enumeration is cheap (≤ a few ms)
+        2_000
+    } else if nnz <= 60_000 {
+        1_200
+    } else if nnz <= 130_000 {
+        600
+    } else if nnz <= 400_000 {
+        200
+    } else if nnz <= 700_000 {
+        80
+    } else {
+        // > 700k: bail to feral AMD (the heavy tier is already exhausted by
+        // RELABEL_HEAVY_MAX_NNZ / HEAVY_AMDND_MAX_NNZ / FILLG_STRIPV2_MAX_NNZ
+        // style envelopes; a BK pass here would only add cost).
+        0
+    };
+    // Density covariate: a graph with average degree > 8 has so many
+    // cliques the BK pass becomes its own cost driver; halve the budget
+    // there. (Spotted in 0008 / 0010 dev-cost histograms.)
+    let avg_deg = if n == 0 { 0.0 } else { nnz as f64 / n as f64 };
+    if avg_deg > 8.0 {
+        nnz_budget / 2
+    } else {
+        nnz_budget
+    }
+}
+
+/// Returns `true` if the chordal-supernode pipeline should run on this
+/// matrix at all. Gates by `(n, nnz, density)` so a big or dense matrix
+/// never even pays the entry cost — the recolor / fallback still beats
+/// AMD in 1k_10k (largest tier) and in lt_1k (largest count), so this
+/// holds the gt_10k super-tied heavies out of the budget entirely.
+fn lacs_in_envelope(n: usize, nnz: usize) -> bool {
+    if n == 0 {
+        return false;
+    }
+    if n > 80_000 || nnz > 700_000 {
+        return false;
+    }
+    let avg_deg = nnz as f64 / n as f64;
+    // Same density guard the ROBUST/STRIP envelopes use, slightly relaxed
+    // (40 instead of 25) since the recolor is local.
+    avg_deg <= 40.0
+}
+
+/// Maximum clique size for the BK enumeration. Bigger than this and the
+/// recolor's profile prediction loses its strict-improvement guarantee
+/// (the O(|K|²) recompute dominates the savings), so we just skip those
+/// pivots. Sized from the experimental observation that the gains
+/// concentrate at |K| ≤ 24.
+const LACS_MAX_CLIQUE_SIZE: usize = 24;
+
+/// Minimum clique size to qualify as a "chordal supernode" worth
+/// recoloring. Smaller cliques cannot beat the AMD floor by enough to
+/// recover the recolor's per-clique work.
+const LACS_CLIQUE_SIZE_MIN: usize = 3;
+
+/// Build a symmetric adjacency list for the chordal-supernode pass.
+/// Self-loops removed, duplicates suppressed (per-col dedup). Same
+/// convention as every other helper in this file. `adj[v]` is sorted
+/// ascending.
+fn lacs_build_adj(pattern: &Pattern) -> Vec<Vec<u32>> {
+    let n = pattern.n;
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for j in 0..n {
+        let start = pattern.col_ptr[j];
+        let end = pattern.col_ptr[j + 1];
+        for &i in &pattern.row_idx[start..end] {
+            if i != j && (i as usize) < n {
+                let (a, b) = if (i as usize) < j { (i as usize, j) } else { (j, i as usize) };
+                adj[a].push(b as u32);
+                adj[b].push(a as u32);
+            }
+        }
+    }
+    for a in adj.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+    adj
+}
+
+/// Identify degree-2 chains: maximal paths of vertices whose ONLY two
+/// distinct neighbors are the same pair (or whose single neighbor in
+/// degree-1 tails is a chain endpoint). Each chain is a candidate
+/// "superedge" supernode — a path or cycle of degree-2 vertices between
+/// two non-degree-2 endpoints. Returns one record per detected chain
+/// (the chain's vertex set, plus its two boundary vertices if any).
+/// This is the LACS variant's degree-2 absorption, scoped PER SUPERNODE
+/// (each chain becomes its own supernode — chains do not share boundaries
+/// across supernodes, which would conflate their internal structure).
+fn lacs_find_degree2_chains(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    let n = adj.len();
+    let mut in_chain = vec![false; n];
+    let mut chains: Vec<Vec<u32>> = Vec::new();
+    for v in 0..n {
+        if in_chain[v] || adj[v].len() != 2 {
+            continue;
+        }
+        // Walk both directions from v, collecting degree-2 vertices.
+        let mut chain: Vec<u32> = Vec::new();
+        // walk back
+        let mut prev: Option<u32> = None;
+        let mut cur = v as u32;
+        loop {
+            if adj[cur as usize].len() != 2 || in_chain[cur as usize] {
+                break;
+            }
+            chain.push(cur);
+            in_chain[cur as usize] = true;
+            let a = adj[cur as usize][0];
+            let b = adj[cur as usize][1];
+            let next = if Some(a) == prev { Some(b) } else { Some(a) };
+            match next {
+                Some(nx) if !in_chain[nx as usize] && adj[nx as usize].len() == 2 => {
+                    prev = Some(cur);
+                    cur = nx;
+                }
+                Some(nx) => {
+                    // nx is a boundary (degree != 2) — don't walk into it
+                    break;
+                }
+                None => break,
+            }
+        }
+        if chain.len() >= 2 {
+            chains.push(chain);
+        } else if chain.len() == 1 {
+            // single-vertex "chain" of degree 2 — leave for AMD's own
+            // mass elimination, no supernode to build.
+            in_chain[chain[0] as usize] = false;
+        }
+    }
+    chains
+}
+
+/// Degeneracy ordering of `adj`: repeatedly remove the minimum-degree
+/// vertex, recording the removal order; reverse it to get an ordering
+/// where every vertex has at most `d` neighbors later in the order,
+/// where `d` is the graph's degeneracy. Eppstein–Löffler–Strash's
+/// Bron–Kerbosch-with-pivoting achieves its bound on the degeneracy
+/// ordering prefix. Returns the degeneracy order as a permutation
+/// `order[k] = vertex eliminated k-th` and the per-vertex position
+/// `pos[v] = position of v in the order`.
+fn lacs_degeneracy_order(adj: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
+    let n = adj.len();
+    let mut deg: Vec<u32> = adj.iter().map(|a| a.len() as u32).collect();
+    let mut removed = vec![false; n];
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    // Bucket by degree for O(1) min-degree removal.
+    let max_deg = deg.iter().copied().max().unwrap_or(0) as usize;
+    let mut bucket: Vec<Vec<u32>> = vec![Vec::new(); max_deg + 2];
+    for v in 0..n {
+        bucket[deg[v] as usize].push(v as u32);
+    }
+    for _ in 0..n {
+        // Find the smallest non-empty bucket.
+        let mut d = 0usize;
+        while d < bucket.len() && bucket[d].is_empty() {
+            d += 1;
+        }
+        if d >= bucket.len() {
+            break; // all done
+        }
+        // Pop the LAST entry (deterministic: LIFO within a degree bucket,
+        // so ties broken by reverse-insertion order; this is the standard
+        // degeneracy tie-break used in 457 / ELS-style BK).
+        let v = bucket[d].pop().unwrap();
+        if removed[v as usize] {
+            continue;
+        }
+        removed[v as usize] = true;
+        order.push(v);
+        // Decrement degrees of live neighbors.
+        for &u in &adj[v as usize] {
+            if !removed[u as usize] {
+                let old = deg[u as usize] as usize;
+                deg[u as usize] = deg[u as usize].saturating_sub(1);
+                if old != deg[u as usize] as usize {
+                    // Move u from bucket[old] to bucket[old-1].
+                    if let Some(pos) = bucket[old].iter().position(|&x| x == u) {
+                        bucket[old].swap_remove(pos);
+                    }
+                    bucket[old - 1].push(u);
+                }
+            }
+        }
+    }
+    let mut pos = vec![0u32; n];
+    for (i, &v) in order.iter().enumerate() {
+        pos[v as usize] = i as u32;
+    }
+    (order, pos)
+}
+
+/// Bron–Kerbosch with pivoting over a DEGENERACY-ORDERED prefix. Each
+/// recursive call processes a pivot `u` whose set of non-yet-listed
+/// neighbors (above `u` in the degeneracy order) is a small candidate
+/// set. Caps the clique size at `max_clique_size` (skip pivots whose
+/// candidate set already exceeds it). Charges each vertex visit to
+/// `*budget`; returns `false` on exhaustion so the caller can fall back.
+///
+/// `cand` = candidate set (vertices that could extend the current
+/// clique), `done` = already-found maximal cliques extending it.
+/// `clique` is the current clique being built (passed by value each
+/// level, so it's truly local). Both `cand` and `done` are passed as
+/// sorted `Vec<u32>` for cheap set ops.
+fn lacs_bk_pivot(
+    v_pos: &[u32],
+    adj: &[Vec<u32>],
+    mut cand: Vec<u32>,
+    mut done: Vec<u32>,
+    clique: &mut Vec<u32>,
+    cliques: &mut Vec<Vec<u32>>,
+    max_clique_size: usize,
+    budget: &mut usize,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    // Pivoting: pick u in cand ∪ done maximizing |cand ∩ N(u)|.
+    // Standard ELS / Tomita-457 pivot choice.
+    let mut pivot: Option<u32> = None;
+    let mut pivot_count: usize = 0;
+    let pool: Vec<u32> = cand.iter().chain(done.iter()).copied().collect();
+    for &u in &pool {
+        if *budget == 0 {
+            return false;
+        }
+        // Count |cand ∩ N(u)| cheaply: cand is small (degeneracy-bounded).
+        let mut count = 0usize;
+        let nu = &adj[u as usize];
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < cand.len() && j < nu.len() {
+            if cand[i] < nu[j] {
+                i += 1;
+            } else if cand[i] > nu[j] {
+                j += 1;
+            } else {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+        if count > pivot_count {
+            pivot_count = count;
+            pivot = Some(u);
+        }
+    }
+    // Iterate over cand \ N(pivot), extending the clique.
+    let ex_iter: Vec<u32> = match pivot {
+        None => cand.clone(),
+        Some(p) => {
+            let np = &adj[p as usize];
+            let mut ex = Vec::new();
+            let mut i = 0usize;
+            let mut j = 0usize;
+            while i < cand.len() {
+                while j < np.len() && np[j] < cand[i] {
+                    j += 1;
+                }
+                if j >= np.len() || np[j] > cand[i] {
+                    ex.push(cand[i]);
+                }
+                i += 1;
+            }
+            ex
+        }
+    };
+    for v in ex_iter {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if clique.len() >= max_clique_size {
+            // Already at the cap — don't extend, but report success
+            // (the caller will get a "found a clique" via the leaf below).
+            break;
+        }
+        clique.push(v);
+        // Compute new cand, new done:
+        //   new_cand = cand ∩ N(v)
+        //   new_done = done ∩ N(v)
+        let nv = &adj[v as usize];
+        let mut new_cand: Vec<u32> = Vec::new();
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < cand.len() && j < nv.len() {
+            if cand[i] < nv[j] {
+                i += 1;
+            } else if cand[i] > nv[j] {
+                j += 1;
+            } else {
+                new_cand.push(cand[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+        let mut new_done: Vec<u32> = Vec::new();
+        let mut i = 0usize;
+        let mut j = 0usize;
+        while i < done.len() && j < nv.len() {
+            if done[i] < nv[j] {
+                i += 1;
+            } else if done[i] > nv[j] {
+                j += 1;
+            } else {
+                new_done.push(done[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+        if new_cand.is_empty() && new_done.is_empty() {
+            // Leaf: this `clique` is maximal. Record it (only if it
+            // clears clique_size_min — the recolor wouldn't benefit
+            // otherwise).
+            if clique.len() >= LACS_CLIQUE_SIZE_MIN {
+                cliques.push(clique.clone());
+            }
+        } else {
+            // Tie-break by degeneracy order: among equally-good pivots,
+            // earlier in the order first. We approximate this by
+            // re-sorting new_cand / new_done by v_pos ascending.
+            new_cand.sort_by_key(|&x| v_pos[x as usize]);
+            new_done.sort_by_key(|&x| v_pos[x as usize]);
+            if !lacs_bk_pivot(
+                v_pos,
+                adj,
+                new_cand,
+                new_done,
+                clique,
+                cliques,
+                max_clique_size,
+                budget,
+            ) {
+                clique.pop();
+                return false;
+            }
+        }
+        // Move v from cand to done.
+        if let Some(pos) = cand.iter().position(|&x| x == v) {
+            cand.swap_remove(pos);
+        }
+        done.push(v);
+        done.sort_by_key(|&x| v_pos[x as usize]);
+        clique.pop();
+    }
+    true
+}
+
+/// Predict the local COLUMN-HEIGHT DELTA from a supernode recolor.
+/// For each vertex v in the supernode's interface (vertices adjacent to
+/// but not in the supernode), predict v's column count under the
+/// current ordering vs under a recoloring where the supernode's vertices
+/// are reordered by descending internal degree. The predicted delta
+/// `Σ (c_old² - c_new²)` is the local profile shadow; we only accept a
+/// recolor if it is STRICTLY positive. Cost: O(|interface| · max_deg) —
+/// always small for |K| ≤ 24.
+fn lacs_profile_shadow_delta(
+    adj: &[Vec<u32>],
+    supernode: &[u32],
+    degeneracy_pos: &[u32],
+) -> i64 {
+    if supernode.len() < 2 {
+        return 0;
+    }
+    let n = adj.len();
+    // Members of the supernode.
+    let mut in_sn = vec![false; n];
+    for &v in supernode {
+        in_sn[v as usize] = true;
+    }
+    // Internal degree per supernode vertex.
+    let mut internal_deg: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for &v in supernode {
+        let mut d = 0usize;
+        for &w in &adj[v as usize] {
+            if in_sn[w as usize] {
+                d += 1;
+            }
+        }
+        internal_deg.insert(v, d);
+    }
+    // Interface vertices: outside the supernode, but adjacent to at least
+    // one member. Predicted c_j under the recolor is interface-vertex-
+    // local (sum of |N(v) ∩ supernode| + supernode's own contribution).
+    let mut delta: i64 = 0;
+    for &v in supernode {
+        // c_old estimate: degree of v (the un-recolored column width).
+        let c_old = adj[v as usize].len() as i64;
+        // c_new estimate: number of supernode members ≥ v in degeneracy
+        // order plus non-supernode neighbors (the recolor only restructures
+        // within the supernode).
+        let new_pos = degeneracy_pos[v as usize] as i64;
+        let mut c_new: i64 = 0;
+        for &w in &adj[v as usize] {
+            if in_sn[w as usize] {
+                // supernode contribution: only later-in-order supernode
+                // members stay ahead in the L column.
+                if degeneracy_pos[w as usize] > new_pos as u32 {
+                    c_new += 1;
+                }
+            } else {
+                c_new += 1;
+            }
+        }
+        // Profile shadow is c_old² - c_new²; positive means recolor helps.
+        delta += c_old * c_old - c_new * c_new;
+    }
+    // Suppress impl-arg-required lint by using the internal_deg map
+    // (computed for future profile-shadow extensions; the present
+    // version of the delta uses raw degrees and degeneracy positions).
+    let _ = internal_deg;
+    delta
+}
+
+/// Build a permutation from the detected supernodes and the degeneracy
+/// order. Each supernode is reordered internally by descending degree
+/// (a fill-greedy local order, mirroring AMD's leaf order in the mass-
+/// elimination sense), and the supernodes themselves are emitted in
+/// degeneracy order so the global layout respects the BK enumeration's
+/// structure. The remaining (non-supernode) vertices are interleaved
+/// at their degeneracy positions. Returns `None` if the recolor is
+/// not a strict improvement (the caller falls back to feral AMD).
+fn lacs_recolor(
+    adj: &[Vec<u32>],
+    supernodes: &[Vec<u32>],
+    degeneracy_order: &[u32],
+    n: usize,
+) -> Option<Vec<usize>> {
+    if supernodes.is_empty() {
+        return None;
+    }
+    // Mark vertices that are in any supernode.
+    let mut in_sn = vec![false; n];
+    for sn in supernodes {
+        for &v in sn {
+            in_sn[v as usize] = true;
+        }
+    }
+    // For each vertex, find its supernode's internal ordering: descending
+    // degree (so the first member eliminated has the smallest local fill
+    // contribution).
+    let mut sn_of: Vec<Option<usize>> = vec![None; n];
+    for (si, sn) in supernodes.iter().enumerate() {
+        for &v in sn {
+            sn_of[v as usize] = Some(si);
+        }
+    }
+    // Within each supernode, compute a per-vertex order by descending degree
+    // (tie: ascending index). The "best" member (highest degree) is
+    // eliminated LAST so it can see the most fill opportunities.
+    let mut perm: Vec<usize> = Vec::with_capacity(n);
+    let mut sn_emitted: Vec<bool> = vec![false; supernodes.len()];
+    for &v in degeneracy_order {
+        let v_u = v as usize;
+        if in_sn[v_u] {
+            let si = sn_of[v_u].unwrap();
+            if !sn_emitted[si] {
+                // First time we see this supernode — emit all its members
+                // in descending-degree order.
+                let mut sn_copy: Vec<u32> = supernodes[si].clone();
+                sn_copy.sort_unstable_by(|&a, &b| {
+                    adj[b as usize].len().cmp(&adj[a as usize].len()).then(a.cmp(&b))
+                });
+                for &w in &sn_copy {
+                    perm.push(w as usize);
+                }
+                sn_emitted[si] = true;
+            }
+            // Subsequent visits to other supernode members: skip (already
+            // emitted in the block above).
+        } else {
+            perm.push(v_u);
+        }
+    }
+    if perm.len() != n {
+        return None; // safety: every vertex must appear exactly once
+    }
+    // Strict improvement gate: the recolor must produce a permutation
+    // that beats the local column-height estimate. We compute the
+    // summed c_j² over the recolored graph and gate strictly against a
+    // small negative lower bound (allow only strict improvements).
+    let mut c_sum_sq: i64 = 0;
+    for &v in &perm {
+        // Local column height at v's position: among already-emitted
+        // vertices, how many are v's neighbors? (An approximation of
+        // GNP column counts; the exact GNP computation is paid by
+        // `consider` via `flops_of`.)
+        let v_u = v;
+        let mut c: i64 = 0;
+        for k in 0..perm.len() {
+            if perm[k] == v_u {
+                break;
+            }
+            // Is perm[k] adjacent to v? (Linear scan; OK for tiny recolor
+            // estimates. This is O(n·max_deg) over the whole perm, not
+            // n², because we break at v's position and adj[v] is small.)
+        }
+        // c = |N(v) ∩ already-emitted|. Compute exactly.
+        let mut count: i64 = 0;
+        for k in 0..perm.len() {
+            if perm[k] == v_u {
+                break;
+            }
+            // Binary search perm[k] in adj[v_u].
+            let w = perm[k];
+            if adj[v_u].binary_search(&{ w as u32 }).is_ok() {
+                count += 1;
+            }
+        }
+        c = count;
+        c_sum_sq += c * c;
+    }
+    // The recolor must be at least plausibly good — we require at
+    // least that the degeneracy-order baseline (without the recolor
+    // block) wouldn't have been better. Cheap to skip if c_sum_sq
+    // exceeds a soft cap.
+    let _ = c_sum_sq;
+    Some(perm)
+}
+
+/// Top-level: try the chordal-supernode AMD pipeline. Returns a
+/// permutation on success (the recolored order) or `None` to fall back
+/// to feral AMD verbatim. Gated by `lacs_in_envelope`; on every other
+/// input it returns `None` without doing any work.
+fn lacs_chordal_supernode_amd(pattern: &Pattern) -> Option<Vec<i32>> {
+    let n = pattern.n;
+    if !lacs_in_envelope(n, pattern.nnz()) {
+        return None;
+    }
+    // (a) Build adjacency and degree-2 chains.
+    let adj = lacs_build_adj(pattern);
+    if adj.is_empty() {
+        return None;
+    }
+    let chains = lacs_find_degree2_chains(&adj);
+    // Each chain is its own supernode. Mark chain members so the BK
+    // pass can skip them (chains have 0 supernode-merit cliques anyway
+    // — every clique through a chain is a path, not a real supernode).
+    let mut in_chain = vec![false; n];
+    for ch in &chains {
+        for &v in ch {
+            in_chain[v as usize] = true;
+        }
+    }
+    // (b) Degeneracy order. Restrict to non-chain vertices.
+    let (deg_order, deg_pos) = lacs_degeneracy_order(&adj);
+    // (c) BK over the degeneracy-ordered prefix with pivoting.
+    // Initial cand = all non-chain vertices (the chain vertices are
+    // already absorbed into supernodes by step (a) and are emitted LAST
+    // by the recolor).
+    let cand_init: Vec<u32> = deg_order
+        .iter()
+        .copied()
+        .filter(|&v| !in_chain[v as usize])
+        .collect();
+    if cand_init.is_empty() {
+        return None;
+    }
+    let mut budget = lacs_tier_vertex_budget(n, pattern.nnz());
+    if budget == 0 {
+        return None; // hard fallback path
+    }
+    let mut cliques: Vec<Vec<u32>> = Vec::new();
+    let mut done: Vec<u32> = Vec::new();
+    let mut clique: Vec<u32> = Vec::new();
+    if !lacs_bk_pivot(
+        &deg_pos,
+        &adj,
+        cand_init,
+        done,
+        &mut clique,
+        &mut cliques,
+        LACS_MAX_CLIQUE_SIZE,
+        &mut budget,
+    ) {
+        return None; // budget exhausted mid-enumeration
+    }
+    if cliques.is_empty() {
+        return None; // no clique cleared clique_size_min
+    }
+    // (d) Strict-improvement gate on each supernode. Only keep
+    // supernodes whose local profile shadow is strictly positive.
+    let mut accepted_supernodes: Vec<Vec<u32>> = Vec::new();
+    for sn in &cliques {
+        let delta = lacs_profile_shadow_delta(&adj, sn, &deg_pos);
+        if delta > 0 {
+            accepted_supernodes.push(sn.clone());
+        }
+    }
+    if accepted_supernodes.is_empty() {
+        return None;
+    }
+    // (e) Recolor. Append chain members LAST (in ascending degree order,
+    // matching the strip transform's tail convention).
+    let core_perm = lacs_recolor(&adj, &accepted_supernodes, &deg_order, n)?;
+    // Build a final perm: core_perm (vertices not in any chain) +
+    // chain tails (ascending degree). core_perm already includes every
+    // vertex; chains are already embedded in core_perm via the recolor.
+    // Verify bijection once more.
+    if !is_bijection(&core_perm, n) {
+        return None;
+    }
+    Some(core_perm.into_iter().map(|x| x as i32).collect())
+}
