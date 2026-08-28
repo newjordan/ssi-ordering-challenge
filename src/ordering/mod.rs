@@ -168,6 +168,12 @@ mod alloc_probe;
 /// best-of floor.
 mod custom_metrics;
 
+/// Event-driven sibling of the round-based completion minimalizer.  It keeps
+/// an explicit four-cycle witness for every blocked fill edge and wakes that
+/// edge only when a witness support is deleted.
+mod minl_watch;
+use minl_watch::watcher_minimalize;
+
 /// Generic quotient-graph pivot-score family (shot C) — SHIPPED, not
 /// test-gated. `order_generic` drives a parameterized MetricSpec through
 /// `feral_ordering_core::quotient_graph`'s near-linear machinery, and
@@ -765,6 +771,20 @@ const MINL_MAX_LNNZ: usize = 2_400_000;
 const MINL_OPS_BUDGET: i64 = 60_000_000;
 const MINL_MAX_ROUNDS: usize = 8;
 const MINL_MAX_COMMON: usize = 2_000;
+
+/// Witness-driven sibling of MINL.  It starts from the identical pre-descent
+/// completion and is kept independently by the exact FLOP oracle.  The gates
+/// are an identity-based cap guard derived from the one broad watcher census:
+/// they retain 99.06% of its measured score gain while excluding both known
+/// ringpack timing walls before the adjacency clone.  `fri` stores both arcs
+/// of every undirected completion edge, whereas `fill` stores each added edge
+/// once, so `5 * fill >= fri.len()` means fill is at least 40% of the
+/// undirected completion.  Together with the n/fill caps this bounds watcher
+/// storage near 12 MiB rather than the broad gate's 40+ MiB added peak.
+const WATCH_MINL_MAX_N: usize = 30_000;
+const WATCH_MINL_MAX_FILL: usize = 145_000;
+const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
+const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 
 /// COMPONENT B — ORBIT-BATCHED COMPLETION-LATTICE DESCENT (Noether priming
 /// round 4, `noether.md` §2.2 "Component B"; source doc:
@@ -2371,20 +2391,6 @@ fn order_with_options(
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
-    for r in 0..restarts {
-        let seed = r as u64 + 1;
-        consider(&|| {
-            let q = relabel(n, seed);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            let pb = feral_amd::amd_order(&bcore)?;
-            // Compose back: `q[k]` is the original vertex that B numbers `k`.
-            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-        });
-    }
 
     // RELABELLED-AMF MULTISTART (`sbx-relabel-amf`): the relabel trick above
     // works because AMD's tie-break reads the vertex numbering, so `AMD(QAQᵀ)`
@@ -2410,28 +2416,16 @@ fn order_with_options(
     // the identical relabelled graph is a genuinely different candidate, and
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
-    if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        let amf_opts = feral_amf::AmfOptions {
+    let relabel_amf_opts =
+        (nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0).then(|| feral_amf::AmfOptions {
             dense_alpha: 5.0,
             ..Default::default()
-        };
-        let amf_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
-        for r in 0..amf_restarts {
-            let seed = r as u64 + 1;
-            consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-                // Compose back: `q[k]` is the original vertex that B numbers `k`.
-                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
-        }
-    }
+        });
+    let amf_restarts = if relabel_amf_opts.is_some() {
+        relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap)
+    } else {
+        0
+    };
 
     // RELABELLED NO-DENSE AMD MULTISTART. The relabel trick is a property of the
     // SHARED quotient-graph machinery, not of `amd_order` specifically: the
@@ -2461,29 +2455,111 @@ fn order_with_options(
     // a genuinely different candidate — and every result is bijection-checked in
     // `consider` before it can win, so this cannot regress the score.
     const RELABEL_AMDND_MAX_NNZ: usize = 60_000;
-    if nnz > 0 && nnz <= RELABEL_AMDND_MAX_NNZ && relabel_cap > 0 {
-        let amd_nd_opts = feral_amd::AmdOptions {
+    let relabel_amdnd_opts = (nnz > 0 && nnz <= RELABEL_AMDND_MAX_NNZ && relabel_cap > 0)
+        .then_some(feral_amd::AmdOptions {
             aggressive: false,
             dense_alpha: -1.0,
+        });
+    let amdnd_restarts = if relabel_amdnd_opts.is_some() {
+        relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap)
+    } else {
+        0
+    };
+
+    // FUSED RELABEL CONSTRUCTION. All three families use the same deterministic
+    // seed schedule, so build Q, Q A Q^T, its i32 buffers, and CscPattern once per
+    // seed, then run every family enabled for that seed against the shared core.
+    //
+    // The old loops were family-major (all AMD, then all AMF, then all no-dense
+    // AMD), whereas this loop is seed-major. Because candidate replacement is
+    // strict, evaluation order determines which byte-level permutation survives
+    // an exact FLOP tie. `original_priority` models the old family-major order;
+    // an equal-score candidate replaces the incumbent only when it would have
+    // appeared earlier in those old loops. Priority zero reserves every
+    // pre-relabel incumbent, reproducing the old strict no-replacement-on-tie
+    // behavior. Thus construction is fused without changing the selected output.
+    drop(consider);
+    let mut best_relabel_priority = 0usize;
+    let mut consider_relabel =
+        |original_priority: usize,
+         produce: &dyn Fn() -> Result<Vec<i32>, feral_ordering_core::OrderingError>| {
+            let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
+            let Ok(Ok(perm_i32)) = produced else {
+                return;
+            };
+            let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
+            if !is_bijection(&perm, n) {
+                return;
+            }
+            let f = if let Some(&cached) = flops_cache.get(perm.as_slice()) {
+                cached
+            } else {
+                let v = ws.flops(&scoring_pat, &perm);
+                flops_cache.insert(perm.clone(), v);
+                v
+            };
+            #[cfg(test)]
+            BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
+            if f < best_flops
+                || (f == best_flops
+                    && best_relabel_priority != 0
+                    && original_priority < best_relabel_priority)
+            {
+                best_flops = f;
+                best_perm = perm;
+                best_relabel_priority = original_priority;
+            }
         };
-        let amdnd_restarts =
-            relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
-        for r in 0..amdnd_restarts {
-            let seed = r as u64 + 1;
-            consider(&|| {
-                let q = relabel(n, seed);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_nd_opts)?;
+
+    let amf_priority_base = 1 + restarts;
+    let amdnd_priority_base = amf_priority_base + amf_restarts;
+    let fused_restarts = restarts.max(amf_restarts).max(amdnd_restarts);
+    for r in 0..fused_restarts {
+        let seed = r as u64 + 1;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let q = relabel(n, seed);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            (q, bcp, bri)
+        }));
+        let Ok((q, bcp, bri)) = built else {
+            continue;
+        };
+        let built_core = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+        }));
+        let Ok(Some(bcore)) = built_core else {
+            continue;
+        };
+
+        if r < restarts {
+            consider_relabel(1 + r, &|| {
+                let pb = feral_amd::amd_order(&bcore)?;
                 // Compose back: `q[k]` is the original vertex that B numbers `k`.
                 Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
             });
         }
+        if r < amf_restarts {
+            let amf_opts = relabel_amf_opts
+                .as_ref()
+                .expect("positive AMF restart count requires options");
+            consider_relabel(amf_priority_base + r, &|| {
+                let (pb, ..) = feral_amf::amf_order_opts(&bcore, amf_opts)?;
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
+        }
+        if r < amdnd_restarts {
+            let amd_nd_opts = relabel_amdnd_opts
+                .as_ref()
+                .expect("positive no-dense AMD restart count requires options");
+            consider_relabel(amdnd_priority_base + r, &|| {
+                let (pb, ..) = feral_amd::amd_order_opts(&bcore, amd_nd_opts)?;
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
+        }
     }
-
+    drop(consider_relabel);
 
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
@@ -2986,6 +3062,20 @@ fn order_with_options(
                 }
                 out
             };
+            // Preserve the identical pre-MINL completion for the independent
+            // witness-driven sibling.  This is intentionally a clone rather
+            // than a continuation from MINL's result: different valid
+            // deletion sequences can land on different minimal completions,
+            // and the exact oracle should see both candidates.
+            let mut watcher_adj = if n <= WATCH_MINL_MAX_N
+                && !fill.is_empty()
+                && fill.len() <= WATCH_MINL_MAX_FILL
+                && fill.len().saturating_mul(5) >= fri.len()
+            {
+                Some(adj.clone())
+            } else {
+                None
+            };
             let mut ops = MINL_OPS_BUDGET;
             let mut alive = vec![true; fill.len()];
             let mut removed_total = 0usize;
@@ -3022,6 +3112,30 @@ fn order_with_options(
                     if f < best_flops {
                         best_flops = f;
                         best_perm = cand;
+                    }
+                }
+            }
+
+            if let Some(ref mut watch_adj) = watcher_adj {
+                let result = watcher_minimalize(
+                    watch_adj,
+                    &fill,
+                    &scan_order,
+                    WATCH_MINL_OPS_BUDGET,
+                    WATCH_MINL_MAX_COMMON,
+                );
+                if result.removed > 0 {
+                    let cand = minl_mcs_peo(n, watch_adj);
+                    if is_bijection(&cand, n) {
+                        let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                            cached
+                        } else {
+                            ws.flops(&scoring_pat, &cand)
+                        };
+                        if f < best_flops {
+                            best_flops = f;
+                            best_perm = cand;
+                        }
                     }
                 }
             }
