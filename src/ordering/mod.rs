@@ -206,6 +206,14 @@ mod exact_dp;
 /// highly decomposable (median ~30% articulation points, 65-399 blocks per
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
+/// RANDOMIZED GREEDY ELIMINATION-GAME SEARCH — a new candidate family for the
+/// small tier. Maintains the EXACT fill graph as bitsets and runs thousands of
+/// randomized exact-minimum-degree eliminations, accumulating `Σ c_j²` for free
+/// as it goes (the elimination-game identity `exact_dp` is built on), with
+/// partial-sum pruning and a prefix-freezing LNS phase. Distinct from the
+/// relabelled-AMD/AMF multi-start, which can only perturb an APPROXIMATE
+/// minimum-degree code's internal tie-breaks. See its module doc.
+mod rgreedy;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -3196,6 +3204,58 @@ fn order_with_options(
         if arena_flops < best_flops {
             best_flops = arena_flops;
             best_perm = arena_perm;
+        }
+    }
+
+    // ── RGREEDY — randomized exact elimination-game search (small tier) ─────
+    // A genuinely NEW candidate family, not another separator/relabel variant:
+    // it maintains the EXACT fill graph as bitsets and runs tens of thousands
+    // of randomized exact-minimum-degree eliminations, accumulating `Σ c_j²`
+    // for free from the elimination-game identity (so there is no per-candidate
+    // scoring pass and a partial sum that already reaches the incumbent aborts
+    // the run mid-flight), then spends ~15/16 of its budget on a prefix-freezing
+    // LNS around the incumbent. See `rgreedy.rs`.
+    //
+    // Runs LAST, strictly-improving over whatever the whole pipeline produced,
+    // so it is monotone by construction: it cannot perturb any earlier phase's
+    // seed incumbent (the non-monotonicity trap this repo has hit with TELOS),
+    // and the measured per-matrix deltas are exactly what `probe_rgreedy`
+    // predicts against the shipped `order()`.
+    //
+    // GATES. `RGREEDY_MAX_N` = 3000: memory is ~n²/4 bytes (two bitset
+    // adjacency copies), and more importantly the LNS's per-iteration cost is
+    // O(n·⌈n/64⌉), so above ~3000 the budget buys too few iterations to escape
+    // the incumbent's basin. `RGREEDY_MAX_NNZ` = 250_000 keeps the two densest
+    // admitted matrices (`maxcsp-ehi-85-297-71` nnz=207_996,
+    // `qspp_0_14_0_1_10_1` nnz=120_274, both measured wins) in and bounds the
+    // reset cost. `RGREEDY_BUDGET` is in WORD-OPERATIONS, never wall-clock —
+    // determinism requires the stopping rule be a pure function of the pattern.
+    // Measured single-threaded worst case over all 211 admitted dev matrices at
+    // this budget: 0.22 s (on tiny `n`, where the fixed per-run overheads
+    // dominate), median ~0.15 s.
+    const RGREEDY_MAX_N: usize = 3_000;
+    const RGREEDY_MAX_NNZ: usize = 250_000;
+    const RGREEDY_BUDGET: i64 = 600_000_000;
+    if n <= RGREEDY_MAX_N && nnz <= RGREEDY_MAX_NNZ && nnz > 0 {
+        if let Some((cand, _)) = rgreedy::search(
+            n,
+            &pattern.col_ptr,
+            &pattern.row_idx,
+            &best_perm,
+            best_flops,
+            RGREEDY_BUDGET,
+            0x9E37_79B9_7F4A_7C15,
+        ) {
+            // Never trust the elimination-game accumulator: re-score through
+            // the same trusted path every other candidate goes through, and
+            // keep the result only on a STRICT improvement.
+            if is_bijection(&cand, n) {
+                let f = ws.flops(&scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
         }
     }
 

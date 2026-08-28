@@ -3778,3 +3778,208 @@ fn probe_biconn_heavy() {
 fn probe_max_deg(pat: &Pattern) -> usize {
     (0..pat.n).map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j]).max().unwrap_or(0)
 }
+
+/// RGREEDY headroom probe — does the exact randomized elimination-game family
+/// find anything the shipped portfolio misses on the small tier?
+///
+/// For every corpus matrix with `n <= RG_MAX_N`, this runs the FULL shipped
+/// `order()` (so the comparison is against the real incumbent, not against
+/// AMD), then hands that incumbent to `rgreedy::search` with `RG_BUDGET`
+/// word-operations and reports what it recovers. Scored on flops only —
+/// deterministic and load-independent — so it is safe to run with the box
+/// saturated, and it is parallelised across `RG_THREADS` threads.
+///
+/// ```sh
+/// RG_MAX_N=1000 RG_BUDGET=20000000 cargo test --release -p ssi-candidate-worker \
+///   -- --ignored --nocapture probe_rgreedy
+/// ```
+#[test]
+#[ignore]
+fn probe_rgreedy() {
+    let corpus = crate::corpus::corpus();
+    let max_n: usize = envu("RG_MAX_N", 1_000);
+    let budget: i64 = envu("RG_BUDGET", 20_000_000) as i64;
+    let nthreads: usize = envu("RG_THREADS", 8);
+
+    let targets: Vec<usize> = (0..corpus.len())
+        .filter(|&i| corpus[i].1.n > 0 && corpus[i].1.n <= max_n)
+        .collect();
+    eprintln!("rgreedy probe: {} matrices, budget {budget} ops, {nthreads} threads",
+              targets.len());
+
+    struct Row {
+        name: String,
+        n: usize,
+        nnz: usize,
+        amd: u64,
+        port: u64,
+        rg: u64,
+        secs: f64,
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new(Vec::<Row>::new());
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if k >= targets.len() {
+                    break;
+                }
+                let (name, pat) = &corpus[targets[k]];
+                let n = pat.n;
+                let sp = scoring_pattern(pat);
+                let (cp, ri) = core_of(pat);
+                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+                let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+                    .unwrap()
+                    .into_iter()
+                    .map(|x| x as usize)
+                    .collect();
+                let amd = flops_of(&sp, &amd_perm);
+                let pperm = order(pat);
+                let port = flops_of(&sp, &pperm);
+
+                let t0 = Instant::now();
+                let par = crate::ordering::rgreedy::Params {
+                    phase_a_num: envu("RG_PHA_NUM", 1) as i64,
+                    phase_a_den: envu("RG_PHA_DEN", 16) as i64,
+                    pol_mask: envu("RG_POL", 0b1111_1111) as u8,
+                    lns: envu("RG_LNS", 1) != 0,
+                    prefix_mode: envu("RG_PFX", 2) as u8,
+                };
+                let found = crate::ordering::rgreedy::search_with(
+                    n, &pat.col_ptr, &pat.row_idx, &pperm, port, budget,
+                    0x9E3779B97F4A7C15, par,
+                );
+                let secs = t0.elapsed().as_secs_f64();
+                let rg = match found {
+                    Some((ord, f)) => {
+                        assert!(super::is_bijection(&ord, n), "{name}: rgreedy non-bijection");
+                        let trusted = flops_of(&sp, &ord);
+                        assert_eq!(
+                            trusted, f,
+                            "{name}: rgreedy accumulator {f} disagrees with trusted scorer {trusted}"
+                        );
+                        trusted
+                    }
+                    None => port,
+                };
+                out.lock().unwrap().push(Row {
+                    name: name.clone(),
+                    n,
+                    nnz: pat.nnz(),
+                    amd,
+                    port,
+                    rg,
+                    secs,
+                });
+            });
+        }
+    });
+
+    let mut rows = out.into_inner().unwrap();
+    rows.sort_by(|a, b| {
+        let ka = (a.rg as f64) / (a.port as f64);
+        let kb = (b.rg as f64) / (b.port as f64);
+        ka.partial_cmp(&kb).unwrap().then(a.name.cmp(&b.name))
+    });
+
+    println!(
+        "{:<30} {:>5} {:>8} {:>8} {:>8} {:>8} {:>7}",
+        "matrix", "n", "nnz", "r_amd", "r_port", "r_rg", "secs"
+    );
+    let mut improved = 0usize;
+    let mut ln_delta = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut worst_secs = 0.0f64;
+    let mut worst_name = String::new();
+    let mut rate_lo = f64::MAX;
+    let mut rate_hi = 0.0f64;
+    for r in &rows {
+        let b = bucket(r.n);
+        if r.secs > 0.0 {
+            let rate = budget as f64 / r.secs;
+            rate_lo = rate_lo.min(rate);
+            rate_hi = rate_hi.max(rate);
+        }
+        if r.secs > worst_secs {
+            worst_name = r.name.clone();
+        }
+        counts[b] += 1;
+        let rp = r.port as f64 / r.amd as f64;
+        let rr = r.rg as f64 / r.amd as f64;
+        worst_secs = worst_secs.max(r.secs);
+        if envu("RG_ALL", 0) != 0 {
+            println!(
+                "ALL {:<30} {:>5} {:>8} {:>8.4} {:>8.4} {:>7.3} rate={:.0}M",
+                r.name, r.n, r.nnz, rp, rr, r.secs,
+                budget as f64 / r.secs.max(1e-9) / 1e6
+            );
+        }
+        if r.rg < r.port {
+            improved += 1;
+            ln_delta[b] += (r.rg as f64 / r.port as f64).ln();
+            println!(
+                "{:<30} {:>5} {:>8} {:>8.4} {:>8.4} {:>8.4} {:>7.3}  <-- WIN",
+                r.name, r.n, r.nnz, r.amd as f64 / r.amd as f64, rp, rr, r.secs
+            );
+        }
+    }
+    println!("\n--- rgreedy headroom (n <= {max_n}, budget {budget}) ---");
+    println!("matrices              : {}", rows.len());
+    println!("strictly improved     : {improved}");
+    println!("worst rgreedy secs    : {worst_secs:.4}  ({worst_name})");
+    println!("ops/sec spread        : {:.0}M .. {:.0}M", rate_lo / 1e6, rate_hi / 1e6);
+    const GEOMEAN: [f64; 3] = [0.899432, 0.875342, 0.774477];
+    const BUCKET_N: [f64; 3] = [147.0, 108.0, 45.0];
+    let mut gain = 0.0;
+    for b in 0..3 {
+        if counts[b] == 0 {
+            continue;
+        }
+        let lev = BUCKET_WEIGHTS[b] * GEOMEAN[b] / BUCKET_N[b];
+        println!(
+            "bucket {:<7} n={:<4} sum_ln_delta={:+.5}  -> score {:+.6}",
+            BUCKET_NAMES[b], counts[b], ln_delta[b], ln_delta[b] * lev
+        );
+        gain += ln_delta[b] * lev;
+    }
+    println!("predicted dev score delta: {gain:+.6}");
+}
+
+fn envu(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// Cross-check: the elimination-game accumulator must reproduce the trusted
+/// `column_counts_gnp`-based `Σ c_j²` exactly, on real corpus patterns and on
+/// several different permutations each.
+#[test]
+#[ignore]
+fn probe_rgreedy_identity() {
+    let corpus = crate::corpus::corpus();
+    let mut checked = 0usize;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n > 1_500 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let mut g = crate::ordering::rgreedy::Game::new(n, &pat.col_ptr, &pat.row_idx).unwrap();
+        for perm in [amd_perm, (0..n).collect::<Vec<_>>(), (0..n).rev().collect::<Vec<_>>()] {
+            let a = g.replay_flops(&perm);
+            let b = flops_of(&sp, &perm);
+            assert_eq!(a, b, "{name}: elimination-game {a} != trusted {b}");
+        }
+        checked += 1;
+    }
+    println!("elimination-game identity verified on {checked} matrices x 3 permutations");
+}
