@@ -4515,7 +4515,10 @@ fn order_with_options(
         streams: 2,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
-        for _round in 0..2 {
+        // Extra convergence is response-gated below and restricted to the sparse
+        // class so the promoted large-matrix timing tail keeps its full margin.
+        let rounds = if nnz <= 80_000 { 4 } else { 2 };
+        for _round in 0..rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
