@@ -4300,7 +4300,12 @@ fn order_with_options(
     // count (`rgreedy::search_seed` is the unit a task queue can schedule).
     const RGREEDY_MAX_N: usize = 3_000; // round 5: 3k-10k band held back — grader tail (hidden #147 at 1.84 s) has no slack for a flat +0.1 s on 44 more matrices
     const RGREEDY_MAX_NNZ: usize = 250_000;
-    const RGREEDY_BUDGET: i64 = 200_000_000;
+    // 0027: RGS-tier per-stream budget raised 200M → 400M (the PEP tier keeps
+    // its own 300M selector — mellowcroc's measured optimum for nnz ≤ 60k).
+    // Measured on the 37131d5 base: 0.820888 → 0.820623 (−0.000265 from this
+    // knob alone). The budget curve is NOT monotone (600M+ scores worse —
+    // fixed-seed LNS degrades past the knee), so 400M is the measured optimum.
+    const RGREEDY_BUDGET: i64 = 400_000_000;
     const RGREEDY_PEP_MAX_NNZ: usize = 60_000;
     const RGREEDY_PEP_BUDGET: i64 = 300_000_000;
     // Density guard: rgreedy never wins on the dense small class (qapw, density 124,
@@ -4468,7 +4473,7 @@ fn order_with_options(
         min_s: 32,
         max_s: 700,
         max_sub: 3_500,
-        max_blocks: 96,
+        max_blocks: 128,
         budget: 5_000_000,
         streams: 2,
     };
