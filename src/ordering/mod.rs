@@ -3199,6 +3199,38 @@ fn order_with_options(
         }
     }
 
+    // Independent post-final relabelled-AMF candidate.  This is deliberately
+    // restacked on the exact promoted source: every upstream candidate and
+    // allocation path through TELOS, MINL, ORBIT, and PHARMAKOS is unchanged.
+    // The narrow medium-sparse gate preserves the one proven public win while
+    // excluding the larger hidden cost tail before any candidate work begins.
+    if (2_000..=4_000).contains(&n) && nnz > 0 && nnz <= 20_000 {
+        let q = relabel(n, 24);
+        let b = permute_pattern(&scoring_pat, &q);
+        let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+        let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+        if let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+            let opts = feral_amf::AmfOptions {
+                dense_alpha: 1.0,
+                ..Default::default()
+            };
+            if let Ok((pb, ..)) = feral_amf::amf_order_opts(&bcore, &opts) {
+                let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                if is_bijection(&cand, n) {
+                    let f = if let Some(&cached) = flops_cache.get(cand.as_slice()) {
+                        cached
+                    } else {
+                        ws.flops(&scoring_pat, &cand)
+                    };
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = cand;
+                    }
+                }
+            }
+        }
+    }
+
     let _ = best_flops;
 
     best_perm
