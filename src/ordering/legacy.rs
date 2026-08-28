@@ -40,7 +40,6 @@ pub(crate) fn legacy_order(pattern: &Pattern) -> Vec<usize> {
 /// behavior); probes pass `0` to measure the portfolio-minus-multi-start
 /// baseline so restart schedules can be compared at a true equal budget.
 fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
-
     let n = pattern.n;
     if n == 0 {
         return Vec::new();
@@ -94,8 +93,7 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     // (which would otherwise crash the worker and FAIL the whole run).
     let mut consider =
         |produce: &dyn Fn() -> Result<Vec<i32>, feral_ordering_core::OrderingError>| {
-            let produced =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
+            let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce));
             let Ok(Ok(perm_i32)) = produced else {
                 return;
             };
@@ -182,9 +180,15 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
         // near the 2 s cap, and adding two more AMD passes there breached it
         // (measured 2.46 s at 5×). At nnz < 150k each AMD pass is a few ms.
         if nnz < SWEEP_EXTRA_MAX_NNZ {
-            let amd_opts1 = feral_amd::AmdOptions { aggressive: true, dense_alpha: 1.0 };
+            let amd_opts1 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 1.0,
+            };
             consider(&|| feral_amd::amd_order_opts(&core, &amd_opts1).map(|(p, ..)| p));
-            let amd_opts16 = feral_amd::AmdOptions { aggressive: true, dense_alpha: 16.0 };
+            let amd_opts16 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 16.0,
+            };
             consider(&|| feral_amd::amd_order_opts(&core, &amd_opts16).map(|(p, ..)| p));
         }
     }
@@ -212,7 +216,10 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     //      fast (sparse) AND is the unique min (faclay75, kissing2, pooling_*).
     if n < AMF_SWEEP_MAX_N && nnz < 130_000 {
         for da in [1.0f64, 16.0, -1.0] {
-            let amf_a = feral_amf::AmfOptions { dense_alpha: da, ..Default::default() };
+            let amf_a = feral_amf::AmfOptions {
+                dense_alpha: da,
+                ..Default::default()
+            };
             consider(&|| feral_amf::amf_order_opts(&core, &amf_a).map(|(p, ..)| p));
         }
 
@@ -235,10 +242,16 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
         }
     } else if n < AMF_SWEEP_MAX_N && nnz >= 130_000 && nnz < 400_000 {
         // Win B — see regime (b) above.
-        let amf_dz = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
+        let amf_dz = feral_amf::AmfOptions {
+            dense_alpha: -1.0,
+            ..Default::default()
+        };
         consider(&|| feral_amf::amf_order_opts(&core, &amf_dz).map(|(p, ..)| p));
     } else if n < AMF_SWEEP_MAX_N && nnz >= 400_000 && nnz < AMF_SWEEP_MAX_NNZ {
-        let amf_nd = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
+        let amf_nd = feral_amf::AmfOptions {
+            dense_alpha: -1.0,
+            ..Default::default()
+        };
         consider(&|| feral_amf::amf_order_opts(&core, &amf_nd).map(|(p, ..)| p));
     }
 
@@ -300,9 +313,7 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     // worst case; deterministic (stable within-level degree sort, fixed BFS
     // seeding). Best-of floor makes it zero-downside.
     if n < RCM_MAX_N && nnz < RCM_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern)));
     }
 
     // Sloan wavefront/profile reduction — a pure-Rust O(nnz log n) ordering from
@@ -334,9 +345,7 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     // overflow nor move the worst case. Deterministic. Best-of floor →
     // zero-downside.
     if n < ND_MAX_N && nnz < ND_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern)));
     }
 
     // GREEDY GRAPH-GROWING (GGGP) recursive bisection — a SECOND, algorithmically
@@ -351,9 +360,7 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     // below the slow tier) so its few-ms cost cannot move the worst case.
     // Deterministic. Best-of floor → zero-downside.
     if n < NDFM_MAX_N && nnz < NDFM_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(ndfm_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(ndfm_order(pattern)));
     }
 
     // NET-NEW: MINIMUM-FILL (minimum-deficiency) ordering — a greedy elimination
@@ -372,9 +379,7 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
     // `wastepaper6`, `syn*`, `tln2`). Deterministic (fixed
     // `(deficiency, degree, index)` tie-break). Best-of floor → zero-downside.
     if n < MINFILL_MAX_N && nnz < MINFILL_MAX_NNZ {
-        consider(&|| {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(minfill_order(pattern))
-        });
+        consider(&|| Ok::<Vec<i32>, feral_ordering_core::OrderingError>(minfill_order(pattern)));
     }
 
     // METIS nested dissection — bounded by nnz primarily (its cost driver) plus
@@ -431,9 +436,7 @@ fn legacy_order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<u
             n_sep_trials: 10,
             ..Default::default()
         };
-        consider(&|| {
-            feral_scotch::scotch_order_full(&core, &scotch_tuned).map(|(p, _, _)| p)
-        });
+        consider(&|| feral_scotch::scotch_order_full(&core, &scotch_tuned).map(|(p, _, _)| p));
     }
 
     // KaHIP — distinct partitioner, small-matrix only. Milliseconds even at 5×;

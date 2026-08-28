@@ -19,7 +19,7 @@ these to the next scoring win, at zero extra measurement cost:
   not merely worse. One-line change; do not re-measure, just carry it.
 
 ## Current best
-- Best score: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
+- Best score: dev **0.842174** ([0021](experiments/0021-static-gated-telos-seed-split.md), the second Tier-A TELOS round swaps to the AMD anchor only when the incumbent's first round improved, under a strict small-pattern gate). Previous: dev **0.842223** ([0019](experiments/0019-mid-band-restart-floor.md), restart floors in two regimes: hub-gated mid-band + low-nnz; worst order() **1.784 s**, BELOW the incumbent's 1.852 s; reproduced on 3 runs). Previous: dev **0.843129** ([0013](experiments/0013-gate-covariate-audit.md)). Previous: dev **0.843535** (relabelled-AMF multistart, [0011](experiments/0011-relabelled-amf-multistart.md); CURRENT-ROUND corpus, 147/108/45). NOTE: scores below this line predate a corpus rebaseline and are NOT comparable — the round that produced 0.874894 used a different corpus. Previous (this round): dev 0.845333 (inherited promoted frontier, commit eacdb5c).
 - Best score (prior round): dev **0.874894** (hc gate 165k, [0009](experiments/0009-separator-negative-hc-extend.md)). Previous: dev 0.875036 (amdnd ceiling 1.5M, [0008](experiments/0008-amdnd-ceiling-restore.md)). Previous: dev 0.875217 (heavy multi-restart, [0007](experiments/0007-heavy-multi-restart.md)). Previous: dev 0.875359 (hill-climb phase; fill 0.961896), 2026-08-06 —
   see [0006](experiments/0006-hillclimb-phase.md). Previous: dev 0.876511
   (density-guarded heavy tier), 2026-07-26. Promoted EVAL best: **0.886427** (`39f4bfd`). NOTE: dev 0.876329
@@ -97,6 +97,7 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0021-static-gated-telos-seed-split.md](experiments/0021-static-gated-telos-seed-split.md) — **WIN, dev 0.842223→0.842174.** Under `n≤10k`, `nnz≤35k`, no-giant-hub patterns, swap the already-earned second Tier-A TELOS round to the AMD anchor only after round one improves; no forced extra round.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
@@ -206,6 +207,12 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   a hub that size is why its restarts cost. 4 better / **1 worse** / 296 same. **NOT monotone on
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
+
+- [0022-zero-alloc-low-nnz-restarts.md](experiments/0022-zero-alloc-low-nnz-restarts.md) — **WIN,
+  dev 0.842223→0.842104.** GitHub Actions proved the preceding TELOS attempts were hidden timeouts,
+  not validator failures. Restored promoted TELOS, bounded the exact-score memo table, wired the
+  existing vendor-identical zero-allocation CSC carrier into relabel/hill-climb, and spent the
+  recovered time on a bounded 700k low-nnz restart prefix. Full capped corpus and 66 tests pass.
 
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
