@@ -104,19 +104,13 @@ pub(crate) struct CandOut {
 /// immediately. The returned vector is indexed by TASK INDEX, not by
 /// completion order — that is what makes the caller's sequential acceptance
 /// walk reproduce the original semantics exactly.
+#[allow(dead_code)]
 pub(crate) fn run_candidates(
     tasks: &[CandFn<'_>],
     sp: &ScoringPattern,
     n: usize,
     nnz: usize,
     incumbent: u64,
-    // `true` disables the drop-early memory optimization so EVERY valid
-    // candidate keeps its permutation — required by the TELOS seed pool
-    // (0022), which needs the top-8 by value, not just the argmin. Retaining
-    // more can never change the argmin `accept` picks, so this is
-    // output-neutral; callers pass `true` only under the pool's small-matrix
-    // gates, where the retained permutations total a few MB.
-    keep_all: bool,
 ) -> Vec<CandOut> {
     run_generic(
         tasks.len(),
@@ -124,7 +118,36 @@ pub(crate) fn run_candidates(
         n,
         nnz,
         incumbent,
-        keep_all,
+        false,
+        &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
+            Ok(Ok(perm_i32)) => Some(perm_i32.into_iter().map(|x| x as usize).collect()),
+            _ => None,
+        },
+    )
+}
+
+/// [`run_candidates`] with permutation release disabled.
+///
+/// This is used by the bounded portfolio-shoulder selector: it needs a small
+/// set of non-winning, structurally distinct candidates after scoring, rather
+/// than only the strict argmin.  The caller immediately reduces the retained
+/// permutations to one shoulder before entering the sequential post-hoc
+/// phases.  As with [`run_perms_keep_all`], scoring and result order are
+/// unchanged; only the lifetime of candidate permutations differs.
+pub(crate) fn run_candidates_keep_all(
+    tasks: &[CandFn<'_>],
+    sp: &ScoringPattern,
+    n: usize,
+    nnz: usize,
+    incumbent: u64,
+) -> Vec<CandOut> {
+    run_generic(
+        tasks.len(),
+        sp,
+        n,
+        nnz,
+        incumbent,
+        true,
         &|i: usize| match std::panic::catch_unwind(AssertUnwindSafe(|| (tasks[i])())) {
             Ok(Ok(perm_i32)) => Some(perm_i32.into_iter().map(|x| x as usize).collect()),
             _ => None,
