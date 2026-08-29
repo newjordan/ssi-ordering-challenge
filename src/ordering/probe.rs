@@ -9820,3 +9820,345 @@ fn fo_mcs_check_score(
     }
     Some((elim, score))
 }
+
+/// CLAUDE SWEEP: fine (variant x alpha) grid on selected rows, hunting grid
+/// holes (the faclay-class alpha points sat outside the historical
+/// {10,5,2.5,2,1,0.5,-1} grid). Targets from `SSI_SWEEP_TARGETS` (comma list)
+/// or the built-in dev list; corpus from `SSI_CORPUS_FILE` when set.
+#[test]
+#[ignore]
+fn probe_claude_giant_sweep() {
+    use custom_metrics::ScoreVariant as SV;
+    const TARGETS: &[&str] = &[
+        "faclay75",
+        "kissing2",
+        "acopf_case9241pegase_qcqp",
+        "unitcommit_200_100_1_mod_8",
+        "transswitch2383wpr",
+        "emfl100_5_5",
+        "supplychainr1_053050",
+        "squfl020-150",
+    ];
+    let variants = [
+        SV::SqDiv,
+        SV::SqPure,
+        SV::Ammf,
+        SV::AmindNorm,
+        SV::DegSqrt,
+        SV::DegP075,
+        SV::DegP125,
+        SV::DegDivNvSqrtWf,
+        SV::DegDivNvWfP15,
+        SV::DegPlusDegme,
+        SV::DegDivNvDegme,
+    ];
+    let alphas = [0.5f64, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+    let corpus: Vec<(String, crate::Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p)).expect("load env corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let env_targets: Option<Vec<String>> = std::env::var("SSI_SWEEP_TARGETS")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    for (name, pat) in &corpus {
+        let selected = match &env_targets {
+            Some(t) => t.iter().any(|x| x == name),
+            None => TARGETS.contains(&name.as_str()),
+        };
+        if !selected {
+            continue;
+        }
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let mut best = (f64::INFINITY, String::new());
+        let mut check = |label: String, perm: Option<Vec<i32>>, secs: f64| {
+            let Some(p) = perm else {
+                return;
+            };
+            let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+            if !is_bijection(&p, n) {
+                return;
+            }
+            let r = flops_of(&sp, &p) as f64 / base;
+            if r < best.0 {
+                best = (r, label.clone());
+            }
+            if r < 0.9995 {
+                println!("  {label}: ratio={r:.6} ({secs:.3}s)");
+            }
+        };
+        println!("== {name} n={n} nnz={nnz} d={:.1}", nnz as f64 / n as f64);
+        {
+            let t = Instant::now();
+            let inc = crate::ordering::order(pat);
+            let secs = t.elapsed().as_secs_f64();
+            if is_bijection(&inc, n) {
+                let r = flops_of(&sp, &inc) as f64 / base;
+                println!("  INCUMBENT order(): ratio={r:.6} ({secs:.3}s)");
+            }
+        }
+        for v in variants {
+            if matches!(v, SV::Ammf | SV::AmindNorm) && nnz > 700_000 {
+                continue;
+            }
+            for a in alphas {
+                let t = Instant::now();
+                let r = custom_metrics::order_variant(&core, a, true, v).ok();
+                check(format!("cm_{v:?}_a{a}"), r, t.elapsed().as_secs_f64());
+            }
+        }
+        for spec in metric_sweep::EXTRA_METRICS {
+            for a in [0.75f64, 1.25, 1.5] {
+                let t = Instant::now();
+                let r = metric_sweep::order_generic(&core, a, true, spec).ok();
+                check(format!("{}_a{a}", spec.name), r, t.elapsed().as_secs_f64());
+            }
+        }
+        for a in [0.75f64, 1.25, 1.5] {
+            let t = Instant::now();
+            let opts = feral_amf::AmfOptions {
+                dense_alpha: a,
+                ..Default::default()
+            };
+            let r = feral_amf::amf_order_opts(&core, &opts).ok().map(|(p, ..)| p);
+            check(format!("amf_a{a}"), r, t.elapsed().as_secs_f64());
+            let t = Instant::now();
+            let aopts = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: a,
+            };
+            let r = feral_amd::amd_order_opts(&core, &aopts).ok().map(|(p, ..)| p);
+            check(format!("amd_aggr_a{a}"), r, t.elapsed().as_secs_f64());
+        }
+        println!("  BEST {name}: {} ratio={:.6}", best.1, best.0);
+    }
+}
+
+/// CLAUDE CENSUS: incumbent ratio for every row of `$SSI_CORPUS_FILE`
+/// (superset reconstruction), one full `order()` + exact AMD base per row.
+#[test]
+#[ignore]
+fn probe_claude_census() {
+    let corpus: Vec<(String, crate::Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p)).expect("load env corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 || nnz == 0 {
+            println!("CENSUS {name} {n} {nnz} NaN 0.0");
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let Some(core) = feral_ordering_core::CscPattern::new(n, &cp, &ri) else {
+            println!("CENSUS {name} {n} {nnz} CORE_ERR 0.0");
+            continue;
+        };
+        let Ok(amd) = feral_amd::amd_order(&core) else {
+            println!("CENSUS {name} {n} {nnz} AMD_ERR 0.0");
+            continue;
+        };
+        let base = flops_of(&sp, &amd.into_iter().map(|x| x as usize).collect::<Vec<_>>()) as f64;
+        let t = Instant::now();
+        let inc = crate::ordering::order(pat);
+        let secs = t.elapsed().as_secs_f64();
+        if !is_bijection(&inc, n) {
+            println!("CENSUS {name} {n} {nnz} NOT_BIJ {secs:.3}");
+            continue;
+        }
+        let r = flops_of(&sp, &inc) as f64 / base;
+        println!("CENSUS {name} {n} {nnz} {r:.6} {secs:.3}");
+    }
+    println!("CENSUS_DONE {} rows", corpus.len());
+}
+
+/// CLAUDE SEED SEARCH: relabel-seed cells on env-selected rows — AMD/AMDND/AMF
+/// on `Q A Qᵀ` composed back through Q, seeds 1..=`SSI_SEEDS` (default 64).
+#[test]
+#[ignore]
+fn probe_claude_seed_search() {
+    let corpus: Vec<(String, crate::Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p)).expect("load env corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let targets: Vec<String> = std::env::var("SSI_SWEEP_TARGETS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let seeds: u64 = std::env::var("SSI_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    for (name, pat) in &corpus {
+        if !targets.iter().any(|t| t == name) {
+            continue;
+        }
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        println!("== SEEDS {name} n={n} nnz={nnz} base={base}");
+        let mut best = (f64::INFINITY, String::new());
+        for seed in 1..=seeds {
+            let q = relabel(n, seed);
+            let b = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+                continue;
+            };
+            let mut eval = |label: &str, p: Option<Vec<i32>>, secs: f64| {
+                let Some(p) = p else { return };
+                let perm: Vec<usize> = p.iter().map(|&x| q[x as usize]).collect();
+                if !is_bijection(&perm, n) {
+                    return;
+                }
+                let r = flops_of(&sp, &perm) as f64 / base;
+                if r < best.0 {
+                    best = (r, format!("{label} seed {seed}"));
+                }
+                if r < 0.999 {
+                    println!("  seed {seed} {label}: {r:.6} ({secs:.3}s)");
+                }
+            };
+            let t = Instant::now();
+            eval(
+                "amd_aggr",
+                feral_amd::amd_order(&bcore).ok(),
+                t.elapsed().as_secs_f64(),
+            );
+            let t = Instant::now();
+            let nodense = feral_amd::AmdOptions {
+                aggressive: false,
+                dense_alpha: -1.0,
+            };
+            eval(
+                "amd_nodense",
+                feral_amd::amd_order_opts(&bcore, &nodense).ok().map(|(p, ..)| p),
+                t.elapsed().as_secs_f64(),
+            );
+            if nnz <= 1_000_000 {
+                let t = Instant::now();
+                let amf_opts = feral_amf::AmfOptions::default();
+                eval(
+                    "amf",
+                    feral_amf::amf_order_opts(&bcore, &amf_opts).ok().map(|(p, ..)| p),
+                    t.elapsed().as_secs_f64(),
+                );
+            }
+        }
+        println!("  BEST-SEED {name}: {} ratio={:.6}", best.1, best.0);
+    }
+}
+
+/// CLAUDE METIS SEEDS: metis_order_full over seeds x a small option grid on
+/// env-selected rows (`SSI_SWEEP_TARGETS`), corpus from `SSI_CORPUS_FILE`.
+#[test]
+#[ignore]
+fn probe_claude_metis_seeds() {
+    let corpus: Vec<(String, crate::Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p)).expect("load env corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let targets: Vec<String> = std::env::var("SSI_SWEEP_TARGETS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let seeds: u64 = std::env::var("SSI_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    for (name, pat) in &corpus {
+        if !targets.iter().any(|t| t == name) {
+            continue;
+        }
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        println!("== METIS {name} n={n} nnz={nnz} base={base}");
+        let mut best = (f64::INFINITY, String::new());
+        for seed in 0..seeds {
+            for (label, opts) in [
+                ("def", feral_metis::MetisOptions { seed, ..Default::default() }),
+                (
+                    "nip16",
+                    feral_metis::MetisOptions { seed, niparts: 16, ..Default::default() },
+                ),
+                (
+                    "imb05",
+                    feral_metis::MetisOptions { seed, max_imbalance: 0.05, ..Default::default() },
+                ),
+                (
+                    "flr240",
+                    feral_metis::MetisOptions {
+                        seed,
+                        coarsen_floor: 240,
+                        max_imbalance: 0.05,
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let t = Instant::now();
+                let Ok((p, ..)) = feral_metis::metis_order_full(&core, &opts) else {
+                    continue;
+                };
+                let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                if !is_bijection(&p, n) {
+                    continue;
+                }
+                let r = flops_of(&sp, &p) as f64 / base;
+                if r < best.0 {
+                    best = (r, format!("{label} seed {seed}"));
+                }
+                if r < 0.995 {
+                    println!("  seed {seed} {label}: {r:.6} ({:.3}s)", t.elapsed().as_secs_f64());
+                }
+            }
+        }
+        println!("  BEST-METIS {name}: {} ratio={:.6}", best.1, best.0);
+    }
+}

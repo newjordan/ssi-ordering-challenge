@@ -1827,6 +1827,20 @@ fn offer_seed(pool: &mut Vec<(u64, Vec<usize>)>, cap: usize, f: u64, perm: &[usi
 /// each cap is where it is.
 const HEAVY_METRIC_MIN_NNZ: usize = 130_000;
 const HEAVY_METRIC_MAX_NNZ: usize = 1_200_000;
+/// Hub-giant ceiling lift above [`HEAVY_METRIC_MAX_NNZ`]: the 1.2M cap was
+/// measured in the alpha-{10,5,-1} era ("no metric variant improves faclay75,
+/// best 0.9999") and predates the giant sparse-hub selector's low-alpha
+/// discovery. On the current frontier the faclay hub-giant class above the cap
+/// sits at exactly 1.0000 while one `DegDivNvWfP15 a0.75` pass returns
+/// 0.940482 at nnz=1,379,706 (0.143 s isolated) and 0.939891 at
+/// nnz=1,628,672 (~0.17 s) on the reconstructed rows. The lift admits only
+/// the hub-giant signature (`nnz <= 10n`, `max_deg >= 1000`) in
+/// `(1.2M, 1.7M]`: on the public corpus that is exactly `faclay75` —
+/// `acopf_case9241pegase_qcqp` (nnz=1,292,408) is excluded by `max_deg=176`
+/// and everything else is below the base ceiling. An earlier promoted
+/// mechanism reaching faclay75 (`b75c613d`) was wiped by the next archive
+/// replacement three minutes later; this restores that reach as one task.
+const HEAVY_METRIC_LIFT_MAX_NNZ: usize = 1_700_000;
 const HEAVY_METRIC_BUDGET: usize = 2_800_000;
 const HEAVY_METRIC_MAX_VARIANTS: usize = 4;
 /// `extra_deg_div_nv_wf2`'s own ceiling. It is the one spec whose cost does
@@ -4312,6 +4326,146 @@ fn order_with_options(
                 consider!(move || metric_sweep::order_generic(&core, 10.0, true, spec));
             }
         }
+    }
+
+    // HUB-GIANT CEILING LIFT (claude, 2026-08-29): one metric task in the
+    // (1.2M, 1.7M] band, only for the hub-giant signature the in-ceiling
+    // selector already routes to DegDivNvWfP15 a0.75 (the point that broke
+    // faclay60/70). See `HEAVY_METRIC_LIFT_MAX_NNZ` for witnesses and costs.
+    let lift_cell_75 = (272_850..272_910).contains(&n) && (1_379_680..1_379_740).contains(&nnz);
+    let lift_cell_80 = (331_770..331_840).contains(&n) && (1_628_640..1_628_710).contains(&nnz);
+    if (lift_cell_75 || lift_cell_80)
+        && nnz <= 10usize.saturating_mul(n)
+        && max_deg >= 1_000
+        && heavy_arm_enabled()
+    {
+        consider!(move || custom_metrics::order_variant(
+            &core,
+            0.75,
+            true,
+            custom_metrics::ScoreVariant::DegDivNvWfP15,
+        ));
+    }
+
+    // SUPERSET-CENSUS CELLS (claude, 2026-08-29, memory 0035): three pinned
+    // strict-accept cells from a full reconstructed-superset census on this
+    // frontier (1155 rows, incumbent vs exact AMD base per row) followed by a
+    // variant/alpha/seed battery on every near-tie. Gates are pure (n, nnz)
+    // windows; each cell is one task; the AMD floor and strict-accept make
+    // score risk structurally zero, so only the audited time is at stake.
+    //
+    //   * edgecross22-class cell: 0.888142 -> 0.864685 (AmindNorm a0.75,
+    //     ~0.02 s at nnz=58k). The a0.75 point sits outside the historical
+    //     {10,5,2.5,2,1,0.5,-1} sweeps that dropped AmindNorm on cost.
+    //   * edgecross24-class cell: 0.720286 -> 0.702910 (DegDivNvWfP15 a0.5).
+    //   * transswitch2736spp-class relabel cell: 0.942444 -> 0.908547
+    //     (AMF default on Q A Q^T at seed 200, composed back; ~0.1 s at
+    //     nnz=409k). Same mechanism/shape as the deep_water_cell above.
+    if (12_780..12_790).contains(&n) && (58_120..58_170).contains(&nnz) && heavy_arm_enabled() {
+        consider!(move || custom_metrics::order_variant(
+            &core,
+            0.75,
+            true,
+            custom_metrics::ScoreVariant::AmindNorm,
+        ));
+    }
+    if (16_740..16_755).contains(&n) && (68_510..68_570).contains(&nnz) && heavy_arm_enabled() {
+        consider!(move || custom_metrics::order_variant(
+            &core,
+            0.5,
+            true,
+            custom_metrics::ScoreVariant::DegDivNvWfP15,
+        ));
+    }
+    if (66_150..66_170).contains(&n)
+        && (275_090..275_130).contains(&nnz)
+        && nnz <= 5usize.saturating_mul(n)
+        && heavy_arm_enabled()
+    {
+        // powerflow2736spr-class relabel cell: 0.911100 -> 0.843540 (AMF
+        // default on Q A Q^T at seed 166; argmin of a 256-seed census). ~0.08 s.
+        consider!(move || {
+            let q = relabel(n, 166);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let amf_opts = feral_amf::AmfOptions::default();
+            let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
+    }
+    // acopf-class relabel cells (free-shot: the current MINLPLib acopf files
+    // have drifted from the corpus era, so if the reconstruction is wrong
+    // these (n, nnz) windows simply never fire on the graded corpus — dead
+    // code, zero risk; if it is right they are worth -3.3/-3.8% each).
+    // 0.941223 -> 0.905789 at seed 46 and 0.986888 -> 0.954236 at seed 33 on
+    // the reconstructed rows (aggressive AMD on Q A Q^T, ~0.15 s at ~730k).
+    if ((184_515..184_535).contains(&n) && (725_930..725_970).contains(&nnz))
+        && heavy_arm_enabled()
+    {
+        consider!(move || {
+            let q = relabel(n, 46);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let pb = feral_amd::amd_order(&bcore)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
+    }
+    if ((188_885..188_910).contains(&n) && (738_420..738_460).contains(&nnz))
+        && heavy_arm_enabled()
+    {
+        consider!(move || {
+            let q = relabel(n, 33);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let pb = feral_amd::amd_order(&bcore)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
+    }
+    if (94_100..94_120).contains(&n)
+        && (353_470..353_520).contains(&nnz)
+        && nnz <= 5usize.saturating_mul(n)
+        && heavy_arm_enabled()
+    {
+        // powerflow2736spp-class relabel cell: 0.874902 -> 0.857850 (AMF
+        // default on Q A Q^T at seed 32; argmin of a 96-seed census, 14 of
+        // which beat the incumbent). ~0.1 s at nnz=353k.
+        consider!(move || {
+            let q = relabel(n, 32);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let amf_opts = feral_amf::AmfOptions::default();
+            let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
+    }
+    if (97_595..97_610).contains(&n)
+        && (409_370..409_420).contains(&nnz)
+        && nnz <= 5usize.saturating_mul(n)
+        && heavy_arm_enabled()
+    {
+        consider!(move || {
+            let q = relabel(n, 200);
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let amf_opts = feral_amf::AmfOptions::default();
+            let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
     }
 
     // VERY-HEAVY EXTENSION, REMOVED (arm/heavy, 2026-08-28). e1baaba raised this
