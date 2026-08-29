@@ -1794,7 +1794,9 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
 /// verified safety; re-widening it needs isolated per-candidate timing on the
 /// heavy tier first, not another analytic guess.
 const STRIP_MAX_AVG_DEG: usize = 24; // nnz/n >= 25 disables strip entirely
-const STRIP_MAX_NNZ: usize = 400_000;
+/// Aligned to [`SLOAN_MAX_NNZ`]: the 180k–400k band has no Sloan perm to
+/// reuse as a strip ranking, so the whole strip pass is skipped there.
+const STRIP_MAX_NNZ: usize = 180_000;
 const STRIP_MAX_N: usize = 30_000; // strip cost scales with n; cap-safety limit
 
 /// Build one strip candidate: delete the first `k` vertices of `ranked`
@@ -2400,6 +2402,19 @@ fn order_with_options(
     };
     let deg_ranked: &Vec<usize> = &deg_ranked_owned;
     let lcnt_ranked: &Vec<usize> = &lcnt_ranked_owned;
+
+    // Sloan (w1=2, w2=1) once: queued as a candidate AND reused as the
+    // strip k=96 ranking. Never call `sloan_order(pattern, 2, 1)` again.
+    let sloan_gate = n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ;
+    let sloan_w21_owned: Vec<usize> = if sloan_gate {
+        sloan_order(pattern, 2, 1)
+            .into_iter()
+            .map(|x| x as usize)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let sloan_w21: &Vec<usize> = &sloan_w21_owned;
 
     // ── DEFERRED CANDIDATE PORTFOLIO ────────────────────────────────────────
     // `consider!` no longer RUNS a candidate; it queues its producer closure.
@@ -3012,9 +3027,11 @@ fn order_with_options(
     // move the worst case. Deterministic (fixed pseudo-peripheral seeding + a
     // priorities-only monotone max-heap with a fixed tie-break). Best-of floor →
     // zero downside.
-    if n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ {
+    if sloan_gate {
         consider!(move || {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 2, 1))
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                sloan_w21.iter().copied().map(|x| x as i32).collect(),
+            )
         });
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 1, 2))
@@ -3275,11 +3292,11 @@ fn order_with_options(
     // Only has to be a valid bijection — [`strip_candidate`] guarantees that by
     // construction — so provenance is otherwise unconstrained.
     //
-    // Ships exactly SIX candidates (the subset measured to capture 93% of the
-    // full sweep's gain): `deg` k ∈ {6, 24, 48, 64, 96} ranked by degree in the
-    // TRUE pattern A, and `lcnt64` ranked by L-column-count under the baseline
-    // AMD ordering — free to compute, since the anchor factorization
-    // (`amd_perm`/`amd_counts`) already exists above.
+    // Deg-ranked k ∈ {48, 64} plus one Sloan-ranked k=96 (reuse the queued
+    // `sloan_order(w1=2,w2=1)` perm; deg k=6/24 dropped, deg k=96 replaced)
+    // and `lcnt64` ranked by L-column-count under the baseline AMD ordering
+    // — free to compute, since the anchor factorization (`amd_perm`/
+    // `amd_counts`) already exists above.
     //
     // Density-gated OFF entirely at `nnz/n >= 25` — see [`STRIP_MAX_AVG_DEG`]
     // for the measurement that set this boundary. Best-of floor →
@@ -3297,7 +3314,7 @@ fn order_with_options(
         //
         // FILTER TO VALID k FIRST (`k < n`): the original `strip_candidate`
         // silently skipped `k >= n` per-call (`if k == 0 || k >= n { return
-        // None }`), so on small matrices some/all of {96,64,48,24,6} produce
+        // None }`), so on small matrices some/all of {64,48} produce
         // no candidate at all. `NestedSubgraphBuilder::new`/`advance_to`
         // have no such guard (`&ranking[..k_max]` panics if `k_max > n`), so
         // this filter is REQUIRED, not cosmetic — filtering the k's the SAME
@@ -3306,7 +3323,10 @@ fn order_with_options(
         // is byte-identical to the old `strip_candidate(&scoring_pat,
         // &deg_ranked, k)` call it replaces for each surviving k — see its
         // doc comment.
-        let ks: Vec<usize> = [96usize, 64, 48, 24, 6].into_iter().filter(|&k| k < n).collect();
+        // Deg k=6/24 dropped. Deg k=96 replaced by a Sloan-ranked
+        // NestedSubgraphBuilder::new below (different ranking → cannot share
+        // this incremental loop). Remaining deg ks {64,48} stay as-is.
+        let ks: Vec<usize> = [64usize, 48].into_iter().filter(|&k| k < n).collect();
         if let Some((&k0, rest)) = ks.split_first() {
             let (mut deg_builder, deg_sub0) =
                 nested_subgraph::NestedSubgraphBuilder::new(pattern, &deg_ranked, k0);
@@ -3323,6 +3343,18 @@ fn order_with_options(
                 });
                 k_prev = k;
             }
+        }
+
+        // Sloan-ranked k=96: `ranked` prefix is the already-computed
+        // sloan_order(w1=2,w2=1) perm. NestedSubgraphBuilder is ranking-
+        // agnostic — pass that perm into the existing constructor.
+        if sloan_gate && 96 < n {
+            let (_, sloan_sub) =
+                nested_subgraph::NestedSubgraphBuilder::new(pattern, sloan_w21, 96);
+            consider!(move || {
+                strip_from_induced(&scoring_pat, &sloan_sub, &sloan_w21[..96])
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+            });
         }
 
         // L-column-count-ranked candidate: a DIFFERENT ranking, single k —
