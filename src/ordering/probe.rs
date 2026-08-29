@@ -6635,3 +6635,389 @@ fn probe_fleet_i_fullgrid() {
         better[1], worse[1], dln_fg3[0], dln_fg3[1], dln_fg3[2]
     );
 }
+
+
+/// FLEET-J (0033) — systematic METIS seed census, the mechanism behind the
+/// last two frontier promotions (chainyoda's D_WIDE seed-2 arm, mellowcroc's
+/// per-matrix `metis_seed{2,5}_cell`s), swept comprehensively for the first
+/// time.
+///
+/// Scope: every corpus matrix with `nnz >= 100_000` (all densities) plus the
+/// mid-dense band `20_000 <= nnz < 100_000 && nnz >= 8n`. For each in-scope
+/// matrix: incumbent = one full timed `order()` scored by `flops_of` (the
+/// trusted scorer), then `metis_order_full` seeds 0..=7 ISOLATED, each timed
+/// and scored against the incumbent.
+///
+/// Loads the corpus itself from `$SSI_CORPUS_FILE` when set (the
+/// candidate-worker test shim is dev-fixed); reconstructed rows carry blank
+/// names, so rows are keyed `n:nnz`.
+#[test]
+#[ignore]
+fn probe_fleet_j_metis_census() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    // Optional shard bounds so one run fits the foreground timeout.
+    let shard_min: usize = std::env::var("SSI_CEN_MIN_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let shard_max: usize = std::env::var("SSI_CEN_MAX_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    println!("corpus: {} rows", corpus.len());
+    println!("CEN\tkey\tn\tnnz\tmaxdeg\tdens\tinc_secs\tinc_flops\tbest_seed\tbest_rel\tbest_secs\tseeds");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if !(nnz >= 100_000 || (nnz >= 20_000 && nnz >= 8 * n)) {
+            continue;
+        }
+        if nnz < shard_min || nnz >= shard_max {
+            continue;
+        }
+        if let Ok(keys) = std::env::var("SSI_PROBE_KEYS") {
+            let key = format!("{n}:{nnz}");
+            if !keys.split(',').any(|k| k.trim() == key || k.trim() == *name) {
+                continue;
+            }
+        }
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let t0 = Instant::now();
+        let perm = order(pat);
+        let inc_secs = t0.elapsed().as_secs_f64();
+        let inc = flops_of(&sp, &perm);
+        let mut cells: Vec<String> = Vec::new();
+        let mut best = (f64::INFINITY, u64::MAX, 0.0f64);
+        for seed in 0u64..=7 {
+            let opts = feral_metis::MetisOptions {
+                seed,
+                ..Default::default()
+            };
+            let t1 = Instant::now();
+            let got = feral_metis::metis_order_full(&core, &opts);
+            let secs = t1.elapsed().as_secs_f64();
+            match got {
+                Ok((p, _, _)) => {
+                    let cand: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                    let f = flops_of(&sp, &cand);
+                    let rel = f as f64 / inc as f64;
+                    if rel < best.0 {
+                        best = (rel, seed, secs);
+                    }
+                    cells.push(format!("s{seed}={rel:.4}/{secs:.3}"));
+                }
+                Err(e) => cells.push(format!("s{seed}=ERR({e:?})/{secs:.3}")),
+            }
+        }
+        println!(
+            "CEN\t{name}|{n}:{nnz}\t{n}\t{nnz}\t{max_deg}\t{:.1}\t{inc_secs:.3}\t{inc}\t{}\t{:.4}\t{:.3}\t{}",
+            nnz as f64 / n as f64,
+            best.1,
+            best.0,
+            best.2,
+            cells.join(" ")
+        );
+    }
+}
+
+/// FLEET-J (0033) — METIS option-variant sweep on the census winners.
+/// `$SSI_PROBE_KEYS` = comma-separated `n:nnz` keys. For each key, sweeps a
+/// small option grid (each dimension varied from default) x seeds 0..=7,
+/// scored against the full-order() incumbent. Answers whether a non-seed
+/// knob buys anything beyond the best seed.
+#[test]
+#[ignore]
+fn probe_fleet_j_metis_variants() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let keys: Vec<String> = std::env::var("SSI_PROBE_KEYS")
+        .expect("set SSI_PROBE_KEYS=n:nnz,...")
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    // (label, options-with-seed-0; seed is overwritten in the loop)
+    let variants: Vec<(&str, feral_metis::MetisOptions)> = vec![
+        ("default", feral_metis::MetisOptions::default()),
+        (
+            "niparts16",
+            feral_metis::MetisOptions {
+                niparts: 16,
+                ..Default::default()
+            },
+        ),
+        (
+            "fm20",
+            feral_metis::MetisOptions {
+                fm_passes: 20,
+                ..Default::default()
+            },
+        ),
+        (
+            "imb0.05",
+            feral_metis::MetisOptions {
+                max_imbalance: 0.05,
+                ..Default::default()
+            },
+        ),
+        (
+            "imb0.30",
+            feral_metis::MetisOptions {
+                max_imbalance: 0.30,
+                ..Default::default()
+            },
+        ),
+        (
+            "sw100",
+            feral_metis::MetisOptions {
+                nd_to_amd_switch: 100,
+                ..Default::default()
+            },
+        ),
+        (
+            "sw400",
+            feral_metis::MetisOptions {
+                nd_to_amd_switch: 400,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor60",
+            feral_metis::MetisOptions {
+                coarsen_floor: 60,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor240",
+            feral_metis::MetisOptions {
+                coarsen_floor: 240,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor480",
+            feral_metis::MetisOptions {
+                coarsen_floor: 480,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor240_imb05",
+            feral_metis::MetisOptions {
+                coarsen_floor: 240,
+                max_imbalance: 0.05,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor240_imb30",
+            feral_metis::MetisOptions {
+                coarsen_floor: 240,
+                max_imbalance: 0.30,
+                ..Default::default()
+            },
+        ),
+        (
+            "imb02",
+            feral_metis::MetisOptions {
+                max_imbalance: 0.02,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor240_sw400",
+            feral_metis::MetisOptions {
+                coarsen_floor: 240,
+                nd_to_amd_switch: 400,
+                ..Default::default()
+            },
+        ),
+        (
+            "floor240_ni16",
+            feral_metis::MetisOptions {
+                coarsen_floor: 240,
+                niparts: 16,
+                ..Default::default()
+            },
+        ),
+    ];
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let key = format!("{n}:{nnz}");
+        if !keys.iter().any(|k| *k == key || *k == *name) {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let inc = flops_of(&sp, &order(pat));
+        println!("\nVAR {name}|{key} inc_flops={inc}");
+        let seed_max: u64 = std::env::var("SSI_SEED_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        let seed_min: u64 = std::env::var("SSI_SEED_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let var_filter: Option<Vec<String>> = std::env::var("SSI_VARIANTS").ok().map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        });
+        for (label, base_opts) in &variants {
+            if let Some(vf) = &var_filter {
+                if !vf.iter().any(|v| v == label) {
+                    continue;
+                }
+            }
+            let mut best = (f64::INFINITY, u64::MAX);
+            let mut worst_secs = 0.0f64;
+            let mut cells: Vec<String> = Vec::new();
+            for seed in seed_min..=seed_max {
+                let opts = feral_metis::MetisOptions {
+                    seed,
+                    ..base_opts.clone()
+                };
+                let t1 = Instant::now();
+                let Ok((p, _, _)) = feral_metis::metis_order_full(&core, &opts) else {
+                    cells.push(format!("s{seed}=ERR"));
+                    continue;
+                };
+                worst_secs = worst_secs.max(t1.elapsed().as_secs_f64());
+                let cand: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                let rel = flops_of(&sp, &cand) as f64 / inc as f64;
+                cells.push(format!("s{seed}={rel:.4}"));
+                if rel < best.0 {
+                    best = (rel, seed);
+                }
+            }
+            println!(
+                "VAR\t{key}\t{label}\tbest_rel={:.4}\tbest_seed={}\tworst_pass_secs={:.3}\t{}",
+                best.0,
+                best.1,
+                worst_secs,
+                cells.join(" ")
+            );
+        }
+    }
+}
+
+/// FLEET-J (0033) — corpus-flexible full-order() timing/score probe (the
+/// fleet-h pattern, re-created on this base): loads `$SSI_CORPUS_FILE` itself,
+/// `$SSI_PROBE_ONLY` (comma-separated names or `n:nnz` keys) selects targeted
+/// mode with THREE timed passes (min-of-3 damps box noise).
+#[test]
+#[ignore]
+fn probe_fleet_j_full() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    println!(
+        "\ncorpus: {} matrices (targeted={})",
+        corpus.len(),
+        only.is_some()
+    );
+
+    let mut rows: Vec<(f64, String, usize, usize, f64)> = Vec::new();
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        if let Some(list) = &only {
+            let key = format!("{}:{}", n, pat.nnz());
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+
+        let reps = if only.is_some() { 3 } else { 1 };
+        let mut secs = f64::INFINITY;
+        let mut perm = Vec::new();
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            perm = order(pat);
+            secs = secs.min(t0.elapsed().as_secs_f64());
+        }
+        let mine = flops_of(&sp, &perm);
+        let ratio = mine as f64 / base as f64;
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        rows.push((secs, name.clone(), n, pat.nnz(), ratio));
+    }
+
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("\n--- every order() call, slowest first (TSV) ---");
+    println!("secs\tmatrix\tn\tnnz\tratio");
+    for (secs, name, n, nnz, ratio) in rows.iter() {
+        println!("{secs:.4}\t{name}\t{n}\t{nnz}\t{ratio:.6}");
+    }
+    println!("\n--- per-bucket ---");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<8} count={:<5} geomean={:.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("SCORE = {:.6}", aggregate(&log_sums, &counts));
+    if let Some(r0) = rows.first() {
+        println!("WORST order() = {:.3} s ({})", r0.0, r0.1);
+    }
+}

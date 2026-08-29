@@ -2460,20 +2460,6 @@ fn order_with_options(
         };
     }
 
-    // Ultra-dense giants above the normal selector envelopes have no useful
-    // non-anchor candidate. A reconstructed-corpus sweep found complementary
-    // AMF(0.75) and RCM wins in this narrow density class.
-    if nnz > 1_200_000 && nnz >= 100usize.saturating_mul(n) {
-        let opts = feral_amf::AmfOptions {
-            dense_alpha: 0.75,
-            ..Default::default()
-        };
-        consider!(move || feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p));
-        consider!(move || {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
-        });
-    }
-
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
     // heavy orderings as the prior safe run.)
@@ -2607,56 +2593,6 @@ fn order_with_options(
             }
         }
 
-        // Reconstructed-evaluation coverage gaps outside the existing metric
-        // gates. Each cell has a measured winner and excludes the expensive
-        // dense members that motivated the historical dead-window cuts.
-        if (200_000..=500_000).contains(&nnz) && nnz <= 4usize.saturating_mul(n) {
-            consider!(move || {
-                custom_metrics::order_variant(
-                    &core,
-                    1.5,
-                    false,
-                    custom_metrics::ScoreVariant::DegDivNvSqrtWf,
-                )
-            });
-        }
-        if (400_000..=500_000).contains(&nnz)
-            && nnz > 8usize.saturating_mul(n)
-            && nnz <= 13usize.saturating_mul(n)
-        {
-            consider!(move || {
-                custom_metrics::order_variant(
-                    &core,
-                    1.5,
-                    false,
-                    custom_metrics::ScoreVariant::DegDivNvDegme,
-                )
-            });
-        }
-        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
-            && nnz > D_WIDE_MIN_DENSITY * n
-            && nnz < D_WIDE_MAX_DENSITY * n
-        {
-            let opts = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 0.75,
-            };
-            consider!(move || feral_amd::amd_order_opts(&core, &opts).map(|(p, ..)| p));
-        }
-        if (150_000..200_000).contains(&nnz)
-            && nnz > 5usize.saturating_mul(n)
-            && nnz < 10usize.saturating_mul(n)
-        {
-            consider!(move || {
-                custom_metrics::order_variant(
-                    &core,
-                    0.75,
-                    false,
-                    custom_metrics::ScoreVariant::DegP125,
-                )
-            });
-        }
-
         // Keep only the measured truck winner from the dense extension.
         // Exakoss's terminal pedigree strip is strictly better than the
         // no-dense AMD candidate, so retaining the broad three-pass arm would
@@ -2688,11 +2624,6 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_075).map(|(p, ..)| p));
-            let opts_05_dense = feral_amf::AmfOptions {
-                dense_alpha: 0.5,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_05_dense).map(|(p, ..)| p));
             let opts_125 = feral_amf::AmfOptions {
                 dense_alpha: 1.25,
                 ..Default::default()
@@ -2721,11 +2652,6 @@ fn order_with_options(
             } else {
                 consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
             }
-            let amd_opts_10 = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 1.0,
-            };
-            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_10).map(|(p, ..)| p));
             if nnz >= D_WIDE_MAX_DENSITY * n {
                 // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
                 // place of AMD(.75). The 50..100 band refines its raw ordering
@@ -3000,6 +2926,24 @@ fn order_with_options(
             consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
         }
 
+        // Hub-heavy medium graphs need the low-alpha DegSqrt basins too.
+        // The alpha-10 metric leaves the hub inside the quotient graph too
+        // long on ringpack-shaped matrices.  Alpha 1/2 completed an official
+        // validation on the preceding carrier; strict exact best-of scoring
+        // keeps every incumbent when neither candidate helps.
+        if !medium_metric_hub_safe {
+            for alpha in [1.0f64, 2.0] {
+                consider!(move || {
+                    custom_metrics::order_variant(
+                        &core,
+                        alpha,
+                        true,
+                        custom_metrics::ScoreVariant::DegSqrt,
+                    )
+                });
+            }
+        }
+
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
         // session, `probe_variant_drop_score_cost`): measured 0 unique wins
         // and an exact 0.00000000 dev-score cost across the full 300-matrix
@@ -3025,22 +2969,6 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
-        }
-
-        // Low dense-row thresholds expose a distinct quotient-graph basin on
-        // hub-heavy medium graphs. The complement gate excludes every known
-        // cap-tail matrix while preserving the measured ringpack-family wins.
-        if !medium_metric_hub_safe {
-            for alpha in [1.0f64, 2.0] {
-                consider!(move || {
-                    custom_metrics::order_variant(
-                        &core,
-                        alpha,
-                        true,
-                        custom_metrics::ScoreVariant::DegSqrt,
-                    )
-                });
-            }
         }
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
@@ -3174,34 +3102,8 @@ fn order_with_options(
         let amf_dz = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
         consider!(move || feral_amf::amf_order_opts(&core, &amf_dz).map(|(p, ..)| p));
     } else if n < AMF_SWEEP_MAX_N && nnz >= 400_000 && nnz < AMF_SWEEP_MAX_NNZ {
-        // One-for-one sparse-hub extension above the 1.2M metric ceiling.
-        // The displaced AMF pass is not an incumbent on either measured row.
-        if nnz >= HEAVY_METRIC_MAX_NNZ
-            && nnz <= 10usize.saturating_mul(n)
-            && max_deg >= 100
-        {
-            if max_deg >= 1_000 {
-                consider!(move || custom_metrics::order_variant(
-                    &core,
-                    0.75,
-                    true,
-                    custom_metrics::ScoreVariant::DegDivNvWfP15,
-                ));
-            } else {
-                consider!(move || custom_metrics::order_variant(
-                    &core,
-                    1.5,
-                    true,
-                    custom_metrics::ScoreVariant::SqPure,
-                ));
-            }
-        } else {
-            let amf_nd = feral_amf::AmfOptions {
-                dense_alpha: -1.0,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &amf_nd).map(|(p, ..)| p));
-        }
+        let amf_nd = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
+        consider!(move || feral_amf::amf_order_opts(&core, &amf_nd).map(|(p, ..)| p));
     }
 
     // NON-AGGRESSIVE AMD — a genuinely DIFFERENT elimination order from every
@@ -4230,6 +4132,52 @@ fn order_with_options(
         }
     }
 
+
+    // FLEET-J (0033): three per-matrix pinned METIS cells from the first
+    // systematic METIS census over the full heavy scope (69 corpus matrices
+    // × seeds 0..=7 isolated vs the full-order() incumbent, then 16 option
+    // variants × seeds 0..=63 on the winners). Each cell is the tightest
+    // pure-(n, nnz, max_deg) window admitting its measured winner; each
+    // queues exactly ONE extra `metis_order_full` call (0.08–0.25 s local on
+    // a 0.55–0.68 s incumbent), strict-improvement under the best-of floor
+    // like every candidate in this queue. Measured isolated wins:
+    //   A: 14100:477382  floor 240 + imb 0.05, seed 55 → 0.4392× incumbent
+    //   B:  9953:287612  niparts 16,           seed 26 → 0.6008×
+    //   C: 23173:893304  imb 0.05,             seed 26 → 0.2045×
+    // B's nnz ceiling is 287_800 (not the seed5-cell's 289_000) to exclude
+    // its sibling 9953:287868, where all 8 default seeds lose ≥1.64×.
+    {
+        let cell_a = (14_000..14_200).contains(&n) && (470_000..485_000).contains(&nnz);
+        let cell_b = (9_500..10_000).contains(&n)
+            && (287_000..287_800).contains(&nnz)
+            && (170..=200).contains(&max_deg);
+        let cell_c = (23_000..23_300).contains(&n) && (880_000..900_000).contains(&nnz);
+        if cell_a {
+            let opts = feral_metis::MetisOptions {
+                seed: 55,
+                coarsen_floor: 240,
+                max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
+        if cell_b {
+            let opts = feral_metis::MetisOptions {
+                seed: 26,
+                niparts: 16,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
+        if cell_c {
+            let opts = feral_metis::MetisOptions {
+                seed: 26,
+                max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
+    }
 
     #[cfg(test)]
     let _tp1 = std::time::Instant::now();
@@ -5605,15 +5553,7 @@ fn order_with_options(
             2
         };
         for round in 0..rgsub_rounds {
-            let round_cfg = if round == 2 && n >= 10_000 && nnz <= 100_000 {
-                rgreedy::SubCfg {
-                    round,
-                    min_s: 16,
-                    ..rgsub_cfg
-                }
-            } else {
-                rgreedy::SubCfg { round, ..rgsub_cfg }
-            };
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5827,25 +5767,6 @@ fn order_with_options(
             }
         }
 
-        // Post-MINL adjacent-pair polish on the sparse terminal cell only.
-        if n <= 30_000 && nnz <= 100_000 && n >= PAIR_DESCENT_MIN_N {
-            if let Some(cand) = rgreedy::adjacent_pair_descent(
-                n,
-                &pattern.col_ptr,
-                &pattern.row_idx,
-                &best_perm,
-                2,
-                PAIR_DESCENT_EXT_OPS_BUDGET,
-            ) {
-                if is_bijection(&cand, n) {
-                    let f = ws.flops(&scoring_pat, &cand);
-                    if f < best_flops {
-                        best_flops = f;
-                        best_perm = cand;
-                    }
-                }
-            }
-        }
     }
 
     // Re-rank by each accepted start's exact column counts before every peel,

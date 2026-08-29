@@ -252,6 +252,13 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
 
+- [0032-fleet-i.md](experiments/0032-fleet-i.md) — **WIN (v2 proxy −0.000314 + −0.000168)**: TELOS Regime-A full-grid discriminator (hub_safe ∧ nnz≥3n) + terminal-MINL sparse-gt cell (30k<n≤50k ∧ nnz≤170k ∧ d<10); rgsub round-3 widening killed (kill-proof at site).
+
+- [0033-fleet-j.md](experiments/0033-fleet-j.md) — **WIN (v2 proxy −0.009964, 0.805444→0.795480)**: the
+  first systematic METIS census (69 heavy matrices × 8 seeds isolated, then 16 option variants ×
+  64 seeds on the winners) → three pinned cells (14100:477382 floor240+imb0.05 s55 → 0.4246×;
+  9953:287612 niparts16 s26 → 0.5825×; 23173:893304 imb0.05 s26 → 0.2032×). 65/69 matrices: METIS
+
 - [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
   pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
