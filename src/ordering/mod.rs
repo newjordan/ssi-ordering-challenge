@@ -2223,6 +2223,29 @@ fn order_with_relabel_cap(pattern: &Pattern, relabel_cap: usize) -> Vec<usize> {
     order_with_options(pattern, relabel_cap, true, true, true, true, usize::MAX)
 }
 
+/// Deterministic operation floor for whole-matrix rgreedy.
+///
+/// The two narrow `n > 1000` PEP density bands were measured to have enough
+/// cap slack to spend the same 800M ops as the small tier. Everything else in
+/// the middle tier retains the promoted 600M floor.
+fn rgreedy_slack_floor_for(n: usize, nnz: usize, pep_max_nnz: usize) -> i64 {
+    const MIN_N: usize = 64;
+    const SMALL: i64 = 800_000_000;
+    const MID: i64 = 600_000_000;
+
+    if n < MIN_N {
+        return 0;
+    }
+    if n <= 1_000 {
+        return SMALL;
+    }
+    let narrow_pep = nnz <= pep_max_nnz
+        && (nnz <= n.saturating_mul(2)
+            || (n.saturating_mul(4) <= nnz
+                && nnz.saturating_mul(2) <= n.saturating_mul(9)));
+    if narrow_pep { SMALL } else { MID }
+}
+
 /// Same portfolio, with Component B (ORBIT) and the PHARMAKOS phase each
 /// additionally toggleable — `orbit_enabled = false` / `pharmakos_enabled =
 /// false` give probes the incumbent with that phase switched off, for
@@ -4727,16 +4750,7 @@ fn order_with_options(
     // (n = 8) is the SLOWEST matrix under n = 1000 at 0.664 s -- worse than any
     // matrix in the 1k-4k band. Below this bound the floor buys nothing and
     // costs the most, so it is simply not applied.
-    const RGREEDY_SLACK_MIN_N: usize = 64;
-    const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
-    const RGREEDY_SLACK_MID: i64 = 600_000_000;
-    let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
-        0
-    } else if n <= 1_000 {
-        RGREEDY_SLACK_SMALL
-    } else {
-        RGREEDY_SLACK_MID
-    };
+    let rgreedy_slack_floor = rgreedy_slack_floor_for(n, nnz, RGREEDY_PEP_MAX_NNZ);
     // MID BAND, 3000 < n <= 10000, sparse arm only (nnz <= 60k). The band was
     // measured when the bucket engine landed — worst ADDED order() 0.094 s
     // local, score -0.000285 (see `Game::use_buckets`) — and held back in
@@ -4959,6 +4973,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -4975,7 +4990,8 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        for round in 0..2 {
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5000,7 +5016,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                round_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
@@ -6966,5 +6982,35 @@ mod tests {
         let amd_flops = flops_of(&scoring_pat, &amd);
         let ours_flops = flops_of(&scoring_pat, &order(&pat));
         assert!(ours_flops <= amd_flops, "ours {ours_flops} > amd {amd_flops}");
+    }
+
+    #[test]
+    fn narrow_pep_floor_uses_equal_work_only_in_measured_density_bands() {
+        const PEP_MAX: usize = 60_000;
+        assert_eq!(super::rgreedy_slack_floor_for(63, 100, PEP_MAX), 0);
+        assert_eq!(super::rgreedy_slack_floor_for(1_000, 60_000, PEP_MAX), 800_000_000);
+        assert_eq!(super::rgreedy_slack_floor_for(2_000, 4_000, PEP_MAX), 800_000_000);
+        assert_eq!(super::rgreedy_slack_floor_for(2_000, 8_500, PEP_MAX), 800_000_000);
+        assert_eq!(super::rgreedy_slack_floor_for(2_000, 6_000, PEP_MAX), 600_000_000);
+        assert_eq!(super::rgreedy_slack_floor_for(2_000, 9_001, PEP_MAX), 600_000_000);
+        assert_eq!(super::rgreedy_slack_floor_for(2_000, 60_001, PEP_MAX), 600_000_000);
+    }
+
+    #[test]
+    fn second_rgsub_round_diversifies_only_large_d1_stream() {
+        let d1 = 0xD1B5_4A32_D192_ED03u64;
+        assert_eq!(super::rgreedy::subtree_stream_seed(12_000, 1, 0), d1);
+        assert_eq!(
+            super::rgreedy::subtree_stream_seed(12_000, 1, 1),
+            d1 ^ 0xA076_1D64_78BD_642F,
+        );
+        assert_eq!(
+            super::rgreedy::subtree_stream_seed(12_000, 0, 1),
+            super::rgreedy::stream_rng(0),
+        );
+        assert_eq!(
+            super::rgreedy::subtree_stream_seed(9_999, 1, 1),
+            super::rgreedy::stream_rng(1),
+        );
     }
 }

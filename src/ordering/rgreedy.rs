@@ -869,6 +869,23 @@ pub(crate) fn stream_rng(k: usize) -> u64 {
     0x9E37_79B9_7F4A_7C15u64.wrapping_mul(2 * k as u64 + 1) ^ (k as u64) << 32
 }
 
+/// Round-aware seed for a subtree search stream. Only the second large-matrix
+/// stream changes, and only in the second outer round, so trajectory count and
+/// deterministic work remain identical while repeated unchanged blocks do not
+/// revisit the same D1 basin byte-for-byte.
+pub(crate) fn subtree_stream_seed(n: usize, k: usize, round: usize) -> u64 {
+    let seed = if n >= 10_000 && k == 1 {
+        0xD1B5_4A32_D192_ED03
+    } else {
+        stream_rng(k)
+    };
+    if n >= 10_000 && k == 1 && round == 1 {
+        seed ^ 0xA076_1D64_78BD_642F
+    } else {
+        seed
+    }
+}
+
 pub(crate) fn stream_params(k: usize) -> Params {
     let mut p = Params::DEFAULT;
     match k % 4 {
@@ -1271,11 +1288,7 @@ pub(crate) fn subtree_refine(
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
                             // seed to sample an independent subtree basin.
-                            let rng_seed = if n >= 10_000 && k == 1 {
-                                0xD1B5_4A32_D192_ED03
-                            } else {
-                                stream_rng(k)
-                            };
+                            let rng_seed = subtree_stream_seed(n, k, cfg.round);
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1338,4 +1351,6 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Zero-based outer RGSUB round, used only for equal-work seed diversity.
+    pub(crate) round: usize,
 }
