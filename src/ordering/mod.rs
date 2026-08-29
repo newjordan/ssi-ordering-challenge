@@ -7595,6 +7595,20 @@ fn terminal_core_successor_schedule(n: usize, nnz: usize) -> Option<&'static [u8
         (71_573, 250_344) => Some(&[DEEP_AMDND, DEEP_AMDND, DEEP_ID_HI]),
         // The third round bought only 0.002%.
         (13_235, 59_618) => Some(&[DEEP_INCPOS_LO, DEEP_ID_LO]),
+        // A sub-0.5% first step compounds to a 2.16% four-round cut.
+        (7_522, 254_840) => Some(&[
+            DEEP_HASH_BASE + 12,
+            DEEP_ORIGDEG_HI,
+            DEEP_HASH_BASE + 3,
+            DEEP_HASH_BASE + 7,
+        ]),
+        // Four cheap MCS realizations cross the 1% row threshold.
+        (7_153, 31_632) => Some(&[
+            DEEP_ID_LO,
+            DEEP_INCPOS_LO,
+            DEEP_INCPOS_LO,
+            DEEP_FILLDEG_LO,
+        ]),
         _ => None,
     }
 }

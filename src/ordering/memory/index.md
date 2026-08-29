@@ -282,6 +282,12 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   500 rows. Exact-only, no broad grid; slowest affected complete path 0.258 s,
   active tests 66/66 and hard-cap 5/5.
 
+- [0046-core-successor-tail.md](experiments/0046-core-successor-tail.md) —
+  **BANKED, not submitted alone:** four-round tail census adds `arki0005` −2.16%
+  and `kan_r3_h1_n9` −1.15% for incremental ln delta **−0.033401**. The nominal
+  1.01% `acopf6468` tail is dropped at 0.745 s. A beam-8 non-improving bridge
+  screen opens zero new basins, closing the completion-successor family.
+
 - [0032-fleet-i.md](experiments/0032-fleet-i.md) — **WIN (v2 proxy −0.000314 + −0.000168)**: TELOS Regime-A full-grid discriminator (hub_safe ∧ nnz≥3n) + terminal-MINL sparse-gt cell (30k<n≤50k ∧ nnz≤170k ∧ d<10); rgsub round-3 widening killed (kill-proof at site).
 
 - [0033-fleet-j.md](experiments/0033-fleet-j.md) — **WIN (v2 proxy −0.009964, 0.805444→0.795480)**: the
