@@ -4343,6 +4343,17 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+            // FLEET-K (0034): seed 0 as second candidate inside cell_c.
+            // Mirrors the cell_a (14100:477382) seed 2→0 refresh in 3f497f6
+            // and the cell_b seed 26+0 second candidate attempt; per 0033,
+            // pinned seeds rot as the portfolio grows. Cost: one extra
+            // metis_order_full call on a single matrix (~0.2 s local).
+            let opts0 = feral_metis::MetisOptions {
+                seed: 0,
+                max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts0).map(|(p, ..)| p));
         }
     }
 
