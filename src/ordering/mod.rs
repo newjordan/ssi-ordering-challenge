@@ -4884,8 +4884,8 @@ fn order_with_options(
         max_s: 700,
         max_sub: 3_500,
         max_blocks: 96,
-        budget: 5_000_000,
-        streams: 2,
+        budget: 3_000_000,
+        streams: 4,
         rank_blocks: false,
         round: 0,
     };
@@ -4904,11 +4904,6 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        // Third round re-restored (it was promoted in 0d475d2a and then wiped
-        // by a later graft whose base predated it), extended to the sparse
-        // hub-free sub-10k class per 0027: in both regimes the extra round
-        // runs only when round 2 strictly improved (the loop breaks on
-        // non-improvement below).
         let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
             || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
         {
