@@ -2536,11 +2536,26 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
-            let amd_opts_075 = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 0.75,
-            };
-            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p));
+            if nnz >= D_WIDE_MAX_DENSITY * n {
+                // Above the D_WIDE density ceiling, a low-alpha DegSqrt
+                // quotient pass is both cheaper and materially more diverse
+                // than the AMD pass it replaces. Keeping this one-for-one
+                // preserves the accepted candidate count and timing envelope.
+                consider!(move || custom_metrics::order_variant(
+                    &core,
+                    0.75,
+                    true,
+                    custom_metrics::ScoreVariant::DegSqrt,
+                ));
+            } else {
+                let amd_opts_075 = feral_amd::AmdOptions {
+                    aggressive: true,
+                    dense_alpha: 0.75,
+                };
+                consider!(move || {
+                    feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p)
+                });
+            }
             if nnz < D_WIDE_MAX_DENSITY * n {
                 let opts_20 = feral_amf::AmfOptions {
                     dense_alpha: 2.0,
