@@ -6703,7 +6703,9 @@ fn probe_fleet_j_metis_census() {
         let inc = flops_of(&sp, &perm);
         let mut cells: Vec<String> = Vec::new();
         let mut best = (f64::INFINITY, u64::MAX, 0.0f64);
-        for seed in 0u64..=7 {
+        let seed_lo: u64 = envu("SSI_CEN_SEED_LO", 0) as u64;
+        let seed_hi: u64 = envu("SSI_CEN_SEED_HI", 7) as u64;
+        for seed in seed_lo..=seed_hi {
             let opts = feral_metis::MetisOptions {
                 seed,
                 ..Default::default()
@@ -7314,4 +7316,1389 @@ fn probe_strip_v2() {
 #[cfg(test)]
 fn core_dummy_alpha<'a>(c: &'a feral_ordering_core::CscPattern<'a>) -> feral_ordering_core::CscPattern<'a> {
     c.clone()
+}
+// // DIVERSITY GRID SWEEP (session 20260829T1145Z-n1-push)
+//
+// Rationale: the shipped custom-metric portfolio (11 `ScoreVariant` + 15
+// `EXTRA_METRICS`) was selected from a 42-point grid that varied ONLY the
+// score-formula shape (`deg_pow`, `nv_pow`, `wf_weight`, `wf_pow`,
+// `degme_weight`, `perverse`). Three axes of `order_generic` were never
+// crossed with that grid and are fixed at one value at every shipped call
+// site:
+//   * `dense_alpha` — always 10.0 (yet the AMD/AMF relabel arms ship
+//     [10,5,2,16] / [5,2.5,10,1], i.e. alpha diversity already pays there);
+//   * `aggressive`  — always true;
+//   * `bucket_div`  — always 8 (the score-quantization stride, i.e. the
+//     tie-break granularity; `metric_sweep`'s own doc says it was "only varied
+//     in the dedicated tie-break sub-sweep, never crossed with the main grid").
+//
+// This probe measures the MARGINAL value of each new grid point against the
+// REAL shipped `order()` portfolio (not against AMD alone), which is the
+// baseline `memory/experiments/0010` flagged as the correct one. It prints one
+// row per (candidate, matrix) pair where the candidate STRICTLY beats the
+// shipped portfolio, so offline greedy forward-selection is exact.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Base formula shapes drawn from the shipped set (the 7 win-F `ScoreVariant`
+/// shapes re-expressed as `MetricSpec`, plus the strongest `EXTRA_METRICS`).
+/// Crossed below with the three unswept axes.
+fn grid_base_specs() -> Vec<metric_sweep::MetricSpec> {
+    use metric_sweep::MetricSpec;
+    let mk = |name: &'static str,
+              deg_pow: f64,
+              nv_pow: f64,
+              wf_weight: f64,
+              wf_pow: f64,
+              degme_weight: f64| MetricSpec {
+        name,
+        deg_pow,
+        nv_pow,
+        wf_weight,
+        wf_pow,
+        degme_weight,
+        perverse: false,
+        bucket_div: 8,
+        jitter: 0,
+        seed: 0,
+    };
+    vec![
+        mk("deg1_nv1", 1.00, 1.00, 0.00, 1.00, 0.00), // AMD-ish loose degree / nv
+        mk("deg2_nv1", 2.00, 1.00, 0.00, 1.00, 0.00), // SqDiv
+        mk("deg2_nv0", 2.00, 0.00, 0.00, 1.00, 0.00), // SqPure
+        mk("deg05_nv0", 0.50, 0.00, 0.00, 1.00, 0.00), // DegSqrt
+        mk("deg075_nv0", 0.75, 0.00, 0.00, 1.00, 0.00),
+        mk("deg125_nv0", 1.25, 0.00, 0.00, 1.00, 0.00),
+        mk("deg3_nv1", 3.00, 1.00, 0.00, 1.00, 0.00),
+        mk("deg15_nv1", 1.50, 1.00, 0.00, 1.00, 0.00),
+        mk("deg1_nv1_wf05", 1.00, 1.00, 0.50, 1.00, 0.00),
+        mk("deg1_nv0_wf1", 1.00, 0.00, 1.00, 1.00, 0.00),
+        mk("deg1_nv1_degme2", 1.00, 1.00, 0.00, 1.00, 2.00),
+        mk("deg2_nv1_degme05", 2.00, 1.00, 0.00, 1.00, 0.50),
+    ]
+}
+
+/// The full cross-product this probe evaluates. `(label, alpha, aggressive,
+/// spec)`. Shipped combinations (alpha 10.0, aggressive true, bucket_div 8)
+/// are EXCLUDED for the shapes already in the portfolio — they add nothing.
+fn grid_points() -> Vec<(String, f64, bool, metric_sweep::MetricSpec)> {
+    // `SSI_GRID_SET` selects which axes to sweep: "alpha" (dense_alpha and
+    // aggressive), "jitter" (seeded randomized-restart perturbation of the
+    // pivot score), or "both" (default).
+    let set = std::env::var("SSI_GRID_SET").unwrap_or_else(|_| "both".into());
+    let want_alpha = set == "alpha" || set == "both";
+    let want_jitter = set == "jitter" || set == "both";
+    let mut out = Vec::new();
+    if want_jitter {
+        // RANDOMIZED-RESTART axis. The shipped portfolio has exactly ONE
+        // ordering per formula; here each (amplitude, seed) is a different
+        // draw from the same formula's neighborhood, which is the diversity
+        // shape that paid in the exact elimination game (rgreedy) but has
+        // never been tried at quotient-graph cost.
+        for (bname, deg_pow, nv_pow) in [("deg1_nv1", 1.0f64, 1.0f64), ("deg2_nv1", 2.0, 1.0)] {
+            for amp in [16u32, 48, 96] {
+                for seed in 0u64..6 {
+                    let spec = metric_sweep::MetricSpec {
+                        name: bname,
+                        deg_pow,
+                        nv_pow,
+                        wf_weight: 0.0,
+                        wf_pow: 1.0,
+                        degme_weight: 0.0,
+                        perverse: false,
+                        bucket_div: 8,
+                        jitter: amp,
+                        seed,
+                    };
+                    out.push((format!("j{amp}s{seed}|{bname}"), 10.0, true, spec));
+                }
+            }
+        }
+    }
+    if !want_alpha {
+        return out;
+    }
+    for base in grid_base_specs() {
+        // Axis 1: dense_alpha (shipped: 10.0 only).
+        for alpha in [-1.0f64, 1.0, 2.0, 5.0, 20.0] {
+            out.push((
+                format!("a{alpha}|{}", base.name),
+                alpha,
+                true,
+                base,
+            ));
+        }
+        // Axis 2: aggressive absorption off (shipped: true only).
+        out.push((format!("nag|{}", base.name), 10.0, false, base));
+        // Axis 3: aggressive off CROSSED with a non-default alpha -- the two
+        // cheap axes together, since neither is in the shipped grid.
+        for alpha in [2.0f64, 20.0] {
+            out.push((format!("nag_a{alpha}|{}", base.name), alpha, false, base));
+        }
+        // NOTE: the `bucket_div` axis is deliberately ABSENT. Measured, not
+        // assumed: `b2|deg3_nv1` (bucket_div=2, deg_pow=3) does not terminate
+        // on himmel11 (n=14, nnz=60) -- the coarse stride crowds every vertex
+        // into the saturated top bucket and the vendor pivot scan stops making
+        // progress. A non-terminating candidate cannot be bounded from inside
+        // this probe (no preemption), so the whole axis is excluded until it
+        // can be measured in a preemptible harness. `metric_sweep`'s own doc
+        // already warns this stride was "never crossed with the main grid".
+
+    }
+    out
+}
+
+/// Marginal-value sweep of the unswept `order_generic` axes against the real
+/// shipped portfolio. Emits TSV:
+///   `BASE  <matrix> <n> <nnz> <bucket> <inc_ratio> <inc_flops> <amd_flops>`
+///   `WIN   <label> <matrix> <cand_flops> <gain_ln>`
+///   `COST  <label> <total_secs> <matrices>`
+/// `gain_ln` is `ln(inc_flops) - ln(cand_flops)`, i.e. the reduction in the
+/// per-matrix log-ratio the candidate would deliver if selected — additive in
+/// the bucket geomean, so offline greedy selection is exact arithmetic.
+///
+/// `SSI_GRID_MAX_NNZ` (default 130_000, the shipped `WINF_MAX_NNZ`) bounds
+/// which matrices are evaluated; set it higher to price a gate widening.
+#[test]
+#[ignore]
+fn probe_diversity_grid() {
+    let corpus = crate::corpus::corpus();
+    let max_nnz: usize = std::env::var("SSI_GRID_MAX_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(130_000);
+    let min_nnz: usize = std::env::var("SSI_GRID_MIN_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let points = grid_points();
+    println!("GRIDPOINTS\t{}", points.len());
+    let mut cost = vec![0.0f64; points.len()];
+    let mut panicked = vec![0usize; points.len()];
+    let mut skipped = vec![0usize; points.len()];
+    let mut seen = 0usize;
+    // Per-point cumulative wall budget. `metric_sweep`'s own doc warns that a
+    // wide-dynamic-range score formula can hit a COST CLIFF (the coarse score
+    // buckets crowd and the pivot scan degenerates); one such point stalled an
+    // earlier run of this probe for minutes on an n=1131 matrix. Two guards:
+    // matrices are visited in ASCENDING nnz order so a cliff shows up on a
+    // cheap matrix first, and a point that burns its budget is dropped for the
+    // rest of the sweep. Both are reported, so a dropped point is visible
+    // rather than silently missing.
+    // `SSI_GRID_TRACE=1` prints the (candidate, matrix) pair BEFORE running it
+    // and flushes, so a non-terminating grid point is identified by the last
+    // line of the log rather than guessed at.
+    let trace = std::env::var("SSI_GRID_TRACE").ok().as_deref() == Some("1");
+    let point_budget: f64 = std::env::var("SSI_GRID_POINT_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0);
+    // Silence the per-panic backtrace spam; the counts are reported instead.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let mut ordered: Vec<&(String, Pattern)> = corpus
+        .iter()
+        .filter(|(_, p)| p.n > 0 && p.nnz() < max_nnz && p.nnz() >= min_nnz)
+        .collect();
+    ordered.sort_by_key(|(_, p)| p.nnz());
+
+    for (name, pat) in ordered {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        seen += 1;
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_flops = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+        let inc_perm = order(pat);
+        let inc_flops = flops_of(&sp, &inc_perm);
+        let inc_ratio = inc_flops as f64 / amd_flops as f64;
+        println!(
+            "BASE\t{name}\t{n}\t{nnz}\t{}\t{inc_ratio:.6}\t{inc_flops}\t{amd_flops}",
+            BUCKET_NAMES[bucket(n)]
+        );
+
+        for (i, (label, alpha, aggressive, spec)) in points.iter().enumerate() {
+            if cost[i] > point_budget {
+                skipped[i] += 1;
+                continue;
+            }
+            if trace {
+                println!("TRY\t{label}\t{name}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            let t0 = Instant::now();
+            // Vendor quotient-graph bookkeeping can panic on some off-grid
+            // option combinations (observed: an index-out-of-bounds at
+            // algo.rs:1443). The shipped `consider!` already wraps every
+            // candidate in `catch_unwind`, so a panicking point is contained
+            // in production too -- but we still want to KNOW which ones do it
+            // rather than lose the whole sweep, so catch and record here.
+            let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                metric_sweep::order_generic(&core, *alpha, *aggressive, spec)
+            }));
+            cost[i] += t0.elapsed().as_secs_f64();
+            let raw = match raw {
+                Ok(r) => r,
+                Err(_) => {
+                    panicked[i] += 1;
+                    continue;
+                }
+            };
+            let perm: Vec<usize> = match raw {
+                Ok(p) => p.into_iter().map(|x| x as usize).collect(),
+                Err(_) => continue,
+            };
+            if !is_bijection(&perm, n) {
+                continue;
+            }
+            let f = flops_of(&sp, &perm);
+            if f < inc_flops {
+                let gain = (inc_flops as f64).ln() - (f as f64).ln();
+                println!("WIN\t{label}\t{name}\t{f}\t{gain:.8}");
+            }
+        }
+    }
+    std::panic::set_hook(prev_hook);
+    for (i, (label, ..)) in points.iter().enumerate() {
+        println!(
+            "COST\t{label}\t{:.4}\t{seen}\t{}\t{}",
+            cost[i], panicked[i], skipped[i]
+        );
+    }
+    println!("GRIDDONE\tmatrices={seen}\tmax_nnz={max_nnz}\tmin_nnz={min_nnz}");
+}
+// ONE-MATRIX SAMPLING LOOP (session 20260829T1145Z-n1-push): repeatedly run
+// order() on the matrix named by SSI_ONE_MATRIX so an external profiler
+// (macOS `sample`) can attribute wall time to phases. Ignored by default.
+#[test]
+#[ignore]
+fn probe_one_matrix_loop() {
+    let name_want = std::env::var("SSI_ONE_MATRIX").unwrap_or_else(|_| "crudeoil_pooling_ct3".into());
+    let reps: usize = std::env::var("SSI_ONE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let corpus = crate::corpus::corpus();
+    for (name, pat) in &corpus {
+        if *name != name_want { continue; }
+        println!("matrix {} n={} nnz={}", name, pat.n, pat.nnz());
+        for r in 0..reps {
+            let t = Instant::now();
+            let p = order(pat);
+            println!("rep {} secs {:.3} len {}", r, t.elapsed().as_secs_f64(), p.len());
+        }
+        return;
+    }
+    panic!("matrix {} not in dev corpus", name_want);
+}
+// EXACT BOUNDED-WINDOW SUBSET DP (session 20260829T1145Z-n1-push, seat probe):
+// cheapest falsifier for SEAT-codex-sol-max.md proposal 1. Takes order(pat)'s
+// incumbent as the seed permutation and, over two non-overlapping tilings
+// (offsets 0 and k/2), exactly re-orders each contiguous block of k seed
+// positions via the exact_dp.rs set-state subset DP played on the LIVE
+// residual elimination graph: F[S ∪ {v}] = min(F[S] + (1 + deg_GS(v))²).
+// The residual graph after eliminating a set is order-independent, so a
+// window's local Σ(1+deg)² reduction is an equal GLOBAL reduction; committed
+// wins must therefore reproduce as true flops_of() gains, which is verified
+// per matrix at the end (WDPMISMATCH would flag a broken invariant).
+// Windows with |B ∪ N_live(B)| > 512 are skipped and counted. Base gate only:
+// 1_000 <= n <= 4_000, nnz <= 60_000.
+// Env: SSI_WDP_K (default 6), SSI_WDP_MAX_U (default 512), SSI_WDP_BUDGET_S
+// (default 600; wall time only decides WHERE the sweep stops — checked
+// between matrices, never inside the algorithm, so results per matrix are
+// deterministic).
+#[test]
+#[ignore]
+fn probe_window_dp() {
+    use std::collections::{HashMap, HashSet};
+
+    let k = envu("SSI_WDP_K", 6).max(2).min(16);
+    let max_u = envu("SSI_WDP_MAX_U", 512);
+    let budget_s: f64 = std::env::var("SSI_WDP_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600.0);
+
+    // Live elimination game on hash-set adjacency. Gate matrices are small
+    // (n <= 4_000), so the O(d²) clique insertion per pivot is affordable.
+    // HashSet iteration order is nondeterministic but only ever feeds
+    // set-valued results (bitsets, sorted vecs), so the probe stays
+    // deterministic.
+    fn build_live(pat: &Pattern) -> Vec<HashSet<u32>> {
+        let mut g: Vec<HashSet<u32>> = vec![HashSet::new(); pat.n];
+        for v in 0..pat.n {
+            for &r in &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]] {
+                if r != v {
+                    g[v].insert(r as u32);
+                    g[r].insert(v as u32);
+                }
+            }
+        }
+        g
+    }
+    fn eliminate(g: &mut [HashSet<u32>], v: usize) {
+        let nbrs: Vec<u32> = g[v].iter().copied().collect();
+        for &u in &nbrs {
+            g[u as usize].remove(&(v as u32));
+        }
+        g[v].clear();
+        for i in 0..nbrs.len() {
+            for j in (i + 1)..nbrs.len() {
+                g[nbrs[i] as usize].insert(nbrs[j]);
+                g[nbrs[j] as usize].insert(nbrs[i]);
+            }
+        }
+    }
+
+    // One tiling pass: replay the game from scratch, DP-optimize every full
+    // window of k consecutive positions starting at `offset`, commit a window
+    // reorder only on STRICT local cost reduction. Tie-break is deterministic
+    // and lexicographic: pivots are relaxed in ascending global vertex id
+    // with strict `<` updates, so among equal-cost transitions the smallest
+    // id wins. Returns (windows_tried, windows_skipped_width, improved).
+    fn sweep(
+        pat: &Pattern,
+        perm: &mut [usize],
+        k: usize,
+        offset: usize,
+        max_u: usize,
+    ) -> (usize, usize, usize) {
+        let n = pat.n;
+        let mut g = build_live(pat);
+        let (mut tried, mut skipped, mut improved) = (0usize, 0usize, 0usize);
+        for i in 0..offset.min(n) {
+            eliminate(&mut g, perm[i]);
+        }
+        let mut p = offset;
+        while p + k <= n {
+            let b: Vec<usize> = perm[p..p + k].to_vec();
+            // U = B ∪ N_live(B), compressed to ascending local ids.
+            let mut u: Vec<u32> = b.iter().map(|&x| x as u32).collect();
+            for &v in &b {
+                u.extend(g[v].iter().copied());
+            }
+            u.sort_unstable();
+            u.dedup();
+            if u.len() > max_u {
+                skipped += 1;
+                for i in p..p + k {
+                    eliminate(&mut g, perm[i]);
+                }
+                p += k;
+                continue;
+            }
+            tried += 1;
+            let words = (u.len() + 63) / 64;
+            let lid: HashMap<u32, usize> =
+                u.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+            // Per window vertex: U-bitset of live neighbours, k-bit mask of
+            // window-internal adjacency, and its own bit position in U.
+            let mut adjw = vec![vec![0u64; words]; k];
+            let mut badj = vec![0u32; k];
+            let mut bpos = vec![0usize; k];
+            for (j, &v) in b.iter().enumerate() {
+                bpos[j] = lid[&(v as u32)];
+                for &w in &g[v] {
+                    let q = lid[&w];
+                    adjw[j][q / 64] |= 1u64 << (q % 64);
+                }
+            }
+            for j in 0..k {
+                for j2 in 0..k {
+                    if j != j2 && g[b[j]].contains(&(b[j2] as u32)) {
+                        badj[j] |= 1u32 << j2;
+                    }
+                }
+            }
+            // Connected components of G[S] among the window vertices, with
+            // their U-bitset boundaries — the exact_dp.rs component-boundary
+            // formulation, widened from u32 masks to word bitsets over U.
+            let comps_of = |smask: u32| -> Vec<(u32, Vec<u64>)> {
+                let mut out = Vec::new();
+                let mut rem = smask;
+                while rem != 0 {
+                    let start = rem.trailing_zeros();
+                    let mut stack = 1u32 << start;
+                    let mut comp = 0u32;
+                    let mut nbr = vec![0u64; words];
+                    while stack != 0 {
+                        let j = stack.trailing_zeros() as usize;
+                        let jb = 1u32 << j;
+                        stack &= !jb;
+                        if comp & jb != 0 {
+                            continue;
+                        }
+                        comp |= jb;
+                        for w in 0..words {
+                            nbr[w] |= adjw[j][w];
+                        }
+                        stack |= badj[j] & smask & !comp;
+                    }
+                    rem &= !comp;
+                    out.push((comp, nbr));
+                }
+                out
+            };
+            // Exact pivot charge (1 + live fill degree)² for eliminating
+            // window vertex j out of eliminated window subset smask. All fill
+            // neighbours of j after eliminating S ⊆ B lie inside U, so the
+            // U-bitsets carry the FULL live degree, not an approximation.
+            let trans = |smask: u32, j: usize, comps: &[(u32, Vec<u64>)]| -> u64 {
+                let mut reach = adjw[j].clone();
+                for (cm, cn) in comps {
+                    if badj[j] & cm != 0 {
+                        for w in 0..words {
+                            reach[w] |= cn[w];
+                        }
+                    }
+                }
+                // Drop eliminated window vertices and the pivot itself.
+                let mut dead = smask | (1u32 << j);
+                while dead != 0 {
+                    let j2 = dead.trailing_zeros() as usize;
+                    dead &= dead - 1;
+                    reach[bpos[j2] / 64] &= !(1u64 << (bpos[j2] % 64));
+                }
+                let deg: u32 = reach.iter().map(|w| w.count_ones()).sum();
+                let c = (deg + 1) as u64;
+                c * c
+            };
+            // Exact cost of the seed order inside this window.
+            let mut seed_cost = 0u64;
+            {
+                let mut smask = 0u32;
+                for j in 0..k {
+                    let comps = comps_of(smask);
+                    seed_cost += trans(smask, j, &comps);
+                    smask |= 1u32 << j;
+                }
+            }
+            // Subset DP over the window.
+            let states = 1usize << k;
+            let mut f = vec![u64::MAX; states];
+            let mut choice = vec![0u8; states];
+            f[0] = 0;
+            let mut order_js: Vec<usize> = (0..k).collect();
+            order_js.sort_by_key(|&j| b[j]);
+            for s in 0..states {
+                if f[s] == u64::MAX {
+                    continue;
+                }
+                let smask = s as u32;
+                let comps = comps_of(smask);
+                for &j in &order_js {
+                    if smask & (1u32 << j) != 0 {
+                        continue;
+                    }
+                    let cost = f[s] + trans(smask, j, &comps);
+                    let ns = s | (1usize << j);
+                    if cost < f[ns] {
+                        f[ns] = cost;
+                        choice[ns] = j as u8;
+                    }
+                }
+            }
+            if f[states - 1] < seed_cost {
+                improved += 1;
+                let mut rev = Vec::with_capacity(k);
+                let mut s = states - 1;
+                while s != 0 {
+                    let j = choice[s] as usize;
+                    rev.push(b[j]);
+                    s &= !(1usize << j);
+                }
+                rev.reverse();
+                perm[p..p + k].copy_from_slice(&rev);
+            }
+            // Advance the game past the window (any order gives the same
+            // residual; use the committed one).
+            for i in p..p + k {
+                eliminate(&mut g, perm[i]);
+            }
+            p += k;
+        }
+        (tried, skipped, improved)
+    }
+
+    let corpus = crate::corpus::corpus();
+    let mut gate: Vec<&(String, Pattern)> = corpus
+        .iter()
+        .filter(|(_, p)| p.n >= 1_000 && p.n <= 4_000 && p.nnz() <= 60_000)
+        .collect();
+    gate.sort_by_key(|(_, p)| p.nnz());
+
+    let t0 = Instant::now();
+    println!(
+        "WDP\tk={k}\tmax_u={max_u}\tbudget_s={budget_s}\tgate_matrices={}",
+        gate.len()
+    );
+    println!("name\tn\tnnz\twindows_tried\twindows_skipped_width\twindows_improved\tseed_flops\tnew_flops\trel_gain");
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (mut done, mut improved_m, mut panics) = (0usize, 0usize, 0usize);
+    let mut stopped = false;
+    let mut sum_ln = 0.0f64;
+    for (name, pat) in &gate {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            stopped = true;
+            break;
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sp = scoring_pattern(pat);
+            let seed = order(pat);
+            let seed_flops = flops_of(&sp, &seed);
+            let mut perm = seed.clone();
+            let (t1, s1, i1) = sweep(pat, &mut perm, k, 0, max_u);
+            let (t2, s2, i2) = sweep(pat, &mut perm, k, k / 2, max_u);
+            assert!(is_bijection(&perm, pat.n), "window DP broke the bijection");
+            let new_flops = flops_of(&sp, &perm);
+            (t1 + t2, s1 + s2, i1 + i2, seed_flops, new_flops)
+        }));
+        done += 1;
+        match res {
+            Ok((wt, ws, wi, sf, nf)) => {
+                let rel = 1.0 - nf as f64 / sf as f64;
+                if nf < sf {
+                    improved_m += 1;
+                }
+                sum_ln += (nf as f64 / sf as f64).ln();
+                println!(
+                    "{name}\t{}\t{}\t{wt}\t{ws}\t{wi}\t{sf}\t{nf}\t{rel:.6}",
+                    pat.n,
+                    pat.nnz()
+                );
+                if wi > 0 && nf >= sf {
+                    // A committed strict local win MUST show up globally.
+                    println!("WDPMISMATCH\t{name}\tcommitted={wi}\tbut new_flops >= seed_flops");
+                }
+            }
+            Err(_) => {
+                panics += 1;
+                println!("{name}\t{}\t{}\tPANIC", pat.n, pat.nnz());
+            }
+        }
+    }
+    std::panic::set_hook(prev_hook);
+    println!(
+        "WDPSUMMARY\tmatrices={done}/{}\timproved={improved_m}\tpanics={panics}\tsum_ln_ratio={sum_ln:.8}\telapsed_s={:.1}\tstopped_early={stopped}",
+        gate.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    // All gate matrices sit in the 1k_10k bucket; the orchestrator folds
+    // sum_ln_ratio into that bucket's geomean offline for the score delta.
+}
+
+/// P1 falsifier — SIMPLICIAL PRESOLVE (SEAT-fable5, run 20260829T1145Z-n1-push).
+///
+/// For every dev matrix with `n >= SSI_SP_MIN_N` (default 10_000):
+///   1. Iteratively strip simplicial vertices of live degree <= SSI_SP_KMAX
+///      (default 4, the census-backed rule: deg >= 5 strippables are
+///      negligible corpus-wide) exactly as P1 specifies — fixed deterministic
+///      queue in ascending vertex id, iterated to a fixed point. Simplicial
+///      eliminations create zero fill, so the live graph is always the
+///      induced subgraph of the original pattern: alive flags + live degrees
+///      suffice, no adjacency mutation.
+///   2. Order the CORE with feral AMD (library defaults) and with AMF α5
+///      (the report's strongest cheap core alternative), splice
+///      `[strip order] ++ [core order]`, verify the bijection, and score the
+///      composed candidate with the trusted `flops_of`.
+///   3. Compare against (a) full-graph AMD and (b) the shipped `order(pat)`.
+///
+/// Kill condition (P1's own falsifier): if the composed candidates never
+/// strictly beat shipped on the strip-rich set (faclay30, powerflow0300p,
+/// transswitch0300p, chp_shorttermplan2d, mpbp_21/48, edgecross24-115,
+/// kissing2), the lane is dead. This probe covers the diversity leg only;
+/// the exact-game leg on cores is a follow-up if this leg shows life.
+///
+/// Flops-only, load-immune, deterministic, no submission.
+#[test]
+#[ignore]
+fn probe_simplicial_presolve() {
+    let min_n = envu("SSI_SP_MIN_N", 10_000);
+    let kmax = envu("SSI_SP_KMAX", 4);
+    let budget_s: f64 = std::env::var("SSI_SP_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900.0);
+
+    // Returns (strip_order, core_old_ids_ascending, prefix_flops), where
+    // prefix_flops = Σ (live_deg+1)² over the strip (P1's exact prefix
+    // charge; reported for cross-checking against the composed score).
+    fn strip_simplicial(pat: &Pattern, kmax: usize) -> (Vec<usize>, Vec<usize>, u64) {
+        use std::collections::BTreeSet;
+        let n = pat.n;
+        let mut alive = vec![true; n];
+        let mut live_deg: Vec<usize> = (0..n).map(|v| pat.col(v).len()).collect();
+        // Pattern columns are sorted+unique with no diagonal, so adjacency
+        // tests are binary searches on the ORIGINAL lists (induced-subgraph
+        // invariant above: a live pair is adjacent iff originally adjacent).
+        let has_edge = |a: usize, b: usize| pat.col(a).binary_search(&b).is_ok();
+        let mut queue: BTreeSet<usize> = (0..n).filter(|&v| live_deg[v] <= kmax).collect();
+        let mut strip: Vec<usize> = Vec::new();
+        let mut prefix_flops = 0u64;
+        while let Some(v) = queue.pop_first() {
+            if !alive[v] || live_deg[v] > kmax {
+                continue;
+            }
+            let nbrs: Vec<usize> = pat.col(v).iter().copied().filter(|&u| alive[u]).collect();
+            debug_assert_eq!(nbrs.len(), live_deg[v]);
+            let mut clique = true;
+            'pairs: for i in 0..nbrs.len() {
+                for j in (i + 1)..nbrs.len() {
+                    if !has_edge(nbrs[i], nbrs[j]) {
+                        clique = false;
+                        break 'pairs;
+                    }
+                }
+            }
+            if !clique {
+                continue;
+            }
+            let c = (nbrs.len() + 1) as u64;
+            prefix_flops += c * c;
+            alive[v] = false;
+            strip.push(v);
+            for &u in &nbrs {
+                live_deg[u] -= 1;
+                if live_deg[u] <= kmax {
+                    queue.insert(u);
+                }
+            }
+        }
+        let core: Vec<usize> = (0..n).filter(|&v| alive[v]).collect();
+        (strip, core, prefix_flops)
+    }
+
+    // Compose `[strip order] ++ expand(sub(core))` and score it. Core CSC is
+    // built in the shipped strip_candidate/strip_general_v2 idiom (induced
+    // subgraph, i32, no diagonal — same convention as the source pattern).
+    fn presolve_flops(
+        pat: &Pattern,
+        sp: &ScoringPattern,
+        strip: &[usize],
+        core: &[usize],
+        sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>,
+    ) -> Option<u64> {
+        let n = pat.n;
+        let mut composed: Vec<usize> = strip.to_vec();
+        if !core.is_empty() {
+            let mut new_id = vec![usize::MAX; n];
+            for (i, &v) in core.iter().enumerate() {
+                new_id[v] = i;
+            }
+            let m = core.len();
+            let mut scp: Vec<i32> = Vec::with_capacity(m + 1);
+            let mut sri: Vec<i32> = Vec::new();
+            scp.push(0);
+            for &v in core {
+                for &w in pat.col(v) {
+                    if new_id[w] != usize::MAX {
+                        sri.push(new_id[w] as i32);
+                    }
+                }
+                scp.push(sri.len() as i32);
+            }
+            let csc = feral_ordering_core::CscPattern::new(m, &scp, &sri)?;
+            let sub_perm = sub(&csc)?;
+            composed.extend(sub_perm.iter().map(|&x| core[x as usize]));
+        }
+        assert!(is_bijection(&composed, n), "presolve compose broke the bijection");
+        Some(flops_of(sp, &composed))
+    }
+
+    let corpus = crate::corpus::corpus();
+    let mut gate: Vec<&(String, Pattern)> = corpus.iter().filter(|(_, p)| p.n >= min_n).collect();
+    gate.sort_by_key(|(_, p)| p.nnz());
+
+    let t0 = Instant::now();
+    println!(
+        "SP\tmin_n={min_n}\tkmax={kmax}\tbudget_s={budget_s}\tgate_matrices={}",
+        gate.len()
+    );
+    println!(
+        "name\tn\tnnz\tstripped\tstrip_frac\tcore_n\tflops_full_amd\tflops_shipped\tflops_presolve_amd\tflops_presolve_amf\tbest_rel_vs_shipped"
+    );
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (mut done, mut wins, mut panics) = (0usize, 0usize, 0usize);
+    let mut stopped = false;
+    let mut sum_ln = 0.0f64;
+    for (name, pat) in &gate {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            stopped = true;
+            break;
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sp = scoring_pattern(pat);
+            let (cp, ri) = core_of(pat);
+            let full = feral_ordering_core::CscPattern::new(pat.n, &cp, &ri).unwrap();
+            let full_amd = flops_of(
+                &sp,
+                &feral_amd::amd_order(&full)
+                    .unwrap()
+                    .into_iter()
+                    .map(|x| x as usize)
+                    .collect::<Vec<_>>(),
+            );
+            let shipped = flops_of(&sp, &order(pat));
+            let (strip, core, _prefix_flops) = strip_simplicial(pat, kmax);
+            let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+            let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
+                let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+                feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+            };
+            let p_amd = presolve_flops(pat, &sp, &strip, &core, &sub_amd);
+            let p_amf = presolve_flops(pat, &sp, &strip, &core, &sub_amf5);
+            (full_amd, shipped, strip.len(), core.len(), p_amd, p_amf)
+        }));
+        done += 1;
+        match res {
+            Ok((full_amd, shipped, stripped, core_n, p_amd, p_amf)) => {
+                let frac = stripped as f64 / pat.n as f64;
+                let best: Option<u64> = match (p_amd, p_amf) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let fmt = |x: Option<u64>| x.map_or("NA".to_string(), |v| v.to_string());
+                let rel_txt = match best {
+                    Some(b) if shipped > 0 => {
+                        let r = b as f64 / shipped as f64;
+                        sum_ln += r.ln();
+                        if b < shipped {
+                            wins += 1;
+                        }
+                        format!("{:+.6}", r - 1.0)
+                    }
+                    _ => "NA".to_string(),
+                };
+                println!(
+                    "{name}\t{}\t{}\t{stripped}\t{frac:.3}\t{core_n}\t{full_amd}\t{shipped}\t{}\t{}\t{rel_txt}",
+                    pat.n,
+                    pat.nnz(),
+                    fmt(p_amd),
+                    fmt(p_amf)
+                );
+            }
+            Err(_) => {
+                panics += 1;
+                println!("{name}\t{}\t{}\tPANIC", pat.n, pat.nnz());
+            }
+        }
+    }
+    std::panic::set_hook(prev_hook);
+    println!(
+        "SPSUMMARY\tmatrices={done}/{}\tpresolve_beats_shipped={wins}\tpanics={panics}\tsum_ln_best_vs_shipped={sum_ln:.8}\telapsed_s={:.1}\tstopped_early={stopped}",
+        gate.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    // Gate matrices all sit in gt_10k (weight 0.40); the orchestrator folds
+    // sum_ln_best_vs_shipped into that bucket's geomean offline. Negative
+    // sum_ln = the presolve diversity leg is alive; zero everywhere on the
+    // strip-rich named set = P1's kill condition fires.
+}
+
+/// SK census — SCOTCH + KaHIP seed/strategy sweep against the full `order()`
+/// incumbent over the heavy dev tier; the analogue of
+/// `probe_fleet_j_metis_census` for the two non-METIS partitioners.
+///
+/// Knobs swept:
+///   * `feral_scotch::ScotchOptions` — `seed` (coarsening-matching RNG) over
+///     `SSI_SK_SEED_LO..=SSI_SK_SEED_HI` (default 0..=15), plus option
+///     variants at the default seed: compression off, `max_imbalance`
+///     0.02 / 0.30, `n_sep_trials = 10`, `fm_pass_cap = 8`.
+///   * `feral_kahip::KahipOptions` — `seed` over the same range in the
+///     default `Fast` mode, plus `KahipMode::Eco` and `KahipMode::Strong`
+///     at the default seed (1).
+///
+/// Same in-scope gate and `SSI_CEN_MIN_NNZ`/`SSI_CEN_MAX_NNZ` shard envs as
+/// the METIS census, same incumbent (one full timed `order()` scored by
+/// `flops_of`). Every candidate runs under `catch_unwind`; `SSI_SK_BUDGET_S`
+/// (default 1200 s) caps the cumulative wall clock. Rows print as `SKCEN`.
+#[test]
+#[ignore]
+fn probe_scotch_kahip_census() {
+    enum SkCand {
+        Scotch(feral_scotch::ScotchOptions),
+        Kahip(feral_kahip::KahipOptions),
+    }
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let shard_min: usize = std::env::var("SSI_CEN_MIN_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let shard_max: usize = std::env::var("SSI_CEN_MAX_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    let seed_lo: u64 = envu("SSI_SK_SEED_LO", 0) as u64;
+    let seed_hi: u64 = envu("SSI_SK_SEED_HI", 15) as u64;
+    let budget_s: f64 = envu("SSI_SK_BUDGET_S", 1200) as f64;
+    let wall = Instant::now();
+    println!("corpus: {} rows", corpus.len());
+    println!("SKCEN\tkey\tn\tnnz\tmaxdeg\tdens\tinc_secs\tinc_flops\tbest_cand\tbest_rel\tbest_secs\tcells");
+    'rows: for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if !(nnz >= 100_000 || (nnz >= 20_000 && nnz >= 8 * n)) {
+            continue;
+        }
+        if nnz < shard_min || nnz >= shard_max {
+            continue;
+        }
+        if let Ok(keys) = std::env::var("SSI_PROBE_KEYS") {
+            let key = format!("{n}:{nnz}");
+            if !keys.split(',').any(|k| k.trim() == key || k.trim() == *name) {
+                continue;
+            }
+        }
+        if wall.elapsed().as_secs_f64() > budget_s {
+            println!("SKCEN\tBUDGET_EXHAUSTED\tbefore {name}|{n}:{nnz}");
+            break 'rows;
+        }
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let t0 = Instant::now();
+        let perm = order(pat);
+        let inc_secs = t0.elapsed().as_secs_f64();
+        let inc = flops_of(&sp, &perm);
+        let mut cands: Vec<(String, SkCand)> = Vec::new();
+        for seed in seed_lo..=seed_hi {
+            cands.push((
+                format!("sc_s{seed}"),
+                SkCand::Scotch(feral_scotch::ScotchOptions {
+                    seed,
+                    ..Default::default()
+                }),
+            ));
+        }
+        cands.push((
+            "sc_nocmp".to_string(),
+            SkCand::Scotch(feral_scotch::ScotchOptions {
+                compress: false,
+                ..Default::default()
+            }),
+        ));
+        cands.push((
+            "sc_imb0.02".to_string(),
+            SkCand::Scotch(feral_scotch::ScotchOptions {
+                max_imbalance: 0.02,
+                ..Default::default()
+            }),
+        ));
+        cands.push((
+            "sc_imb0.30".to_string(),
+            SkCand::Scotch(feral_scotch::ScotchOptions {
+                max_imbalance: 0.30,
+                ..Default::default()
+            }),
+        ));
+        cands.push((
+            "sc_nsep10".to_string(),
+            SkCand::Scotch(feral_scotch::ScotchOptions {
+                n_sep_trials: 10,
+                ..Default::default()
+            }),
+        ));
+        cands.push((
+            "sc_fmp8".to_string(),
+            SkCand::Scotch(feral_scotch::ScotchOptions {
+                fm_pass_cap: 8,
+                ..Default::default()
+            }),
+        ));
+        for seed in seed_lo..=seed_hi {
+            cands.push((
+                format!("kh_s{seed}"),
+                SkCand::Kahip(feral_kahip::KahipOptions {
+                    seed,
+                    ..Default::default()
+                }),
+            ));
+        }
+        cands.push((
+            "kh_eco".to_string(),
+            SkCand::Kahip(feral_kahip::KahipOptions {
+                mode: feral_kahip::KahipMode::Eco,
+                ..Default::default()
+            }),
+        ));
+        cands.push((
+            "kh_strong".to_string(),
+            SkCand::Kahip(feral_kahip::KahipOptions {
+                mode: feral_kahip::KahipMode::Strong,
+                ..Default::default()
+            }),
+        ));
+        let mut cells: Vec<String> = Vec::new();
+        let mut best: (f64, String, f64) = (f64::INFINITY, String::new(), 0.0);
+        for (label, cand) in &cands {
+            if wall.elapsed().as_secs_f64() > budget_s {
+                cells.push(format!("{label}=BUDGET"));
+                break;
+            }
+            let t1 = Instant::now();
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match cand {
+                SkCand::Scotch(o) => {
+                    feral_scotch::scotch_order_full(&core, o).map(|(p, _, _)| p)
+                }
+                SkCand::Kahip(o) => {
+                    feral_kahip::kahip_order_full(&core, o).map(|(p, _, _)| p)
+                }
+            }));
+            let secs = t1.elapsed().as_secs_f64();
+            match got {
+                Ok(Ok(p)) => {
+                    let cand_perm: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                    let f = flops_of(&sp, &cand_perm);
+                    let rel = f as f64 / inc as f64;
+                    if rel < best.0 {
+                        best = (rel, label.clone(), secs);
+                    }
+                    cells.push(format!("{label}={rel:.4}/{secs:.3}"));
+                }
+                Ok(Err(e)) => cells.push(format!("{label}=ERR({e:?})/{secs:.3}")),
+                Err(_) => cells.push(format!("{label}=PANIC/{secs:.3}")),
+            }
+        }
+        println!(
+            "SKCEN\t{name}|{n}:{nnz}\t{n}\t{nnz}\t{max_deg}\t{:.1}\t{inc_secs:.3}\t{inc}\t{}\t{:.4}\t{:.3}\t{}",
+            nnz as f64 / n as f64,
+            best.1,
+            best.0,
+            best.2,
+            cells.join(" ")
+        );
+    }
+}
+
+/// P1 falsifier — BLOCKWISE PORTFOLIO RECOMBINATION (etree-subtree crossover),
+/// from runs/20260829T1145Z-n1-push/SEAT-opus-bigideas.md, proposal P1.
+///
+/// Offline probe that returns the EXACT realized gain of donor recombination,
+/// with no submission and no randomized search:
+///
+///   1. Build the incumbent with the shipped `order(pat)`, postorder it, and
+///      enumerate the same disjoint descendant-closed etree blocks the RGSUB
+///      call site would pick for n >= 10_000 (min_s=32, max_s=700,
+///      max_sub=3500, ranked by exact contribution / size^(3/4), limit 96 —
+///      the `split_ranked_streams` ranked_limit, i.e. the widest block set the
+///      shipped phase touches).
+///   2. Keep a donor pool of structurally diverse WHOLE-MATRIX permutations
+///      (per P1: not the best-by-flops, one per family): feral AMD default,
+///      AMD aggressive dense_alpha variants (5.0, 20.0), no-dense AMD
+///      (aggressive=false, dense_alpha=-1.0), AMF default, METIS default,
+///      Scotch default.
+///   3. For each block `S`: extract each donor's subsequence restricted to `S`
+///      (a valid order of `S` whatever the donor did globally), map it through
+///      the block's local id map, and score it with the block's own exact
+///      elimination game (`Game::replay_flops` over the induced
+///      `S u boundary` subgraph — byte-identical construction to
+///      `rgreedy::subtree_refine`'s per-block subproblem). Compare against the
+///      incumbent block contribution `sum_{v in S} counts[v]^2`.
+///   4. Blocks are disjoint subtrees, so per-block gains are exactly additive:
+///      the per-matrix realized total = incumbent flops - sum of gains is the
+///      exact `sum c^2` the full mechanism would reach (rgreedy-seeding upside
+///      excluded — a LOWER bound on P1).
+///
+/// Divergences from `subtree_refine` itself: none in the subproblem
+/// construction (same local-id map, same boundary = original-graph neighbours
+/// of S, same bitset adjacency, same max_sub skip); the only difference is
+/// WHAT is scored in the block — donor restrictions replayed exactly, instead
+/// of randomized-greedy trajectories. The block-ranking comparator
+/// (`rank_product` / `rank_alpha_three_quarters_cmp`) is private to
+/// rgreedy.rs and is replicated verbatim below.
+///
+/// Kill condition (P1's own falsifier): predicted score delta under -0.0005.
+///
+/// Env: SSI_BR_MIN_N (default 10_000), SSI_BR_BUDGET_S (default 1200),
+/// SSI_CORPUS_FILE as usual. Flops-only, load-immune, deterministic.
+#[test]
+#[ignore]
+fn probe_block_recombination() {
+    use crate::ordering::rgreedy::Game;
+
+    let min_n = envu("SSI_BR_MIN_N", 10_000);
+    let budget_s: f64 = std::env::var("SSI_BR_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1200.0);
+
+    // ── replicas of rgreedy.rs's private block-ranking helpers ──────────────
+    fn br_rank_product(value: u64, value_power: usize, len: usize, len_power: usize) -> [u64; 6] {
+        fn mul(words: &mut [u64; 6], factor: u64) {
+            let mut carry = 0u128;
+            for word in words.iter_mut() {
+                let product = *word as u128 * factor as u128 + carry;
+                *word = product as u64;
+                carry = product >> 64;
+            }
+            debug_assert_eq!(carry, 0);
+        }
+        let mut product = [0u64; 6];
+        product[0] = 1;
+        for _ in 0..value_power {
+            mul(&mut product, value);
+        }
+        for _ in 0..len_power {
+            mul(&mut product, len as u64);
+        }
+        product
+    }
+    fn br_rank_cmp(a: &(usize, usize, u64), b: &(usize, usize, u64)) -> std::cmp::Ordering {
+        let len_a = a.1 + 1 - a.0;
+        let len_b = b.1 + 1 - b.0;
+        let b_cross = br_rank_product(b.2, 4, len_a, 3);
+        let a_cross = br_rank_product(a.2, 4, len_b, 3);
+        b_cross
+            .iter()
+            .rev()
+            .cmp(a_cross.iter().rev())
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.1.cmp(&a.1))
+    }
+
+    // Shipped RGSUB geometry for the ranked n >= 10_000 configuration.
+    const BR_MIN_S: usize = 32;
+    const BR_MAX_S: usize = 700;
+    const BR_MAX_SUB: usize = 3_500;
+    const BR_MAX_BLOCKS: usize = 96;
+    const BR_MAX_NNZ: usize = 1_500_000;
+
+    let corpus = crate::corpus::corpus();
+    let mut gate: Vec<&(String, Pattern)> = corpus
+        .iter()
+        .filter(|(_, p)| p.n >= min_n && p.nnz() > 0 && p.nnz() <= BR_MAX_NNZ)
+        .collect();
+    gate.sort_by_key(|(_, p)| p.nnz());
+
+    let t0 = Instant::now();
+    println!(
+        "BR\tmin_n={min_n}\tbudget_s={budget_s}\tgate_matrices={}",
+        gate.len()
+    );
+    println!(
+        "matrix\tn\tnnz\tblocks\tblocks_improved_by_donor\tbest_donor_name\tsum_local_gain_flops\tincumbent_flops\trealized_flops\trel_vs_incumbent\tdonor_wins\tsanity_bad\tdonors_ok"
+    );
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (mut done, mut improved_mats, mut panics) = (0usize, 0usize, 0usize);
+    let mut sum_ln = 0.0f64;
+    let mut stopped = false;
+    for (name, pat) in &gate {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            stopped = true;
+            break;
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let n = pat.n;
+            let sp = scoring_pattern(pat);
+            let best_perm = order(pat);
+            assert!(is_bijection(&best_perm, n), "order() broke the bijection");
+            let incumbent_flops = flops_of(&sp, &best_perm);
+
+            // ── donor pool: one deterministic whole-matrix order per family ─
+            let (cp, ri) = core_of(pat);
+            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+            let to_usize =
+                |p: Vec<i32>| -> Vec<usize> { p.into_iter().map(|x| x as usize).collect() };
+            let mut donors: Vec<(&'static str, Vec<usize>)> = Vec::new();
+            if let Ok(p) = feral_amd::amd_order(&core) {
+                donors.push(("amd_default", to_usize(p)));
+            }
+            for (tag, alpha) in [("amd_a5", 5.0f64), ("amd_a20", 20.0f64)] {
+                let o = feral_amd::AmdOptions {
+                    aggressive: true,
+                    dense_alpha: alpha,
+                };
+                if let Ok((p, ..)) = feral_amd::amd_order_opts(&core, &o) {
+                    donors.push((tag, to_usize(p)));
+                }
+            }
+            {
+                let o = feral_amd::AmdOptions {
+                    aggressive: false,
+                    dense_alpha: -1.0,
+                };
+                if let Ok((p, ..)) = feral_amd::amd_order_opts(&core, &o) {
+                    donors.push(("amd_nodense", to_usize(p)));
+                }
+            }
+            if let Ok((p, ..)) = feral_amf::amf_order_opts(&core, &feral_amf::AmfOptions::default())
+            {
+                donors.push(("amf_default", to_usize(p)));
+            }
+            if let Ok((p, ..)) =
+                feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default())
+            {
+                donors.push(("metis_default", to_usize(p)));
+            }
+            if let Ok(p) = feral_scotch::scotch_order(&core) {
+                donors.push(("scotch_default", to_usize(p)));
+            }
+            // rank[v] = position of v in the donor order, for O(s log s)
+            // restriction of the donor to a block (P1's own fix for the O(n)
+            // subsequence scan).
+            let ranks: Vec<Vec<u32>> = donors
+                .iter()
+                .map(|(_, p)| {
+                    let mut r = vec![u32::MAX; n];
+                    for (pos, &v) in p.iter().enumerate() {
+                        r[v] = pos as u32;
+                    }
+                    r
+                })
+                .collect();
+
+            // ── incumbent postorder + blocks, exactly as the RGSUB call site ─
+            let permuted = permute_pattern(&sp, &best_perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            assert_eq!(post.len(), n, "postorder incomplete");
+            let mut post_of = vec![0usize; n];
+            for (k, &p) in post.iter().enumerate() {
+                post_of[p] = k;
+            }
+            let counts = column_counts_gnp(&permuted, &etree);
+            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+            let parent_post: Vec<i32> = post
+                .iter()
+                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                .collect();
+            // Global permutation in postorder: position k eliminates work[k].
+            let work: Vec<usize> = post.iter().map(|&p| best_perm[p]).collect();
+
+            let mut size: Vec<u32> = vec![1; n];
+            for j in 0..n {
+                let p = parent_post[j];
+                if p >= 0 {
+                    size[p as usize] += size[j];
+                }
+            }
+            let mut covered = vec![false; n];
+            let mut blocks: Vec<(usize, usize)> = Vec::new();
+            for j in (0..n).rev() {
+                if covered[j] {
+                    continue;
+                }
+                let sz = size[j] as usize;
+                if sz < BR_MIN_S || sz > BR_MAX_S {
+                    continue;
+                }
+                let a = j + 1 - sz;
+                for c in covered.iter_mut().take(j + 1).skip(a) {
+                    *c = true;
+                }
+                blocks.push((a, j));
+            }
+            let mut ranked: Vec<(usize, usize, u64)> = blocks
+                .drain(..)
+                .map(|(a, b)| {
+                    let contribution = counts_post[a..=b]
+                        .iter()
+                        .map(|&c| {
+                            let c = c as u64;
+                            c * c
+                        })
+                        .sum();
+                    (a, b, contribution)
+                })
+                .collect();
+            ranked.sort_by(br_rank_cmp);
+            let blocks: Vec<(usize, usize)> = ranked
+                .into_iter()
+                .take(BR_MAX_BLOCKS)
+                .map(|(a, b, _)| (a, b))
+                .collect();
+
+            // ── per block: donor restrictions scored by the exact game ──────
+            let mut local: Vec<u32> = vec![u32::MAX; n];
+            let mut touched: Vec<usize> = Vec::new();
+            let mut verts: Vec<usize> = Vec::new();
+            let mut blocks_seen = 0usize;
+            let mut blocks_improved = 0usize;
+            let mut sanity_bad = 0usize;
+            let mut sum_gain = 0u64;
+            let mut donor_wins = vec![0usize; donors.len()];
+            let mut donor_gain = vec![0u64; donors.len()];
+            for &(a, b) in &blocks {
+                let ssz = b + 1 - a;
+                verts.clear();
+                for &c in touched.iter() {
+                    local[c] = u32::MAX;
+                }
+                touched.clear();
+                // S first, in incumbent block order (identity seed), then the
+                // boundary: original-graph neighbours of S outside S — the
+                // same construction subtree_refine uses.
+                for &v in &work[a..=b] {
+                    local[v] = verts.len() as u32;
+                    touched.push(v);
+                    verts.push(v);
+                }
+                for i in 0..ssz {
+                    let v = verts[i];
+                    for &u in &sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]] {
+                        if u < n && local[u] == u32::MAX {
+                            local[u] = verts.len() as u32;
+                            touched.push(u);
+                            verts.push(u);
+                        }
+                    }
+                }
+                let m = verts.len();
+                if m > BR_MAX_SUB || m > crate::ordering::rgreedy::MAX_N {
+                    continue;
+                }
+                let w = m.div_ceil(64);
+                let mut adj0 = vec![0u64; m * w];
+                for (li, &v) in verts.iter().enumerate() {
+                    for &u in &sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]] {
+                        if u >= n {
+                            continue;
+                        }
+                        let lu = local[u];
+                        if lu == u32::MAX || lu as usize == li {
+                            continue;
+                        }
+                        let lu = lu as usize;
+                        adj0[li * w + (lu >> 6)] |= 1u64 << (lu & 63);
+                        adj0[lu * w + (li >> 6)] |= 1u64 << (li & 63);
+                    }
+                }
+                let seed_flops: u64 = counts_post[a..=b]
+                    .iter()
+                    .map(|&c| {
+                        let c = c as u64;
+                        c * c
+                    })
+                    .sum();
+                let Some(mut game) = Game::new(m, &adj0) else {
+                    continue;
+                };
+                // Sanity: replaying the incumbent block order must reproduce
+                // the exact contribution (the separation argument, checked).
+                let seed: Vec<usize> = (0..ssz).collect();
+                if game.replay_flops(&seed) != seed_flops {
+                    sanity_bad += 1;
+                    continue;
+                }
+                blocks_seen += 1;
+                let mut best_f = seed_flops;
+                let mut best_d: Option<usize> = None;
+                for (di, rank) in ranks.iter().enumerate() {
+                    let mut ord = seed.clone();
+                    ord.sort_by_key(|&li| rank[verts[li]]);
+                    if ord == seed {
+                        continue; // donor restriction == incumbent block order
+                    }
+                    let f = game.replay_flops(&ord);
+                    if f < best_f {
+                        best_f = f;
+                        best_d = Some(di);
+                    }
+                }
+                if let Some(di) = best_d {
+                    let gain = seed_flops - best_f;
+                    blocks_improved += 1;
+                    sum_gain += gain;
+                    donor_wins[di] += 1;
+                    donor_gain[di] += gain;
+                }
+            }
+            let names: Vec<&'static str> = donors.iter().map(|(t, _)| *t).collect();
+            (
+                n,
+                pat.nnz(),
+                blocks_seen,
+                blocks_improved,
+                sum_gain,
+                incumbent_flops,
+                donor_wins,
+                donor_gain,
+                names,
+                sanity_bad,
+            )
+        }));
+        done += 1;
+        match res {
+            Ok((
+                n,
+                nnz,
+                blocks_seen,
+                blocks_improved,
+                sum_gain,
+                incumbent_flops,
+                donor_wins,
+                donor_gain,
+                names,
+                sanity_bad,
+            )) => {
+                let realized = incumbent_flops - sum_gain;
+                let rel = if incumbent_flops > 0 {
+                    realized as f64 / incumbent_flops as f64
+                } else {
+                    1.0
+                };
+                sum_ln += rel.ln();
+                if sum_gain > 0 {
+                    improved_mats += 1;
+                }
+                let best_donor = donor_gain
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &g)| g > 0)
+                    .max_by_key(|&(_, &g)| g)
+                    .map_or("none", |(i, _)| names[i]);
+                let wins_txt = names
+                    .iter()
+                    .zip(donor_wins.iter())
+                    .filter(|(_, &c)| c > 0)
+                    .map(|(t, c)| format!("{t}:{c}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{name}\t{n}\t{nnz}\t{blocks_seen}\t{blocks_improved}\t{best_donor}\t{sum_gain}\t{incumbent_flops}\t{realized}\t{:+.6}\t{}\t{sanity_bad}\t{}",
+                    rel - 1.0,
+                    if wins_txt.is_empty() { "-".to_string() } else { wins_txt },
+                    names.len()
+                );
+            }
+            Err(_) => {
+                panics += 1;
+                println!("{name}\t{}\t{}\tPANIC", pat.n, pat.nnz());
+            }
+        }
+    }
+    std::panic::set_hook(prev_hook);
+    println!(
+        "BRSUMMARY\tmatrices={done}/{}\timproved={improved_mats}\tpanics={panics}\tsum_ln_realized_vs_incumbent={sum_ln:.8}\telapsed_s={:.1}\tstopped_early={stopped}",
+        gate.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    // Gate matrices sit in gt_10k by default (weight 0.40, geomean over the
+    // bucket); the orchestrator folds sum_ln_realized_vs_incumbent into that
+    // bucket offline. This total EXCLUDES the rgreedy-seeding upside, so it is
+    // a lower bound on P1; a predicted score delta under -0.0005 = P1's kill
+    // condition fires.
 }
