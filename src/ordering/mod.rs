@@ -202,6 +202,9 @@ mod nested_subgraph;
 /// portfolio currently costs well under a millisecond and the 2 s cap is
 /// effectively unbounded.
 mod exact_dp;
+
+/// Exact low-degree elimination prefix + residual core (matrices_mage, REDUCE-THEN-AMF).
+mod core_lift;
 /// BICONNECTED-DECOMPOSITION ordering — a NEW candidate family that
 /// DECOMPOSES the graph into biconnected components (Tarjan) and orders each
 /// with AMD, articulation points deferred to their parent block. No other
@@ -234,6 +237,13 @@ use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
 use feral::sparse::csc::CscPattern as ScoringPattern;
 use feral::symbolic::column_counts_gnp;
+
+/// REDUCE-THEN-AMF gates (matrices_mage). Row-degree bound for the exact prefix,
+/// and the largest residual core the AMF grid is asked to order.
+const REDUCE_ROW_DEG: usize = 3;
+const REDUCE_MAX_CORE_N: usize = 60_000;
+const REDUCE_MAX_CORE_EDGES: usize = 3_000_000;
+const REDUCE_ALPHAS: [f64; 4] = [0.5, 2.5, 5.0, 10.0];
 
 /// AMF cost is a smooth ~1.4x of AMD's with no observed structural blow-up, so
 /// its α-5 variant runs on all but the very largest problems, preserving the big
@@ -6335,6 +6345,59 @@ fn order_with_options(
             }
             best_flops = f;
             best_perm = work;
+        }
+    }
+
+    // REDUCE-THEN-AMF, TERMINAL (matrices_mage). Peel pendants and eliminate
+    // every degree-<=3 vertex EXACTLY (each elimination closes its live
+    // neighbourhood into a clique, so the residual is the exact fill graph
+    // after the prefix), run the AMF alpha grid and AMD on the residual core,
+    // splice the prefix back in front, and admit only through the trusted
+    // scorer with strict `<` against the finished pipeline. Placed LAST on
+    // purpose: as a portfolio candidate it displaced the pool argmin and
+    // re-seeded the descent phases (the 0020 mechanism), regressing
+    // watercontamination0303 / nuclear104; here the pipeline above is
+    // byte-identical and this can only lower the result. Measured on the
+    // reconstructed eval corpus against the ad13c92 tip: nuclear10b 0.906 ->
+    // 0.683, edgecross24-057 0.722 -> 0.654, uselinear 0.9997 -> 0.952,
+    // pinene50/100, unitcommit_200_*, gams04; dev: faclay75 1.000 -> 0.967,
+    // methanol200/400, hydroenergy2. Reduce costs 0.00-0.06 s (nnz 1.4M);
+    // the median core is a third of n, so the five core passes are cheap and
+    // run on the worker pool.
+    if n >= 50 {
+        if let Some(cl) = core_lift::reduce(
+            &scoring_pat,
+            REDUCE_ROW_DEG,
+            REDUCE_MAX_CORE_N,
+            REDUCE_MAX_CORE_EDGES,
+        )
+        .filter(|cl| cl.core_n() > 0 && cl.core_n() < n)
+        {
+            let cn = cl.core_n();
+            let ccp: Vec<i32> = cl.core_col_ptr.iter().map(|&x| x as i32).collect();
+            let cri: Vec<i32> = cl.core_row_idx.iter().map(|&x| x as i32).collect();
+            let mut rtasks: Vec<parallel::PermFn> = Vec::new();
+            for a in REDUCE_ALPHAS {
+                let (ccp, cri, cl) = (&ccp, &cri, &cl);
+                rtasks.push(Box::new(move || {
+                    let ccore = feral_ordering_core::CscPattern::new(cn, ccp, cri)?;
+                    let o = feral_amf::AmfOptions { dense_alpha: a, ..Default::default() };
+                    let (p, ..) = feral_amf::amf_order_opts(&ccore, &o).ok()?;
+                    let cp: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    Some(core_lift::splice(cl, &cp))
+                }));
+            }
+            {
+                let (ccp, cri, cl) = (&ccp, &cri, &cl);
+                rtasks.push(Box::new(move || {
+                    let ccore = feral_ordering_core::CscPattern::new(cn, ccp, cri)?;
+                    let p = feral_amd::amd_order(&ccore).ok()?;
+                    let cp: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    Some(core_lift::splice(cl, &cp))
+                }));
+            }
+            let mut res = parallel::run_perms(&rtasks, &scoring_pat, n, nnz, best_flops);
+            parallel::accept(&mut res, &mut best_flops, &mut best_perm, |_| {});
         }
     }
 
