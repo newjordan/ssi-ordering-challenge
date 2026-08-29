@@ -930,6 +930,16 @@ const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 const PAIR_DESCENT_SWEEPS: usize = 4;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 
+/// FINAL short-range use of the simplicial-vertex early-elimination theorem
+/// (Ost, Schulz, Strash, arXiv:2004.11315). The density and absolute-nnz gates
+/// keep the exact bitset replay in the measured medium tier; a deterministic
+/// precharged budget makes exhaustion fail closed.
+const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
+const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
+const SIMPLICIAL_PROMOTION_MAX_DENSITY: usize = 24;
+const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
+
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -5069,6 +5079,21 @@ fn order_with_options(
         }
     }
 
+    // FINAL, after adjacent-pair descent: move a bounded number of currently
+    // simplicial lower-degree neighbours forward across short non-adjacent
+    // windows. The helper validates the bijection and admits only a canonical
+    // ScoreWorkspace strict improvement.
+    if let Some((candidate, candidate_flops)) = final_simplicial_promotion(
+        pattern,
+        &scoring_pat,
+        &mut ws,
+        &best_perm,
+        best_flops,
+    ) {
+        best_flops = candidate_flops;
+        best_perm = candidate;
+    }
+
     let _ = best_flops;
 
     best_perm
@@ -6502,6 +6527,58 @@ fn flops_of(pat: &ScoringPattern, perm: &[usize]) -> u64 {
     counts.iter().map(|&c| (c as u64) * (c as u64)).sum()
 }
 
+/// Generate, validate, and canonically score one simplicial-promotion
+/// candidate. Keeping the strict objective check here makes the raw
+/// elimination-game transform impossible to admit on a tie or regression.
+fn scored_simplicial_promotion(
+    pattern: &Pattern,
+    scoring_pat: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    seed: &[usize],
+    seed_flops: u64,
+    budget: i64,
+) -> Option<(Vec<usize>, u64)> {
+    let candidate = rgreedy::simplicial_promotion(
+        pattern.n,
+        &pattern.col_ptr,
+        &pattern.row_idx,
+        seed,
+        budget,
+    )?;
+    if !is_bijection(&candidate, pattern.n) {
+        return None;
+    }
+    let candidate_flops = ws.flops(scoring_pat, &candidate);
+    (candidate_flops < seed_flops).then_some((candidate, candidate_flops))
+}
+
+/// Production gate for the FINAL simplicial-promotion pass.
+fn final_simplicial_promotion(
+    pattern: &Pattern,
+    scoring_pat: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    seed: &[usize],
+    seed_flops: u64,
+) -> Option<(Vec<usize>, u64)> {
+    let n = pattern.n;
+    let nnz = pattern.nnz();
+    if !(SIMPLICIAL_PROMOTION_MIN_N..=SIMPLICIAL_PROMOTION_MAX_N).contains(&n)
+        || nnz == 0
+        || nnz > SIMPLICIAL_PROMOTION_MAX_NNZ
+        || nnz > n.saturating_mul(SIMPLICIAL_PROMOTION_MAX_DENSITY)
+    {
+        return None;
+    }
+    scored_simplicial_promotion(
+        pattern,
+        scoring_pat,
+        ws,
+        seed,
+        seed_flops,
+        SIMPLICIAL_PROMOTION_OPS_BUDGET,
+    )
+}
+
 /// Whether `perm` is a bijection of `0..n` (guards a candidate before scoring).
 fn is_bijection(perm: &[usize], n: usize) -> bool {
     if perm.len() != n {
@@ -6932,6 +7009,200 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(minfill_order(&pat), minfill_order(&pat));
+    }
+
+    fn scoring_pattern_for_test(pat: &Pattern) -> ScoringPattern {
+        ScoringPattern {
+            n: pat.n,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        }
+    }
+
+    fn k4_minus_edge() -> Pattern {
+        Pattern::from_edges(
+            4,
+            &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3)],
+        )
+    }
+
+    #[test]
+    fn simplicial_promotion_k4_minus_edge_lowers_30_to_23() {
+        let pat = k4_minus_edge();
+        let scoring_pat = scoring_pattern_for_test(&pat);
+        let seed = vec![0, 1, 2, 3];
+        let seed_flops = flops_of(&scoring_pat, &seed);
+        assert_eq!(seed_flops, 30, "fixed witness precondition changed");
+
+        let mut ws = ScoreWorkspace::new(pat.n, pat.nnz());
+        let (candidate, candidate_flops) = scored_simplicial_promotion(
+            &pat,
+            &scoring_pat,
+            &mut ws,
+            &seed,
+            seed_flops,
+            SIMPLICIAL_PROMOTION_OPS_BUDGET,
+        )
+        .expect("the distance-two simplicial vertex must be promoted");
+
+        assert_eq!(candidate, vec![2, 0, 1, 3]);
+        assert_eq!(candidate_flops, 23);
+        assert_eq!(flops_of(&scoring_pat, &candidate), 23);
+    }
+
+    #[test]
+    fn simplicial_promotion_returns_only_trusted_strict_improvements() {
+        let mut returned = 0usize;
+        for n in 4usize..=10 {
+            for salt in 0..32usize {
+                let mut edges = Vec::new();
+                for u in 0..n {
+                    for v in u + 1..n {
+                        let mix = u
+                            .wrapping_mul(17)
+                            .wrapping_add(v.wrapping_mul(31))
+                            .wrapping_add(salt.wrapping_mul(13));
+                        if mix % 7 < 3 {
+                            edges.push((u, v));
+                        }
+                    }
+                }
+                let pat = Pattern::from_edges(n, &edges);
+                let scoring_pat = scoring_pattern_for_test(&pat);
+                let mut seeds: Vec<Vec<usize>> = vec![
+                    (0..n).collect(),
+                    (0..n).rev().collect(),
+                    (0..n).map(|k| (k + salt) % n).collect(),
+                ];
+                if n == 4 && salt == 0 {
+                    let witness = k4_minus_edge();
+                    let witness_sp = scoring_pattern_for_test(&witness);
+                    let seed = vec![0, 1, 2, 3];
+                    let seed_flops = flops_of(&witness_sp, &seed);
+                    let mut ws = ScoreWorkspace::new(4, witness.nnz());
+                    let got = scored_simplicial_promotion(
+                        &witness,
+                        &witness_sp,
+                        &mut ws,
+                        &seed,
+                        seed_flops,
+                        SIMPLICIAL_PROMOTION_OPS_BUDGET,
+                    )
+                    .expect("property suite must contain a non-vacuous witness");
+                    assert!(got.1 < seed_flops);
+                    returned += 1;
+                }
+                for seed in seeds.drain(..) {
+                    let seed_flops = flops_of(&scoring_pat, &seed);
+                    let mut ws = ScoreWorkspace::new(n, pat.nnz());
+                    if let Some((candidate, candidate_flops)) = scored_simplicial_promotion(
+                        &pat,
+                        &scoring_pat,
+                        &mut ws,
+                        &seed,
+                        seed_flops,
+                        SIMPLICIAL_PROMOTION_OPS_BUDGET,
+                    ) {
+                        returned += 1;
+                        assert_bijection(&candidate, n);
+                        assert_eq!(candidate_flops, flops_of(&scoring_pat, &candidate));
+                        assert!(
+                            candidate_flops < seed_flops,
+                            "returned candidate {candidate:?} did not strictly improve {seed:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(returned > 1, "property exercise was unexpectedly vacuous");
+    }
+
+    #[test]
+    fn simplicial_promotion_rejects_malformed_inputs_and_exhausted_budget() {
+        let pat = k4_minus_edge();
+        let seed = [0, 1, 2, 3];
+
+        assert!(rgreedy::simplicial_promotion(4, &[0], &[], &seed, 1_000_000).is_none());
+        assert!(rgreedy::simplicial_promotion(
+            4,
+            &[0, 2, 1, 4, 4],
+            &[1, 2, 0, 3],
+            &seed,
+            1_000_000,
+        )
+        .is_none());
+        assert!(rgreedy::simplicial_promotion(
+            4,
+            &[0, 1, 2, 3, 4],
+            &[1, 0, 4, 2],
+            &seed,
+            1_000_000,
+        )
+        .is_none());
+        assert!(rgreedy::simplicial_promotion(
+            4,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &[0, 1, 1, 3],
+            1_000_000,
+        )
+        .is_none());
+        assert!(rgreedy::simplicial_promotion(
+            4,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            1,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn simplicial_promotion_is_deterministic() {
+        let pat = k4_minus_edge();
+        let seed = [0, 1, 2, 3];
+        let first = rgreedy::simplicial_promotion(
+            4,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            SIMPLICIAL_PROMOTION_OPS_BUDGET,
+        );
+        let second = rgreedy::simplicial_promotion(
+            4,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            SIMPLICIAL_PROMOTION_OPS_BUDGET,
+        );
+        assert_eq!(first, second);
+        assert_eq!(first, Some(vec![2, 0, 1, 3]));
+    }
+
+    #[test]
+    fn simplicial_promotion_default_path_is_live_inside_all_gates() {
+        let n = SIMPLICIAL_PROMOTION_MIN_N;
+        let pat = Pattern::from_edges(
+            n,
+            &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3)],
+        );
+        let scoring_pat = scoring_pattern_for_test(&pat);
+        let seed: Vec<usize> = (0..n).collect();
+        let seed_flops = flops_of(&scoring_pat, &seed);
+        let mut ws = ScoreWorkspace::new(n, pat.nnz());
+
+        let (candidate, candidate_flops) = final_simplicial_promotion(
+            &pat,
+            &scoring_pat,
+            &mut ws,
+            &seed,
+            seed_flops,
+        )
+        .expect("production gate and default budget must admit the padded witness");
+
+        assert_eq!(&candidate[..4], &[2, 0, 1, 3]);
+        assert_eq!(&candidate[4..], &seed[4..]);
+        assert_eq!(candidate_flops + 7, seed_flops);
     }
 
     /// Best-of must never be worse than the grader's baseline AMD: on any pattern
