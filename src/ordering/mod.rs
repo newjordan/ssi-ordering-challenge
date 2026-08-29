@@ -2543,30 +2543,6 @@ fn order_with_options(
             }
         }
 
-        // D_WIDE METIS (reconstructed-eval sweep, this session): the 20-50
-        // density window ships only AMF/AMD-family candidates, so the whole
-        // window has no separator-based ordering at all. An isolated battery
-        // over the reconstructed eval rows found `pooling_sppc1tp`
-        // (nnz=477,382, density 33.9) drops 0.3595 -> 0.1881 under one plain
-        // METIS full nested dissection (seed 2), while its denser siblings
-        // (`pooling_sppb5tp` 36.4, `pooling_sppc3tp` 38.6, `telecomsp_njlata`
-        // 46.1) keep their better incumbents through the best-of floor.
-        // Isolated cost is 0.05-0.15s on every admitted row (min-of-3), far
-        // from the cap on this class (worst admitted row 0.49s total). One
-        // pass, same window as D_WIDE, no new gate constants.
-        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
-            && nnz > D_WIDE_MIN_DENSITY * n
-            && nnz < D_WIDE_MAX_DENSITY * n
-        {
-            let metis_s2 = feral_metis::MetisOptions {
-                seed: 2,
-                ..Default::default()
-            };
-            consider!(move || {
-                feral_metis::metis_order_full(&core, &metis_s2).map(|(p, _, _)| p)
-            });
-        }
-
         // D DENSE LOW-ALPHA ARM (matrices_mage r1.1, EG-1-dense-low-alpha-arm):
         // for nnz >= 400k the shipped grid offers AMF only inside the 20-50
         // density window, leaving the dense-heavy class (nnz/n > 50) with no
@@ -2735,15 +2711,46 @@ fn order_with_options(
                     Ok(perm.into_iter().map(|v| v as i32).collect())
                 });
             } else if nnz < FILLG_STRIPV2_MAX_NNZ {
-                // Keep AMD(.75) for the lower-cost part of the middle band.
-                // At >=700k it is replaced by the incumbent-count strip below,
-                // which must run after the portfolio has chosen its incumbent.
-                let amd_opts_075 = feral_amd::AmdOptions {
-                    aggressive: true,
-                    dense_alpha: 0.75,
-                };
+                // Middle band (35n..42n, nnz<700k): try a DegSqrt 0.75
+                // 128-strip in place of the raw AMD(.75) pass. Mirrors the
+                // shape of the 42n..50n branch above, which the 5f024a7
+                // author found to win on the upper-middle band. The strip
+                // cost is bounded: k=128 with a DegSqrt sub-orderer
+                // measured at ~0.02s on telecomsp_class matrices, so the
+                // per-matrix timing envelope is preserved within the
+                // 5f024a7 budget.
                 consider!(move || {
-                    feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p)
+                    let tie_key: Vec<u64> = (0..n)
+                        .map(|v| {
+                            let mut x = (v as u64)
+                                .wrapping_add(11u64.wrapping_mul(0x9E37_79B9));
+                            x ^= x >> 30;
+                            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                            x ^= x >> 27;
+                            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+                            x ^ (x >> 31)
+                        })
+                        .collect();
+                    let mut ranked: Vec<usize> = (0..n).collect();
+                    ranked.sort_unstable_by(|&a, &b| {
+                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                        db.cmp(&da)
+                            .then(tie_key[a].cmp(&tie_key[b]))
+                            .then(a.cmp(&b))
+                    });
+                    let sub = |c: &feral_ordering_core::CscPattern| {
+                        custom_metrics::order_variant(
+                            c,
+                            0.75,
+                            true,
+                            custom_metrics::ScoreVariant::DegSqrt,
+                        )
+                        .ok()
+                    };
+                    let perm = strip_general_v2(scoring_pat, &ranked, 128, &sub)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    Ok(perm.into_iter().map(|v| v as i32).collect())
                 });
             }
             if nnz < D_WIDE_MAX_DENSITY * n {
