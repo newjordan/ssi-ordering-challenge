@@ -5370,18 +5370,33 @@ fn order_with_options(
         && nnz <= PAIR_DESCENT_MAX_NNZ
         && (n <= PAIR_DESCENT_MAX_N || pair_descent_ext);
     if pair_descent_gate {
-        if let Some(cand) = rgreedy::adjacent_pair_descent(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            PAIR_DESCENT_SWEEPS,
-            if pair_descent_ext && n > PAIR_DESCENT_MAX_N {
-                PAIR_DESCENT_EXT_OPS_BUDGET
-            } else {
-                PAIR_DESCENT_OPS_BUDGET
-            },
-        ) {
+        let budget = if pair_descent_ext && n > PAIR_DESCENT_MAX_N {
+            PAIR_DESCENT_EXT_OPS_BUDGET
+        } else {
+            PAIR_DESCENT_OPS_BUDGET
+        };
+        // Keep the established sparse extension unchanged.  The exact
+        // three-pivot replay is promoted only in the measured 1k--4k band.
+        let cand = if n <= PAIR_DESCENT_MAX_N {
+            rgreedy::adjacent_pair_then_triple_descent(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &best_perm,
+                PAIR_DESCENT_SWEEPS,
+                budget,
+            )
+        } else {
+            rgreedy::adjacent_pair_descent(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &best_perm,
+                PAIR_DESCENT_SWEEPS,
+                budget,
+            )
+        };
+        if let Some(cand) = cand {
             if is_bijection(&cand, n) {
                 let f = ws.flops(&scoring_pat, &cand);
                 if f < best_flops {
