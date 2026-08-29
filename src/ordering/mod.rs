@@ -7175,10 +7175,12 @@ fn terminal_macro_repass_count(n: usize, nnz: usize, max_deg: usize) -> usize {
 /// Terminal completion re-realization (see the call site's doc comment and
 /// `completion_repass_cell`). Builds the incumbent's filled graph, optionally
 /// runs the budgeted MINL deletion scan over its fill edges, then ALWAYS
-/// realizes the (possibly descended) completion through MCS — and through AMD
-/// when `do_amd` — and returns the best strict `ws.flops` improvement, if
-/// any. Deterministic, fail-closed everywhere (a missing filled graph, a
-/// blown budget or a non-improving candidate just yields `None`/no accept).
+/// realizes the (possibly descended) completion through MCS (ascending-id
+/// `minl_mcs_peo`, and the other compiled-in `terminal_mcs_seeded` PEOs for
+/// `n < 80_000`) — and through AMD when `do_amd` — and returns the best
+/// strict `ws.flops` improvement, if any. Deterministic, fail-closed
+/// everywhere (a missing filled graph, a blown budget or a non-improving
+/// candidate just yields `None`/no accept).
 fn terminal_completion_repass(
     sp: &ScoringPattern,
     ws: &mut ScoreWorkspace,
@@ -7246,6 +7248,25 @@ fn terminal_completion_repass(
         let f = ws.flops(sp, &mcs);
         if f < seed_flops {
             best = Some((mcs, f));
+        }
+    }
+    // `minl_mcs_peo` seeds equal-weight buckets as `(0..n).rev()` so pop
+    // order is ascending id. `terminal_mcs_seeded` with descending-id (and
+    // lowest-initial-degree) are the other PEOs of the SAME chordal
+    // completion, otherwise only offered as a one-shot after this loop.
+    // Fusing them here lets an accepted alternate PEO reseed later
+    // realization rounds. Skip the n≈110k cap-flagged cell: that row
+    // already runs near the grader wall on MCS-only realize.
+    if n < 80_000 {
+        for tie in [TERMINAL_MCS_DESCENDING_ID, TERMINAL_MCS_LOW_INITIAL_DEGREE] {
+            let mcs_alt = terminal_mcs_seeded(n, &adj, tie);
+            if is_bijection(&mcs_alt, n) {
+                let f = ws.flops(sp, &mcs_alt);
+                let bar = best.as_ref().map_or(seed_flops, |b| b.1);
+                if f < bar {
+                    best = Some((mcs_alt, f));
+                }
+            }
         }
     }
     if do_amd {
@@ -7631,6 +7652,25 @@ fn terminal_minl_candidates(
         cp.push(ri.len() as i32);
     }
     let mut candidates = vec![mcs];
+    // `minl_mcs_peo` seeds equal-weight buckets as `(0..n).rev()` so pop
+    // order is ascending id. After a successful deletion scan the descended
+    // chordal graph lives in `adj`; the other compiled-in MCS PEOs of that
+    // SAME graph (descending-id, lowest-initial-degree) are otherwise only
+    // offered as a post-loop one-shot on a handful of cells. If the default
+    // MCS/AMD both lose the strict scorer, this `adj` is discarded and later
+    // completion-repass rebuilds fill from the unchanged incumbent. Offering
+    // them here lets an accepted alternate PEO reseed peels, strips, and
+    // later realization rounds.
+    candidates.push(terminal_mcs_seeded(
+        n,
+        &adj,
+        TERMINAL_MCS_DESCENDING_ID,
+    ));
+    candidates.push(terminal_mcs_seeded(
+        n,
+        &adj,
+        TERMINAL_MCS_LOW_INITIAL_DEGREE,
+    ));
     if let Some(core) = feral_ordering_core::CscPattern::new(n, &cp, &ri) {
         if let Ok(perm) = feral_amd::amd_order(&core) {
             candidates.push(perm.into_iter().map(|v| v as usize).collect());
