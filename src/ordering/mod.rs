@@ -196,6 +196,9 @@ use scoring_ws::ScoreWorkspace;
 /// algorithm and the byte-identical-to-naive-rebuild proof.
 mod nested_subgraph;
 
+/// Twin compression + simplicial peeling — exact preprocessing for Σ c_j².
+mod compress;
+
 /// EXACT minimum-`Σ cⱼ²` ordering by subset DP over the elimination game — the
 /// one candidate family here that is provably optimal rather than heuristic.
 /// Only reachable on very small `n` (see `EXACT_DP_MAX_N`), where the whole
@@ -1870,6 +1873,27 @@ fn strip_candidate(sp: &ScoringPattern, ranked: &[usize], k: usize) -> Option<Ve
     Some(perm)
 }
 
+/// Degree-tail gap hub prefix lengths for adaptive hub deferral.
+fn gap_hub_prefix_lengths(n: usize, col_ptr: &[usize], max_deg: usize) -> Vec<usize> {
+    let sqrt_n = (n as f64).sqrt() as usize;
+    if max_deg <= 2 * sqrt_n.max(1) {
+        return Vec::new();
+    }
+    let mut degs: Vec<usize> = (0..n).map(|v| col_ptr[v + 1] - col_ptr[v]).collect();
+    degs.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = Vec::new();
+    for k in 1..degs.len().min(6) {
+        if degs[k - 1] <= 2 * sqrt_n {
+            break;
+        }
+        let gap = degs[k - 1].saturating_sub(degs[k]);
+        if gap >= degs[k].max(1) / 3 {
+            out.push(k);
+        }
+    }
+    out
+}
+
 /// STRIP-V2 (win, `sbx-families2`/`probe_blind.rs`'s `strip_general`, ported
 /// unmodified): same subgraph-delete-and-AMD construction as
 /// [`strip_candidate`], generalized to (1) take an arbitrary `ranked` order
@@ -2254,6 +2278,108 @@ fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static
     }
 }
 
+/// Hub-first arm: when most hub neighbours already sit at the tree top,
+/// eliminating the hub first removes it from all subsequent degrees.
+fn hub_first_candidate(
+    pattern: &Pattern,
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    perm: &[usize],
+    max_deg: usize,
+    n: usize,
+) -> Option<(Vec<usize>, u64)> {
+    let sqrt_n = (n as f64).sqrt() as usize;
+    if max_deg <= 2 * sqrt_n.max(1) || n < 5_000 {
+        return None;
+    }
+    let mut hub = 0usize;
+    let mut hub_deg = 0usize;
+    for v in 0..n {
+        let d = pattern.col_ptr[v + 1] - pattern.col_ptr[v];
+        if d > hub_deg {
+            hub_deg = d;
+            hub = v;
+        }
+    }
+    if hub_deg <= 2 * sqrt_n {
+        return None;
+    }
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let mut lcnt = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        lcnt[v] = counts[pos];
+    }
+    let mut flops_by_v: Vec<u64> = lcnt.iter().map(|&c| (c as u64) * (c as u64)).collect();
+    flops_by_v.sort_unstable();
+    let thresh = flops_by_v[flops_by_v.len() * 99 / 100];
+    let mut top_nbrs = 0usize;
+    let mut total_nbrs = 0usize;
+    for k in pattern.col_ptr[hub]..pattern.col_ptr[hub + 1] {
+        let u = pattern.row_idx[k];
+        if u != hub {
+            total_nbrs += 1;
+            if (lcnt[u] as u64) * (lcnt[u] as u64) >= thresh {
+                top_nbrs += 1;
+            }
+        }
+    }
+    if total_nbrs == 0 || top_nbrs * 10 < total_nbrs * 8 {
+        return None;
+    }
+    let mut cand: Vec<usize> = Vec::with_capacity(n);
+    cand.push(hub);
+    cand.extend(perm.iter().copied().filter(|&v| v != hub));
+    if !is_bijection(&cand, n) {
+        return None;
+    }
+    let f = ws.flops(sp, &cand);
+    let f0 = ws.flops(sp, perm);
+    if f < f0 { Some((cand, f)) } else { None }
+}
+
+/// Root-region strip: defer the top-1% fill columns, AMD on remainder.
+fn root_strip_refine(
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    perm: &[usize],
+    n: usize,
+    nnz: usize,
+) -> Option<(Vec<usize>, u64)> {
+    if n < 10_000 || nnz == 0 || nnz > 600_000 {
+        return None;
+    }
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let total: u64 = counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+    let top_k = (n / 100).max(1).min(32);
+    let top_mass: u64 = counts
+        .iter()
+        .rev()
+        .take(top_k)
+        .map(|&c| (c as u64) * (c as u64))
+        .sum();
+    if top_mass * 100 < total * 40 {
+        return None;
+    }
+    let mut lcnt = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        lcnt[v] = counts[pos];
+    }
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
+    let k = top_k.min(n - 1);
+    let cand = strip_general_v2(sp, &ranked, k, &|c| feral_amd::amd_order(c).ok())?;
+    if !is_bijection(&cand, n) {
+        return None;
+    }
+    let f = ws.flops(sp, &cand);
+    let f0 = ws.flops(sp, perm);
+    if f < f0 { Some((cand, f)) } else { None }
+}
+
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     order_with_relabel_cap(pattern, usize::MAX)
@@ -2458,6 +2584,110 @@ fn order_with_options(
         ($f:expr) => {
             tasks.push(Box::new($f))
         };
+    }
+
+    // Twin compression + simplicial peel — AMD/AMF on the compressed graph,
+    // expanded consecutively back to original indices (exact for Σ c_j²).
+    if let Some(comp) = compress::preprocess(&scoring_pat_owned) {
+        if comp.compressed.n > 0 {
+            let comp_cp: Vec<i32> = comp
+                .compressed
+                .col_ptr
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            let comp_ri: Vec<i32> = comp
+                .compressed
+                .row_idx
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            let comp_nc = comp.compressed.n;
+            let comp_meta = comp.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp, &comp_ri)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let p = feral_amd::amd_order(&comp_core)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta.expand_perm_i32(&pu)
+            });
+            let comp_cp2 = comp.compressed.col_ptr.iter().map(|&x| x as i32).collect::<Vec<_>>();
+            let comp_ri2 = comp.compressed.row_idx.iter().map(|&x| x as i32).collect::<Vec<_>>();
+            let comp_cp3 = comp_cp2.clone();
+            let comp_ri3 = comp_ri2.clone();
+            let comp_meta2 = comp.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp2, &comp_ri2)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let opts = feral_amf::AmfOptions {
+                    dense_alpha: 5.0,
+                    ..Default::default()
+                };
+                let (p, ..) = feral_amf::amf_order_opts(&comp_core, &opts)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta2.expand_perm_i32(&pu)
+            });
+            let comp_meta3 = comp;
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp3, &comp_ri3)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let opts = feral_amd::AmdOptions {
+                    aggressive: false,
+                    dense_alpha: -1.0,
+                };
+                let (p, ..) = feral_amd::amd_order_opts(&comp_core, &opts)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta3.expand_perm_i32(&pu)
+            });
+        }
+    }
+
+    // Gap-based hub deferral: cut at visible degree-tail gaps, AMD on remainder.
+    if max_deg * max_deg > 4 * n && nnz >= 200_000 && nnz < MEDIUM_MAX_NNZ && n >= 1_000 {
+        let mut deg_ranked_hub: Vec<usize> = (0..n).collect();
+        deg_ranked_hub.sort_unstable_by(|&a, &b| {
+            let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
+            let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
+            db.cmp(&da).then(a.cmp(&b))
+        });
+        for k in gap_hub_prefix_lengths(n, &pattern.col_ptr, max_deg) {
+            if k >= n {
+                continue;
+            }
+            let ranked = deg_ranked_hub.clone();
+            consider!(move || {
+                strip_general_v2(&scoring_pat, &ranked, k, &|c| feral_amd::amd_order(c).ok())
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                    .map(|p| p.into_iter().map(|x| x as i32).collect())
+            });
+            let ranked2 = deg_ranked_hub.clone();
+            consider!(move || {
+                strip_general_v2(&scoring_pat, &ranked2, k, &|c| {
+                    let o = feral_amf::AmfOptions {
+                        dense_alpha: 0.75,
+                        ..Default::default()
+                    };
+                    feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+                })
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                .map(|p| p.into_iter().map(|x| x as i32).collect())
+            });
+        }
+    }
+
+    // Structured AMD relabel: RCM numbering biases tie-breaks toward locality.
+    if n >= 100 && nnz < ND_MAX_NNZ {
+        let amd_rcm = feral_amd::AmdOptions::default();
+        consider!(move || {
+            let q: Vec<usize> = rcm_order(pattern).into_iter().map(|x| x as usize).collect();
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_rcm)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
     }
 
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
@@ -5544,6 +5774,24 @@ fn order_with_options(
                 }
             } else {
                 break;
+            }
+        }
+    }
+
+    // Hub-first and root-strip refinement on hub-heavy gt_10k matrices.
+    if n >= 5_000 && nnz >= 100_000 && max_deg * max_deg > 4 * n {
+        if let Some((cand, f)) = hub_first_candidate(pattern, &scoring_pat, &mut ws, &best_perm, max_deg, n) {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+    if n >= 10_000 && nnz > 0 && nnz <= 600_000 {
+        if let Some((cand, f)) = root_strip_refine(&scoring_pat, &mut ws, &best_perm, n, nnz) {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
             }
         }
     }
