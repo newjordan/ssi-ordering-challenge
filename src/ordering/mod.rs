@@ -660,6 +660,88 @@ const HEAVY_AMDND_MAX_NNZ: usize = 700_000;
 /// `HEAVY_AMDND_MAX_NNZ` boundary already used for the same reason above.
 const PEEL_CNTREL_MAX_NNZ: usize = HEAVY_AMDND_MAX_NNZ;
 
+/// The two `t=1` PEEL tasks are universally identical: sorting a singleton
+/// tail by degree or count yields the same permutation. Reuse the second paid
+/// generation/scoring slot for the measured missing `t=6` count-tail.
+const PEEL_DUP_REPLACEMENT_T: usize = 6;
+
+fn peel_slot(t: usize, tail_by_deg: bool, n: usize) -> (usize, bool) {
+    if t == 1 && !tail_by_deg && PEEL_DUP_REPLACEMENT_T < n {
+        (PEEL_DUP_REPLACEMENT_T, false)
+    } else {
+        (t, tail_by_deg)
+    }
+}
+
+fn peel_candidate(
+    pattern: &Pattern,
+    base_perm: &[usize],
+    ranked_by_cnt: &[usize],
+    cnt_by_v: &[usize],
+    t: usize,
+    tail_by_deg: bool,
+) -> Option<Vec<usize>> {
+    let n = pattern.n;
+    if t == 0
+        || t >= n
+        || base_perm.len() != n
+        || ranked_by_cnt.len() != n
+        || cnt_by_v.len() != n
+    {
+        return None;
+    }
+    // The replacement path validates its inputs while doing the normal head
+    // scan. Existing PEEL slots retain their original hot path exactly; only
+    // the reclaimed t=6 slot pays the bounded (six-element) validation work.
+    let validate_inputs = t == PEEL_DUP_REPLACEMENT_T && !tail_by_deg;
+    let mut marked = vec![false; n];
+    for &v in &ranked_by_cnt[..t] {
+        if v >= n || (validate_inputs && marked[v]) {
+            return None;
+        }
+        marked[v] = true;
+    }
+    let mut cand: Vec<usize> = Vec::with_capacity(n);
+    if validate_inputs {
+        let mut tail_seen = vec![false; t];
+        for &v in base_perm {
+            if v >= n {
+                return None;
+            }
+            if marked[v] {
+                // A marked vertex is either an as-yet-unseen tail member or a
+                // duplicate base entry. Here t is exactly six, so this lookup
+                // is bounded independently of n and needs no second bitset.
+                let pos = ranked_by_cnt[..t].iter().position(|&tail_v| tail_v == v)?;
+                if tail_seen[pos] {
+                    return None;
+                }
+                tail_seen[pos] = true;
+            } else {
+                cand.push(v);
+                marked[v] = true;
+            }
+        }
+    } else {
+        for &v in base_perm {
+            if v >= n {
+                return None;
+            }
+            if !marked[v] {
+                cand.push(v);
+            }
+        }
+    }
+    let mut tail: Vec<usize> = ranked_by_cnt[..t].to_vec();
+    if tail_by_deg {
+        tail.sort_unstable_by_key(|&v| (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v));
+    } else {
+        tail.sort_unstable_by_key(|&v| (cnt_by_v[v], v));
+    }
+    cand.extend(tail);
+    Some(cand)
+}
+
 /// FILLED-GRAPH REORDER + STRIP-V2 (win, `sbx-families2`) shared nnz(A)
 /// ceiling. SAME `PEEL_CNTREL_MAX_NNZ` (700_000) boundary, deliberately
 /// reused rather than the wider gates these families were probed under
@@ -4147,27 +4229,12 @@ fn order_with_options(
                 break;
             }
             for tail_by_deg in [true, false] {
+                // The second singleton task is byte-identical to the first.
+                // Route only that paid slot to the missing t=6 count peel;
+                // tiny patterns retain the original singleton as a fallback.
+                let (t, tail_by_deg) = peel_slot(t, tail_by_deg, n);
                 ptasks.push(Box::new(move || {
-                    let mut fat = vec![false; n];
-                    for &v in &ranked_by_cnt[..t] {
-                        fat[v] = true;
-                    }
-                    let mut cand: Vec<usize> = Vec::with_capacity(n);
-                    for &v in base_perm {
-                        if !fat[v] {
-                            cand.push(v);
-                        }
-                    }
-                    let mut tail: Vec<usize> = ranked_by_cnt[..t].to_vec();
-                    if tail_by_deg {
-                        tail.sort_unstable_by_key(|&v| {
-                            (pattern.col_ptr[v + 1] - pattern.col_ptr[v], v)
-                        });
-                    } else {
-                        tail.sort_unstable_by_key(|&v| (cnt_by_v[v], v));
-                    }
-                    cand.extend(tail);
-                    Some(cand)
+                    peel_candidate(pattern, base_perm, ranked_by_cnt, cnt_by_v, t, tail_by_deg)
                 }));
             }
         }
@@ -7427,6 +7494,106 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(minfill_order(&pat), minfill_order(&pat));
+    }
+
+    fn peel_fixture() -> (Pattern, Vec<usize>, Vec<usize>, Vec<usize>) {
+        let pat = Pattern::from_edges(
+            12,
+            &[
+                (0, 1), (0, 2), (0, 3), (1, 4), (2, 4), (3, 5),
+                (4, 6), (5, 7), (6, 8), (7, 9), (8, 10), (9, 11),
+            ],
+        );
+        let base: Vec<usize> = (0..12).rev().collect();
+        let counts = vec![9, 2, 8, 3, 7, 4, 6, 5, 12, 1, 11, 10];
+        let mut ranked: Vec<usize> = (0..12).collect();
+        ranked.sort_unstable_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+        (pat, base, ranked, counts)
+    }
+
+    #[test]
+    fn peel_singleton_tail_modes_are_identical() {
+        let (pat, base, ranked, counts) = peel_fixture();
+        let by_degree = peel_candidate(&pat, &base, &ranked, &counts, 1, true).unwrap();
+        let by_count = peel_candidate(&pat, &base, &ranked, &counts, 1, false).unwrap();
+        assert_eq!(by_degree, by_count);
+        assert_bijection(&by_degree, pat.n);
+    }
+
+    #[test]
+    fn peel_duplicate_slot_preserves_width_and_tiny_fallback() {
+        assert_eq!(peel_slot(1, true, 20), (1, true));
+        assert_eq!(peel_slot(1, false, 20), (6, false));
+        assert_eq!(peel_slot(1, false, 6), (1, false));
+        assert_eq!(peel_slot(1, false, 7), (6, false));
+        assert_eq!(peel_slot(8, false, 20), (8, false));
+        for n in 0..=260 {
+            let original: Vec<(usize, bool)> = [1usize, 2, 4, 8, 16, 32, 64, 128]
+                .into_iter()
+                .take_while(|&t| t < n)
+                .flat_map(|t| [(t, true), (t, false)])
+                .collect();
+            let replaced: Vec<(usize, bool)> = original
+                .iter()
+                .map(|&(t, by_degree)| peel_slot(t, by_degree, n))
+                .collect();
+            assert_eq!(original.len(), replaced.len(), "task width at n={n}");
+            assert!(replaced.iter().all(|&(t, _)| t < n));
+        }
+    }
+
+    #[test]
+    fn peel_replacement_is_deterministic_bijection_and_fail_closed() {
+        let (pat, base, ranked, counts) = peel_fixture();
+        let a = peel_candidate(&pat, &base, &ranked, &counts, 6, false).unwrap();
+        let b = peel_candidate(&pat, &base, &ranked, &counts, 6, false).unwrap();
+        assert_eq!(a, b);
+        assert_bijection(&a, pat.n);
+        assert!(peel_candidate(&pat, &base, &ranked, &counts, 0, false).is_none());
+        assert!(peel_candidate(&pat, &base, &ranked, &counts, pat.n, false).is_none());
+        assert!(peel_candidate(&pat, &base[..11], &ranked, &counts, 6, false).is_none());
+
+        let mut duplicate_base = base.clone();
+        duplicate_base[1] = duplicate_base[0];
+        assert!(peel_candidate(&pat, &duplicate_base, &ranked, &counts, 6, false).is_none());
+
+        let mut out_of_range_base = base.clone();
+        out_of_range_base[0] = pat.n;
+        assert!(
+            peel_candidate(&pat, &out_of_range_base, &ranked, &counts, 6, false).is_none()
+        );
+
+        let mut duplicate_rank = ranked.clone();
+        duplicate_rank[1] = duplicate_rank[0];
+        assert!(peel_candidate(&pat, &base, &duplicate_rank, &counts, 6, false).is_none());
+
+        let mut out_of_range_rank = ranked.clone();
+        out_of_range_rank[0] = pat.n;
+        assert!(
+            peel_candidate(&pat, &base, &out_of_range_rank, &counts, 6, false).is_none()
+        );
+        assert!(peel_candidate(&pat, &base, &ranked[..11], &counts, 6, false).is_none());
+        assert!(peel_candidate(&pat, &base, &ranked, &counts[..11], 6, false).is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn peel_duplicate_slot_real_witness_is_default_reachable() {
+        let corpus = crate::corpus::corpus();
+        let (name, pat) = corpus
+            .iter()
+            .find(|(name, _)| name == "pooling_sppc1pq")
+            .expect("focused witness must exist in the development corpus");
+        let sp = ScoringPattern {
+            n: pat.n,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        };
+        let first = order(pat);
+        let second = order(pat);
+        assert_eq!(first, second, "default-path determinism on {name}");
+        assert_bijection(&first, pat.n);
+        assert_eq!(flops_of(&sp, &first), 155_527_826);
     }
 
     /// Best-of must never be worse than the grader's baseline AMD: on any pattern
