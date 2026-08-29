@@ -4330,6 +4330,25 @@ fn order_with_options(
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
         }
+        // Cell D: gams05-class (n≈17-19k, nnz≈200-300k, density ≈ 12-18,
+        // gt_10k bucket, dev ratio 0.528). The FLEET-J census did not
+        // cover this band; the cell-specific METIS options are a plausible
+        // guess. Frodan's three FLEET-J cells (A, B, C) all used
+        // max_imbalance ≤ 0.05; this cell uses a slightly looser
+        // max_imbalance to accommodate the lower-density structure.
+        let cell_d = (17_000..19_000).contains(&n)
+            && (200_000..310_000).contains(&nnz)
+            && nnz >= 10 * n
+            && nnz <= 18 * n;
+        if cell_d {
+            let opts = feral_metis::MetisOptions {
+                seed: 73,
+                coarsen_floor: 200,
+                max_imbalance: 0.10,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
     }
 
     #[cfg(test)]
