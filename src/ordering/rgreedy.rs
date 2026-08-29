@@ -60,7 +60,7 @@ fn rank_product(value: u64, value_power: usize, len: usize, len_power: usize) ->
     product
 }
 
-fn rank_alpha_three_quarters_cmp(
+pub(crate) fn rank_alpha_three_quarters_cmp(
     a: &(usize, usize, u64),
     b: &(usize, usize, u64),
 ) -> std::cmp::Ordering {
@@ -399,9 +399,9 @@ impl<'a> Game<'a> {
     }
 
     /// Exact `Σ c_j²` of an arbitrary elimination order, computed by replaying
-    /// the elimination game. Used only by probes/tests to cross-check against
-    /// the trusted `column_counts_gnp` path.
-    #[cfg(test)]
+    /// the elimination game. Used by probes/tests to cross-check against the
+    /// trusted `column_counts_gnp` path, and by the production block-
+    /// recombination pre-pass in `mod.rs` to score donor block orders.
     pub(crate) fn replay_flops(&mut self, order: &[usize]) -> u64 {
         self.reset();
         let mut f = 0u64;
