@@ -5370,12 +5370,13 @@ fn order_with_options(
         && nnz <= PAIR_DESCENT_MAX_NNZ
         && (n <= PAIR_DESCENT_MAX_N || pair_descent_ext);
     if pair_descent_gate {
-        if let Some(cand) = rgreedy::adjacent_pair_descent(
+        if let Some(cand) = rgreedy::adjacent_pair_triple_descent(
             n,
             &pattern.col_ptr,
             &pattern.row_idx,
             &best_perm,
             PAIR_DESCENT_SWEEPS,
+            12,
             if pair_descent_ext && n > PAIR_DESCENT_MAX_N {
                 PAIR_DESCENT_EXT_OPS_BUDGET
             } else {
@@ -7403,6 +7404,33 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(minfill_order(&pat), minfill_order(&pat));
+    }
+
+    #[test]
+    fn triple_descent_escapes_pairwise_local_minimum() {
+        let pat = Pattern::from_edges(5, &[(0, 1), (0, 4), (1, 3)]);
+        let seed = [0, 1, 3, 4, 2];
+        let pair = rgreedy::adjacent_pair_descent(
+            5,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            4,
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(pair, vec![0, 3, 1, 4, 2]);
+        let triple = rgreedy::adjacent_pair_triple_descent(
+            5,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            4,
+            1,
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(triple, vec![3, 1, 0, 4, 2]);
     }
 
     /// Best-of must never be worse than the grader's baseline AMD: on any pattern

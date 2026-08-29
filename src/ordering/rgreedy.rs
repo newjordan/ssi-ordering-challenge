@@ -995,7 +995,49 @@ pub(crate) fn adjacent_pair_descent(
     sweeps: usize,
     budget: i64,
 ) -> Option<Vec<usize>> {
-    if n < 2 || seed.len() != n || sweeps == 0 || budget <= 0 {
+    adjacent_local_descent(n, col_ptr, row_idx, seed, sweeps, 0, budget)
+}
+
+/// Run the existing exact adjacent-pair sweeps, then spend only the remaining
+/// operation budget on exact permutations of disjoint consecutive triples.
+/// A partial triple sweep is discarded, preserving the last completed pair
+/// result and therefore the incumbent quality of [`adjacent_pair_descent`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adjacent_pair_triple_descent(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    pair_sweeps: usize,
+    triple_sweeps: usize,
+    budget: i64,
+) -> Option<Vec<usize>> {
+    adjacent_local_descent(
+        n,
+        col_ptr,
+        row_idx,
+        seed,
+        pair_sweeps,
+        triple_sweeps,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adjacent_local_descent(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    pair_sweeps: usize,
+    triple_sweeps: usize,
+    budget: i64,
+) -> Option<Vec<usize>> {
+    if n < 2
+        || seed.len() != n
+        || (pair_sweeps == 0 && triple_sweeps == 0)
+        || budget <= 0
+    {
         return None;
     }
     let mut seen = vec![false; n];
@@ -1012,7 +1054,7 @@ pub(crate) fn adjacent_pair_descent(
     let mut next = Vec::with_capacity(n);
     let mut changed_any = false;
 
-    for sweep in 0..sweeps {
+    for sweep in 0..pair_sweeps {
         game.reset();
         if game.ops > budget {
             return None;
@@ -1065,7 +1107,135 @@ pub(crate) fn adjacent_pair_descent(
         }
     }
 
+    if triple_sweeps == 0 || n < 3 {
+        return changed_any.then_some(cur);
+    }
+
+    // Six internal permutations. The incumbent orientation is first and ties
+    // use strict `<`, so an equal-work triple is left byte-identical.
+    const ORDERS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    let mut row_b = vec![0u64; game.w];
+    let mut row_c = vec![0u64; game.w];
+    for sweep in 0..triple_sweeps {
+        game.reset();
+        if game.ops > budget {
+            return changed_any.then_some(cur);
+        }
+        next.clear();
+
+        let mut k = 0usize;
+        let offset = sweep % 3;
+        while k < offset.min(n) {
+            let v = cur[k];
+            next.push(v);
+            game.eliminate(v);
+            if game.ops > budget {
+                return changed_any.then_some(cur);
+            }
+            k += 1;
+        }
+
+        let mut changed = false;
+        while k + 2 < n {
+            let triple = [cur[k], cur[k + 1], cur[k + 2]];
+            // Two copied rows, up to three ORs, two popcount passes, and loop
+            // overhead for each of six permutations. Precharge before ranking
+            // so exhaustion cannot leave a partially ranked choice.
+            game.ops += (48 * game.w + 64) as i64;
+            if game.ops > budget {
+                return changed_any.then_some(cur);
+            }
+
+            let mut best = triple;
+            let mut best_score = triple_work(&game, triple, &mut row_b, &mut row_c);
+            for idx in ORDERS.into_iter().skip(1) {
+                let cand = [triple[idx[0]], triple[idx[1]], triple[idx[2]]];
+                let score = triple_work(&game, cand, &mut row_b, &mut row_c);
+                if score < best_score {
+                    best = cand;
+                    best_score = score;
+                }
+            }
+            changed |= best != triple;
+            for v in best {
+                next.push(v);
+                game.eliminate(v);
+                if game.ops > budget {
+                    return changed_any.then_some(cur);
+                }
+            }
+            k += 3;
+        }
+        while k < n {
+            let v = cur[k];
+            next.push(v);
+            game.eliminate(v);
+            if game.ops > budget {
+                return changed_any.then_some(cur);
+            }
+            k += 1;
+        }
+
+        if changed {
+            changed_any = true;
+            std::mem::swap(&mut cur, &mut next);
+        }
+    }
+
     changed_any.then_some(cur)
+}
+
+/// Exact `Σ c²` contribution of three pivots in `order`, evaluated against the
+/// current live fill graph without mutating it. Eliminating a fixed set leaves
+/// the same residual graph, so comparing only these three columns is exact.
+fn triple_work(
+    game: &Game<'_>,
+    order: [usize; 3],
+    row_b: &mut [u64],
+    row_c: &mut [u64],
+) -> u64 {
+    let [a, b, c] = order;
+    let w = game.w;
+    let row_a = &game.adj[a * w..a * w + w];
+    row_b.copy_from_slice(&game.adj[b * w..b * w + w]);
+    row_c.copy_from_slice(&game.adj[c * w..c * w + w]);
+
+    let a_bit = 1u64 << (a & 63);
+    let b_bit = 1u64 << (b & 63);
+    let c_bit = 1u64 << (c & 63);
+    if row_b[a >> 6] & a_bit != 0 {
+        for i in 0..w {
+            row_b[i] |= row_a[i];
+        }
+        row_b[a >> 6] &= !a_bit;
+        row_b[b >> 6] &= !b_bit;
+    }
+    if row_c[a >> 6] & a_bit != 0 {
+        for i in 0..w {
+            row_c[i] |= row_a[i];
+        }
+        row_c[a >> 6] &= !a_bit;
+        row_c[c >> 6] &= !c_bit;
+    }
+
+    let ca = game.deg[a] as u64 + 1;
+    let cb = row_b.iter().map(|x| x.count_ones() as u64).sum::<u64>() + 1;
+    if row_c[b >> 6] & b_bit != 0 {
+        for i in 0..w {
+            row_c[i] |= row_b[i];
+        }
+        row_c[b >> 6] &= !b_bit;
+        row_c[c >> 6] &= !c_bit;
+    }
+    let cc = row_c.iter().map(|x| x.count_ones() as u64).sum::<u64>() + 1;
+    ca * ca + cb * cb + cc * cc
 }
 
 // ════════════════════════════════════════════════════════════════════════════
