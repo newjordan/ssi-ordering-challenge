@@ -4730,10 +4730,20 @@ fn order_with_options(
     const RGREEDY_SLACK_MIN_N: usize = 64;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
+    const RGREEDY_SLACK_MID_NARROW: i64 = 800_000_000;
+    // Two narrow PEP density bands still have measured cap slack after the
+    // promoted small-pattern floor. Spend it without widening the phase gate:
+    // this changes only the deterministic op floor, not search policy or seed.
+    let narrow_mid_pep = nnz <= RGREEDY_PEP_MAX_NNZ
+        && (nnz <= n.saturating_mul(2)
+            || (n.saturating_mul(4) <= nnz
+                && nnz.saturating_mul(2) <= n.saturating_mul(9)));
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
+    } else if narrow_mid_pep {
+        RGREEDY_SLACK_MID_NARROW
     } else {
         RGREEDY_SLACK_MID
     };
@@ -4959,6 +4969,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -4975,7 +4986,20 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        // Third round re-restored (it was promoted in 0d475d2a and then wiped
+        // by a later graft whose base predated it), extended to the sparse
+        // hub-free sub-10k class per 0027: in both regimes the extra round
+        // runs only when round 2 strictly improved (the loop breaks on
+        // non-improvement below).
+        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
+            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
+        {
+            3
+        } else {
+            2
+        };
+        for round in 0..rgsub_rounds {
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5000,7 +5024,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                round_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
