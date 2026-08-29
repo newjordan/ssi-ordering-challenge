@@ -230,10 +230,5 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
-- [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
-  pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress
-  (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
-  0024 grader failure. Also: the hub-gated dense RGS mid arm admits zero dev matrices.
-
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
