@@ -1349,20 +1349,7 @@ fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize) -> bool {
     // `gasprod_sarawak81` win, 0.9934→0.9198, needed the full grid at seed
     // #2 exactly; it is now largely captured by the frontier's own rgreedy
     // policy work anyway.)
-    // Regime A discriminator (0032, fleet-i): the hub-safe, non-near-forest
-    // half of the `nnz <= 20k` band. A full-grid-vs-light A/B over ALL of
-    // regime A on both corpora (probe_fleet_i_fullgrid) found every full-grid
-    // WINNER hub-safe at density >= 3 (eval-proxy n=2545/nnz=11146
-    // 0.332885->0.262729; dev gasprod_sarawak16 0.982329->0.913645) and every
-    // LOSER either hub-heavy (`max_deg*50 > n`: dev netmod_kar1, proxy
-    // n=1758/n=186 rows — the 0022 downstream-seeding regression class) or
-    // near-forest sparse (`nnz < 3n`: dev rsyn0820m04m +0.028, st_e31 —
-    // EternaPeptix's structural-tie shape one band up). Added cost is bounded
-    // by regime A's own ceiling: 33 in-cell proxy rows, worst add +0.056 s
-    // local on the winner itself, every other add <= 0.032 s.
-    if nnz <= 20_000 && nnz >= 3 * n && hub_safe {
-        return true;
-    }
+    let _ = hub_safe;
     false
 }
 
@@ -1533,6 +1520,99 @@ fn relabel(n: usize, seed: u64) -> Vec<usize> {
         q.swap(i, j);
     }
     q
+}
+
+/// Run AMD on a relabelled copy of the pattern where new vertex `i` holds old
+/// vertex `q[i]`, then map the ordering back to original indices.
+fn amd_on_numbering(
+    scoring_pat: &ScoringPattern,
+    q: &[usize],
+    opts: &feral_amd::AmdOptions,
+) -> Option<Vec<i32>> {
+    let n = q.len();
+    if n != scoring_pat.n {
+        return None;
+    }
+    let b = permute_pattern(scoring_pat, q);
+    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
+    let (pb, ..) = feral_amd::amd_order_opts(&bcore, opts).ok()?;
+    Some(pb.iter().map(|&x| q[x as usize] as i32).collect())
+}
+
+/// When the top 1% of columns carry most of `Σ c_j²`, defer the highest-fill
+/// vertices and re-order the remainder with AMD (root-separator / halo-style).
+fn root_separator_refine(
+    sp: &ScoringPattern,
+    perm: &[usize],
+    ws: &mut ScoreWorkspace,
+) -> Option<(Vec<usize>, u64)> {
+    let n = sp.n;
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let total_flops: u64 = counts
+        .iter()
+        .map(|&c| {
+            let c = c as u64;
+            c * c
+        })
+        .sum();
+    if total_flops == 0 {
+        return None;
+    }
+    let top_k = (n / 100).max(1).min(128);
+    let mut ranked_pos: Vec<usize> = (0..n).collect();
+    ranked_pos.sort_unstable_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+    let top_flops: u64 = ranked_pos[..top_k]
+        .iter()
+        .map(|&p| {
+            let c = counts[p] as u64;
+            c * c
+        })
+        .sum();
+    if top_flops * 100 < total_flops * 40 {
+        return None;
+    }
+    let mut count_by_v = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        count_by_v[v] = counts[pos];
+    }
+    let mut ranked_v: Vec<usize> = (0..n).collect();
+    ranked_v.sort_unstable_by(|&a, &b| count_by_v[b].cmp(&count_by_v[a]).then(a.cmp(&b)));
+    let baseline = ws.flops(sp, perm);
+    let mut best_f = baseline;
+    let mut best = perm.to_vec();
+    let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+    let sub_amf = |c: &feral_ordering_core::CscPattern| {
+        let o = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
+        feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+    };
+    for &k in &[16usize, 48] {
+        if k >= n {
+            continue;
+        }
+        for sub in [&sub_amd as &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>, &sub_amf] {
+            if let Some(cand) = strip_general_v2(sp, &ranked_v, k, sub) {
+                if is_bijection(&cand, n) {
+                    let f = ws.flops(sp, &cand);
+                    if f < best_f {
+                        best_f = f;
+                        best = cand;
+                    }
+                }
+            }
+        }
+    }
+    if best_f < baseline {
+        Some((best, best_f))
+    } else {
+        None
+    }
 }
 
 /// Restart count for the budgeted relabelled-AMD multi-start: spend at most
@@ -2624,6 +2704,16 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_075).map(|(p, ..)| p));
+            let opts_05_dense = feral_amf::AmfOptions {
+                dense_alpha: 0.5,
+                ..Default::default()
+            };
+            consider!(move || feral_amf::amf_order_opts(&core, &opts_05_dense).map(|(p, ..)| p));
+            let amd_opts_10 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 1.0,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_10).map(|(p, ..)| p));
             let opts_125 = feral_amf::AmfOptions {
                 dense_alpha: 1.25,
                 ..Default::default()
@@ -2858,28 +2948,6 @@ fn order_with_options(
             consider!(move || feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
         }
 
-    }
-
-    // ULTRA-DENSE NO-DENSE-AMD ARM (experiment 0030, winnable-band hunt on
-    // the reconstructed eval corpus). The heavy no-dense-AMD pass is ceilinged
-    // at `HEAVY_AMDND_MAX_NNZ` (700k) and the D dense selectors stop at
-    // `D_WIDE_MAX_NNZ` (1M), which leaves the ultra-dense heavy cell
-    // (nnz >= 100n) with no deferral-style candidate at all. Measured there
-    // (isolated, trusted scorer): n=2587/nnz=921k/density 356 improves
-    // 0.9719 -> 0.9556 (+0.016 s) and n=9016/nnz=1.045M/density 116 improves
-    // 0.06898 -> 0.06809 (+0.036 s); every deg/count-ranked strip and
-    // AMF/AMD-alpha alternative scored worse on both. The density >= 100
-    // floor keeps the pass out of the 20-100 bands, where the same probe
-    // measured zero wins (idx146/287/398/476/253/392 census rows), and the
-    // nnz ceiling bounds the pass's cost at the measured 0.036 s while
-    // admitting the 1.045M-nnz winner the 1M D ceiling excludes. Routed
-    // through `consider`, so strictly-improving under the AMD floor.
-    if (400_000..1_200_000).contains(&nnz) && nnz >= 100usize.saturating_mul(n) {
-        let opts_nd_ultra = feral_amd::AmdOptions {
-            aggressive: false,
-            dense_alpha: -1.0,
-        };
-        consider!(move || feral_amd::amd_order_opts(&core, &opts_nd_ultra).map(|(p, ..)| p));
     }
 
     // Medium-size extras: cheap here, pure upside layered over the AMD floor.
@@ -3153,6 +3221,87 @@ fn order_with_options(
             dense_alpha: -1.0,
         };
         consider!(move || feral_amd::amd_order_opts(&core, &amd_nodense_agg).map(|(p, ..)| p));
+    }
+
+    // Structured vertex numberings for AMD: one pass each, biasing tie-breaks
+    // toward locality (RCM / Sloan bandwidth-profile order) or separator
+    // structure (ND hybrid postorder) instead of random relabel seeds.
+    if n < RCM_MAX_N && nnz < RCM_MAX_NNZ {
+        let amd_def = feral_amd::AmdOptions::default();
+        consider!(move || {
+            let q: Vec<usize> = rcm_order(pattern).into_iter().map(|x| x as usize).collect();
+            amd_on_numbering(&scoring_pat, &q, &amd_def)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+        });
+    }
+    if n < ND_MAX_N && nnz < ND_MAX_NNZ {
+        let amd_def = feral_amd::AmdOptions::default();
+        consider!(move || {
+            let q: Vec<usize> = nd_order_impl(pattern, true)
+                .into_iter()
+                .map(|x| x as usize)
+                .collect();
+            amd_on_numbering(&scoring_pat, &q, &amd_def)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+        });
+    }
+    if n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ {
+        let amd_def = feral_amd::AmdOptions::default();
+        consider!(move || {
+            let q: Vec<usize> = sloan_order(pattern, 2, 1)
+                .into_iter()
+                .map(|x| x as usize)
+                .collect();
+            amd_on_numbering(&scoring_pat, &q, &amd_def)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+        });
+    }
+
+    // One-way dissection for narrow BFS level width (time-expanded / path-like).
+    if n >= 500 && nnz < ND_MAX_NNZ {
+        consider!(move || {
+            one_way_dissection_order(pattern)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+        });
+    }
+
+    // Gap-detected hub deferral: evaluate tail-gap hub sets with AMD/AMF.
+    if max_deg * max_deg > 4 * n && nnz >= MEDIUM_MAX_NNZ {
+        for k in gap_hub_prefix_lengths(n, &pattern.col_ptr, max_deg) {
+            if k >= n {
+                continue;
+            }
+            consider!(move || {
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| {
+                    let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                    let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                let sub = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+                let perm = strip_general_v2(&scoring_pat, &ranked, k, &sub)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                Ok(perm.into_iter().map(|v| v as i32).collect())
+            });
+            consider!(move || {
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| {
+                    let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                    let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                let sub = |c: &feral_ordering_core::CscPattern| {
+                    let o = feral_amf::AmfOptions {
+                        dense_alpha: 0.75,
+                        ..Default::default()
+                    };
+                    feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+                };
+                let perm = strip_general_v2(&scoring_pat, &ranked, k, &sub)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                Ok(perm.into_iter().map(|v| v as i32).collect())
+            });
+        }
     }
 
     // Reverse Cuthill–McKee — a pure-Rust, O(nnz) ordering from a family
@@ -5493,12 +5642,6 @@ fn order_with_options(
         // hub-free sub-10k class per 0027: in both regimes the extra round
         // runs only when round 2 strictly improved (the loop breaks on
         // non-improvement below).
-        // (0032 fleet-i measured and REJECTED widening the third round to the
-        // sparse (100k, 350k] half: 9 rows improve but by only −0.0002 to
-        // −0.001 ln each (−1.4e-5 of score in total) while the round costs
-        // +0.09–0.21 s on rows already at 1.0–1.3 s local — and the grader is
-        // ~2.6× on rgreedy-style work. Do not re-tread without a cheaper
-        // round.)
         let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
             || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
         {
@@ -5507,7 +5650,15 @@ fn order_with_options(
             2
         };
         for round in 0..rgsub_rounds {
-            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
+            let round_cfg = if round == 2 && n >= 10_000 && nnz <= 100_000 {
+                rgreedy::SubCfg {
+                    round,
+                    min_s: 16,
+                    ..rgsub_cfg
+                }
+            } else {
+                rgreedy::SubCfg { round, ..rgsub_cfg }
+            };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5544,6 +5695,18 @@ fn order_with_options(
                 }
             } else {
                 break;
+            }
+        }
+    }
+
+    // Root-separator refinement when objective mass sits at the etree top.
+    const ROOT_SEP_MIN_N: usize = 10_000;
+    const ROOT_SEP_MAX_NNZ: usize = 600_000;
+    if n >= ROOT_SEP_MIN_N && nnz > 0 && nnz <= ROOT_SEP_MAX_NNZ {
+        if let Some((cand, f)) = root_separator_refine(&scoring_pat, &best_perm, &mut ws) {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
             }
         }
     }
@@ -5691,22 +5854,7 @@ fn order_with_options(
     // Terminal completion-lattice descent. Late portfolio phases can create a
     // chordal completion the early MINL family never saw. Descend that final
     // completion in the measured sparse envelope and dense pooling cell.
-    // 0032 (fleet-i) sparse-gt cell, 30k < n <= 50k ∧ nnz <= 170k ∧ nnz < 10n:
-    // the 0030 census's winnable sparse gt_10k mass sits just above the old
-    // n ceiling. Measured on the eval proxy: n≈44.9k/nnz≈160k twins
-    // 0.549608→0.538018 and 0.548431→0.537539 (plus two −0.0006/−0.0016
-    // riders), −0.044 ln total, for +0.15–0.16 s local on rows at 0.87 s.
-    // The 170k nnz ceiling cuts the measured near-zero-value cost rows above
-    // it (n=43.7k/nnz=172k: −0.00025 for +0.126 s); the n>30k floor keeps the
-    // (n≤30k, 100k<nnz) rows out (both measured members changed nothing at
-    // +0.05 s each). Wider variants (nnz≤200k, no n floor) measured and cut.
     let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
-        // MID-DENSITY WIDENING (fleet-h, experiment 0031): the 100k..300k slice
-        // of the 20 < nnz/n < 50 density band, measured cell-by-cell on the
-        // reconstructed eval corpus (gams03 0.8379→0.8005, pooling_sppb2pq
-        // 0.6102→0.5919, pooling_sppc0pq/tp, pooling_sppb0pq; ≈−1.6e-4 proxy).
-        || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
-        || (n > 30_000 && n <= 50_000 && nnz <= 170_000 && nnz < 10 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {
@@ -5720,7 +5868,24 @@ fn order_with_options(
                 }
             }
         }
-
+        if n <= 30_000 && nnz <= 100_000 && n >= PAIR_DESCENT_MIN_N {
+            if let Some(cand) = rgreedy::adjacent_pair_descent(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &best_perm,
+                2,
+                PAIR_DESCENT_EXT_OPS_BUDGET,
+            ) {
+                if is_bijection(&cand, n) {
+                    let f = ws.flops(&scoring_pat, &cand);
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = cand;
+                    }
+                }
+            }
+        }
     }
 
     // Re-rank by each accepted start's exact column counts before every peel,
@@ -7360,6 +7525,104 @@ fn sloan_order(pattern: &Pattern, w1: i64, w2: i64) -> Vec<i32> {
     }
 
     order.into_iter().map(|x| x as i32).collect()
+}
+
+/// George one-way dissection along a BFS level structure when width is narrow
+/// relative to `n` (path-like / time-expanded graphs). Returns `None` when the
+/// width test fails so callers can skip the candidate cheaply.
+fn one_way_dissection_order(pattern: &Pattern) -> Option<Vec<i32>> {
+    let n = pattern.n;
+    if n < 500 {
+        return None;
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for j in 0..n {
+        for &i in &pattern.row_idx[pattern.col_ptr[j]..pattern.col_ptr[j + 1]] {
+            if i != j && i < n {
+                adj[j].push(i);
+                adj[i].push(j);
+            }
+        }
+    }
+    for a in adj.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+    let degree: Vec<usize> = adj.iter().map(|a| a.len()).collect();
+    let mut dist = vec![0u32; n];
+    let mut touched = Vec::new();
+    let start = pseudo_peripheral(0, &adj, &degree, &mut dist, &mut touched);
+    let mut level_of = vec![u32::MAX; n];
+    let mut queue = std::collections::VecDeque::new();
+    level_of[start] = 0;
+    queue.push_back(start);
+    let mut max_width = 1usize;
+    let mut num_levels = 1usize;
+    let mut width_at = vec![1usize];
+    while let Some(u) = queue.pop_front() {
+        let lv = level_of[u];
+        for &v in &adj[u] {
+            if level_of[v] == u32::MAX {
+                let nl = lv + 1;
+                level_of[v] = nl;
+                let li = nl as usize;
+                if li >= num_levels {
+                    num_levels = li + 1;
+                    width_at.resize(num_levels, 0);
+                }
+                width_at[li] += 1;
+                max_width = max_width.max(width_at[li]);
+                queue.push_back(v);
+            }
+        }
+    }
+    if max_width * 8 > n || max_width > 400 || num_levels < 8 {
+        return None;
+    }
+    let mut by_level: Vec<Vec<usize>> = vec![Vec::new(); num_levels];
+    for v in 0..n {
+        if level_of[v] != u32::MAX {
+            by_level[level_of[v] as usize].push(v);
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    for level in &mut by_level {
+        level.sort_unstable_by_key(|&v| (degree[v], v));
+        order.extend(level.iter().copied());
+    }
+    for v in 0..n {
+        if level_of[v] == u32::MAX {
+            order.push(v);
+        }
+    }
+    Some(order.into_iter().map(|x| x as i32).collect())
+}
+
+/// Degree-tail gap positions: prefix lengths `k` where deferred hub sets
+/// change discretely (adaptive dense deferral instead of a fixed `alpha`).
+fn gap_hub_prefix_lengths(n: usize, col_ptr: &[usize], max_deg: usize) -> Vec<usize> {
+    if max_deg * max_deg <= 4 * n {
+        return Vec::new();
+    }
+    let sqrt_n = (n as f64).sqrt() as usize;
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_unstable_by(|&a, &b| {
+        let da = col_ptr[a + 1] - col_ptr[a];
+        let db = col_ptr[b + 1] - col_ptr[b];
+        db.cmp(&da).then(a.cmp(&b))
+    });
+    let mut ks = Vec::new();
+    for i in 0..ranked.len().saturating_sub(1) {
+        let di = col_ptr[ranked[i] + 1] - col_ptr[ranked[i]];
+        let dj = col_ptr[ranked[i + 1] + 1] - col_ptr[ranked[i + 1]];
+        if di > 2 * sqrt_n && di >= dj.saturating_mul(2) {
+            ks.push(i + 1);
+            if ks.len() >= 3 {
+                break;
+            }
+        }
+    }
+    ks
 }
 
 /// Find a pseudo-peripheral node within `seed`'s component: repeatedly BFS to the
