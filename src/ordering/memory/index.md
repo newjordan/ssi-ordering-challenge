@@ -230,6 +230,8 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   score** — restarts share budget with the appended hill-climb, which is the one loss; do not widen
   blindly.
 
+- [0029-compose-plus-dense-low-relabel.md](experiments/0029-compose-plus-dense-low-relabel.md) — 0028 + a32d51f5 (dense low-alpha relabel complement, terminal block); dev-neutral, hidden-only.
+- [0028-compose-narrow-slack-rgsub3-runnerup-swap.md](experiments/0028-compose-narrow-slack-rgsub3-runnerup-swap.md) — **WIN (dev −0.000241, 22/2)**: same-round compose of 19b52f11 (narrow PEP slack 800M + RGSUB round 3 + round-2 seed diversification) and bbebe613 (runner-up seed swap in the multi-start plan) on f48a17f.
 - [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
   pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
