@@ -715,11 +715,15 @@ const STRIPV2_DENSE_MIN_NNZ: usize = 130_000;
 ///
 /// Of the remaining two dense sub-orderers, MUTUAL EXCLUSION (run exactly
 /// one, chosen by density) replaces "run all three unconditionally":
-/// `sub_amf5` runs at/above this split (measured cheaper at the
-/// high-density end — 0.207s vs `sub_amd`'s 0.287s at density 46 on the
-/// breaching matrix — and AMF's own dense-handling is the more natural fit
-/// there); `sub_amd` covers the lower part of the dense-class band below it.
+/// dense AMF (`STRIPV2_DENSE_ALPHA`) runs at/above this split (measured
+/// cheaper at the high-density end — 0.207s vs `sub_amd`'s 0.287s at
+/// density 46 on the breaching matrix — and AMF's own dense-handling is
+/// the more natural fit there); `sub_amd` covers the lower part of the
+/// dense-class band below it.
 const STRIPV2_DENSE_SPLIT_AVG_DEG: f64 = 35.0;
+/// STRIP-V2 dense-branch AMF `dense_alpha` (was 5.0). Same 0.75 already
+/// compiled into the D dense-low-alpha arm; not previously wired here.
+const STRIPV2_DENSE_ALPHA: f64 = 0.75;
 
 /// ── TELOS-GRADIENT DESCENT (shipped trim of `probe_telos3`, 2026-08
 /// first-principles session) ─────────────────────────────────────────────
@@ -1826,7 +1830,7 @@ fn strip_candidate(sp: &ScoringPattern, ranked: &[usize], k: usize) -> Option<Ve
 /// [`strip_candidate`], generalized to (1) take an arbitrary `ranked` order
 /// (STRIP-V2's callers rank by the INCUMBENT's exact column count, not
 /// baseline-AMD's loose degree) and (2) take an arbitrary sub-orderer
-/// (dense-class STRIP-V2 variants use no-dense AMD / AMF α5 instead of plain
+/// (dense-class STRIP-V2 variants use no-dense AMD / AMF α0.75 instead of plain
 /// AMD). Returns `Vec<usize>` (not `Vec<i32>`) since every caller here is a
 /// hand-rolled `best_perm` comparison, not a `consider()` candidate.
 fn strip_general_v2(
@@ -4066,12 +4070,13 @@ fn order_with_options(
         // threshold is exactly what the breaching matrix clears — the
         // family that should least be trusted un-isolated-timed). Of the
         // remaining two, exactly ONE runs per matrix, chosen by a pure
-        // density rule: `sub_amf5` measured cheaper at the high-density end
+        // density rule: dense AMF measured cheaper at the high-density end
         // (0.207s vs sv2damd's 0.287s at density 46 on the breaching
         // matrix) and AMF's dense_alpha handling is the more natural fit
         // there; `sub_amd` covers the lower part of the dense-class band.
         if dense_class {
-            let use_amf5 = nnz as f64 / n as f64 >= STRIPV2_DENSE_SPLIT_AVG_DEG;
+            let use_amf = nnz as f64 / n as f64 >= STRIPV2_DENSE_SPLIT_AVG_DEG;
+            let stripv2_dense_alpha = STRIPV2_DENSE_ALPHA;
             for &k in &[8usize, 32, 64] {
                 if k >= n {
                     break;
@@ -4079,12 +4084,15 @@ fn order_with_options(
                 vtasks.push(Box::new(move || {
                     let sub_amd =
                         |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
-                    let sub_amf5 = |c: &feral_ordering_core::CscPattern| {
-                        let o = feral_amf::AmfOptions { dense_alpha: 5.0, ..Default::default() };
+                    let sub_amf = |c: &feral_ordering_core::CscPattern| {
+                        let o = feral_amf::AmfOptions {
+                            dense_alpha: stripv2_dense_alpha,
+                            ..Default::default()
+                        };
                         feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
                     };
                     let sub: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>> =
-                        if use_amf5 { &sub_amf5 } else { &sub_amd };
+                        if use_amf { &sub_amf } else { &sub_amd };
                     strip_general_v2(scoring_pat, deg_ranked_v2, k, sub)
                 }));
             }
