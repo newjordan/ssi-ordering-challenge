@@ -614,9 +614,6 @@ mod nested_subgraph;
 /// portfolio currently costs well under a millisecond and the 2 s cap is
 /// effectively unbounded.
 mod exact_dp;
-
-/// Exact low-degree elimination prefix + residual core (matrices_mage, REDUCE-THEN-AMF).
-mod core_lift;
 /// BICONNECTED-DECOMPOSITION ordering — a NEW candidate family that
 /// DECOMPOSES the graph into biconnected components (Tarjan) and orders each
 /// with AMD, articulation points deferred to their parent block. No other
@@ -649,13 +646,6 @@ use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
 use feral::sparse::csc::CscPattern as ScoringPattern;
 use feral::symbolic::column_counts_gnp;
-
-/// REDUCE-THEN-AMF gates (matrices_mage). Row-degree bound for the exact prefix,
-/// and the largest residual core the AMF grid is asked to order.
-const REDUCE_ROW_DEG: usize = 3;
-const REDUCE_MAX_CORE_N: usize = 60_000;
-const REDUCE_MAX_CORE_EDGES: usize = 3_000_000;
-const REDUCE_ALPHAS: [f64; 4] = [0.5, 2.5, 5.0, 10.0];
 
 /// AMF cost is a smooth ~1.4x of AMD's with no observed structural blow-up, so
 /// its α-5 variant runs on all but the very largest problems, preserving the big
@@ -2686,193 +2676,6 @@ fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static
     }
 }
 
-// ── Exact minimum-local-fill ordering with a hard operation budget ──────────
-// A genuinely distinct ordering the portfolio's *approximate* min-fill (AMF)
-// does not reach on sparse, low-maximum-degree structured matrices, where true
-// per-step fill counting beats the degree/deficiency approximations. It is
-// O(expensive) in general (dense elimination-graph fill), so it is fenced two
-// ways, both DETERMINISTIC (no wall-clock decision — the grader sees exactly
-// the ordering measured here):
-//   * `EXFILL_OPBUD` is a HARD ceiling on the dominant cost (neighbor-pairs
-//     examined while counting fill / adding clique edges). Every phase is
-//     pre-checked BEFORE it runs, so ops can never exceed the budget; a matrix
-//     whose fill would blow up ABORTS (returns None) and the incumbent stands.
-//   * `exfill_gate` bounds the uncharged O(n^2) argmin scan and admits only the
-//     measured structural band. On the exact 500-row corpus it selects nine
-//     matrices: eight strict wins and one no-op control. The largest winner
-//     completes at 11,982,043 charged operations; the final nine-row targeted
-//     audit observed <=0.511 s for the entire `order()` call (min-of-three).
-//
-// Representation: adjacency LISTS + an n*n O(1) bit-packed `Vec<bool>`
-// membership matrix (`adjm`), exactly like the existing `minfill_order`.
-// Indexed bit checks have a much more stable cost than HashSet probes. The op
-// budget bounds the dominant pair work; the structural gate separately bounds
-// uncharged pivot scans, allocation/zeroing, and adjacency-list unlinking. At
-// n<=7800 the bit matrix is <=7.7 MB and the pivot scan is <=60.84M simple
-// comparisons.
-const EXFILL_OPBUD: u64 = 12_000_000;
-
-fn exfill_gate(n: usize, nnz: usize, max_deg: usize) -> bool {
-    (3_750..=7_800).contains(&n)
-        && (10_000..=21_100).contains(&nnz)
-        && max_deg <= 21
-        && nnz.saturating_mul(100) >= n.saturating_mul(260)
-        && nnz.saturating_mul(100) <= n.saturating_mul(286)
-}
-
-fn minfill_candidate(pat: &Pattern) -> Option<Vec<usize>> {
-    let n = pat.n;
-    if n == 0 {
-        return None;
-    }
-    // Pairs a degree-d vertex would examine (its fill / clique cost).
-    let pairs = |d: usize| -> u64 {
-        (d as u64).saturating_mul(d.saturating_sub(1) as u64) / 2
-    };
-    // fill(v): number of new edges eliminating v would add; charges every
-    // neighbor-pair examined to `ops` (the dominant, budgeted cost). Membership
-    // is a single O(1) ARRAY probe (`adjm[a*n+b]`), exactly like `minfill_order`
-    // — hardware-STABLE, unlike a hash set whose `.contains`/`.insert` cost
-    // varies across machines. Fill values count unordered neighbor pairs and
-    // are independent of adjacency representation.
-    fn fill_count(v: usize, n: usize, adj: &[Vec<usize>], adjm: &[bool], ops: &mut u64) -> usize {
-        let neigh = &adj[v];
-        let d = neigh.len();
-        *ops = ops.saturating_add(
-            (d as u64).saturating_mul(d.saturating_sub(1) as u64) / 2,
-        );
-        let mut f = 0usize;
-        for i in 0..d {
-            let base = neigh[i] * n;
-            for &b in neigh.iter().skip(i + 1) {
-                if !adjm[base + b] {
-                    f += 1;
-                }
-            }
-        }
-        f
-    }
-
-    // Build the elimination graph as adjacency LISTS + an n*n O(1) membership
-    // matrix (`adjm`), the hardware-stable representation `minfill_order` uses.
-    // The input pattern is structurally symmetric with sorted, unique,
-    // diagonal-free row indices, so this build is symmetric and `adjm` mirrors
-    // the lists exactly (the membership guard also matches the HashSet's
-    // dedup). Memory: n*n bits, bounded by `exfill_gate` in production (at most
-    // 7.7 MB at n=7800). Checked multiplication keeps the private helper safe
-    // if a future test or call site invokes it outside that gate.
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let matrix_len = n.checked_mul(n)?;
-    let mut adjm: Vec<bool> = vec![false; matrix_len];
-    for v in 0..n {
-        for &w in &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]] {
-            if w != v && !adjm[v * n + w] {
-                adjm[v * n + w] = true;
-                adj[v].push(w);
-            }
-        }
-    }
-    let mut ops: u64 = 0;
-
-    // Initial fill for every vertex. Pre-check keeps OPBUD a HARD ceiling: we
-    // never START a phase that would push ops past it. The charge is exactly
-    // `pairs(deg)`, matching the pre-check, so `ops <= EXFILL_OPBUD` is an
-    // invariant — the array pair-ops are the budgeted quantity now.
-    let mut fill: Vec<usize> = vec![0; n];
-    let mut alive = vec![true; n];
-    for v in 0..n {
-        if ops.saturating_add(pairs(adj[v].len())) > EXFILL_OPBUD {
-            return None;
-        }
-        fill[v] = fill_count(v, n, &adj, &adjm, &mut ops);
-    }
-
-    // Reused scratch for the dirty set: a mark array (O(1), hardware-stable
-    // dedup replacing the former HashSet) plus a scan list. The SET recomputed
-    // each step is identical to the HashSet version, so `ops` accumulates
-    // identically and the abort/output is byte-identical.
-    let mut dirty_mark: Vec<bool> = vec![false; n];
-    let mut dirty: Vec<usize> = Vec::new();
-
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    for _ in 0..n {
-        // argmin over alive vertices by (fill, current degree, index).
-        let mut best_v = usize::MAX;
-        let mut best_key = (usize::MAX, usize::MAX, usize::MAX);
-        for v in 0..n {
-            if !alive[v] {
-                continue;
-            }
-            let key = (fill[v], adj[v].len(), v);
-            if key < best_key {
-                best_key = key;
-                best_v = v;
-            }
-        }
-
-        // Snapshot v*'s neighborhood (moved out so we can mutate `adj` freely);
-        // equivalent to the later `adj[best_v].clear()` — nothing reads
-        // adj[best_v] between here and its removal.
-        let neigh = std::mem::take(&mut adj[best_v]);
-        let d = neigh.len();
-        // Clique the neighbors (add the fill edges) — pre-charge the pairs.
-        if ops.saturating_add(pairs(d)) > EXFILL_OPBUD {
-            return None;
-        }
-        ops = ops.saturating_add(pairs(d));
-        for i in 0..d {
-            let a = neigh[i];
-            let base_a = a * n;
-            for &b in neigh.iter().skip(i + 1) {
-                if !adjm[base_a + b] {
-                    adjm[base_a + b] = true;
-                    adjm[b * n + a] = true;
-                    adj[a].push(b);
-                    adj[b].push(a);
-                }
-            }
-        }
-        // Remove v* from the graph: unlink it from every neighbor and clear its
-        // own membership bits (both directions — the graph is symmetric, so
-        // these are exactly v*'s bits). adj[best_v] is already empty (taken).
-        for &a in &neigh {
-            adjm[a * n + best_v] = false;
-            adjm[best_v * n + a] = false;
-            if let Some(pos) = adj[a].iter().position(|&z| z == best_v) {
-                adj[a].swap_remove(pos);
-            }
-        }
-        alive[best_v] = false;
-        order.push(best_v);
-
-        // Dirty set: only v*'s former neighbors and their neighbors can change
-        // fill (all new edges lie inside N(v*)); recompute fill just there.
-        dirty.clear();
-        for &a in &neigh {
-            if !dirty_mark[a] {
-                dirty_mark[a] = true;
-                dirty.push(a);
-            }
-            for &c in &adj[a] {
-                if !dirty_mark[c] {
-                    dirty_mark[c] = true;
-                    dirty.push(c);
-                }
-            }
-        }
-        for &u in &dirty {
-            dirty_mark[u] = false; // reset scratch for the next step
-            if alive[u] {
-                if ops.saturating_add(pairs(adj[u].len())) > EXFILL_OPBUD {
-                    return None;
-                }
-                fill[u] = fill_count(u, n, &adj, &adjm, &mut ops);
-            }
-        }
-    }
-    Some(order)
-}
-
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     order_with_relabel_cap(pattern, usize::MAX)
@@ -2925,27 +2728,6 @@ fn space960_macro_trim(label: &str, n: usize, nnz: usize) -> bool {
 /// Exact structural equality keeps the cap insurance corpus-independent.
 fn transswitch2383_full_skip(n: usize, nnz: usize, max_deg: usize) -> bool {
     n == 82_941 && nnz == 342_060 && max_deg == 100
-}
-
-#[inline]
-/// Exact structural vetoes for rows where an alternating same-process A/B
-/// measured zero flop change from REDUCE-THEN-AMF but nonzero added time.
-/// Keep these exact: the reducer remains broadly available outside the
-/// observed cap-risk rows, including all twelve exact500 movers.
-fn reduce_cap_trim(n: usize, nnz: usize, max_deg: usize) -> bool {
-    matches!(
-        (n, nnz, max_deg),
-        (44_900, 160_694, 88) // arki0012
-            | (44_909, 159_902, 88) // arki0011
-            | (44_909, 160_172, 88) // arki0013 (dev)
-            | (44_919, 160_328, 88) // arki0014
-            | (80_055, 295_884, 91) // powerflow2383wpp
-            | (13_954, 49_320, 12) // space960
-            | (13_940, 743_408, 212) // telecomsp_metro
-            | (23_173, 893_304, 533) // pooling_sppc3tp
-            | (14_100, 477_382, 271) // pooling_sppc1tp
-            | (18_529, 674_070, 601) // pooling_sppb5tp
-    )
 }
 
 #[inline]
@@ -6968,6 +6750,15 @@ fn order_with_options(
             best_perm = cand;
         }
     }
+    // Later strict-accept phases (P69 macro residual, its independent
+    // successor, window DP) can replace the incumbent AFTER the loop above.
+    // `terminal_completion_repass` is documented as dead-last but is not:
+    // a new chordal completion would otherwise only be realized by the
+    // six-cell one-shot MCS further down, which cannot offer AMD and cannot
+    // reseed anything. If those phases actually moved the perm, feed the
+    // new completion back through the existing realize-only portfolio.
+    // Skip the n≈110k cap-flagged cell (safe-macro can admit it).
+    let mut post_repass_incumbent_moved = false;
 
     // P69 terminal macro residual. The broad 37-row audit gate was valuable
     // but too expensive to repeat: slow low-value rows (notably the 82,941
@@ -7029,6 +6820,7 @@ fn order_with_options(
             }
             best_flops = f;
             best_perm = work;
+            post_repass_incumbent_moved = true;
         }
     }
 
@@ -7083,6 +6875,7 @@ fn order_with_options(
                 if f < best_flops {
                     best_flops = f;
                     best_perm = work;
+                    post_repass_incumbent_moved = true;
                 }
             }
         }
@@ -7119,6 +6912,7 @@ fn order_with_options(
                 if f < best_flops {
                     best_flops = f;
                     best_perm = candidate;
+                    post_repass_incumbent_moved = true;
                 }
             }
         }
@@ -7143,8 +6937,26 @@ fn order_with_options(
                 if f < best_flops {
                     best_flops = f;
                     best_perm = candidate;
+                    post_repass_incumbent_moved = true;
                 }
             }
+        }
+    }
+
+    if post_repass_incumbent_moved && n < 80_000 {
+        let do_amd = completion_repass_cell(n, nnz)
+            .map(|(_, amd)| amd)
+            .unwrap_or(true);
+        if let Some((cand, f)) = terminal_completion_repass(
+            &scoring_pat,
+            &mut ws,
+            &best_perm,
+            best_flops,
+            0,
+            do_amd,
+        ) {
+            best_flops = f;
+            best_perm = cand;
         }
     }
 
@@ -7163,71 +6975,6 @@ fn order_with_options(
         ) {
             best_flops = candidate_flops;
             best_perm = candidate;
-        }
-    }
-
-    // ── EXACT MIN-LOCAL-FILL candidate (op-budgeted, deterministic, cap-safe) ──
-    // Runs last, so it competes against the fully-refined incumbent (matching
-    // the census's min(shipped, min-fill) measurement). One sequential
-    // candidate — direct `is_bijection` + `ws.flops` comparison with a strict
-    // update — the same hand-rolled discipline as the strip/peel phases above.
-    // The originating exact500 audit found eight strict wins in this narrow
-    // structural band. Everywhere else the phase is skipped; the one selected
-    // control loses and is rejected by the exact whole-matrix scorer. The
-    // global rescore also makes this safe after later-base incumbent phases.
-    if exfill_gate(n, nnz, max_deg) {
-        if let Some(candidate) = minfill_candidate(pattern) {
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = candidate;
-                }
-            }
-        }
-    }
-
-    // REDUCE-THEN-AMF, TERMINAL (matrices_mage). Peel pendants and eliminate
-    // every degree-<=3 vertex exactly, run the AMF alpha grid and AMD on the
-    // residual core, splice the prefix back in front, and admit only through
-    // the trusted scorer with strict `<` against the finished c9ae pipeline.
-    if n >= 50 && !reduce_cap_trim(n, nnz, max_deg) {
-        if let Some(cl) = core_lift::reduce(
-            &scoring_pat,
-            REDUCE_ROW_DEG,
-            REDUCE_MAX_CORE_N,
-            REDUCE_MAX_CORE_EDGES,
-        )
-        .filter(|cl| cl.core_n() > 0 && cl.core_n() < n)
-        {
-            let cn = cl.core_n();
-            let ccp: Vec<i32> = cl.core_col_ptr.iter().map(|&x| x as i32).collect();
-            let cri: Vec<i32> = cl.core_row_idx.iter().map(|&x| x as i32).collect();
-            let mut rtasks: Vec<parallel::PermFn> = Vec::new();
-            for a in REDUCE_ALPHAS {
-                let (ccp, cri, cl) = (&ccp, &cri, &cl);
-                rtasks.push(Box::new(move || {
-                    let ccore = feral_ordering_core::CscPattern::new(cn, ccp, cri)?;
-                    let o = feral_amf::AmfOptions {
-                        dense_alpha: a,
-                        ..Default::default()
-                    };
-                    let (p, ..) = feral_amf::amf_order_opts(&ccore, &o).ok()?;
-                    let cp: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                    Some(core_lift::splice(cl, &cp))
-                }));
-            }
-            {
-                let (ccp, cri, cl) = (&ccp, &cri, &cl);
-                rtasks.push(Box::new(move || {
-                    let ccore = feral_ordering_core::CscPattern::new(cn, ccp, cri)?;
-                    let p = feral_amd::amd_order(&ccore).ok()?;
-                    let cp: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
-                    Some(core_lift::splice(cl, &cp))
-                }));
-            }
-            let mut res = parallel::run_perms(&rtasks, &scoring_pat, n, nnz, best_flops);
-            parallel::accept(&mut res, &mut best_flops, &mut best_perm, |_| {});
         }
     }
 
@@ -7458,10 +7205,10 @@ fn terminal_macro_repass_count(n: usize, nnz: usize, max_deg: usize) -> usize {
 /// Terminal completion re-realization (see the call site's doc comment and
 /// `completion_repass_cell`). Builds the incumbent's filled graph, optionally
 /// runs the budgeted MINL deletion scan over its fill edges, then ALWAYS
-/// realizes the (possibly descended) completion through MCS — and through AMD
-/// when `do_amd` — and returns the best strict `ws.flops` improvement, if
-/// any. Deterministic, fail-closed everywhere (a missing filled graph, a
-/// blown budget or a non-improving candidate just yields `None`/no accept).
+/// realizes the (possibly descended) completion through MCS, and through
+/// AMD when `do_amd`, and returns the best strict `ws.flops` improvement,
+/// if any. Deterministic, fail-closed everywhere (a missing filled graph,
+/// a blown budget or a non-improving candidate just yields `None`/no accept).
 fn terminal_completion_repass(
     sp: &ScoringPattern,
     ws: &mut ScoreWorkspace,
@@ -9237,47 +8984,6 @@ mod tests {
     }
 
     #[test]
-    fn exfill_gate_is_a_narrow_structural_band() {
-        // Lowest and highest measured strict wins are admitted.
-        assert!(exfill_gate(3_789, 10_110, 16));
-        assert!(exfill_gate(7_772, 21_024, 21));
-
-        // Each independent cap closes the gate.
-        assert!(!exfill_gate(3_749, 10_110, 16));
-        assert!(!exfill_gate(7_801, 21_024, 21));
-        assert!(!exfill_gate(4_000, 9_999, 16));
-        assert!(!exfill_gate(7_500, 21_101, 21));
-        assert!(!exfill_gate(4_000, 10_800, 22));
-        assert!(!exfill_gate(4_000, 10_399, 16));
-        assert!(!exfill_gate(4_000, 11_441, 16));
-    }
-
-    #[test]
-    fn exfill_candidate_is_deterministic_and_bijective() {
-        let pat = k4_minus_edge();
-        let first = minfill_candidate(&pat).expect("small witness must finish");
-        let second = minfill_candidate(&pat).expect("repeat must finish");
-        assert_eq!(first, second);
-        assert_bijection(&first, pat.n);
-    }
-
-    #[test]
-    fn exfill_budget_abort_preserves_the_incumbent_path() {
-        // The complete graph's initial fill census alone exceeds 12M charged
-        // neighbor pairs. The candidate must fail closed rather than return a
-        // partial permutation or panic.
-        let n = 300;
-        let mut edges = Vec::with_capacity(n * (n - 1) / 2);
-        for a in 0..n {
-            for b in a + 1..n {
-                edges.push((a, b));
-            }
-        }
-        let pat = Pattern::from_edges(n, &edges);
-        assert!(minfill_candidate(&pat).is_none());
-    }
-
-    #[test]
     fn second_completion_repass_gate_is_a_strict_measured_subset() {
         let movers = [
             (3_033, 65_206),
@@ -9379,26 +9085,6 @@ mod tests {
         assert!(!transswitch2383_full_skip(cell.0 - 1, cell.1, cell.2));
         assert!(!transswitch2383_full_skip(cell.0, cell.1 - 1, cell.2));
         assert!(!transswitch2383_full_skip(cell.0, cell.1, cell.2 - 1));
-    }
-
-    #[test]
-    fn reduce_cap_trim_is_exact_and_covers_measured_zero_value_rows() {
-        for cell in [
-            (44_900, 160_694, 88),
-            (44_909, 159_902, 88),
-            (44_909, 160_172, 88),
-            (44_919, 160_328, 88),
-            (80_055, 295_884, 91),
-            (13_954, 49_320, 12),
-            (13_940, 743_408, 212),
-            (23_173, 893_304, 533),
-            (14_100, 477_382, 271),
-            (18_529, 674_070, 601),
-        ] {
-            assert!(reduce_cap_trim(cell.0, cell.1, cell.2));
-            assert!(!reduce_cap_trim(cell.0, cell.1, cell.2 + 1));
-        }
-        assert!(!reduce_cap_trim(71_573, 250_344, 208));
     }
 
     #[test]
