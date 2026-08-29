@@ -2257,6 +2257,72 @@ fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static
 }
 
 /// Return an elimination order for `pattern` (best-of over the ordering family).
+fn leaf_core_amf(pattern: &Pattern, dense_alpha: f64) -> Option<Vec<i32>> {
+    let n = pattern.n;
+    let mut degree: Vec<usize> = (0..n)
+        .map(|v| {
+            pattern.row_idx[pattern.col_ptr[v]..pattern.col_ptr[v + 1]]
+                .iter()
+                .filter(|&&w| w != v)
+                .count()
+        })
+        .collect();
+    let mut queue = std::collections::VecDeque::new();
+    for (v, &d) in degree.iter().enumerate() {
+        if d <= 1 {
+            queue.push_back(v);
+        }
+    }
+    let mut removed = vec![false; n];
+    let mut prefix = Vec::new();
+    while let Some(v) = queue.pop_front() {
+        if removed[v] || degree[v] > 1 {
+            continue;
+        }
+        removed[v] = true;
+        prefix.push(v as i32);
+        for &w in &pattern.row_idx[pattern.col_ptr[v]..pattern.col_ptr[v + 1]] {
+            if w != v && !removed[w] {
+                degree[w] = degree[w].saturating_sub(1);
+                if degree[w] == 1 {
+                    queue.push_back(w);
+                }
+            }
+        }
+    }
+    if prefix.len() < n / 5 {
+        return None;
+    }
+
+    let mut new_id = vec![usize::MAX; n];
+    let mut old_id = Vec::with_capacity(n - prefix.len());
+    for v in 0..n {
+        if !removed[v] {
+            new_id[v] = old_id.len();
+            old_id.push(v);
+        }
+    }
+    let mut cp = Vec::with_capacity(old_id.len() + 1);
+    let mut ri = Vec::new();
+    cp.push(0i32);
+    for &v in &old_id {
+        for &w in &pattern.row_idx[pattern.col_ptr[v]..pattern.col_ptr[v + 1]] {
+            if !removed[w] {
+                ri.push(new_id[w] as i32);
+            }
+        }
+        cp.push(ri.len() as i32);
+    }
+    let core = feral_ordering_core::CscPattern::new(old_id.len(), &cp, &ri)?;
+    let opts = feral_amf::AmfOptions {
+        dense_alpha,
+        ..Default::default()
+    };
+    let (perm, ..) = feral_amf::amf_order_opts(&core, &opts).ok()?;
+    prefix.extend(perm.into_iter().map(|v| old_id[v as usize] as i32));
+    Some(prefix)
+}
+
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     order_with_relabel_cap(pattern, usize::MAX)
 }
@@ -2480,6 +2546,14 @@ fn order_with_options(
         consider!(move || Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(
             pattern
         )));
+    }
+
+    // Sparse ultra-giants sit above every ordinary portfolio envelope. One
+    // AMF alpha-5 pass is near-linear in this density class and supplies a
+    // candidate where the incumbent otherwise falls back to its AMD anchor.
+    if nnz > 2_500_000 && nnz <= 4usize.saturating_mul(n) {
+        consider!(move || leaf_core_amf(pattern, 5.0)
+            .ok_or(feral_ordering_core::OrderingError::MalformedInput));
     }
 
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
@@ -6479,21 +6553,11 @@ fn terminal_minl_candidates(
         // sparse, low-hub n≈12.7k Gabriel row. AMF with dense detection
         // disabled realizes the same descended chordal graph at 0.834 of the
         // incumbent's flops; one fixed relabel reaches a slightly better
-        // tie-break basin. The tight structural cell reaches one exact row,
-        // and both permutations are admitted only through the trusted global
-        // strict scorer in the caller.
-        let original_nnz = sp.row_idx.len();
-        let original_max_deg = (0..n)
-            .map(|v| sp.col_ptr[v + 1] - sp.col_ptr[v])
-            .max()
-            .unwrap_or(0);
-        let gabriel_terminal_cell = (12_000..13_000).contains(&n)
-            && (65_000..75_000).contains(&original_nnz)
-            && original_max_deg <= 40;
-        #[cfg(test)]
-        let gabriel_terminal_cell =
-            gabriel_terminal_cell || std::env::var_os("SSI_TERMINAL_ALL").is_some();
-        if gabriel_terminal_cell {
+        // tie-break basin. Both permutations are admitted only through the
+        // trusted global strict scorer in the caller. The same two realizations
+        // are cheap on every completion already admitted by the terminal-MINL
+        // gate, so keep them available across that pre-budgeted envelope.
+        {
             let options = feral_amf::AmfOptions { dense_alpha: -1.0 };
             if let Ok((perm, ..)) = feral_amf::amf_order_opts(&core, &options) {
                 candidates.push(perm.into_iter().map(|v| v as usize).collect());
@@ -6520,6 +6584,7 @@ fn terminal_minl_candidates(
                 }
             }
         }
+
     }
     Some(candidates)
 }
