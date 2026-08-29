@@ -930,6 +930,29 @@ const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 const PAIR_DESCENT_SWEEPS: usize = 4;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 
+// One conservative terminal composition: when and only when P50 strictly
+// changes the incumbent, give that new basin two passes of the existing exact
+// adjacent-pair descent. `adjacent_pair_descent` charges `Game::ops`
+// cumulatively across resets, so this is one shared 48M `Game::ops` threshold
+// for both sweeps (not 48M per sweep). As in the existing helper, setup is not
+// charged and the threshold is checked after each atomic reset/elimination;
+// exhaustion discards the whole candidate. The narrow sparse/hub-free envelope
+// keeps this extra replay away from the portfolio's cap-bearing rows.
+const POST_P50_PAIR_MIN_N: usize = 1_000;
+const POST_P50_PAIR_MAX_N: usize = 3_000;
+const POST_P50_PAIR_MAX_NNZ: usize = 20_000;
+const POST_P50_PAIR_HUB_DIV: usize = 50;
+const POST_P50_PAIR_SWEEPS: usize = 2;
+const POST_P50_PAIR_OPS_BUDGET: i64 = 48_000_000;
+
+fn post_p50_pair_gate(n: usize, nnz: usize, max_deg: usize) -> bool {
+    (POST_P50_PAIR_MIN_N..=POST_P50_PAIR_MAX_N).contains(&n)
+        && nnz > 0
+        && nnz <= POST_P50_PAIR_MAX_NNZ
+        // Overflow-safe equivalent of `max_deg * 50 <= n`.
+        && max_deg <= n / POST_P50_PAIR_HUB_DIV
+}
+
 /// FINAL short-range use of the simplicial-vertex early-elimination theorem
 /// (Ost, Schulz, Strash, arXiv:2004.11315). The density and absolute-nnz gates
 /// keep the exact bitset replay in the measured medium tier; a deterministic
@@ -5708,6 +5731,7 @@ fn order_with_options(
         || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
         || (n > 30_000 && n <= 50_000 && nnz <= 170_000 && nnz < 10 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
+    let mut terminal_minl_strict_accepted = false;
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {
             for cand in [Some(mcs), amd].into_iter().flatten() {
@@ -5716,11 +5740,33 @@ fn order_with_options(
                     if f < best_flops {
                         best_flops = f;
                         best_perm = cand;
+                        terminal_minl_strict_accepted = true;
                     }
                 }
             }
         }
+    }
 
+    // P50 is a basin-changing terminal candidate. Re-run the existing exact
+    // pair descent only on a strict P50 win, and accept its result only after
+    // bijection validation and trusted whole-matrix strict rescoring.
+    if terminal_minl_strict_accepted && post_p50_pair_gate(n, nnz, max_deg) {
+        if let Some(cand) = rgreedy::adjacent_pair_descent(
+            n,
+            &pattern.col_ptr,
+            &pattern.row_idx,
+            &best_perm,
+            POST_P50_PAIR_SWEEPS,
+            POST_P50_PAIR_OPS_BUDGET,
+        ) {
+            if is_bijection(&cand, n) {
+                let f = ws.flops(&scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
+        }
     }
 
     // Re-rank by each accepted start's exact column counts before every peel,
@@ -7936,6 +7982,64 @@ mod tests {
             col_ptr: pat.col_ptr.clone(),
             row_idx: pat.row_idx.clone(),
         }
+    }
+
+    #[test]
+    fn post_p50_pair_gate_has_exact_conservative_boundaries() {
+        assert!(post_p50_pair_gate(1_000, 1, 20));
+        assert!(post_p50_pair_gate(3_000, 20_000, 60));
+
+        assert!(!post_p50_pair_gate(999, 1, 19));
+        assert!(!post_p50_pair_gate(3_001, 1, 60));
+        assert!(!post_p50_pair_gate(1_000, 0, 20));
+        assert!(!post_p50_pair_gate(1_000, 20_001, 20));
+        assert!(!post_p50_pair_gate(1_000, 1, 21));
+        assert!(!post_p50_pair_gate(1_000, 1, usize::MAX));
+    }
+
+    #[test]
+    fn adjacent_pair_descent_is_deterministic_bijective_and_fails_closed() {
+        let pat = Pattern::from_edges(3, &[(0, 1), (1, 2)]);
+        let seed = [1, 0, 2];
+        let first = rgreedy::adjacent_pair_descent(
+            3,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            1,
+            147,
+        )
+        .expect("one parity sweep must improve the fixed path witness");
+        let second = rgreedy::adjacent_pair_descent(
+            3,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            1,
+            147,
+        );
+        assert_eq!(first, vec![0, 1, 2]);
+        assert_eq!(second, Some(first.clone()));
+        assert_bijection(&first, 3);
+
+        assert!(rgreedy::adjacent_pair_descent(
+            3,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &seed,
+            2,
+            147,
+        )
+        .is_none());
+        assert!(rgreedy::adjacent_pair_descent(
+            3,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &[0, 0, 2],
+            POST_P50_PAIR_SWEEPS,
+            POST_P50_PAIR_OPS_BUDGET,
+        )
+        .is_none());
     }
 
     fn k4_minus_edge() -> Pattern {
