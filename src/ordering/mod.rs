@@ -5069,6 +5069,50 @@ fn order_with_options(
         }
     }
 
+    // DENSE LOW-ALPHA RELABEL COMPLEMENT. The accepted f48 frontier's only
+    // hidden-only mover is the 400k..1M, density>20 low-alpha arm above. Its
+    // alpha census found two distinct AMF basins (0.75 and 1.25), but the
+    // production tree still gives each basin only the original numbering.
+    // Probe four deterministic relabelings of each basin in two four-worker
+    // waves. This stays inside the accepted arm's exact structural window;
+    // unlike the historical broad heavy-relabel attempt it cannot fire on the
+    // giant sparse or >1M-nnz cap hazards. Running terminally is load-bearing:
+    // each result is compared to the completed pipeline, so it cannot reseed a
+    // downstream phase or regress the final exact objective.
+    const DENSE_LOW_RELABEL_MIN_NNZ: usize = 400_000;
+    const DENSE_LOW_RELABEL_MAX_NNZ: usize = 1_000_000;
+    const DENSE_LOW_RELABEL_MIN_DENSITY: usize = 20;
+    if (DENSE_LOW_RELABEL_MIN_NNZ..DENSE_LOW_RELABEL_MAX_NNZ).contains(&nnz)
+        && nnz > DENSE_LOW_RELABEL_MIN_DENSITY * n
+    {
+        let mut low_tasks: Vec<parallel::PermFn> = Vec::with_capacity(8);
+        for alpha in [0.75f64, 1.25] {
+            for seed in 1u64..=4 {
+                let opts = feral_amf::AmfOptions {
+                    dense_alpha: alpha,
+                    ..Default::default()
+                };
+                low_tasks.push(Box::new(move || {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(&scoring_pat, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
+                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &opts).ok()?;
+                    Some(pb.iter().map(|&x| q[x as usize]).collect())
+                }));
+            }
+        }
+        let mut low_results =
+            parallel::run_perms(&low_tasks, scoring_pat, n, nnz, best_flops);
+        parallel::accept(
+            &mut low_results,
+            &mut best_flops,
+            &mut best_perm,
+            |_| {},
+        );
+    }
+
     let _ = best_flops;
 
     best_perm
