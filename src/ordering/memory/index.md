@@ -108,6 +108,10 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+
+- [[experiments/0029-wide-shallow-rgsub]] — 208-trajectory, 624M-op wide-shallow ranked subtree pipeline replacing the 128-trajectory, 640M-op schedule.
+- [[experiments/0028-rgsub-four-lane]] — direct-remote four-lane seed/policy striping for equal-budget ranked RGSUB round two.
+- [[experiments/0027-rgsub-round2-striped-s0]] — direct-remote, equal-work round-two stream-zero diversification on alternating top-ranked large RGSUB blocks.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:

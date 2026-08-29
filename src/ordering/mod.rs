@@ -3298,8 +3298,23 @@ fn order_with_options(
     let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
+    let relabel_alpha_cycle = (n <= 1_000 || n >= 2_000)
+        && (nnz <= n.saturating_mul(3)
+            || (nnz.saturating_mul(2) >= n.saturating_mul(7)
+                && nnz <= n.saturating_mul(4))
+            || (nnz.saturating_mul(5) >= n.saturating_mul(22)
+                && nnz <= n.saturating_mul(6)));
+    const RELABEL_AMD_ALPHAS: [f64; 4] = [10.0, 5.0, 2.0, 16.0];
     for r in 0..restarts {
         let seed = r as u64 + 1;
+        let amd_opts = feral_amd::AmdOptions {
+            aggressive: true,
+            dense_alpha: if relabel_alpha_cycle {
+                RELABEL_AMD_ALPHAS[r & 3]
+            } else {
+                10.0
+            },
+        };
         consider!(move || {
             let q = relabel(n, seed);
             let b = permute_pattern(&scoring_pat, &q);
@@ -3307,7 +3322,7 @@ fn order_with_options(
             let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
             let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            let pb = feral_amd::amd_order(&bcore)?;
+            let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_opts)?;
             // Compose back: `q[k]` is the original vertex that B numbers `k`.
             Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
         });
@@ -3338,19 +3353,19 @@ fn order_with_options(
     // every result is bijection-checked in `consider` before it can win.
     const RELABEL_AMF_MAX_NNZ: usize = 130_000;
     if nnz > 0 && nnz <= RELABEL_AMF_MAX_NNZ && relabel_cap > 0 {
-        let amf_opts = feral_amf::AmfOptions {
-            dense_alpha: 5.0,
-            ..Default::default()
-        };
+        const RELABEL_AMF_ALPHAS: [f64; 4] = [5.0, 2.5, 10.0, 1.0];
         let amf_restarts =
             relabel_restarts(RELABEL_BUDGET, RELABEL_MAX_RESTARTS, n, nnz, max_deg).min(relabel_cap);
         for r in 0..amf_restarts {
             let seed = r as u64 + 1;
-            // Cloned per restart: each queued closure is a `move` closure and
-            // must own its options struct (`AmfOptions` is `Clone`, not
-            // `Copy`). Same values every time, so the candidate set is
-            // unchanged.
-            let amf_opts = amf_opts.clone();
+            let amf_opts = feral_amf::AmfOptions {
+                dense_alpha: if relabel_alpha_cycle {
+                    RELABEL_AMF_ALPHAS[r & 3]
+                } else {
+                    5.0
+                },
+                ..Default::default()
+            };
             consider!(move || {
                 let q = relabel(n, seed);
                 let b = permute_pattern(&scoring_pat, &q);
@@ -4712,6 +4727,13 @@ fn order_with_options(
     if rgreedy_enabled
         && ((n <= RGREEDY_MAX_N && (rgreedy_pep_gate || rgreedy_rgs_gate)) || rgreedy_mid_gate)
     {
+        let rgreedy_pep_varied = rgreedy_pep_gate
+            && nnz.saturating_mul(40) <= n.saturating_mul(207);
+        let rgreedy_budget = if rgreedy_pep_gate {
+            RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor)
+        } else {
+            RGREEDY_BUDGET.max(rgreedy_slack_floor)
+        };
         let found = if rgreedy_mid_gate {
             rgreedy::search_par_default_seeds(
                 n,
@@ -4721,14 +4743,14 @@ fn order_with_options(
                 best_flops,
                 RGREEDY_MID_BUDGET,
             )
-        } else if rgreedy_pep_gate {
+        } else if rgreedy_pep_gate && !rgreedy_pep_varied {
             rgreedy::search_par_default_seeds(
                 n,
                 &pattern.col_ptr,
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_PEP_BUDGET.max(rgreedy_slack_floor),
+                rgreedy_budget,
             )
         } else {
             rgreedy::search_par(
@@ -4737,7 +4759,7 @@ fn order_with_options(
                 &pattern.row_idx,
                 &best_perm,
                 best_flops,
-                RGREEDY_BUDGET.max(rgreedy_slack_floor),
+                rgreedy_budget,
                 0x9E37_79B9_7F4A_7C15,
             )
         };
@@ -4884,8 +4906,8 @@ fn order_with_options(
         max_s: 700,
         max_sub: 3_500,
         max_blocks: 96,
-        budget: 5_000_000,
-        streams: 2,
+        budget: 3_000_000,
+        streams: 4,
         rank_blocks: false,
         round: 0,
     };
@@ -4904,11 +4926,6 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        // Third round re-restored (it was promoted in 0d475d2a and then wiped
-        // by a later graft whose base predated it), extended to the sparse
-        // hub-free sub-10k class per 0027: in both regimes the extra round
-        // runs only when round 2 strictly improved (the loop breaks on
-        // non-improvement below).
         let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
             || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
         {

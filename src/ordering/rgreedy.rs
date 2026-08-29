@@ -116,6 +116,7 @@ pub(crate) struct Game<'a> {
     w: usize,
     adj0: &'a [u64],
     adj: Vec<u64>,
+    deg0: Vec<u32>,
     deg: Vec<u32>,
     /// Live set as a dense array with position index (the linear-scan path).
     livelist: Vec<u32>,
@@ -212,11 +213,16 @@ impl<'a> Game<'a> {
         if adj0.len() < n * w {
             return None;
         }
+        let mut deg0 = vec![0u32; n];
+        for (v, d) in deg0.iter_mut().enumerate() {
+            *d = adj0[v * w..v * w + w].iter().map(|x| x.count_ones()).sum();
+        }
         Some(Game {
             n,
             w,
             adj: adj0[..n * w].to_vec(),
             adj0,
+            deg0,
             deg: vec![0; n],
             livelist: Vec::with_capacity(n),
             pos: vec![0; n],
@@ -238,12 +244,9 @@ impl<'a> Game<'a> {
         self.adj.copy_from_slice(&self.adj0[..self.n * self.w]);
         self.bhead.fill(-1);
         self.livelist.clear();
+        self.deg.copy_from_slice(&self.deg0);
         for v in 0..self.n {
-            let mut d = 0u32;
-            for k in 0..self.w {
-                d += self.adj[v * self.w + k].count_ones();
-            }
-            self.deg[v] = d;
+            let d = self.deg[v];
             if v >= self.nelim {
                 continue; // permanently live: never a pivot, never bucketed
             }
@@ -1106,10 +1109,10 @@ pub(crate) fn subtree_refine(
     parent: &[i32],
     cfg: SubCfg,
 ) -> usize {
-    // Spend the ranked large-matrix budget on more D1 basins without adding
-    // trajectories: 32 blocks get both streams and the next 64 get D1 only.
+    // Wide/shallow fixed-work pipeline: 24 blocks x 4 streams, 40 x 2, 32 x 1.
+    // At 3M ops this is 624M nominal ops versus the promoted 640M schedule.
     let split_ranked_streams =
-        n >= 10_000 && cfg.rank_blocks && cfg.max_blocks == 64 && cfg.streams == 2;
+        n >= 10_000 && cfg.rank_blocks && cfg.max_blocks == 64 && cfg.streams == 4;
 
     // ── subtree sizes and their contiguous postorder blocks ─────────────────
     // Postorder ⇒ every child precedes its parent, so one ascending sweep
@@ -1257,8 +1260,11 @@ pub(crate) fn subtree_refine(
                             .sum();
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
-                        let first_stream =
-                            usize::from(split_ranked_streams && block_rank >= 32);
+                        let first_stream = if split_ranked_streams {
+                            if block_rank < 24 { 0 } else if block_rank < 64 { 2 } else { 3 }
+                        } else {
+                            0
+                        };
                         for k in first_stream..cfg.streams.max(1) {
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
@@ -1268,13 +1274,32 @@ pub(crate) fn subtree_refine(
                             } else {
                                 stream_rng(k)
                             };
-                            // If round one improved some other block, an
-                            // unchanged block would otherwise repeat the same
-                            // deterministic D1 search byte-for-byte. Preserve
-                            // stream 0 and diversify only the second stream in
-                            // round two, with no added trajectories or work.
+                            // Round two otherwise repeats byte-for-byte on an
+                            // unchanged block. D1 is diversified everywhere;
+                            // diversify stream 0 on alternating top-32 ranks,
+                            // retaining the promoted trajectory on the other
+                            // half. No trajectories or work are added.
                             if n >= 10_000 && k == 1 && cfg.round == 1 {
                                 rng_seed ^= 0xA076_1D64_78BD_642F;
+                            }
+                            if n >= 10_000 && k >= 2 && cfg.round == 1 {
+                                rng_seed ^= 0xD134_2543_DE82_EF95u64
+                                    .wrapping_mul((block_rank as u64 + 1) ^ ((k as u64) << 17));
+                            }
+                            let mut par = stream_params(k);
+                            if n >= 10_000 && k == 0 && cfg.round == 1 {
+                                match block_rank & 3 {
+                                    0 => {}
+                                    1 => rng_seed ^= 0xE703_7ED1_A0B4_28DB,
+                                    2 => {
+                                        rng_seed ^= 0x8EBC_6AF0_9C88_C6E3;
+                                        par.prefix_mode = 1;
+                                    }
+                                    _ => {
+                                        rng_seed ^= 0x5899_65CC_7537_4CC3;
+                                        par.pol_mask = 0b0011_0111;
+                                    }
+                                }
                             }
                             let r = search_with_nelim(
                                 m,
@@ -1284,7 +1309,7 @@ pub(crate) fn subtree_refine(
                                 seed_flops,
                                 cfg.budget,
                                 rng_seed,
-                                stream_params(k),
+                                par,
                             );
                             if let Some((o, f)) = r {
                                 if best.as_ref().is_none_or(|(_, bf)| f < *bf) {
