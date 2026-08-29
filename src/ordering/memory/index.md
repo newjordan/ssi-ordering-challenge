@@ -249,6 +249,14 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   bands + heavy relabelled-AMF; (2) the crown band-k "note values" (128/32) — both LOSE on eval,
   the divergent in-code k (146/128) are the real tuned values, the note is stale.
 
+- [0040-fleet-r.md](experiments/0040-fleet-r.md) — **WIN (v2 proxy −0.000263, 0.787870→0.787607)**:
+  profiled the repass rounds (whale = amd_nd, not fill-graph derivation; two compression
+  substitutes killed with proofs), Phase-A bit-identical speedups (single-pass filled_graph,
+  CSR-direct realize-only rounds, cached asort), and schedule REDESIGNS from the pre-repass
+  incumbent — 0038's pinned chains were greedy prefixes of worse basins (9953 −0.0805 ln vs
+  −0.0468; 23173 amd-FIRST; 3033 true fixpoint; new 97603/10637 cells). 48264 (−0.0277) and the
+  >1.0 s classes stay banked.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
 
@@ -258,6 +266,12 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   first systematic METIS census (69 heavy matrices × 8 seeds isolated, then 16 option variants ×
   64 seeds on the winners) → three pinned cells (14100:477382 floor240+imb0.05 s55 → 0.4246×;
   9953:287612 niparts16 s26 → 0.5825×; 23173:893304 imb0.05 s26 → 0.2032×). 65/69 matrices: METIS
+
+- [0038-fleet-p.md](experiments/0038-fleet-p.md) — **WIN (v2 proxy −0.001239, 0.789109→0.787870)**:
+  the 0037 terminal repass ITERATED to per-cell fixpoints with realization variants (MCS under 3
+  tie-break seeds + AMD default/no-dense) via per-cell round schedules `[(scan, mask)]`; round-2+
+  alone held ~0.22 ln on the old cells; 5 new re-census cells. Cap discipline trimmed 4 hot
+  schedules to ≤0.99 s local; −0.13 ln banked on >0.9 s rows. dense_alpha on fill graphs: dead.
 
 - [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
   pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress

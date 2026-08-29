@@ -9820,3 +9820,1178 @@ fn fo_mcs_check_score(
     }
     Some((elim, score))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FLEET-P (0038) — ITERATED terminal completion repass + realization variants.
+//
+// 0037 shipped ONE repass round (realize the final incumbent's completion);
+// its open follow-up: each ACCEPTED realization induces a fresh completion
+// nobody re-prices. probe_fleet_p_iter runs the repass to fixpoint (bounded
+// rounds) on top of the CURRENT order() — on rows already pinned by
+// `completion_repass_cell` its round 1 is the ship's round 2. It doubles as
+// the post-macro-RGSUB re-census when run over the whole corpus.
+// probe_fleet_p_var additionally prices realization VARIANTS per round (AMD
+// dense_alpha grid + MCS tie-break seeds) instead of only ship's pair.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One repass round on `perm`'s completion: filled graph → optional budgeted
+/// MINL deletion scan (`budget` ops, 0 = realize-only) → MCS + AMD
+/// realizations → best candidate STRICTLY below `cur`. Returns
+/// `(perm, flops, removed, which)` or None if nothing improves. Mirrors
+/// `terminal_completion_repass` (lnnz cap 2.4M, MINL_MAX_ROUNDS/MAX_COMMON)
+/// except both realizations are always priced.
+#[allow(clippy::type_complexity)]
+fn fleet_p_repass_round(
+    sp: &ScoringPattern,
+    perm: &[usize],
+    cur: u64,
+    budget: i64,
+) -> Option<(Vec<usize>, u64, usize, &'static str)> {
+    let n = sp.n;
+    let (fcp, fri) = filled_graph(sp, perm, 2_400_000)?;
+    let mut adj: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            fri[fcp[v] as usize..fcp[v + 1] as usize]
+                .iter()
+                .map(|&x| x as u32)
+                .collect()
+        })
+        .collect();
+    let mut removed_total = 0usize;
+    if budget > 0 {
+        let asort: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .filter(|&x| x as usize != v)
+                    .collect();
+                c.sort_unstable();
+                c
+            })
+            .collect();
+        let mut fill: Vec<(u32, u32)> = Vec::new();
+        for u in 0..n {
+            for &w in &adj[u] {
+                if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                    fill.push((u as u32, w));
+                }
+            }
+        }
+        let mut alive = vec![true; fill.len()];
+        let mut ops = budget;
+        for _ in 0..MINL_MAX_ROUNDS {
+            let mut removed_this = 0usize;
+            for ei in 0..fill.len() {
+                if ops < 0 {
+                    break;
+                }
+                if !alive[ei] {
+                    continue;
+                }
+                let (u, v) = fill[ei];
+                if minl_try_delete_edge(&mut adj, u, v, &mut ops, MINL_MAX_COMMON) {
+                    alive[ei] = false;
+                    removed_this += 1;
+                }
+            }
+            removed_total += removed_this;
+            if removed_this == 0 || ops < 0 {
+                break;
+            }
+        }
+    }
+    let mut best: Option<(Vec<usize>, u64, &'static str)> = None;
+    let mcs = minl_mcs_peo(n, &adj);
+    if is_bijection(&mcs, n) {
+        let f = flops_of(sp, &mcs);
+        if f < cur {
+            best = Some((mcs, f, "mcs"));
+        }
+    }
+    {
+        let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+        let mut ri: Vec<i32> = Vec::with_capacity(fri.len());
+        cp.push(0);
+        for row in &adj {
+            ri.extend(row.iter().map(|&v| v as i32));
+            cp.push(ri.len() as i32);
+        }
+        if let Some(p) = feral_ordering_core::CscPattern::new(n, &cp, &ri)
+            .and_then(|core| feral_amd::amd_order(&core).ok())
+        {
+            let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+            if is_bijection(&p, n) {
+                let f = flops_of(sp, &p);
+                let bar = best.as_ref().map_or(cur, |b| b.1);
+                if f < bar {
+                    best = Some((p, f, "amd"));
+                }
+            }
+        }
+    }
+    best.map(|(p, f, w)| (p, f, removed_total, w))
+}
+
+/// Iterated repass census. Env: `SSI_ITER_ROUNDS` (default 3),
+/// `SSI_ITER_BUDGET` (per-round deletion-scan ops, default 60M, 0 =
+/// realize-only), `SSI_ITER_MIN_N`, `SSI_PROBE_ONLY` (names or n:nnz keys).
+/// Per row prints one line per ACCEPTED round (round rel vs the round's own
+/// incumbent) then a TOTAL line (rel vs order()'s output, rounds accepted,
+/// order() wall time, repass wall time).
+#[test]
+#[ignore]
+fn probe_fleet_p_iter() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let rounds_max: usize = std::env::var("SSI_ITER_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let budget: i64 = std::env::var("SSI_ITER_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000_000);
+    let min_n: usize = std::env::var("SSI_ITER_MIN_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let max_n: usize = std::env::var("SSI_ITER_MAX_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n < min_n || n >= max_n {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let t_ord = Instant::now();
+        let mut perm = order(pat);
+        let ord_secs = t_ord.elapsed().as_secs_f64();
+        let inc = flops_of(&sp, &perm);
+        let mut cur = inc;
+        let t0 = Instant::now();
+        let mut accepted = 0usize;
+        for r in 1..=rounds_max {
+            let Some((p, f, removed, which)) = fleet_p_repass_round(&sp, &perm, cur, budget)
+            else {
+                break;
+            };
+            println!(
+                "{key}\t{name}\tround={r}\trel_r={:.6}\tremoved={removed}\twhich={which}",
+                f as f64 / cur as f64
+            );
+            perm = p;
+            cur = f;
+            accepted += 1;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "{key}\t{name}\tTOTAL\tinc={inc}\tfinal={cur}\trel={:.6}\trounds={accepted}\tord={ord_secs:.3}s\tcost={secs:.3}s",
+            cur as f64 / inc as f64
+        );
+    }
+}
+
+/// MCS with a selectable deterministic tie-break seed. `var` 0 = ship order
+/// (`minl_mcs_peo`: ids ascending pop first), 1 = ids descending, 2 = lowest
+/// initial degree pops first (ties by id). Only the initial bucket seeding
+/// differs; the in-run push order is shared.
+fn fleet_p_mcs_tievar(n: usize, adj: &[Vec<u32>], var: u8) -> Vec<usize> {
+    let init: Vec<u32> = match var {
+        1 => (0..n as u32).collect(),
+        2 => {
+            let mut v: Vec<u32> = (0..n as u32).collect();
+            v.sort_by_key(|&x| std::cmp::Reverse((adj[x as usize].len(), x)));
+            v
+        }
+        _ => (0..n as u32).rev().collect(),
+    };
+    let mut w = vec![0u32; n];
+    let mut vis = vec![false; n];
+    let mut buckets: Vec<Vec<u32>> = vec![init];
+    let mut maxw = 0usize;
+    let mut visit: Vec<usize> = Vec::with_capacity(n);
+    while visit.len() < n {
+        let Some(x) = buckets[maxw].pop() else {
+            if maxw == 0 {
+                break;
+            }
+            maxw -= 1;
+            continue;
+        };
+        let xu = x as usize;
+        if vis[xu] || (w[xu] as usize) != maxw {
+            continue;
+        }
+        vis[xu] = true;
+        visit.push(xu);
+        for &uw in &adj[xu] {
+            let u = uw as usize;
+            if !vis[u] {
+                w[u] += 1;
+                let nw = w[u] as usize;
+                if nw >= buckets.len() {
+                    buckets.resize_with(nw + 1, Vec::new);
+                }
+                buckets[nw].push(uw);
+                if nw > maxw {
+                    maxw = nw;
+                }
+            }
+        }
+    }
+    visit.reverse();
+    visit
+}
+
+/// Realization-variant pricing per repass round: at each round the completion
+/// (post optional scan) is realized through MCS tie-break seeds {0,1,2} and
+/// AMD options {default, (agg,0.5), (agg,0.75), (agg,1.5), (no-agg,-1)};
+/// every variant's flops is printed, the best strict improvement is accepted
+/// and iteration continues. Env: `SSI_ITER_ROUNDS`/`SSI_ITER_BUDGET`/
+/// `SSI_PROBE_ONLY` as in probe_fleet_p_iter.
+#[test]
+#[ignore]
+fn probe_fleet_p_var() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let rounds_max: usize = std::env::var("SSI_ITER_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let budget: i64 = std::env::var("SSI_ITER_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000_000);
+    const AMD_OPTS: [(bool, f64, &str); 4] = [
+        (true, 0.5, "amd_a0.5"),
+        (true, 0.75, "amd_a0.75"),
+        (true, 1.5, "amd_a1.5"),
+        (false, -1.0, "amd_nd"),
+    ];
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        } else {
+            continue; // variant probe is per-row only; require SSI_PROBE_ONLY
+        }
+        let sp = scoring_pattern(pat);
+        let mut perm = order(pat);
+        let inc = flops_of(&sp, &perm);
+        let mut cur = inc;
+        for r in 1..=rounds_max {
+            let Some((fcp, fri)) = filled_graph(&sp, &perm, 2_400_000) else {
+                println!("{key}\t{name}\tround={r}\tSKIP lnnz");
+                break;
+            };
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            if budget > 0 {
+                let asort: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .filter(|&x| x as usize != v)
+                            .collect();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect();
+                let mut fill: Vec<(u32, u32)> = Vec::new();
+                for u in 0..n {
+                    for &w in &adj[u] {
+                        if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                            fill.push((u as u32, w));
+                        }
+                    }
+                }
+                let mut alive = vec![true; fill.len()];
+                let mut ops = budget;
+                for _ in 0..MINL_MAX_ROUNDS {
+                    let mut removed_this = 0usize;
+                    for ei in 0..fill.len() {
+                        if ops < 0 {
+                            break;
+                        }
+                        if !alive[ei] {
+                            continue;
+                        }
+                        let (u, v) = fill[ei];
+                        if minl_try_delete_edge(&mut adj, u, v, &mut ops, MINL_MAX_COMMON) {
+                            alive[ei] = false;
+                            removed_this += 1;
+                        }
+                    }
+                    if removed_this == 0 || ops < 0 {
+                        break;
+                    }
+                }
+            }
+            let mut best: Option<(Vec<usize>, u64, String)> = None;
+            let mut line = format!("{key}\t{name}\tround={r}\tcur={cur}");
+            for var in 0u8..3 {
+                let p = fleet_p_mcs_tievar(n, &adj, var);
+                if is_bijection(&p, n) {
+                    let f = flops_of(&sp, &p);
+                    line.push_str(&format!("\tmcs{var}={:.6}", f as f64 / cur as f64));
+                    if f < best.as_ref().map_or(cur, |b| b.1) {
+                        best = Some((p, f, format!("mcs{var}")));
+                    }
+                }
+            }
+            {
+                let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+                let mut ri: Vec<i32> = Vec::with_capacity(fri.len());
+                cp.push(0);
+                for row in &adj {
+                    ri.extend(row.iter().map(|&v| v as i32));
+                    cp.push(ri.len() as i32);
+                }
+                if let Some(core) = feral_ordering_core::CscPattern::new(n, &cp, &ri) {
+                    if let Ok(p) = feral_amd::amd_order(&core) {
+                        let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                        if is_bijection(&p, n) {
+                            let f = flops_of(&sp, &p);
+                            line.push_str(&format!("\tamd_def={:.6}", f as f64 / cur as f64));
+                            if f < best.as_ref().map_or(cur, |b| b.1) {
+                                best = Some((p, f, "amd_def".to_string()));
+                            }
+                        }
+                    }
+                    for (agg, alpha, tag) in AMD_OPTS {
+                        let opts = feral_amd::AmdOptions { aggressive: agg, dense_alpha: alpha };
+                        if let Ok((p, _)) = feral_amd::amd_order_opts(&core, &opts) {
+                            let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                            if is_bijection(&p, n) {
+                                let f = flops_of(&sp, &p);
+                                line.push_str(&format!("\t{tag}={:.6}", f as f64 / cur as f64));
+                                if f < best.as_ref().map_or(cur, |b| b.1) {
+                                    best = Some((p, f, tag.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match best {
+                Some((p, f, w)) => {
+                    println!("{line}\tACCEPT={w}");
+                    perm = p;
+                    cur = f;
+                }
+                None => {
+                    println!("{line}\tACCEPT=none");
+                    break;
+                }
+            }
+        }
+        println!(
+            "{key}\t{name}\tTOTAL\tinc={inc}\tfinal={cur}\trel={:.6}",
+            cur as f64 / inc as f64
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FLEET-R (0040) — repass realization-path PROFILER.
+//
+// 0038 banked ~−0.13 ln of measured repass wins because the rows cost
+// 1.13–1.99 s local at full walk depth. Before optimizing anything, measure
+// WHERE each round's time goes on those exact rows: symbolic factorization
+// (permute+etree+counts, re-derived from scratch every round), the fill-graph
+// merge+scatter+sort inside `filled_graph`, the Vec<Vec> adjacency build, the
+// deletion scan's asort rebuild + edge walk, each realization variant
+// (MCS×3 tie-break seeds, AMD, AMD-nd incl. the CSC rebuild), and each exact
+// `flops_of` rescore. The walk itself is probe_fleet_p_var's minus the dead
+// dense-alpha grid (the ship variant set), so accepted chains reproduce
+// 0038's banked endpoints.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-phase timing of the iterated variant repass. Env: `SSI_ITER_ROUNDS`
+/// (default 12), `SSI_ITER_BUDGET` (default 60M, 0 = realize-only),
+/// `SSI_PROBE_ONLY` (names, n:nnz keys, or bare n values; REQUIRED).
+#[test]
+#[ignore]
+fn probe_fleet_r_prof() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Vec<String> = std::env::var("SSI_PROBE_ONLY")
+        .expect("set SSI_PROBE_ONLY")
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let rounds_max: usize = std::env::var("SSI_ITER_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let budget: i64 = std::env::var("SSI_ITER_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000_000);
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if !only.iter().any(|x| x == name || *x == key || *x == n.to_string()) {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let t_ord = Instant::now();
+        let mut perm = order(pat);
+        let ord_s = t_ord.elapsed().as_secs_f64();
+        let inc = flops_of(&sp, &perm);
+        let mut cur = inc;
+        let t_walk = Instant::now();
+        for r in 1..=rounds_max {
+            // Symbolic-only re-derivation cost (the part an incremental
+            // scheme could avoid) — measured standalone, then the real
+            // filled_graph (which repeats it internally) timed as a whole.
+            let t = Instant::now();
+            let permuted = permute_pattern(&sp, &perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let counts = column_counts_gnp(&permuted, &etree);
+            let lnnz: usize = counts.iter().sum();
+            let symb_ms = ms(t);
+            drop((permuted, etree, counts));
+            let t = Instant::now();
+            let Some((fcp, fri)) = filled_graph(&sp, &perm, 2_400_000) else {
+                println!("{key}\t{name}\tround={r}\tSKIP lnnz={lnnz}");
+                break;
+            };
+            let fill_ms = ms(t);
+            let t = Instant::now();
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let adj_ms = ms(t);
+            let mut asort_ms = 0.0;
+            let mut scan_ms = 0.0;
+            let mut removed_total = 0usize;
+            if budget > 0 {
+                let t = Instant::now();
+                let asort: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .filter(|&x| x as usize != v)
+                            .collect();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect();
+                let mut fill: Vec<(u32, u32)> = Vec::new();
+                for u in 0..n {
+                    for &w in &adj[u] {
+                        if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                            fill.push((u as u32, w));
+                        }
+                    }
+                }
+                asort_ms = ms(t);
+                let t = Instant::now();
+                let mut alive = vec![true; fill.len()];
+                let mut ops = budget;
+                for _ in 0..MINL_MAX_ROUNDS {
+                    let mut removed_this = 0usize;
+                    for ei in 0..fill.len() {
+                        if ops < 0 {
+                            break;
+                        }
+                        if !alive[ei] {
+                            continue;
+                        }
+                        let (u, v) = fill[ei];
+                        if minl_try_delete_edge(&mut adj, u, v, &mut ops, MINL_MAX_COMMON) {
+                            alive[ei] = false;
+                            removed_this += 1;
+                        }
+                    }
+                    removed_total += removed_this;
+                    if removed_this == 0 || ops < 0 {
+                        break;
+                    }
+                }
+                scan_ms = ms(t);
+            }
+            let mut best: Option<(Vec<usize>, u64, String)> = None;
+            let mut line = format!(
+                "{key}\tround={r}\tlnnz={lnnz}\tsymb={symb_ms:.1}\tfill={fill_ms:.1}\tadj={adj_ms:.1}\tasort={asort_ms:.1}\tscan={scan_ms:.1}(rm={removed_total})"
+            );
+            let mut score_ms = 0.0;
+            for var in 0u8..3 {
+                let t = Instant::now();
+                let p = fleet_p_mcs_tievar(n, &adj, var);
+                let real_ms = ms(t);
+                if is_bijection(&p, n) {
+                    let t = Instant::now();
+                    let f = flops_of(&sp, &p);
+                    score_ms += ms(t);
+                    line.push_str(&format!("\tmcs{var}={real_ms:.1}/{:.6}", f as f64 / cur as f64));
+                    if f < best.as_ref().map_or(cur, |b| b.1) {
+                        best = Some((p, f, format!("mcs{var}")));
+                    }
+                }
+            }
+            {
+                let t = Instant::now();
+                let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+                let mut ri: Vec<i32> = Vec::with_capacity(fri.len());
+                cp.push(0);
+                for row in &adj {
+                    ri.extend(row.iter().map(|&v| v as i32));
+                    cp.push(ri.len() as i32);
+                }
+                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri);
+                let csc_ms = ms(t);
+                line.push_str(&format!("\tcsc={csc_ms:.1}"));
+                if let Some(core) = core {
+                    let t = Instant::now();
+                    let amd = feral_amd::amd_order(&core).ok();
+                    let amd_ms = ms(t);
+                    if let Some(p) = amd {
+                        let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                        if is_bijection(&p, n) {
+                            let t = Instant::now();
+                            let f = flops_of(&sp, &p);
+                            score_ms += ms(t);
+                            line.push_str(&format!("\tamd={amd_ms:.1}/{:.6}", f as f64 / cur as f64));
+                            if f < best.as_ref().map_or(cur, |b| b.1) {
+                                best = Some((p, f, "amd".to_string()));
+                            }
+                        }
+                    }
+                    let t = Instant::now();
+                    let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                    let amdnd = feral_amd::amd_order_opts(&core, &o).ok();
+                    let amdnd_ms = ms(t);
+                    if let Some((p, _)) = amdnd {
+                        let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                        if is_bijection(&p, n) {
+                            let t = Instant::now();
+                            let f = flops_of(&sp, &p);
+                            score_ms += ms(t);
+                            line.push_str(&format!("\tamdnd={amdnd_ms:.1}/{:.6}", f as f64 / cur as f64));
+                            if f < best.as_ref().map_or(cur, |b| b.1) {
+                                best = Some((p, f, "amd_nd".to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            line.push_str(&format!("\tscore={score_ms:.1}"));
+            match best {
+                Some((p, f, w)) => {
+                    println!("{line}\tACCEPT={w}");
+                    perm = p;
+                    cur = f;
+                }
+                None => {
+                    println!("{line}\tACCEPT=none");
+                    break;
+                }
+            }
+        }
+        let walk_s = t_walk.elapsed().as_secs_f64();
+        println!(
+            "{key}\t{name}\tTOTAL\tinc={inc}\tfinal={cur}\trel={:.6}\tord={ord_s:.3}s\twalk={walk_s:.3}s",
+            cur as f64 / inc as f64
+        );
+    }
+}
+
+/// Deterministic supervariable compression of an undirected adjacency:
+/// vertices with IDENTICAL closed neighborhoods merge into one quotient
+/// vertex (rep = smallest member id). MEASURED DEAD on repass fill graphs
+/// (q == n on 9953/23173 — back-edges to earlier-eliminated vertices make
+/// every closed neighborhood unique); kept for the record.
+#[allow(dead_code)]
+fn fleet_r_quotient(n: usize, adj: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
+    // Closed-neighborhood hash: fold v and its sorted neighbors through FNV.
+    let mut hash = vec![0u64; n];
+    for v in 0..n {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut fold = |x: u32, h: &mut u64| {
+            *h ^= x as u64 + 1;
+            *h = h.wrapping_mul(0x100000001b3);
+        };
+        // closed neighborhood = sorted merge of adj[v] and {v}
+        let mut placed = false;
+        for &w in &adj[v] {
+            if !placed && (v as u32) < w {
+                fold(v as u32, &mut h);
+                placed = true;
+            }
+            fold(w, &mut h);
+        }
+        if !placed {
+            fold(v as u32, &mut h);
+        }
+        hash[v] = h;
+    }
+    // Exact equality of closed neighborhoods u,v (both sorted, self excluded
+    // from own list): lists minus {u,v} equal AND u,v adjacent (implied).
+    let closed_eq = |u: usize, v: usize| -> bool {
+        if adj[u].len() != adj[v].len() {
+            return false;
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        let (au, av) = (&adj[u], &adj[v]);
+        loop {
+            while i < au.len() && au[i] as usize == v {
+                i += 1;
+            }
+            while j < av.len() && av[j] as usize == u {
+                j += 1;
+            }
+            match (i < au.len(), j < av.len()) {
+                (false, false) => return true,
+                (true, true) => {
+                    if au[i] != av[j] {
+                        return false;
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                _ => return false,
+            }
+        }
+    };
+    // Group: sort ids by (deg, hash, id); scan runs of equal (deg, hash) and
+    // union exact-equal members onto the run's earliest matching rep.
+    let mut ids: Vec<u32> = (0..n as u32).collect();
+    ids.sort_unstable_by_key(|&v| (adj[v as usize].len(), hash[v as usize], v));
+    let mut rep: Vec<u32> = (0..n as u32).collect();
+    let mut run = 0usize;
+    while run < n {
+        let mut end = run + 1;
+        let v0 = ids[run] as usize;
+        while end < n {
+            let v = ids[end] as usize;
+            if adj[v].len() != adj[v0].len() || hash[v] != hash[v0] {
+                break;
+            }
+            end += 1;
+        }
+        // Within the run, match each member against known reps (runs are
+        // tiny in practice; quadratic within a run is fine).
+        let mut reps_here: Vec<u32> = Vec::new();
+        for k in run..end {
+            let v = ids[k];
+            let mut found = None;
+            for &r in &reps_here {
+                if closed_eq(v as usize, r as usize) {
+                    found = Some(r);
+                    break;
+                }
+            }
+            match found {
+                Some(r) => rep[v as usize] = r.min(v),
+                None => reps_here.push(v),
+            }
+        }
+        // Normalize: rep of a class = min id in class.
+        for k in run..end {
+            let v = ids[k] as usize;
+            let mut r = rep[v];
+            while rep[r as usize] != r {
+                r = rep[r as usize];
+            }
+            rep[v] = r;
+        }
+        run = end;
+    }
+    let mut qverts: Vec<u32> = (0..n as u32).filter(|&v| rep[v as usize] == v).collect();
+    qverts.sort_unstable();
+    let mut qidx = vec![u32::MAX; n];
+    for (qi, &v) in qverts.iter().enumerate() {
+        qidx[v as usize] = qi as u32;
+    }
+    let mut qadj: Vec<Vec<u32>> = vec![Vec::new(); qverts.len()];
+    for (qi, &v) in qverts.iter().enumerate() {
+        let mut row: Vec<u32> = adj[v as usize]
+            .iter()
+            .map(|&w| qidx[rep[w as usize] as usize])
+            .filter(|&q| q != qi as u32)
+            .collect();
+        row.sort_unstable();
+        row.dedup();
+        qadj[qi] = row;
+    }
+    (rep, qverts, qadj)
+}
+
+/// Expanded permutation from a quotient-vertex order: each quotient vertex
+/// emits its class members ascending by original id.
+fn fleet_r_expand(
+    n: usize,
+    rep: &[u32],
+    qverts: &[u32],
+    qorder: &[usize],
+) -> Vec<usize> {
+    let mut members: Vec<Vec<u32>> = vec![Vec::new(); qverts.len()];
+    let mut qidx = vec![u32::MAX; n];
+    for (qi, &v) in qverts.iter().enumerate() {
+        qidx[v as usize] = qi as u32;
+    }
+    for v in 0..n {
+        members[qidx[rep[v] as usize] as usize].push(v as u32);
+    }
+    let mut out = Vec::with_capacity(n);
+    for &q in qorder {
+        for &v in &members[q] {
+            out.push(v as usize);
+        }
+    }
+    out
+}
+
+/// Variant cost/quality sweep for the repass round — prices CHEAP candidate
+/// realizers against amd_nd (the measured cost whale): MCS tie-break seeds
+/// 0/1/2 + incumbent-seeded (3), AMD default, AMD {aggressive:false,
+/// dense_alpha: 1.5 / 3.0} (untried middle ground), amd_nd, and
+/// supervariable-compressed quotient realizations (amd + amd_nd on the
+/// quotient, expanded). Iterates accepting the best per round like the ship
+/// walk. Env: SSI_ITER_ROUNDS (default 10), SSI_ITER_BUDGET (default 0 =
+/// realize-only), SSI_PROBE_ONLY (required; names, n:nnz, or bare n).
+#[test]
+#[ignore]
+fn probe_fleet_r_var2() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Vec<String> = std::env::var("SSI_PROBE_ONLY")
+        .expect("set SSI_PROBE_ONLY")
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let rounds_max: usize = std::env::var("SSI_ITER_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let budget: i64 = std::env::var("SSI_ITER_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // SSI_VAR_MASK: comma list of variant tags to COMPUTE+ACCEPT (others are
+    // skipped entirely, so the walk and its wall time match what a pinned
+    // schedule restricted to those variants would replay). Default: all.
+    let vmask: Option<Vec<String>> = std::env::var("SSI_VAR_MASK").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    // SSI_ITER_BUDGETS / SSI_VAR_MASKS: PER-ROUND overrides ('|'-separated
+    // masks, comma-separated budgets), enabling exact replay of a mixed
+    // pinned schedule (e.g. realize-only rounds then scan rounds). Rounds
+    // beyond the lists fall back to the global budget / mask.
+    let budgets_per: Option<Vec<i64>> = std::env::var("SSI_ITER_BUDGETS").ok().map(|s| {
+        s.split(',')
+            .filter(|x| !x.trim().is_empty())
+            .map(|x| x.trim().parse().expect("SSI_ITER_BUDGETS"))
+            .collect()
+    });
+    let masks_per: Option<Vec<Vec<String>>> = std::env::var("SSI_VAR_MASKS").ok().map(|s| {
+        s.split('|')
+            .map(|grp| {
+                grp.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .collect()
+    });
+    // SSI_REPASS_OFF=1: suppress the shipped repass inside order() so walks
+    // start from the PRE-repass incumbent (schedule replacement design).
+    if std::env::var("SSI_REPASS_OFF").is_ok_and(|v| v == "1") {
+        REPASS_OFF.with(|c| c.set(true));
+    }
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if !only.iter().any(|x| x == name || *x == key || *x == n.to_string()) {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let mut perm = order(pat);
+        let inc = flops_of(&sp, &perm);
+        let mut cur = inc;
+        let t_walk = Instant::now();
+        for r in 1..=rounds_max {
+            let budget = budgets_per
+                .as_ref()
+                .and_then(|b| b.get(r - 1).copied())
+                .unwrap_or(budget);
+            let rmask = masks_per.as_ref().and_then(|m| m.get(r - 1)).or(vmask.as_ref());
+            let allow = |tag: &str| rmask.is_none_or(|m| m.iter().any(|x| x == tag));
+            let Some((fcp, fri)) = filled_graph(&sp, &perm, 2_400_000) else {
+                println!("{key}\tround={r}\tSKIP");
+                break;
+            };
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            if budget > 0 {
+                let asort: Vec<Vec<u32>> = (0..n)
+                    .map(|v| {
+                        let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                            .iter()
+                            .map(|&x| x as u32)
+                            .filter(|&x| x as usize != v)
+                            .collect();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect();
+                let mut fill: Vec<(u32, u32)> = Vec::new();
+                for u in 0..n {
+                    for &w in &adj[u] {
+                        if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                            fill.push((u as u32, w));
+                        }
+                    }
+                }
+                let mut alive = vec![true; fill.len()];
+                let mut ops = budget;
+                for _ in 0..MINL_MAX_ROUNDS {
+                    let mut removed_this = 0usize;
+                    for ei in 0..fill.len() {
+                        if ops < 0 {
+                            break;
+                        }
+                        if !alive[ei] {
+                            continue;
+                        }
+                        let (u, v) = fill[ei];
+                        if minl_try_delete_edge(&mut adj, u, v, &mut ops, MINL_MAX_COMMON) {
+                            alive[ei] = false;
+                            removed_this += 1;
+                        }
+                    }
+                    if removed_this == 0 || ops < 0 {
+                        break;
+                    }
+                }
+            }
+            let mut best: Option<(Vec<usize>, u64, String)> = None;
+            let mut line = format!("{key}\tround={r}");
+            let mut offer = |p: Vec<usize>,
+                             tag: &str,
+                             t_ms: f64,
+                             best: &mut Option<(Vec<usize>, u64, String)>,
+                             line: &mut String| {
+                if is_bijection(&p, n) {
+                    let f = flops_of(&sp, &p);
+                    line.push_str(&format!("\t{tag}={t_ms:.1}/{:.6}", f as f64 / cur as f64));
+                    if f < best.as_ref().map_or(cur, |b| b.1) {
+                        *best = Some((p, f, tag.to_string()));
+                    }
+                }
+            };
+            for var in 0u8..3 {
+                if !allow(&format!("mcs{var}")) {
+                    continue;
+                }
+                let t = Instant::now();
+                let p = fleet_p_mcs_tievar(n, &adj, var);
+                let tm = ms(t);
+                offer(p, &format!("mcs{var}"), tm, &mut best, &mut line);
+            }
+            if allow("mcs3") {
+                // mcs3: incumbent-seeded — initial stack pops the incumbent's
+                // LAST-eliminated vertex first (MCS visit order is reverse
+                // elimination order), so ties follow the current perm.
+                let t = Instant::now();
+                let init: Vec<u32> = perm.iter().map(|&v| v as u32).collect();
+                let p = {
+                    let mut w = vec![0u32; n];
+                    let mut vis = vec![false; n];
+                    let mut buckets: Vec<Vec<u32>> = vec![init];
+                    let mut maxw = 0usize;
+                    let mut visit: Vec<usize> = Vec::with_capacity(n);
+                    while visit.len() < n {
+                        let Some(x) = buckets[maxw].pop() else {
+                            if maxw == 0 {
+                                break;
+                            }
+                            maxw -= 1;
+                            continue;
+                        };
+                        let xu = x as usize;
+                        if vis[xu] || (w[xu] as usize) != maxw {
+                            continue;
+                        }
+                        vis[xu] = true;
+                        visit.push(xu);
+                        for &uw in &adj[xu] {
+                            let u = uw as usize;
+                            if !vis[u] {
+                                w[u] += 1;
+                                let nw = w[u] as usize;
+                                if nw >= buckets.len() {
+                                    buckets.resize_with(nw + 1, Vec::new);
+                                }
+                                buckets[nw].push(uw);
+                                if nw > maxw {
+                                    maxw = nw;
+                                }
+                            }
+                        }
+                    }
+                    visit.reverse();
+                    visit
+                };
+                let tm = ms(t);
+                offer(p, "mcs3", tm, &mut best, &mut line);
+            }
+            if allow("amd") || allow("andA1.5") || allow("andA3") || allow("amdnd") {
+                let t = Instant::now();
+                let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+                let mut ri: Vec<i32> = Vec::with_capacity(fri.len());
+                cp.push(0);
+                for row in &adj {
+                    ri.extend(row.iter().map(|&v| v as i32));
+                    cp.push(ri.len() as i32);
+                }
+                let core = feral_ordering_core::CscPattern::new(n, &cp, &ri);
+                let csc_ms = ms(t);
+                line.push_str(&format!("\tcsc={csc_ms:.1}"));
+                if let Some(core) = core {
+                    if allow("amd") {
+                        let t = Instant::now();
+                        let r_amd = feral_amd::amd_order(&core).ok();
+                        let tm = ms(t);
+                        if let Some(p) = r_amd {
+                            offer(
+                                p.into_iter().map(|v| v as usize).collect(),
+                                "amd",
+                                tm,
+                                &mut best,
+                                &mut line,
+                            );
+                        }
+                    }
+                    for (alpha, tag) in [(1.5f64, "andA1.5"), (3.0, "andA3")] {
+                        if !allow(tag) {
+                            continue;
+                        }
+                        let t = Instant::now();
+                        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: alpha };
+                        let rr = feral_amd::amd_order_opts(&core, &o).ok();
+                        let tm = ms(t);
+                        if let Some((p, _)) = rr {
+                            offer(
+                                p.into_iter().map(|v| v as usize).collect(),
+                                tag,
+                                tm,
+                                &mut best,
+                                &mut line,
+                            );
+                        }
+                    }
+                    if allow("amdnd") {
+                        let t = Instant::now();
+                        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                        let rr = feral_amd::amd_order_opts(&core, &o).ok();
+                        let tm = ms(t);
+                        if let Some((p, _)) = rr {
+                            offer(
+                                p.into_iter().map(|v| v as usize).collect(),
+                                "amdnd",
+                                tm,
+                                &mut best,
+                                &mut line,
+                            );
+                        }
+                    }
+                }
+            }
+            if allow("samd") || allow("samdnd") {
+                // Supernode quotient: fundamental-supernode chains of the
+                // incumbent completion (Liu–Ng–Peyton absorbed test, as in
+                // pharmakos_blame) collapse to single quotient vertices;
+                // amd/amd_nd order the quotient; members expand in incumbent
+                // relative order. The point: amd_nd's cost on the FULL fill
+                // graph is the round whale — the quotient is much smaller.
+                let t = Instant::now();
+                let permuted = permute_pattern(&sp, &perm);
+                let etree = EliminationTree::from_pattern(&permuted);
+                let counts = column_counts_gnp(&permuted, &etree);
+                let children = etree.children();
+                let mut absorbed = vec![false; n];
+                for p in 0..n {
+                    if children[p].len() == 1 {
+                        let j = children[p][0];
+                        if counts[j] == counts[p] + 1 {
+                            absorbed[p] = true;
+                        }
+                    }
+                }
+                let mut rank = vec![0usize; n];
+                for (r_, &v) in perm.iter().enumerate() {
+                    rank[v] = r_;
+                }
+                // snode id per RANK: an absorbed rank joins its unique
+                // child's snode (child rank < parent rank in the etree).
+                let mut snode = vec![usize::MAX; n];
+                let mut q = 0usize;
+                for r_ in 0..n {
+                    if absorbed[r_] {
+                        snode[r_] = snode[children[r_][0]];
+                    } else {
+                        snode[r_] = q;
+                        q += 1;
+                    }
+                }
+                // Quotient adjacency from the (post-scan) fill adjacency.
+                let mut qadj: Vec<Vec<u32>> = vec![Vec::new(); q];
+                for v in 0..n {
+                    let sv = snode[rank[v]];
+                    for &w in &adj[v] {
+                        let sw = snode[rank[w as usize]];
+                        if sw != sv {
+                            qadj[sv].push(sw as u32);
+                        }
+                    }
+                }
+                for row in qadj.iter_mut() {
+                    row.sort_unstable();
+                    row.dedup();
+                }
+                let mut qcp: Vec<i32> = Vec::with_capacity(q + 1);
+                let mut qri: Vec<i32> = Vec::new();
+                qcp.push(0);
+                for row in &qadj {
+                    qri.extend(row.iter().map(|&v| v as i32));
+                    qcp.push(qri.len() as i32);
+                }
+                // members of each snode, ascending rank = incumbent order.
+                let mut members: Vec<Vec<u32>> = vec![Vec::new(); q];
+                for r_ in 0..n {
+                    members[snode[r_]].push(perm[r_] as u32);
+                }
+                let quot_ms = ms(t);
+                line.push_str(&format!("\tq={q}({quot_ms:.1})"));
+                let expand = |qorder: &[usize]| -> Vec<usize> {
+                    let mut out = Vec::with_capacity(n);
+                    for &s in qorder {
+                        for &v in &members[s] {
+                            out.push(v as usize);
+                        }
+                    }
+                    out
+                };
+                if let Some(core) = feral_ordering_core::CscPattern::new(q, &qcp, &qri) {
+                    let t = Instant::now();
+                    let r_amd = feral_amd::amd_order(&core).ok();
+                    let tm = ms(t);
+                    if let Some(p) = r_amd {
+                        let qorder: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                        if qorder.len() == q {
+                            offer(expand(&qorder), "samd", quot_ms + tm, &mut best, &mut line);
+                        }
+                    }
+                    let t = Instant::now();
+                    let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                    let rr = feral_amd::amd_order_opts(&core, &o).ok();
+                    let tm = ms(t);
+                    if let Some((p, _)) = rr {
+                        let qorder: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                        if qorder.len() == q {
+                            offer(expand(&qorder), "samdnd", quot_ms + tm, &mut best, &mut line);
+                        }
+                    }
+                }
+            }
+            match best {
+                Some((p, f, w)) => {
+                    println!("{line}\tACCEPT={w}");
+                    perm = p;
+                    cur = f;
+                }
+                None => {
+                    println!("{line}\tACCEPT=none");
+                    break;
+                }
+            }
+        }
+        let walk_s = t_walk.elapsed().as_secs_f64();
+        println!(
+            "{key}\t{name}\tTOTAL\tinc={inc}\tfinal={cur}\trel={:.6}\twalk={walk_s:.3}s",
+            cur as f64 / inc as f64
+        );
+    }
+}
