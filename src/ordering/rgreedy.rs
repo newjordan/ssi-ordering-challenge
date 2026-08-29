@@ -1089,7 +1089,7 @@ pub(crate) fn simplicial_promotion(
     seed: &[usize],
     budget: i64,
 ) -> Option<Vec<usize>> {
-    const MAX_DISTANCE: usize = 16;
+    const MAX_DISTANCE: usize = 24;
     const MAX_PROMOTIONS: usize = 256;
 
     struct PrechargedBudget {
@@ -1180,7 +1180,7 @@ pub(crate) fn simplicial_promotion(
         let last = (k + MAX_DISTANCE).min(n - 1);
         let mut best: Option<(u32, usize, usize)> = None;
 
-        for (j, &v) in cur.iter().enumerate().take(last + 1).skip(k + 2) {
+        for (j, &v) in cur.iter().enumerate().take(last + 1).skip(k + 1) {
             // Position/id reads, degree comparison, and adjacency membership.
             if !work.charge(4) {
                 return None;
@@ -1192,12 +1192,17 @@ pub(crate) fn simplicial_promotion(
                 continue;
             }
 
-            let deficiency_cost = (degree as usize + 1)
-                .saturating_mul(2usize.saturating_mul(w).saturating_add(4));
-            if !work.charge(deficiency_cost) {
-                return None;
-            }
-            if game.deficiency(v) == 0 {
+            let is_simplicial = if degree <= 1 {
+                true
+            } else {
+                let deficiency_cost = (degree as usize + 1)
+                    .saturating_mul(2usize.saturating_mul(w).saturating_add(4));
+                if !work.charge(deficiency_cost) {
+                    return None;
+                }
+                game.deficiency(v) == 0
+            };
+            if is_simplicial {
                 let key = (degree, j, v);
                 if best.is_none_or(|old| key < old) {
                     best = Some(key);
