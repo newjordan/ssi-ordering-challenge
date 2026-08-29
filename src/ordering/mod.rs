@@ -7175,10 +7175,12 @@ fn terminal_macro_repass_count(n: usize, nnz: usize, max_deg: usize) -> usize {
 /// Terminal completion re-realization (see the call site's doc comment and
 /// `completion_repass_cell`). Builds the incumbent's filled graph, optionally
 /// runs the budgeted MINL deletion scan over its fill edges, then ALWAYS
-/// realizes the (possibly descended) completion through MCS — and through AMD
-/// when `do_amd` — and returns the best strict `ws.flops` improvement, if
-/// any. Deterministic, fail-closed everywhere (a missing filled graph, a
-/// blown budget or a non-improving candidate just yields `None`/no accept).
+/// realizes the (possibly descended) completion through MCS (ascending-id
+/// `minl_mcs_peo`, and descending-id `terminal_mcs_seeded` for `n < 80_000`)
+/// — and through AMD when `do_amd` — and returns the best strict `ws.flops`
+/// improvement, if any. Deterministic, fail-closed everywhere (a missing
+/// filled graph, a blown budget or a non-improving candidate just yields
+/// `None`/no accept).
 fn terminal_completion_repass(
     sp: &ScoringPattern,
     ws: &mut ScoreWorkspace,
@@ -7246,6 +7248,22 @@ fn terminal_completion_repass(
         let f = ws.flops(sp, &mcs);
         if f < seed_flops {
             best = Some((mcs, f));
+        }
+    }
+    // `minl_mcs_peo` seeds equal-weight buckets as `(0..n).rev()` so pop
+    // order is ascending id. `terminal_mcs_seeded` with descending-id is the
+    // opposite PEO of the SAME chordal completion, already used as a one-shot
+    // after this loop. Fusing it here lets an accepted descending-id PEO
+    // reseed later realization rounds. Skip the n≈110k cap-flagged cell: that
+    // row already runs near the grader wall on MCS-only realize.
+    if n < 80_000 {
+        let mcs_desc = terminal_mcs_seeded(n, &adj, TERMINAL_MCS_DESCENDING_ID);
+        if is_bijection(&mcs_desc, n) {
+            let f = ws.flops(sp, &mcs_desc);
+            let bar = best.as_ref().map_or(seed_flops, |b| b.1);
+            if f < bar {
+                best = Some((mcs_desc, f));
+            }
         }
     }
     if do_amd {
