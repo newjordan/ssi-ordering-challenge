@@ -995,27 +995,164 @@ pub(crate) fn adjacent_pair_descent(
     sweeps: usize,
     budget: i64,
 ) -> Option<Vec<usize>> {
+    adjacent_window_descent(n, col_ptr, row_idx, seed, sweeps, budget, false).0
+}
+
+/// The current pair descent followed by one exact consecutive-three-pivot
+/// descent, under the SAME cumulative operation budget.
+///
+/// The three-pivot phase runs only after an exact replay proves that every
+/// adjacent transposition of the pair result is non-improving.  It evaluates
+/// all six orders of every length-three window.  A strict three-pivot win can
+/// still exist because two zero-delta adjacent moves may hide a later strict
+/// move (the four-vertex witness in the tests is the smallest example).
+///
+/// Overlapping winning windows cannot all be applied at once, so a tiny
+/// weighted-interval DP selects the maximum total exact local decrease among
+/// disjoint windows.  Eliminating the same three-vertex SET leaves the same
+/// residual graph in every order; consequently those disjoint local decreases
+/// add exactly, and the caller's trusted whole-order scorer remains the final
+/// admission gate.
+pub(crate) fn adjacent_pair_then_triple_descent(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    sweeps: usize,
+    budget: i64,
+) -> Option<Vec<usize>> {
+    adjacent_window_descent(n, col_ptr, row_idx, seed, sweeps, budget, true).0
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WindowDescentStats {
+    pair_fixed: bool,
+    triple_witnesses: usize,
+    triple_selected: usize,
+    local_gain: u64,
+    ops: i64,
+}
+
+#[derive(Clone, Copy)]
+struct TripleMove {
+    order: [u8; 3],
+    gain: u64,
+}
+
+impl Default for TripleMove {
+    fn default() -> Self {
+        Self {
+            order: [0, 1, 2],
+            gain: 0,
+        }
+    }
+}
+
+const TRIPLE_ORDERS: [[u8; 3]; 6] = [
+    [0, 1, 2],
+    [1, 0, 2],
+    [0, 2, 1],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+];
+
+/// Exact contribution of three pivots in `order`, without mutating `game`.
+///
+/// Only rows for the three pivots are needed.  If `x` is eliminated first,
+/// another pivot `y` absorbs `N(x)` iff `xy` is an edge; applying that identity
+/// twice yields the exact degrees of the second and third pivots.  The work is
+/// charged as word operations so the caller's deterministic budget remains a
+/// real upper bound rather than an unmetered side path.
+fn triple_local_cost(game: &mut Game<'_>, pivots: [usize; 3], order: [u8; 3]) -> u64 {
+    let x = pivots[order[0] as usize];
+    let y = pivots[order[1] as usize];
+    let z = pivots[order[2] as usize];
+    let w = game.w;
+    let xy = game.adj[x * w + (y >> 6)] & (1u64 << (y & 63)) != 0;
+    let xz = game.adj[x * w + (z >> 6)] & (1u64 << (z & 63)) != 0;
+    let yz_after_x = game.adj[y * w + (z >> 6)] & (1u64 << (z & 63)) != 0
+        || (xy && xz);
+
+    let mut dy = 0u64;
+    let mut dz = 0u64;
+    for q in 0..w {
+        let ax = game.adj[x * w + q];
+        let mut ay = game.adj[y * w + q];
+        let mut az = game.adj[z * w + q];
+        if xy {
+            ay |= ax;
+        }
+        if xz {
+            az |= ax;
+        }
+        if q == x >> 6 {
+            let bit = !(1u64 << (x & 63));
+            ay &= bit;
+            az &= bit;
+        }
+        if q == y >> 6 {
+            ay &= !(1u64 << (y & 63));
+        }
+        if q == z >> 6 {
+            az &= !(1u64 << (z & 63));
+        }
+        dy += ay.count_ones() as u64;
+        if yz_after_x {
+            az |= ay;
+            if q == y >> 6 {
+                az &= !(1u64 << (y & 63));
+            }
+            if q == z >> 6 {
+                az &= !(1u64 << (z & 63));
+            }
+        }
+        dz += az.count_ones() as u64;
+    }
+    game.ops += (3 * w + 16) as i64;
+    let cx = game.deg[x] as u64 + 1;
+    let cy = dy + 1;
+    let cz = dz + 1;
+    cx * cx + cy * cy + cz * cz
+}
+
+fn adjacent_window_descent(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    sweeps: usize,
+    budget: i64,
+    triples: bool,
+) -> (Option<Vec<usize>>, WindowDescentStats) {
+    let mut stats = WindowDescentStats::default();
     if n < 2 || seed.len() != n || sweeps == 0 || budget <= 0 {
-        return None;
+        return (None, stats);
     }
     let mut seen = vec![false; n];
     for &v in seed {
         if v >= n || seen[v] {
-            return None;
+            return (None, stats);
         }
         seen[v] = true;
     }
 
-    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
-    let mut game = Game::new(n, &adj0)?;
+    let Some(adj0) = Game::build_adj(n, col_ptr, row_idx) else {
+        return (None, stats);
+    };
+    let Some(mut game) = Game::new(n, &adj0) else {
+        return (None, stats);
+    };
     let mut cur = seed.to_vec();
     let mut next = Vec::with_capacity(n);
     let mut changed_any = false;
+    let mut unchanged_streak = 0usize;
 
     for sweep in 0..sweeps {
         game.reset();
         if game.ops > budget {
-            return None;
+            stats.ops = game.ops;
+            return (changed_any.then_some(cur), stats);
         }
         next.clear();
 
@@ -1025,7 +1162,8 @@ pub(crate) fn adjacent_pair_descent(
             next.push(v);
             game.eliminate(v);
             if game.ops > budget {
-                return None;
+                stats.ops = game.ops;
+                return (changed_any.then_some(cur), stats);
             }
             k = 1;
         }
@@ -1042,11 +1180,13 @@ pub(crate) fn adjacent_pair_descent(
             next.push(second);
             game.eliminate(first);
             if game.ops > budget {
-                return None;
+                stats.ops = game.ops;
+                return (changed_any.then_some(cur), stats);
             }
             game.eliminate(second);
             if game.ops > budget {
-                return None;
+                stats.ops = game.ops;
+                return (changed_any.then_some(cur), stats);
             }
             k += 2;
         }
@@ -1055,20 +1195,302 @@ pub(crate) fn adjacent_pair_descent(
             next.push(v);
             game.eliminate(v);
             if game.ops > budget {
-                return None;
+                stats.ops = game.ops;
+                return (changed_any.then_some(cur), stats);
             }
         }
 
         if changed {
             changed_any = true;
+            unchanged_streak = 0;
             std::mem::swap(&mut cur, &mut next);
+        } else {
+            unchanged_streak += 1;
+            if unchanged_streak == 2 {
+                break;
+            }
         }
     }
 
-    changed_any.then_some(cur)
+    let pair_result = changed_any.then(|| cur.clone());
+    if !triples || n < 3 {
+        stats.ops = game.ops;
+        return (pair_result, stats);
+    }
+
+    // One exact replay simultaneously (a) certifies the pair fixed point and
+    // (b) prices every three-pivot window.  If the shared budget is exhausted,
+    // preserve the already-computed pair result; the new path can therefore
+    // never delete an incumbent pair improvement.
+    game.reset();
+    if game.ops > budget {
+        stats.ops = game.ops;
+        return (pair_result, stats);
+    }
+    let mut moves = vec![TripleMove::default(); n];
+    for k in 0..n {
+        if k + 1 < n {
+            let a = cur[k];
+            let b = cur[k + 1];
+            let adjacent = game.adj[a * game.w + (b >> 6)] & (1u64 << (b & 63)) != 0;
+            game.ops += 4;
+            if adjacent && game.deg[b] < game.deg[a] {
+                stats.ops = game.ops;
+                return (pair_result, stats);
+            }
+        }
+
+        if k + 2 < n {
+            let pivots = [cur[k], cur[k + 1], cur[k + 2]];
+            let base = triple_local_cost(&mut game, pivots, TRIPLE_ORDERS[0]);
+            let left_swap = triple_local_cost(&mut game, pivots, TRIPLE_ORDERS[1]);
+            let right_swap = triple_local_cost(&mut game, pivots, TRIPLE_ORDERS[2]);
+            let mut best = base;
+            let mut best_order = TRIPLE_ORDERS[0];
+            for &order in &TRIPLE_ORDERS[3..] {
+                let f = triple_local_cost(&mut game, pivots, order);
+                if f < best {
+                    best = f;
+                    best_order = order;
+                }
+            }
+            // Both one-step neighbours must be non-improving: every accepted
+            // move is therefore a genuine three-pivot witness, not pair work
+            // that merely happened to be found by the larger evaluator.
+            if left_swap >= base && right_swap >= base && best < base {
+                moves[k] = TripleMove {
+                    order: best_order,
+                    gain: base - best,
+                };
+                stats.triple_witnesses += 1;
+            }
+            if game.ops > budget {
+                stats.ops = game.ops;
+                return (pair_result, stats);
+            }
+        }
+
+        game.eliminate(cur[k]);
+        if game.ops > budget {
+            stats.ops = game.ops;
+            return (pair_result, stats);
+        }
+    }
+    stats.pair_fixed = true;
+
+    // Maximum-weight packing of length-three windows.  Ties prefer `skip`, a
+    // fixed rule that makes the candidate byte-identical across runs.
+    let mut dp = vec![0u64; n + 3];
+    let mut take = vec![false; n];
+    for k in (0..n).rev() {
+        let skip = dp[k + 1];
+        let with = moves[k].gain.saturating_add(dp[k + 3]);
+        if moves[k].gain > 0 && with > skip {
+            dp[k] = with;
+            take[k] = true;
+        } else {
+            dp[k] = skip;
+        }
+    }
+    game.ops += (12 * n) as i64;
+    if dp[0] == 0 || game.ops > budget {
+        stats.ops = game.ops;
+        return (pair_result, stats);
+    }
+
+    let mut cand = cur.clone();
+    let mut k = 0usize;
+    while k + 2 < n {
+        if take[k] {
+            let old = [cur[k], cur[k + 1], cur[k + 2]];
+            let order = moves[k].order;
+            cand[k] = old[order[0] as usize];
+            cand[k + 1] = old[order[1] as usize];
+            cand[k + 2] = old[order[2] as usize];
+            stats.triple_selected += 1;
+            k += 3;
+        } else {
+            k += 1;
+        }
+    }
+    stats.local_gain = dp[0];
+    stats.ops = game.ops;
+    (Some(cand), stats)
+}
+
+#[cfg(test)]
+pub(crate) fn adjacent_pair_then_triple_stats(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    sweeps: usize,
+    budget: i64,
+) -> (Option<Vec<usize>>, bool, usize, usize, u64, i64) {
+    let (perm, s) = adjacent_window_descent(n, col_ptr, row_idx, seed, sweeps, budget, true);
+    (
+        perm,
+        s.pair_fixed,
+        s.triple_witnesses,
+        s.triple_selected,
+        s.local_gain,
+        s.ops,
+    )
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+pub(crate) fn simplicial_promotion(
+    n: usize,
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    seed: &[usize],
+    budget: i64,
+) -> Option<Vec<usize>> {
+    const MAX_DISTANCE: usize = 16;
+    const MAX_PROMOTIONS: usize = 256;
+
+    struct PrechargedBudget {
+        remaining: i64,
+    }
+    impl PrechargedBudget {
+        fn charge(&mut self, cost: usize) -> bool {
+            let Ok(cost) = i64::try_from(cost) else {
+                return false;
+            };
+            if cost > self.remaining {
+                return false;
+            }
+            self.remaining -= cost;
+            true
+        }
+    }
+
+    if n < 3 || n > MAX_N || budget <= 0 || seed.len() != n || col_ptr.len() != n + 1 {
+        return None;
+    }
+    let mut work = PrechargedBudget { remaining: budget };
+
+    // Reserve the complete validation scan before touching caller-provided
+    // offsets: offsets, rows, seed, and initialization of the seen set.
+    // Saturation turns impossible sizes into a clean budget failure.
+    let validation_cost = (n + 1)
+        .saturating_add(row_idx.len())
+        .saturating_add(seed.len())
+        .saturating_add(n);
+    if !work.charge(validation_cost)
+        || col_ptr.first().copied() != Some(0)
+        || col_ptr.last().copied() != Some(row_idx.len())
+        || col_ptr
+            .windows(2)
+            .any(|p| p[0] > p[1] || p[1] > row_idx.len())
+        || row_idx.iter().any(|&v| v >= n)
+    {
+        return None;
+    }
+    let mut seen = vec![false; n];
+    for &v in seed {
+        if v >= n || seen[v] {
+            return None;
+        }
+        seen[v] = true;
+    }
+
+    let w = n.div_ceil(64);
+    // Zeroing the pristine bit matrix, scanning all input entries/columns, then
+    // constructing `Game`'s mutable adjacency copy and O(n) work arrays.
+    let build_cost = n
+        .saturating_mul(w)
+        .saturating_add(row_idx.len())
+        .saturating_add(n);
+    let game_cost = n
+        .saturating_mul(w)
+        .saturating_add(9usize.saturating_mul(n))
+        .saturating_add(w);
+    if !work.charge(build_cost) {
+        return None;
+    }
+    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
+    if !work.charge(game_cost) {
+        return None;
+    }
+    let mut game = Game::new(n, &adj0)?;
+
+    // `reset`: adjacency copy + popcount pass + fixed per-vertex bookkeeping,
+    // matching the operation model used by `Game` itself.
+    let reset_cost = 2usize
+        .saturating_mul(n)
+        .saturating_mul(w)
+        .saturating_add(8usize.saturating_mul(n));
+    if !work.charge(reset_cost) {
+        return None;
+    }
+    game.reset();
+
+    if !work.charge(n) {
+        return None;
+    }
+    let mut cur = seed.to_vec();
+    let mut promotions = 0usize;
+    for k in 0..n - 2 {
+        let x = cur[k];
+        let x_degree = game.deg[x];
+        let last = (k + MAX_DISTANCE).min(n - 1);
+        let mut best: Option<(u32, usize, usize)> = None;
+
+        for (j, &v) in cur.iter().enumerate().take(last + 1).skip(k + 2) {
+            // Position/id reads, degree comparison, and adjacency membership.
+            if !work.charge(4) {
+                return None;
+            }
+            let degree = game.deg[v];
+            if degree >= x_degree
+                || game.adj[x * game.w + (v >> 6)] & (1u64 << (v & 63)) == 0
+            {
+                continue;
+            }
+
+            let deficiency_cost = (degree as usize + 1)
+                .saturating_mul(2usize.saturating_mul(w).saturating_add(4));
+            if !work.charge(deficiency_cost) {
+                return None;
+            }
+            if game.deficiency(v) == 0 {
+                let key = (degree, j, v);
+                if best.is_none_or(|old| key < old) {
+                    best = Some(key);
+                }
+            }
+        }
+
+        if let Some((_, j, _)) = best {
+            if !work.charge(j - k) {
+                return None;
+            }
+            cur[k..=j].rotate_right(1);
+            promotions += 1;
+            if promotions == MAX_PROMOTIONS {
+                return Some(cur);
+            }
+        }
+
+        // No later scan exists after k == n-3, so replaying that last pivot
+        // would consume budget without changing the candidate.
+        if k + 1 < n - 2 {
+            let v = cur[k];
+            let eliminate_cost = (game.deg[v] as usize + 1)
+                .saturating_mul(3usize.saturating_mul(w).saturating_add(6))
+                .saturating_add(24);
+            if !work.charge(eliminate_cost) {
+                return None;
+            }
+            game.eliminate(v);
+        }
+    }
+
+    (promotions > 0).then_some(cur)
+}
+
+
 // SUBTREE REFINEMENT — the exact elimination game on gt_10k, one etree subtree
 // at a time.
 // ════════════════════════════════════════════════════════════════════════════
@@ -1291,6 +1713,17 @@ pub(crate) fn subtree_refine(
                             {
                                 rng_seed ^= 0xE703_7ED1_A0B4_28DB;
                             }
+                            // Later outer rounds otherwise revisit the same
+                            // local trajectories. Replace only their seeds;
+                            // block count, stream count, and work are unchanged.
+                            if n < 10_000 && cfg.round >= 1 {
+                                rng_seed ^= 0x2545_F491_4F6C_DD1Du64
+                                    .wrapping_mul(cfg.round as u64 * 2 + 1);
+                            }
+                            if n >= 10_000 && cfg.round >= 2 {
+                                rng_seed ^= 0x3C6E_F372_FE94_F82Bu64
+                                    .wrapping_mul(cfg.round as u64 * 2 + 1);
+                            }
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1355,4 +1788,121 @@ pub(crate) struct SubCfg {
     pub(crate) rank_blocks: bool,
     /// Zero-based outer RGSUB round, used only to diversify an equal-work seed.
     pub(crate) round: usize,
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn csc_from_mask(n: usize, mask: u64) -> (Vec<usize>, Vec<usize>) {
+        let mut rows = vec![Vec::new(); n];
+        let mut bit = 0u32;
+        for u in 0..n {
+            for v in u + 1..n {
+                if mask & (1u64 << bit) != 0 {
+                    rows[u].push(v);
+                    rows[v].push(u);
+                }
+                bit += 1;
+            }
+        }
+        let mut col_ptr = Vec::with_capacity(n + 1);
+        let mut row_idx = Vec::new();
+        col_ptr.push(0);
+        for row in rows {
+            row_idx.extend(row);
+            col_ptr.push(row_idx.len());
+        }
+        (col_ptr, row_idx)
+    }
+
+    fn replay_prefix(game: &mut Game<'_>, pivots: [usize; 3], order: [u8; 3]) -> u64 {
+        game.reset();
+        order
+            .iter()
+            .map(|&i| {
+                let c = game.eliminate(pivots[i as usize]);
+                c * c
+            })
+            .sum()
+    }
+
+    #[test]
+    fn triple_local_formula_matches_exact_replay_on_all_four_vertex_graphs() {
+        // 2^6 labelled simple graphs, every ordered three-vertex window, all
+        // six permutations: this is an exhaustive property sweep, not a few
+        // hand-picked shapes.
+        for mask in 0..(1u64 << 6) {
+            let (cp, ri) = csc_from_mask(4, mask);
+            let adj0 = Game::build_adj(4, &cp, &ri).unwrap();
+            for a in 0..4 {
+                for b in 0..4 {
+                    for c in 0..4 {
+                        if a == b || a == c || b == c {
+                            continue;
+                        }
+                        let pivots = [a, b, c];
+                        for &order in &TRIPLE_ORDERS {
+                            let mut formula_game = Game::new(4, &adj0).unwrap();
+                            formula_game.reset();
+                            let formula = triple_local_cost(&mut formula_game, pivots, order);
+                            let mut replay_game = Game::new(4, &adj0).unwrap();
+                            let replay = replay_prefix(&mut replay_game, pivots, order);
+                            assert_eq!(
+                                formula, replay,
+                                "mask={mask} pivots={pivots:?} order={order:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn triple_window_escapes_a_strict_pair_plateau() {
+        // Edges 0-1 and 0-2.  In the consecutive window (0,3,1), the current
+        // local cost and both one-step neighbours are all 14, while (1,0,3)
+        // costs 9.  Pair descent cannot cross either zero-delta edge; the
+        // exact three-pivot move can.
+        let (cp, ri) = csc_from_mask(4, 0b000_011);
+        let seed = vec![0, 3, 1, 2];
+        assert!(adjacent_pair_descent(4, &cp, &ri, &seed, 4, 1_000_000).is_none());
+
+        let (cand, fixed, witnesses, selected, gain, _) =
+            adjacent_pair_then_triple_stats(4, &cp, &ri, &seed, 4, 1_000_000);
+        let cand = cand.expect("the three-pivot witness must be found");
+        assert!(fixed);
+        assert!(witnesses >= 1);
+        assert!(selected >= 1);
+        assert_eq!(gain, 5);
+        assert_ne!(cand, seed);
+
+        let adj0 = Game::build_adj(4, &cp, &ri).unwrap();
+        let mut game = Game::new(4, &adj0).unwrap();
+        let before = game.replay_flops(&seed);
+        let after = game.replay_flops(&cand);
+        assert_eq!(before - after, gain);
+    }
+
+    #[test]
+    fn triple_window_is_deterministic_bijective_and_fail_closed() {
+        let (cp, ri) = csc_from_mask(4, 0b000_011);
+        let seed = vec![0, 3, 1, 2];
+        let a = adjacent_pair_then_triple_descent(4, &cp, &ri, &seed, 4, 1_000_000)
+            .expect("witness");
+        let b = adjacent_pair_then_triple_descent(4, &cp, &ri, &seed, 4, 1_000_000)
+            .expect("witness");
+        assert_eq!(a, b);
+        let mut sorted = a;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..4).collect::<Vec<_>>());
+
+        assert!(adjacent_pair_then_triple_descent(4, &cp, &ri, &seed, 4, 1).is_none());
+        assert!(adjacent_pair_then_triple_descent(4, &cp, &ri, &[0, 0, 1, 2], 4, 1_000_000)
+            .is_none());
+        assert!(adjacent_pair_then_triple_descent(4, &cp, &ri, &seed, 0, 1_000_000)
+            .is_none());
+    }
+
 }
