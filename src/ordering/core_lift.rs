@@ -101,6 +101,7 @@ pub(crate) fn reduce(
     max_row_deg: usize,
     max_core_n: usize,
     max_core_edges: usize,
+    max_clique_pair_checks: u64,
 ) -> Option<CoreLift> {
     let n = sp.n;
     if n == 0 || n > u32::MAX as usize {
@@ -130,6 +131,7 @@ pub(crate) fn reduce(
     let mut alive = vec![true; n];
     let mut prefix: Vec<usize> = Vec::new();
     let mut prefix_flops: u64 = 0;
+    let mut clique_pair_checks_left = max_clique_pair_checks;
 
     // Ascending (degree, index). Pendants (degree ≤ 1) therefore always come
     // out before any degree-2/3 vertex, at every point in the run — the
@@ -167,6 +169,12 @@ pub(crate) fn reduce(
         if live.len() != deg[vu] as usize || live.len() > max_row_deg {
             return None;
         }
+        let clique_pair_checks = live
+            .len()
+            .checked_mul(live.len().saturating_sub(1))?
+            / 2;
+        clique_pair_checks_left = clique_pair_checks_left
+            .checked_sub(u64::try_from(clique_pair_checks).ok()?)?;
         // c_v = its live degree at elimination time (Liu): the column count of
         // v in the factor is exactly |live| + 1 counting the diagonal. The
         // grader's Σ c_j² counts the diagonal, matching `column_counts_gnp`.
@@ -329,23 +337,28 @@ mod tests {
     #[test]
     fn path_star_and_k4_obey_degree_thresholds_and_full_drain() {
         let path = pattern(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
-        let untouched_path = reduce(&path, 0, 5, 4).expect("degree-zero threshold keeps path");
+        let untouched_path =
+            reduce(&path, 0, 5, 4, u64::MAX).expect("degree-zero threshold keeps path");
         assert!(untouched_path.prefix.is_empty());
         assert_eq!(untouched_path.core_ids, (0..5).collect::<Vec<_>>());
         assert!(
-            reduce(&path, 1, 5, 4).is_none(),
+            reduce(&path, 1, 5, 4, u64::MAX).is_none(),
             "pendant peeling drains path"
         );
 
         let star = pattern(6, &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
-        assert!(reduce(&star, 1, 6, 5).is_none(), "leaf peeling drains star");
+        assert!(
+            reduce(&star, 1, 6, 5, u64::MAX).is_none(),
+            "leaf peeling drains star"
+        );
 
         let k4 = pattern(4, &all_edges(4));
-        let untouched_k4 = reduce(&k4, 2, 4, 6).expect("K4 minimum degree is three");
+        let untouched_k4 =
+            reduce(&k4, 2, 4, 6, u64::MAX).expect("K4 minimum degree is three");
         assert!(untouched_k4.prefix.is_empty());
         assert_eq!(untouched_k4.core_nnz(), 12);
         assert!(
-            reduce(&k4, 3, 4, 6).is_none(),
+            reduce(&k4, 3, 4, 6, u64::MAX).is_none(),
             "degree-three pass drains K4"
         );
     }
@@ -361,7 +374,8 @@ mod tests {
             .collect::<Vec<_>>();
         edges.sort_unstable();
         let sp = pattern(7, &edges);
-        let cl = reduce(&sp, 3, 7, 32).expect("one degree-three elimination leaves K6");
+        let cl =
+            reduce(&sp, 3, 7, 32, u64::MAX).expect("one degree-three elimination leaves K6");
         assert_eq!(cl.prefix, vec![0]);
         assert_eq!(cl.prefix_flops, 16);
         assert_eq!(cl.core_ids, vec![1, 2, 3, 4, 5, 6]);
@@ -391,8 +405,8 @@ mod tests {
         let mut edges = all_edges(4);
         edges.extend([(3, 4), (4, 5)]);
         let sp = pattern(6, &edges);
-        let a = reduce(&sp, 1, 6, 8).expect("pendant chain leaves K4");
-        let b = reduce(&sp, 1, 6, 8).expect("same reduction repeats");
+        let a = reduce(&sp, 1, 6, 8, u64::MAX).expect("pendant chain leaves K4");
+        let b = reduce(&sp, 1, 6, 8, u64::MAX).expect("same reduction repeats");
         assert_eq!(a.prefix, b.prefix);
         assert_eq!(a.core_ids, b.core_ids);
         assert_eq!(a.core_col_ptr, b.core_col_ptr);
@@ -409,10 +423,10 @@ mod tests {
     #[test]
     fn core_size_edge_and_arithmetic_caps_fail_closed() {
         let k4 = pattern(4, &all_edges(4));
-        assert!(reduce(&k4, 2, 3, 6).is_none());
-        assert!(reduce(&k4, 2, 4, 5).is_none());
-        assert!(reduce(&k4, usize::MAX, 4, 6).is_none());
-        assert!(reduce(&k4, 2, 4, usize::MAX).is_none());
+        assert!(reduce(&k4, 2, 3, 6, u64::MAX).is_none());
+        assert!(reduce(&k4, 2, 4, 5, u64::MAX).is_none());
+        assert!(reduce(&k4, usize::MAX, 4, 6, u64::MAX).is_none());
+        assert!(reduce(&k4, 2, 4, usize::MAX, u64::MAX).is_none());
     }
 
     #[test]
@@ -424,6 +438,23 @@ mod tests {
             col_ptr: vec![0, 2, 4],
             row_idx: vec![1, 1, 0, 0],
         };
-        assert!(reduce(&duplicate, 3, 2, 1).is_none());
+        assert!(reduce(&duplicate, 3, 2, 1, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn clique_pair_budget_is_exact_and_fail_closed() {
+        let mut edges = all_edges(7)
+            .into_iter()
+            .filter(|&(a, b)| {
+                !((a == 0 && b >= 4)
+                    || matches!((a, b), (1, 2) | (1, 3) | (2, 3)))
+            })
+            .collect::<Vec<_>>();
+        edges.sort_unstable();
+        let sp = pattern(7, &edges);
+        assert!(reduce(&sp, 3, 7, 32, 2).is_none());
+        let cl = reduce(&sp, 3, 7, 32, 3).expect("one degree-three clique costs three pairs");
+        assert_eq!(cl.prefix, vec![0]);
+        assert_eq!(cl.core_nnz(), 30);
     }
 }
