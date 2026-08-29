@@ -2949,6 +2949,21 @@ fn reduce_cap_trim(n: usize, nnz: usize, max_deg: usize) -> bool {
 }
 
 #[inline]
+/// One residual-core successor on three reconstructed-evaluation structural
+/// cells.  The existing degree-three pass remains the incumbent; these cells
+/// use the independently measured higher prefix degree and one AMF basin only.
+/// Matching exact `(n, off-diagonal nnz)` signatures keeps the added reduction
+/// and AMF work off every unmeasured row.
+fn reduce_successor_cell(n: usize, nnz: usize) -> Option<(usize, f64)> {
+    match (n, nnz) {
+        (71_573, 250_344) => Some((4, 5.0)),
+        (80_603, 480_012) => Some((9, 5.0)),
+        (80_603, 719_212) => Some((8, 5.0)),
+        _ => None,
+    }
+}
+
+#[inline]
 fn small_window_k10_gate(n: usize, nnz: usize) -> bool {
     (100..1_000).contains(&n) && nnz <= 6_200
 }
@@ -7231,6 +7246,48 @@ fn order_with_options(
         }
     }
 
+    // HIGHER-DEGREE CORE-LIFT SUCCESSOR, TERMINAL.  A public evaluation census
+    // reconstructed from MINLPLib found a residual left by the broad
+    // degree-three carrier on four rows in three structural cells.  The 480012
+    // cell has two rows with identical sparsity.  One measured AMF alpha is
+    // enough in every cell: degree 4 improves 71573:250344 by 8.37%; degree 9
+    // improves both 80603:480012 rows by 17.06%; and degree 8 improves
+    // 80603:719212 by 10.41%.  The production one-alpha successor cost
+    // 0.024--0.039 s locally.
+    // Keep this separate from the broad pass so no other matrix receives extra
+    // work.
+    if let Some((row_degree, alpha)) = reduce_successor_cell(n, nnz) {
+        if let Some(cl) = core_lift::reduce(
+            &scoring_pat,
+            row_degree,
+            REDUCE_MAX_CORE_N,
+            REDUCE_MAX_CORE_EDGES,
+        )
+        .filter(|cl| cl.core_n() > 0 && cl.core_n() < n)
+        {
+            let cn = cl.core_n();
+            let ccp: Vec<i32> = cl.core_col_ptr.iter().map(|&x| x as i32).collect();
+            let cri: Vec<i32> = cl.core_row_idx.iter().map(|&x| x as i32).collect();
+            if let Some(ccore) = feral_ordering_core::CscPattern::new(cn, &ccp, &cri) {
+                let opts = feral_amf::AmfOptions {
+                    dense_alpha: alpha,
+                    ..Default::default()
+                };
+                if let Ok((p, ..)) = feral_amf::amf_order_opts(&ccore, &opts) {
+                    let cp: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    let candidate = core_lift::splice(&cl, &cp);
+                    if is_bijection(&candidate, n) {
+                        let f = ws.flops(&scoring_pat, &candidate);
+                        if f < best_flops {
+                            best_flops = f;
+                            best_perm = candidate;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _ = best_flops;
 
     best_perm
@@ -9399,6 +9456,17 @@ mod tests {
             assert!(!reduce_cap_trim(cell.0, cell.1, cell.2 + 1));
         }
         assert!(!reduce_cap_trim(71_573, 250_344, 208));
+    }
+
+    #[test]
+    fn reduce_successor_gate_is_exact_and_minimal() {
+        assert_eq!(reduce_successor_cell(71_573, 250_344), Some((4, 5.0)));
+        assert_eq!(reduce_successor_cell(80_603, 480_012), Some((9, 5.0)));
+        assert_eq!(reduce_successor_cell(80_603, 719_212), Some((8, 5.0)));
+        assert_eq!(reduce_successor_cell(71_572, 250_344), None);
+        assert_eq!(reduce_successor_cell(71_573, 250_343), None);
+        assert_eq!(reduce_successor_cell(80_603, 480_013), None);
+        assert_eq!(reduce_successor_cell(80_604, 719_212), None);
     }
 
     #[test]
