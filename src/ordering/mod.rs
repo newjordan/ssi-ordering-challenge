@@ -4959,6 +4959,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -4975,7 +4976,17 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        // Third round for sparse large (gt_10k, nnz<=100k) and sparse hub-free
+        // sub-10k; only runs when round 2 strictly improved (loop breaks below).
+        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
+            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
+        {
+            3
+        } else {
+            2
+        };
+        for round in 0..rgsub_rounds {
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5000,7 +5011,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                round_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);

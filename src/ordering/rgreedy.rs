@@ -1271,11 +1271,16 @@ pub(crate) fn subtree_refine(
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
                             // seed to sample an independent subtree basin.
-                            let rng_seed = if n >= 10_000 && k == 1 {
+                            let mut rng_seed = if n >= 10_000 && k == 1 {
                                 0xD1B5_4A32_D192_ED03
                             } else {
                                 stream_rng(k)
                             };
+                            // Diversify stream 1 in round two: unchanged blocks
+                            // would otherwise repeat the same D1 search.
+                            if n >= 10_000 && k == 1 && cfg.round == 1 {
+                                rng_seed ^= 0xA076_1D64_78BD_642F;
+                            }
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1338,4 +1343,6 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Zero-based outer RGSUB round, used only to diversify an equal-work seed.
+    pub(crate) round: usize,
 }
