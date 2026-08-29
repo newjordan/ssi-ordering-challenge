@@ -5952,3 +5952,568 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+/// ── CENSUS WRITERS (batch3-C slot swaps) ────────────────────────────────
+/// Deterministic flops-only census: for every matrix, the exact candidate
+/// flops (Σ cⱼ² of `order()`'s output) and the AMD-anchor flops, written as
+/// JSON to `$CENSUS_OUT` (required). Pure function of the pattern — no
+/// timing, load-tolerant, bit-exact run-to-run. The header score is the
+/// harness's exact bucketed weighted-geomean aggregation ([`aggregate`]).
+///
+/// `probe_census` runs the dev corpus; `probe_census_eval` loads the
+/// reconstructed eval corpus directly via `ssi_scoring::load_corpus_jsonl`
+/// (`crate::corpus::corpus()` is hardcoded to the dev corpus in the test
+/// shim). CAUTION: the loader UNLINKS the file at SSI_CORPUS_FILE — always
+/// point it at a /tmp copy.
+#[test]
+#[ignore]
+fn probe_census() {
+    let out_path =
+        std::env::var("CENSUS_OUT").expect("set CENSUS_OUT=<path> for probe_census");
+    let corpus = crate::corpus::corpus();
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut rows: Vec<String> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+        let perm = order(pat);
+        let mine = flops_of(&sp, &perm);
+        let ratio = mine as f64 / base as f64;
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        rows.push(format!(
+            "    {{\"name\": {:?}, \"n\": {}, \"nnz\": {}, \"flops\": {}, \"amd_flops\": {}, \"ratio\": {:.10}}}",
+            name,
+            n,
+            pat.nnz(),
+            mine,
+            base,
+            ratio
+        ));
+    }
+    let mut j = String::new();
+    j.push_str("{\n");
+    j.push_str(&format!("  \"score\": {:.10},\n", aggregate(&log_sums, &counts)));
+    for b in 0..3 {
+        let g = if counts[b] > 0 {
+            (log_sums[b] / counts[b] as f64).exp()
+        } else {
+            f64::NAN
+        };
+        j.push_str(&format!(
+            "  \"bucket_{}\": {{\"count\": {}, \"geomean\": {:.10}}},\n",
+            BUCKET_NAMES[b], counts[b], g
+        ));
+    }
+    j.push_str("  \"matrices\": [\n");
+    j.push_str(&rows.join(",\n"));
+    j.push_str("\n  ]\n}\n");
+    std::fs::write(&out_path, j).expect("write CENSUS_OUT");
+    println!("census written to {} ({} matrices)", out_path, rows.len());
+}
+
+#[test]
+#[ignore]
+fn probe_census_eval() {
+    let out_path =
+        std::env::var("CENSUS_OUT").expect("set CENSUS_OUT=<path> for probe_census_eval");
+    let default_path =
+        "/Users/amal/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl";
+    let path_string =
+        std::env::var("SSI_CORPUS_FILE").unwrap_or_else(|_| default_path.to_string());
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_census_eval: failed to load {path_string}: {e}");
+            return;
+        }
+    };
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut rows: Vec<String> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+        let perm = order(pat);
+        let mine = flops_of(&sp, &perm);
+        let ratio = mine as f64 / base as f64;
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        rows.push(format!(
+            "    {{\"name\": {:?}, \"n\": {}, \"nnz\": {}, \"flops\": {}, \"amd_flops\": {}, \"ratio\": {:.10}}}",
+            name,
+            n,
+            pat.nnz(),
+            mine,
+            base,
+            ratio
+        ));
+    }
+    let mut j = String::new();
+    j.push_str("{\n");
+    j.push_str(&format!("  \"score\": {:.10},\n", aggregate(&log_sums, &counts)));
+    for b in 0..3 {
+        let g = if counts[b] > 0 {
+            (log_sums[b] / counts[b] as f64).exp()
+        } else {
+            f64::NAN
+        };
+        j.push_str(&format!(
+            "  \"bucket_{}\": {{\"count\": {}, \"geomean\": {:.10}}},\n",
+            BUCKET_NAMES[b], counts[b], g
+        ));
+    }
+    j.push_str("  \"matrices\": [\n");
+    j.push_str(&rows.join(",\n"));
+    j.push_str("\n  ]\n}\n");
+    std::fs::write(&out_path, j).expect("write CENSUS_OUT");
+    println!("census written to {} ({} matrices)", out_path, rows.len());
+}
+
+/// ── B3C BAND PRICER ─────────────────────────────────────────────────────
+/// On the reconstructed eval corpus, for every matrix inside the two
+/// candidate bands, measure IN ISOLATION:
+///   old slot  : AMD(.75)                                    [band (a)]
+///               degree-ranked top-1024 strip, DegSqrt sub   [band (b)]
+///   new cand  : AMD(.75)-seeded incumbent-count k=64 strip,
+///               AMD(0.5) sub-orderer, at several fill gates [band (a)]
+///               incumbent-count top-1024 strip (seeded from
+///               raw DegSqrt), DegSqrt sub-orderer           [band (b)]
+/// reporting per-row ratios, the seed fills, and wall-clock per variant.
+#[test]
+#[ignore]
+fn probe_b3c_bands() {
+    let default_path =
+        "/Users/amal/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl";
+    let path_string =
+        std::env::var("SSI_CORPUS_FILE").unwrap_or_else(|_| default_path.to_string());
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_b3c_bands: failed to load {path_string}: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices", corpus.len());
+    // Also scan the dev corpus (prefixed DEV:) so the dev twin of each band
+    // row is priced with the same battery.
+    let mut corpus = corpus;
+    for (name, pat) in crate::corpus::corpus() {
+        corpus.push((format!("DEV:{name}"), pat));
+    }
+
+    // Band (a): 400k <= nnz < 700k, 35n <= nnz < 42n (inside the D_WIDE gate,
+    // so also nnz > 20n — implied by 35n).
+    // Band (b): 400k <= nnz < 1M, nnz >= 100n, n > 1024.
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let in_a = (400_000..700_000).contains(&nnz)
+            && nnz >= 35 * n
+            && nnz < 42 * n;
+        let in_b = (400_000..1_000_000).contains(&nnz)
+            && nnz >= 100 * n
+            && n > 1_024;
+        let in_c = nnz >= 1_000_000;
+        if !in_a && !in_b && !in_c {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        // Composed current portfolio ratio for context (isolated slots only
+        // matter where they BEAT the composed best).
+        let composed = flops_of(&sp, &order(pat)) as f64 / base;
+
+        let counts_of = |perm: &[usize]| -> Vec<usize> {
+            let permuted = permute_pattern(&sp, perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            column_counts_gnp(&permuted, &etree)
+        };
+
+        println!(
+            "\n== {} n={} nnz={} density={:.1} band={} composed={:.6} ==",
+            name,
+            n,
+            nnz,
+            nnz as f64 / n as f64,
+            if in_a {
+                "A(35-42,<700k)"
+            } else if in_b {
+                "B(>=100n)"
+            } else {
+                "C(>=1M)"
+            },
+            composed
+        );
+
+        if in_c {
+            // Current giant slot: the single generic metric variant the
+            // band_cap=1 trim leaves for nnz >= 700k dense/hub-free giants
+            // (sparse-hub giants take the matched-metric branch instead).
+            let maxd = (0..pat.n)
+                .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+                .max()
+                .unwrap_or(0);
+            let is_sparse_hub = nnz <= 10 * n && maxd >= 100;
+            println!("  sparse_hub_giant={} max_deg={}", is_sparse_hub, maxd);
+            // Giant-tie battery: every quotient metric the mellowcroc recipe
+            // uses, plus relabelled-AMD seeds, on the >=1.2M uncovered tier.
+            for (label, alpha, var) in [
+                ("DegSqrt@0.75", 0.75f64, custom_metrics::ScoreVariant::DegSqrt),
+                ("SqPure@1.5", 1.5, custom_metrics::ScoreVariant::SqPure),
+                ("SqDiv@1.5", 1.5, custom_metrics::ScoreVariant::SqDiv),
+                ("DegDivNvWfP15@0.75", 0.75, custom_metrics::ScoreVariant::DegDivNvWfP15),
+            ] {
+                let t = Instant::now();
+                if let Ok(p) = custom_metrics::order_variant(&core, alpha, true, var) {
+                    let dt = t.elapsed().as_secs_f64();
+                    let f = flops_of(&sp, &p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+                    println!(
+                        "  giant alt {}: ratio={:.6} t={:.4}s{}",
+                        label,
+                        f as f64 / base,
+                        dt,
+                        if f as f64 / base < composed { "  < COMPOSED" } else { "" }
+                    );
+                }
+            }
+            // The regime-(c) slot being replaced: AMF dense_alpha=-1.
+            {
+                let t = Instant::now();
+                let o = feral_amf::AmfOptions { dense_alpha: -1.0, ..Default::default() };
+                if let Ok((pp, ..)) = feral_amf::amf_order_opts(&core, &o) {
+                    let dt = t.elapsed().as_secs_f64();
+                    let f = flops_of(&sp, &pp.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+                    println!(
+                        "  regime-c slot AMF a-1: ratio={:.6} t={:.4}s{}",
+                        f as f64 / base,
+                        dt,
+                        if f as f64 / base < composed { "  < COMPOSED" } else { "" }
+                    );
+                }
+            }
+            for seed in 1u64..=3 {
+                let q = relabel(n, seed);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                if let Some(c) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) {
+                    if let Ok(pb) = feral_amd::amd_order(&c) {
+                        let perm = pb.iter().map(|&x| q[x as usize]).collect::<Vec<_>>();
+                        let f = flops_of(&sp, &perm);
+                        println!("  giant relabel-amd s{}: ratio={:.6}", seed, f as f64 / base);
+                    }
+                }
+            }
+            if !is_sparse_hub && nnz < 1_200_000 {
+                if let Some(spec) = metric_sweep::EXTRA_METRICS
+                    .iter()
+                    .find(|s| s.name == "extra_deg2_div_nv_wf05")
+                {
+                    let t = Instant::now();
+                    let cur = metric_sweep::order_generic(&core, 10.0, true, spec);
+                    let dt = t.elapsed().as_secs_f64();
+                    if let Ok(p) = cur {
+                        let f = flops_of(&sp, &p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+                        println!("  cur slot deg2divnv_wf05@10: ratio={:.6} t={:.4}s", f as f64 / base, dt);
+                    }
+                }
+                let sub_dsq = |c: &feral_ordering_core::CscPattern| {
+                    custom_metrics::order_variant(
+                        c,
+                        0.75,
+                        true,
+                        custom_metrics::ScoreVariant::DegSqrt,
+                    )
+                    .ok()
+                };
+                let mut deg_ranked: Vec<usize> = (0..n).collect();
+                deg_ranked.sort_unstable_by(|&a, &b| {
+                    let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
+                    let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                for k in [1_024usize, 2_048] {
+                    if k >= n {
+                        break;
+                    }
+                    let t = Instant::now();
+                    if let Some(c) = strip_general_v2(&sp, &deg_ranked, k, &sub_dsq) {
+                        let f = flops_of(&sp, &c);
+                        println!(
+                            "  alt deg-strip k={:<5}: ratio={:.6} t={:.4}s",
+                            k,
+                            f as f64 / base,
+                            t.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+
+        if in_a {
+            // Old slot: plain AMD(.75).
+            let opts_075 = feral_amd::AmdOptions { aggressive: true, dense_alpha: 0.75 };
+            let t0 = Instant::now();
+            let raw: Vec<usize> = feral_amd::amd_order_opts(&core, &opts_075)
+                .ok()
+                .map(|(p, ..)| p.into_iter().map(|x| x as usize).collect::<Vec<_>>())
+                .unwrap();
+            let t_amd = t0.elapsed().as_secs_f64();
+            let f_old = flops_of(&sp, &raw);
+            let cnts = counts_of(&raw);
+            let fill: usize = cnts.iter().sum();
+            println!(
+                "  old AMD(.75): ratio={:.6} fill={} ({:.1}x nnz) t={:.4}s",
+                f_old as f64 / base,
+                fill,
+                fill as f64 / nnz as f64,
+                t_amd
+            );
+
+            // New: incumbent-count strip seeded by the slot's own AMD(.75)
+            // output, k x sub-orderer grid.
+            let mut count_by_vertex = vec![0usize; n];
+            for (pos, &v) in raw.iter().enumerate() {
+                count_by_vertex[v] = cnts[pos];
+            }
+            let mut ranked: Vec<usize> = (0..n).collect();
+            ranked.sort_unstable_by(|&a, &b| {
+                count_by_vertex[b]
+                    .cmp(&count_by_vertex[a])
+                    .then(a.cmp(&b))
+            });
+            let subs: [(&str, &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>); 4] = [
+                (
+                    "amd.5",
+                    &|c: &feral_ordering_core::CscPattern| {
+                        let o = feral_amd::AmdOptions { aggressive: true, dense_alpha: 0.5 };
+                        feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
+                    },
+                ),
+                (
+                    "amf1.5",
+                    &|c: &feral_ordering_core::CscPattern| {
+                        let o = feral_amf::AmfOptions { dense_alpha: 1.5, ..Default::default() };
+                        feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+                    },
+                ),
+                (
+                    "amd1.0na",
+                    &|c: &feral_ordering_core::CscPattern| {
+                        let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: 1.0 };
+                        feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
+                    },
+                ),
+                (
+                    "dsq.75",
+                    &|c: &feral_ordering_core::CscPattern| {
+                        custom_metrics::order_variant(
+                            c,
+                            0.75,
+                            true,
+                            custom_metrics::ScoreVariant::DegSqrt,
+                        )
+                        .ok()
+                    },
+                ),
+            ];
+            for (sname, sub) in subs {
+                for k in [64usize, 128, 146, 192, 384] {
+                    if k >= n {
+                        break;
+                    }
+                    let t = Instant::now();
+                    let cand = strip_general_v2(&sp, &ranked, k, sub);
+                    let dt = t.elapsed().as_secs_f64();
+                    if let Some(c) = cand {
+                        let f = flops_of(&sp, &c);
+                        println!(
+                            "  b3cA cnt-strip k={:<4} sub={:<8}: ratio={:.6} ({:+.4} vs old) t={:.4}s{}",
+                            k,
+                            sname,
+                            f as f64 / base,
+                            f as f64 / base - f_old as f64 / base,
+                            dt,
+                            if f as f64 / base < composed { "  < COMPOSED" } else { "" }
+                        );
+                    }
+                }
+            }
+            // Also: quotient-metric alternative in the same slot (DegSqrt@0.75
+            // raw, the dense-band winner above nnz/n=50).
+            let dq = custom_metrics::order_variant(
+                &core,
+                0.75,
+                true,
+                custom_metrics::ScoreVariant::DegSqrt,
+            )
+            .ok()
+            .map(|p| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            if let Some(d) = dq {
+                let f = flops_of(&sp, &d);
+                println!("  alt DegSqrt@.75 raw: ratio={:.6}", f as f64 / base);
+            }
+        }
+
+        if in_b {
+            // Old slot: degree-ranked top-1024 strip, DegSqrt(0.75) sub.
+            // Also test the e61e7c9-style SplitMix equal-degree tie-key,
+            // which the >=100n arm never received (it still breaks degree
+            // ties by input index).
+            let deg_ranked: Vec<usize> = {
+                let tie_key: Vec<u64> = (0..n)
+                    .map(|v| {
+                        let mut x = (v as u64)
+                            .wrapping_add(21u64.wrapping_mul(0x9E37_79B9));
+                        x ^= x >> 30;
+                        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                        x ^= x >> 27;
+                        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+                        x ^ (x >> 31)
+                    })
+                    .collect();
+                let mut r: Vec<usize> = (0..n).collect();
+                r.sort_unstable_by(|&a, &b| {
+                    let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
+                    let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
+                    db.cmp(&da).then(tie_key[a].cmp(&tie_key[b])).then(a.cmp(&b))
+                });
+                r
+            };
+            let deg_ranked_idx: Vec<usize> = {
+                let mut r: Vec<usize> = (0..n).collect();
+                r.sort_unstable_by(|&a, &b| {
+                    let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
+                    let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                r
+            };
+            let sub_dsq = |c: &feral_ordering_core::CscPattern| {
+                custom_metrics::order_variant(
+                    c,
+                    0.75,
+                    true,
+                    custom_metrics::ScoreVariant::DegSqrt,
+                )
+                .ok()
+            };
+            let t0 = Instant::now();
+            let old = strip_general_v2(&sp, &deg_ranked_idx, 1_024, &sub_dsq);
+            let t_old = t0.elapsed().as_secs_f64();
+            if let Some(o) = &old {
+                println!(
+                    "  old deg-strip k=1024: ratio={:.6} t={:.4}s",
+                    flops_of(&sp, o) as f64 / base,
+                    t_old
+                );
+            }
+            if deg_ranked != deg_ranked_idx {
+                if let Some(c) = strip_general_v2(&sp, &deg_ranked, 1_024, &sub_dsq) {
+                    let f = flops_of(&sp, &c);
+                    println!(
+                        "  b3cB tiekey deg-strip k=1024: ratio={:.6} ({:+.4} vs old){}",
+                        f as f64 / base,
+                        f as f64 / base
+                            - old.as_ref().map(|o| flops_of(&sp, o)).unwrap_or(f) as f64 / base,
+                        if f as f64 / base < composed { "  < COMPOSED" } else { "" }
+                    );
+                }
+            } else {
+                println!("  (tie-key ranking identical to input-index ranking)");
+            }
+
+            // New: seed raw DegSqrt(0.75), rank by its incumbent counts,
+            // strip k=1024 (and neighbors) with DegSqrt sub.
+            let t1 = Instant::now();
+            let raw_d = custom_metrics::order_variant(
+                &core,
+                0.75,
+                true,
+                custom_metrics::ScoreVariant::DegSqrt,
+            )
+            .ok()
+            .map(|p| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            if let Some(rd) = raw_d {
+                let f_raw = flops_of(&sp, &rd);
+                let cnts = counts_of(&rd);
+                let fill: usize = cnts.iter().sum();
+                let mut count_by_vertex = vec![0usize; n];
+                for (pos, &v) in rd.iter().enumerate() {
+                    count_by_vertex[v] = cnts[pos];
+                }
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| {
+                    count_by_vertex[b]
+                        .cmp(&count_by_vertex[a])
+                        .then(a.cmp(&b))
+                });
+                for k in [1_024usize, 512, 2_048] {
+                    if k >= n {
+                        break;
+                    }
+                    let t = Instant::now();
+                    let cand = strip_general_v2(&sp, &ranked, k, &sub_dsq);
+                    let dt = t.elapsed().as_secs_f64();
+                    if let Some(c) = cand {
+                        let f = flops_of(&sp, &c);
+                        println!(
+                            "  b3cB cnt-strip k={:<5}: ratio={:.6} ({:+.4} vs old) t={:.4}s",
+                            k,
+                            f as f64 / base,
+                            f as f64 / base - old.as_ref().map(|o| flops_of(&sp, o)).unwrap_or(f) as f64 / base,
+                            dt
+                        );
+                    }
+                }
+                println!(
+                    "  seed raw DegSqrt ratio={:.6} fill={} ({:.1}x nnz) total_t={:.4}s",
+                    f_raw as f64 / base,
+                    fill,
+                    fill as f64 / nnz as f64,
+                    t1.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+}
