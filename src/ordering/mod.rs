@@ -2333,8 +2333,6 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
-    let max_deg_sq = (max_deg as u128) * (max_deg as u128);
-    let medium_metric_hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -2790,7 +2788,16 @@ fn order_with_options(
 
         // Tighter-dense AMF (α2) — a distinct AMF ordering for dense-ish mediums
         // that the α5/α10 AMF variants miss. Time-trivial at this size.
-        if nnz >= 200_000 && medium_metric_hub_safe {
+        // Medium slot recovery: in 200k <= nnz < 400k, AMF(α2) is provably
+        // redundant with the global AMF(α5) whenever no vertex crosses either
+        // dense threshold. Test without floating point: max_deg <= 16 or
+        // max_deg² <= 4*n (u128 for overflow safety). On that predicate,
+        // replace the slot one-for-one with DegSqrt(α0.75).
+        let amf2_redundant = nnz >= 200_000
+            && (max_deg <= 16
+                || (max_deg as u128).saturating_mul(max_deg as u128)
+                    <= 4u128.saturating_mul(n as u128));
+        if amf2_redundant {
             consider!(move || custom_metrics::order_variant(
                 &core,
                 0.75,
@@ -3158,12 +3165,12 @@ fn order_with_options(
     // default/tuned separators for small structures. `seed = 1` (default) keeps
     // it deterministic.
     if n < METIS_HITRIAL_MAX_N && nnz < METIS_HITRIAL_MAX_NNZ {
-        let metis_hitrial = feral_metis::MetisOptions {
+        for &s in &[1, 2, 3, 4, 5] { let metis_hitrial = feral_metis::MetisOptions { seed: s,
             niparts: 32,
             fm_passes: 30,
             ..Default::default()
         };
-        consider!(move || feral_metis::metis_order_full(&core, &metis_hitrial).map(|(p, _, _)| p));
+        consider!(move || feral_metis::metis_order_full(&core, &metis_hitrial).map(|(p, _, _)| p)); }
     }
 
     // Scotch — extra candidate on small/medium matrices (time-trivial there),
@@ -3559,7 +3566,7 @@ fn order_with_options(
     // known to have passed the grader (~0.86-1.0s worst dev `order()`). The
     // aggressive build (`sbx-integrate`) keeps win C, trimmed per the measured
     // score-vs-cap curve.
-    let (relabel_budget, relabel_cap_bucket) = (RELABEL_BUDGET, RELABEL_MAX_RESTARTS);
+    let (relabel_budget, relabel_cap_bucket) = if n >= 10_000 && nnz < 100_000 { (RELABEL_BUDGET_LARGE, RELABEL_MAX_RESTARTS_LARGE) } else { (RELABEL_BUDGET, RELABEL_MAX_RESTARTS) };
     let restarts =
         relabel_restarts(relabel_budget, relabel_cap_bucket, n, nnz, max_deg).min(relabel_cap);
     // Cycle dense thresholds inside the two cross-corpus positive density bands.
@@ -5178,13 +5185,8 @@ fn order_with_options(
         // construction: identical descent count, different seeds. Modes 7
         // and 2 are the plan's two strongest per the measured table above;
         // same dedup discipline; pure function of the pattern.
-        // Near the hub threshold, the mid-density runner-up can displace a
-        // stronger incumbent-seed basin. Retain it for low/high densities and
-        // strong hubs, where the full exact A/B was positive or unchanged.
-        let runner_up_swap = max_deg.saturating_mul(50) <= n
-            || nnz < n.saturating_mul(4)
-            || nnz > n.saturating_mul(5);
-        if slots.len() == 3 && plan.len() >= 4 && runner_up_swap {
+        let suppress_runner_up = max_deg.saturating_mul(50) > n && nnz >= n.saturating_mul(4) && nnz <= n.saturating_mul(5);
+        if slots.len() == 3 && plan.len() >= 4 && !suppress_runner_up {
             let mut adds: Vec<(usize, u8)> = Vec::new();
             for &mode in &[7u8, 2u8] {
                 let key = (slots[2].0, mode);
@@ -5391,27 +5393,127 @@ fn order_with_options(
             }
         }
     }
-
-    // TERMINAL COMPLETION-LATTICE DESCENT.  The ordinary MINL/watcher/ORBIT
-    // batch runs before PHARMAKOS, whole-matrix exact-game search, TELOS
-    // multi-start, RGSUB and adjacent-pair descent.  Those late phases can
-    // therefore create a new chordal completion which has never been
-    // minimalized.  Descend that FINAL completion in a broad sparse envelope
-    // plus one measured dense cell.  The broad n/nnz envelope retains 47 independent
-    // public wins while excluding the dense no-win walls where a full
-    // fill-edge scan is costly.
-    // Candidate construction is fail-closed and admission remains a trusted
-    // exact-score strict comparison, so this phase cannot worsen the result.
-    let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
+    // ── TERMINAL COMPLETION-LATTICE DESCENT ──
+    // One bounded MINL pass on the ACTUAL final incumbent, after all other
+    // phases have had their say. This sees the real permutation that would
+    // otherwise be returned — no earlier phase can regress it. Gates:
+    // broad sparse (n <= 30k, nnz <= 100k) and measured dense (22k-25k n,
+    // 800k-1M nnz). Same chordal-completion rule as the batch MINL: a fill
+    // edge uv is deleted only when N(u) ∩ N(v) is a clique. Surviving
+    // completion is realized through both MCS and AMD; only a strict
+    // reduction under the trusted symbolic objective replaces the incumbent.
+    const TERM_MINL_FILL_CAP: usize = 1_200_000;
+    const TERM_MINL_OPS_BUDGET: i64 = 60_000_000;
+    const TERM_MINL_MAX_ROUNDS: usize = 8;
+    const TERM_MINL_MAX_LNNZ: usize = 2_400_000;
+    const TERM_MINL_MAX_COMMON: usize = 2_000;
+    let term_minl_gate = (n <= 30_000 && nnz <= 100_000)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
-    if terminal_minl_gate {
-        if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {
-            for cand in [Some(mcs), amd].into_iter().flatten() {
-                if is_bijection(&cand, n) {
-                    let f = ws.flops(&scoring_pat, &cand);
-                    if f < best_flops {
-                        best_flops = f;
-                        best_perm = cand;
+    if term_minl_gate && nnz > 0 {
+        if let Some((fcp, fri)) = filled_graph(scoring_pat, &best_perm, TERM_MINL_MAX_LNNZ) {
+            let mut adj: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    fri[fcp[v] as usize..fcp[v + 1] as usize]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect()
+                })
+                .collect();
+            let asort: Vec<Vec<u32>> = (0..n)
+                .map(|v| {
+                    let mut c: Vec<u32> = scoring_pat.row_idx
+                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .filter(|&x| x as usize != v)
+                        .collect();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            let mut fill: Vec<(u32, u32)> = Vec::new();
+            for u in 0..n {
+                for &wv in &adj[u] {
+                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                        fill.push((u as u32, wv));
+                    }
+                }
+            }
+            if !fill.is_empty() && fill.len() <= TERM_MINL_FILL_CAP {
+                let scan_order: Vec<u32> = {
+                    let mut keys: Vec<usize> = Vec::with_capacity(fill.len());
+                    let mut maxk = 0usize;
+                    for &(u, v) in &fill {
+                        let k = adj[u as usize].len() + adj[v as usize].len();
+                        maxk = maxk.max(k);
+                        keys.push(k);
+                    }
+                    let mut cnt = vec![0u32; maxk + 2];
+                    for &k in &keys {
+                        cnt[k + 1] += 1;
+                    }
+                    for i in 1..cnt.len() {
+                        cnt[i] += cnt[i - 1];
+                    }
+                    let mut out = vec![0u32; fill.len()];
+                    for (ei, &k) in keys.iter().enumerate() {
+                        out[cnt[k] as usize] = ei as u32;
+                        cnt[k] += 1;
+                    }
+                    out
+                };
+                let mut ops = TERM_MINL_OPS_BUDGET;
+                let mut alive = vec![true; fill.len()];
+                let mut removed_total = 0usize;
+                'term_rounds: for _round in 0..TERM_MINL_MAX_ROUNDS {
+                    let mut removed_this = 0usize;
+                    for &ei in &scan_order {
+                        let ei = ei as usize;
+                        if !alive[ei] {
+                            continue;
+                        }
+                        if ops < 0 {
+                            break 'term_rounds;
+                        }
+                        let (u, v) = fill[ei];
+                        if !minl_try_delete_edge(&mut adj, u, v, &mut ops, TERM_MINL_MAX_COMMON) {
+                            continue;
+                        }
+                        alive[ei] = false;
+                        removed_this += 1;
+                    }
+                    if removed_this == 0 {
+                        break;
+                    }
+                    removed_total += removed_this;
+                }
+                if removed_total > 0 {
+                    // Realize through MCS PEO.
+                    let peo = minl_mcs_peo(n, &adj);
+                    if is_bijection(&peo, n) {
+                        let f = ws.flops(scoring_pat, &peo);
+                        if f < best_flops {
+                            best_flops = f;
+                            best_perm = peo;
+                        }
+                    }
+                    // Also try AMD on the reduced completion.
+                    let mut fcp2: Vec<i32> = vec![0i32; n + 1];
+                    for v in 0..n {
+                        fcp2[v + 1] = fcp2[v] + adj[v].len() as i32;
+                    }
+                    let fri2: Vec<i32> = adj.iter().flat_map(|a| a.iter().map(|&x| x as i32)).collect();
+                    if let Some(fcore) = feral_ordering_core::CscPattern::new(n, &fcp2, &fri2) {
+                        if let Ok(p) = feral_amd::amd_order(&fcore) {
+                            let perm_amd: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                            if is_bijection(&perm_amd, n) {
+                                let f = ws.flops(scoring_pat, &perm_amd);
+                                if f < best_flops {
+                                    best_flops = f;
+                                    best_perm = perm_amd;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5663,128 +5765,6 @@ fn minl_try_delete_edge(
         adj[vv].remove(p);
     }
     true
-}
-
-/// Delete chordality-redundant fill edges from a completed final ordering and
-/// realize the resulting completion through two deterministic PEO families.
-///
-/// This deliberately preserves the original terminal probe's lexicographic
-/// fill-edge schedule.  Deletion order selects a basin in the lattice of
-/// minimal chordal completions; replacing it with the earlier MINL phase's
-/// degree-sum schedule changes the measured result.  Every successful deletion
-/// satisfies the exact local chordality criterion, and all resource limits
-/// fail closed by returning no candidate or a partially descended (still
-/// chordal) completion.
-fn terminal_minl_candidates(
-    sp: &ScoringPattern,
-    seed: &[usize],
-) -> Option<(Vec<usize>, Option<Vec<usize>>)> {
-    const MAX_FILL_EDGES: usize = 1_200_000;
-    let n = sp.n;
-    let (fcp, fri) = filled_graph(sp, seed, MINL_MAX_LNNZ)?;
-    let mut adj: Vec<Vec<u32>> = (0..n)
-        .map(|v| {
-            fri[fcp[v] as usize..fcp[v + 1] as usize]
-                .iter()
-                .map(|&x| x as u32)
-                .collect()
-        })
-        .collect();
-    let asort: Vec<Vec<u32>> = (0..n)
-        .map(|v| {
-            let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
-                .iter()
-                .map(|&x| x as u32)
-                .filter(|&x| x as usize != v)
-                .collect();
-            c.sort_unstable();
-            c
-        })
-        .collect();
-    let mut fill: Vec<(u32, u32)> = Vec::new();
-    for u in 0..n {
-        for &wv in &adj[u] {
-            if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
-                fill.push((u as u32, wv));
-            }
-        }
-    }
-    if fill.is_empty() || fill.len() > MAX_FILL_EDGES {
-        return None;
-    }
-
-    let mut alive = vec![true; fill.len()];
-    let mut ops = MINL_OPS_BUDGET;
-    let mut removed_total = 0usize;
-    for _ in 0..MINL_MAX_ROUNDS {
-        let mut removed_this = 0usize;
-        for ei in 0..fill.len() {
-            if ops < 0 {
-                break;
-            }
-            if !alive[ei] {
-                continue;
-            }
-            let (u, v) = fill[ei];
-            let (uu, vv) = (u as usize, v as usize);
-            let (au, av) = (&adj[uu], &adj[vv]);
-            // Charge the common-neighbour intersection itself before doing
-            // any work.  Wide failed candidates are therefore bounded too;
-            // they cannot bypass the budget merely because the subsequent
-            // clique check is skipped.
-            ops -= (au.len() + av.len()) as i64;
-            if ops < 0 {
-                break;
-            }
-            let mut common: Vec<u32> = Vec::with_capacity(au.len().min(av.len()));
-            let (mut i, mut j) = (0usize, 0usize);
-            while i < au.len() && j < av.len() {
-                if au[i] < av[j] {
-                    i += 1;
-                } else if au[i] > av[j] {
-                    j += 1;
-                } else {
-                    common.push(au[i]);
-                    i += 1;
-                    j += 1;
-                }
-            }
-            if common.len() > MINL_MAX_COMMON || !minl_is_clique(&adj, &common, &mut ops) {
-                continue;
-            }
-            let (Ok(pu), Ok(pv)) = (adj[uu].binary_search(&v), adj[vv].binary_search(&u))
-            else {
-                continue;
-            };
-            adj[uu].remove(pu);
-            adj[vv].remove(pv);
-            alive[ei] = false;
-            removed_this += 1;
-        }
-        if removed_this == 0 {
-            break;
-        }
-        removed_total += removed_this;
-        if ops < 0 {
-            break;
-        }
-    }
-    if removed_total == 0 {
-        return None;
-    }
-
-    let mcs = minl_mcs_peo(n, &adj);
-    let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
-    let mut ri: Vec<i32> = Vec::with_capacity(fri.len());
-    cp.push(0);
-    for row in &adj {
-        ri.extend(row.iter().map(|&v| v as i32));
-        cp.push(ri.len() as i32);
-    }
-    let amd = feral_ordering_core::CscPattern::new(n, &cp, &ri)
-        .and_then(|core| feral_amd::amd_order(&core).ok())
-        .map(|p| p.into_iter().map(|v| v as usize).collect());
-    Some((mcs, amd))
 }
 
 /// Component B step 0 ("detect"): deterministic 1-WL color refinement — the
