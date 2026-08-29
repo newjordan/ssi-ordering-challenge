@@ -69,6 +69,37 @@ pub struct MetricSpec {
     /// `8` reproduces the shipped convention exactly. Only varied in the
     /// dedicated tie-break sub-sweep, never crossed with the main grid.
     pub bucket_div: usize,
+    /// Multiplicative pivot-score jitter amplitude, in 256ths. `0` disables it
+    /// and reproduces the un-jittered formula bit-for-bit.
+    ///
+    /// This is the cheap end of a RANDOMIZED-RESTART family: the score of each
+    /// candidate vertex is scaled by `1 + (jitter/256) * u`, `u` uniform in
+    /// `[-1, 1)` drawn from a splitmix64 hash of `(seed, vertex index)`. It is
+    /// therefore a PURE FUNCTION of `(pattern, spec)` — the vertex index is the
+    /// original one, so both required `order()` calls agree byte-for-byte, and
+    /// no `rand` crate is involved (none is available).
+    ///
+    /// Why perturb the score rather than the selection: the vendor pivot scan
+    /// is O(number of buckets) from `mindeg`, and this module's own doc warns
+    /// that a wide-dynamic-range score crowds one coarse bucket and degenerates
+    /// that scan. A MULTIPLICATIVE jitter leaves the score distribution's shape
+    /// (and therefore the scan cost) intact while still moving the argmin,
+    /// which is the whole point: under the best-of floor a restart only has to
+    /// win on one matrix to pay for itself.
+    pub jitter: u32,
+    /// Seed for the jitter hash. Ignored when `jitter == 0`.
+    pub seed: u64,
+}
+
+/// splitmix64 — one round, deterministic, no dependencies. Used only to turn
+/// `(seed, vertex index)` into a uniform `u64` for [`MetricSpec::jitter`].
+#[inline(always)]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }
 
 const DEFAULT_BUCKET_DIV: usize = 8;
@@ -357,6 +388,12 @@ fn finalize_step_generic(
                 0.0
             };
             let mut score_f = deg_term + wf_term + degme_term;
+            if spec.jitter != 0 {
+                let h = splitmix64(spec.seed ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15));
+                // u in [0,1) from the top 53 bits, then mapped to [-1,1).
+                let u = ((h >> 11) as f64) / ((1u64 << 53) as f64);
+                score_f *= 1.0 + (spec.jitter as f64 / 256.0) * (2.0 * u - 1.0);
+            }
             if spec.perverse {
                 score_f = 1.0 / (1.0 + score_f.max(0.0));
             }
@@ -464,21 +501,21 @@ pub fn order_generic(
 /// the shipped `SqDiv`/`SqPure`/win-F variants (never the saturated-RMF
 /// branch responsible for the `AmindNorm` cost cliff).
 pub const EXTRA_METRICS: &[MetricSpec] = &[
-    MetricSpec { name: "extra_deg3_div_nv", deg_pow: 3.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_wf002", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.02, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_plus_wf", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 1.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_plus_wf01", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_p15", deg_pow: 1.50, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_p05", deg_pow: 1.00, nv_pow: 0.50, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_degme05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.50, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg15_div_nv", deg_pow: 1.50, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf05", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg2_div_nv_wf05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_mul_nv", deg_pow: 1.00, nv_pow: -1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_p175", deg_pow: 1.75, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_degme2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 2.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf01", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
-    MetricSpec { name: "extra_deg_div_nv_wf2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 2.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV },
+    MetricSpec { name: "extra_deg3_div_nv", deg_pow: 3.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg2_div_nv_wf002", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.02, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_plus_wf", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 1.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_plus_wf01", deg_pow: 1.00, nv_pow: 0.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_p15", deg_pow: 1.50, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_div_nv_p05", deg_pow: 1.00, nv_pow: 0.50, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg2_div_nv_degme05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.50, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg15_div_nv", deg_pow: 1.50, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_div_nv_wf05", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg2_div_nv_wf05", deg_pow: 2.00, nv_pow: 1.00, wf_weight: 0.50, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_mul_nv", deg_pow: 1.00, nv_pow: -1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_p175", deg_pow: 1.75, nv_pow: 0.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_div_nv_degme2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.00, wf_pow: 1.00, degme_weight: 2.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_div_nv_wf01", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 0.10, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
+    MetricSpec { name: "extra_deg_div_nv_wf2", deg_pow: 1.00, nv_pow: 1.00, wf_weight: 2.00, wf_pow: 1.00, degme_weight: 0.00, perverse: false, bucket_div: DEFAULT_BUCKET_DIV, jitter: 0, seed: 0 },
 ];
 
 #[cfg(test)]
