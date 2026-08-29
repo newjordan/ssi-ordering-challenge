@@ -108,6 +108,11 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0033-monotone-carrier-union.md](experiments/0033-monotone-carrier-union.md) — **SUBMISSION
+  CARRIER, clean promoted 1147d54 dev 0.812602→0.811905**: composes the five
+  officially improving coverage cells, preserves both pre/post-MINL starts for
+  the downstream sparse strip (`arki0013` 215.7M→193.7M), and adds the measured
+  true-terminal pair replay. All 300 rows and 43 active tests pass.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:
