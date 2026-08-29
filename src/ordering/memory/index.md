@@ -108,6 +108,7 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0027-cap-safe-small-pair-cleanup.md](experiments/0027-cap-safe-small-pair-cleanup.md) — **REVALIDATING ON THE 5f024a7 CARRIER.** Extends exact adjacent-pair cleanup to `n<1000` with 32 bounded sweeps, preserves the last fully completed sweep on budget exhaustion, and stops after two unchanged parity sweeps. On `7d22390`: nine strict wins, `sum_ln=-0.026522269`, 0.003 s worst isolated.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:
