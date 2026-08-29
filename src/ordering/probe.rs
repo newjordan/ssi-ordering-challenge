@@ -9820,3 +9820,18 @@ fn fo_mcs_check_score(
     }
     Some((elim, score))
 }
+
+#[test]
+#[ignore]
+fn probe_flops_dump() {
+    let corpus = census_corpus();
+    for (name, pat) in corpus.iter() {
+        let n = pat.n;
+        if n == 0 { continue; }
+        let sp = scoring_pattern(pat);
+        let t = Instant::now();
+        let perm = order(pat);
+        let secs = t.elapsed().as_secs_f64();
+        println!("DUMP\t{name}\t{n}\t{}\t{}\t{secs:.3}", pat.nnz(), flops_of(&sp, &perm));
+    }
+}
