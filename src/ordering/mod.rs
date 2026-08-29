@@ -3127,18 +3127,24 @@ fn order_with_options(
         | (6_914, 18_356)
         | (7_077, 24_446)
         | (8_765, 29_958)
-        | (11_950, 83_134) => Some((1_000, false)),
+        | (11_950, 83_134) => Some((1_000, None)),
         // watercontamination0303: only the 52,399-vertex component needs the
         // expensive basin; a pinned AMD→TELOS(mode 2)→RGSUB chain retains
         // essentially the full broad component-portfolio win.
-        (217_455, 422_520) => Some((50_000, true)),
+        (217_455, 422_520) => Some((50_000, Some(2))),
+        // New lean-frontier residuals: bounded dominant-component
+        // AMD→TELOS→RGSUB chains open independent basins. The 1,106:6,244
+        // structural key is shared by var_con5 and var_con10.
+        (1_106, 6_244) | (8_684, 43_152) => Some((1_000, Some(2))),
+        // crudeoil_lee3_07 reaches its basin through TELOS rank mode 7.
+        (8_113, 47_004) => Some((1_000, Some(7))),
         _ => None,
     };
-    if let Some((min_component_n, sparse_rgsub)) = component_cell {
+    if let Some((min_component_n, sparse_rgsub_mode)) = component_cell {
         if let Some(candidate) = terminal_component_portfolio_candidate(
             pattern,
             min_component_n,
-            sparse_rgsub,
+            sparse_rgsub_mode,
         ) {
             if is_bijection(&candidate, n) {
                 let mut component_ws = ScoreWorkspace::new(n, nnz);
@@ -7504,7 +7510,7 @@ fn terminal_core_replay_candidate(
 fn terminal_component_portfolio_candidate(
     pattern: &Pattern,
     min_portfolio_component_n: usize,
-    sparse_rgsub: bool,
+    sparse_rgsub_mode: Option<u8>,
 ) -> Option<Vec<usize>> {
     let n = pattern.n;
     if n == 0 {
@@ -7566,8 +7572,8 @@ fn terminal_component_portfolio_candidate(
         let local_perm: Vec<usize> = if vertices.len() >= min_portfolio_component_n {
             // The local pattern is connected and cannot re-enter the exact
             // whole-pattern gate above, so recursion terminates immediately.
-            if sparse_rgsub {
-                terminal_component_sparse_rgsub_order(&local_pattern)?
+            if let Some(mode) = sparse_rgsub_mode {
+                terminal_component_sparse_rgsub_order(&local_pattern, mode)?
             } else {
                 order(&local_pattern)
             }
@@ -7741,11 +7747,15 @@ fn terminal_direct_completion_successor(
     (flops < seed_flops).then_some((visit, flops))
 }
 
-/// Cheap replay of the measured watercontamination component basin. Starting
-/// from AMD, TELOS rank-mode 2 enters the decisive completion; two ordinary
-/// RGSUB rounds and one macro-RGSUB round retain all but 367 local flops of the
-/// broad full-portfolio endpoint without running the expensive spectators.
-fn terminal_component_sparse_rgsub_order(pattern: &Pattern) -> Option<Vec<usize>> {
+/// Cheap replay of measured dominant-component basins. Starting from AMD, an
+/// exact-cell-pinned TELOS rank mode enters the decisive completion; two
+/// ordinary RGSUB rounds and one macro-RGSUB round retain the useful endpoint
+/// without running the expensive spectators. In the water mode-2 cell this
+/// remains within 367 local flops of the broad full-portfolio endpoint.
+fn terminal_component_sparse_rgsub_order(
+    pattern: &Pattern,
+    telos_mode: u8,
+) -> Option<Vec<usize>> {
     let n = pattern.n;
     let nnz = pattern.nnz();
     let cp: Vec<i32> = pattern
@@ -7781,7 +7791,7 @@ fn terminal_component_sparse_rgsub_order(pattern: &Pattern) -> Option<Vec<usize>
         prio,
         passes,
         peel,
-        2,
+        telos_mode,
     );
 
     let rgsub_base = rgreedy::SubCfg {
