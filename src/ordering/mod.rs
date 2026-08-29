@@ -935,10 +935,10 @@ const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 /// keep the exact bitset replay in the measured medium tier; a deterministic
 /// precharged budget makes exhaustion fail closed.
 const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
-const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
-const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
+const SIMPLICIAL_PROMOTION_MAX_N: usize = 6_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 100_000;
 const SIMPLICIAL_PROMOTION_MAX_DENSITY: usize = 24;
-const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
+const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 64_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -2969,7 +2969,7 @@ fn order_with_options(
                 // seed-2 mover or the measured dense metric winner.
                 if metis_seed2_cell {
                     let opts = feral_metis::MetisOptions {
-                        seed: 2,
+                        seed: 0,
                         ..Default::default()
                     };
                     consider!(move || {
@@ -3095,6 +3095,14 @@ fn order_with_options(
                     )
                 });
             }
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.0,
+                    true,
+                    custom_metrics::ScoreVariant::SqDiv,
+                )
+            });
         }
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
@@ -4305,6 +4313,7 @@ fn order_with_options(
             && (287_000..287_800).contains(&nnz)
             && (170..=200).contains(&max_deg);
         let cell_c = (23_000..23_300).contains(&n) && (880_000..900_000).contains(&nnz);
+        let cell_d = n == 5_040 && nnz == 121_302 && (200..=240).contains(&max_deg);
         if cell_a {
             let opts = feral_metis::MetisOptions {
                 seed: 55,
@@ -4326,6 +4335,13 @@ fn order_with_options(
             let opts = feral_metis::MetisOptions {
                 seed: 26,
                 max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
+        if cell_d {
+            let opts = feral_metis::MetisOptions {
+                seed: 35,
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
