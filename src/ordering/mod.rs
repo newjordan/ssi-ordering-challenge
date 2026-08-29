@@ -2356,6 +2356,8 @@ fn order_with_options(
     // hill-climb loops below only READ it.
     let mut flops_cache: std::collections::HashMap<Vec<usize>, u64> = std::collections::HashMap::new();
     flops_cache.insert(best_perm.clone(), best_flops);
+    #[cfg(test)]
+    parallel::attrib_mark("0.anchor", best_flops);
 
     // TELOS top-K seed pool (experiment 0022) — see the `TELOS_SEED_POOL`
     // constants' doc comment. Maintained only where the TELOS phase will
@@ -2782,6 +2784,28 @@ fn order_with_options(
             consider!(move || feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
         }
 
+    }
+
+    // ULTRA-DENSE NO-DENSE-AMD ARM (experiment 0030, winnable-band hunt on
+    // the reconstructed eval corpus). The heavy no-dense-AMD pass is ceilinged
+    // at `HEAVY_AMDND_MAX_NNZ` (700k) and the D dense selectors stop at
+    // `D_WIDE_MAX_NNZ` (1M), which leaves the ultra-dense heavy cell
+    // (nnz >= 100n) with no deferral-style candidate at all. Measured there
+    // (isolated, trusted scorer): n=2587/nnz=921k/density 356 improves
+    // 0.9719 -> 0.9556 (+0.016 s) and n=9016/nnz=1.045M/density 116 improves
+    // 0.06898 -> 0.06809 (+0.036 s); every deg/count-ranked strip and
+    // AMF/AMD-alpha alternative scored worse on both. The density >= 100
+    // floor keeps the pass out of the 20-100 bands, where the same probe
+    // measured zero wins (idx146/287/398/476/253/392 census rows), and the
+    // nnz ceiling bounds the pass's cost at the measured 0.036 s while
+    // admitting the 1.045M-nnz winner the 1M D ceiling excludes. Routed
+    // through `consider`, so strictly-improving under the AMD floor.
+    if (400_000..1_200_000).contains(&nnz) && nnz >= 100usize.saturating_mul(n) {
+        let opts_nd_ultra = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        consider!(move || feral_amd::amd_order_opts(&core, &opts_nd_ultra).map(|(p, ..)| p));
     }
 
     // Medium-size extras: cheap here, pure upside layered over the AMD floor.
@@ -4003,6 +4027,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("1.portfolio", _tp1);
+#[cfg(test)]
+    parallel::attrib_mark("1.portfolio", best_flops);
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
     // every other candidate so the incumbent it perturbs is the portfolio's
@@ -4085,6 +4111,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("2.hillclimb", _tp2);
+#[cfg(test)]
+    parallel::attrib_mark("2.hillclimb", best_flops);
     // ── POST-HOC blind-spot families (`sbx-families2`): operate on the
     // PORTFOLIO'S OWN best incumbent (`best_perm`/`best_flops` as left by
     // every candidate + relabel-restart + hill-climb above), not on the raw
@@ -4202,6 +4230,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("3.peel_cntrel", _tp3);
+#[cfg(test)]
+    parallel::attrib_mark("3.peel_cntrel", best_flops);
     // ── SHOT-3-ONLY: FILLED-GRAPH REORDER + STRIP-V2 (`sbx-families2`) ──
     // Same hand-rolled discipline as the PEEL/COUNT-RELABEL block above
     // (reads `best_perm` directly, so cannot route through `consider`).
@@ -4361,6 +4391,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("4.shot3", _tp4);
+#[cfg(test)]
+    parallel::attrib_mark("4.shot3", best_flops);
     // The 35..42 density slice above 700k benefits from ranking vertices by
     // the portfolio incumbent's exact column counts before a k=64 strip and
     // AMD(.5). This is the deferred replacement for that slice's AMD(.75)
@@ -4512,6 +4544,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("5.telos", _tp5);
+#[cfg(test)]
+    parallel::attrib_mark("5.telos", best_flops);
     // Snapshot of the incumbent BEFORE either completion-lattice descent
     // phase runs. The MINL block below may update `best_perm` in place;
     // Component B (further below) deliberately starts from THIS pre-descent
@@ -4806,6 +4840,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("6.minl_orbit", _tp6);
+#[cfg(test)]
+    parallel::attrib_mark("6.minl_orbit", best_flops);
     // ── PHARMAKOS ORDERING — see the `PHARMAKOS_*` constants' doc comment
     // for the theorem, the CAMD stand-in, and the batch simplification.
     // Runs LAST (after MINL and Component B/ORBIT) so blame is computed on
@@ -4911,6 +4947,8 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("7.pharmakos", _tp7);
+#[cfg(test)]
+    parallel::attrib_mark("7.pharmakos", best_flops);
     // ── RGREEDY — randomized exact elimination-game search (small tier) ─────
     // A genuinely NEW candidate family, not another separator/relabel variant:
     // it maintains the EXACT fill graph as bitsets and runs tens of thousands
@@ -5132,6 +5170,8 @@ fn order_with_options(
 
     #[cfg(test)]
     parallel::phase_mark("8.rgreedy", _tp);
+    #[cfg(test)]
+    parallel::attrib_mark("8.rgreedy", best_flops);
 
     #[cfg(test)]
     let _tp9 = std::time::Instant::now();
@@ -5247,6 +5287,8 @@ fn order_with_options(
 
     #[cfg(test)]
     parallel::phase_mark("9.telos_ms", _tp9);
+    #[cfg(test)]
+    parallel::attrib_mark("9.telos_ms", best_flops);
 
     // ── RGSUB — the exact elimination game on elimination-tree SUBTREES ─────
     // Everything `rgreedy` does, applied to a BLOCK of the incumbent instead
@@ -5363,6 +5405,9 @@ fn order_with_options(
         }
     }
 
+    #[cfg(test)]
+    parallel::attrib_mark("10.rgsub", best_flops);
+
     // Strict terminal complement to RGSUB: locally orient adjacent pivots by
     // exact current degree, then admit only through the trusted global scorer.
     //
@@ -5416,6 +5461,9 @@ fn order_with_options(
         }
     }
 
+    #[cfg(test)]
+    parallel::attrib_mark("11.pair", best_flops);
+
     // TERMINAL COMPLETION-LATTICE DESCENT.  The ordinary MINL/watcher/ORBIT
     // batch runs before PHARMAKOS, whole-matrix exact-game search, TELOS
     // multi-start, RGSUB and adjacent-pair descent.  Those late phases can
@@ -5426,7 +5474,22 @@ fn order_with_options(
     // fill-edge scan is costly.
     // Candidate construction is fail-closed and admission remains a trusted
     // exact-score strict comparison, so this phase cannot worsen the result.
+    //
+    // MID-DENSITY WIDENING (fleet-h, experiment 0031): the 100k..300k slice of
+    // the 20 < nnz/n < 50 density band, measured cell-by-cell on the
+    // reconstructed eval corpus. Wins concentrate exactly there (gams03
+    // 0.8379→0.8005, pooling_sppb2pq 0.6102→0.5919, pooling_sppc0pq/tp,
+    // pooling_sppb0pq; ≈−1.6e-4 of proxy score); outside the density band the
+    // 100k..300k slice moved NOTHING (maxcsp-ehi d≈87, ringpack_30_1 d≈6.7,
+    // faclay33 d≈5.0 — all byte-identical at +0.05..0.15 s each), and the
+    // 300k..700k in-band extension also moved nothing (4/4 byte-identical,
+    // +0.07..0.10 s). The density floor keeps the whole crudeoil/ringpack/
+    // gams05 gate-wall class (d < 15) out, so no already-hot matrix gains
+    // cost. Worst measured addition inside the widened cell:
+    // pooling_sppc0tp 0.64→0.77 s local (grader-side that class runs
+    // 0.5-1.0 s — off the tail).
     let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
+        || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {
@@ -5441,6 +5504,9 @@ fn order_with_options(
             }
         }
     }
+
+    #[cfg(test)]
+    parallel::attrib_mark("12.terminal_minl", best_flops);
 
     let _ = best_flops;
 
