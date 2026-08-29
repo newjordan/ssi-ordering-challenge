@@ -20,11 +20,15 @@ these to the next scoring win, at zero extra measurement cost:
   have a second, pool-shaped consequence.
 
 ## Current best
-- Best score: dev **0.840107** ([0022](experiments/0022-topk-telos-seeding.md) rev3,
+- Best score: dev **0.816097** ([0030](experiments/0030-simplicial-prepeel-deduction.md),
+  exact simplicial and low-degree deduction pre-peeling + AMD/AMF on reduced core;
+  improved lt_1k 0.892062 → 0.891259; fill 0.933260 → 0.933199). Previous: dev **0.816337**
+  ([0029](experiments/0029-pr346-terminal-p50-pedigree.md)). Previous: dev **0.840107**
+  ([0022](experiments/0022-topk-telos-seeding.md) rev3,
   top-K TELOS seeding with LIGHT extra descents: descend from the incumbent + up to 2
   retained `consider` seeds in three gated regimes, extras on the Tier-B grid; plus
   the `hub_gatewall` trim (multistart+hill-climb measured-zero on ringpack_30_2 /
-  popdynm200 and now skipped there — the 0015 reclaim shipped). Worst order()
+  popdynm200 and now skipped there — the 0015 reclaim shipped). Worst order() 
   **1.164 s** vs the untouched frontier's 1.254 s on the same box — NOTE that box is
   ~1.45× faster than the one older pages' timings were recorded on, so compare
   timings only within one box. The full-grid variant scored dev 0.839362 but FAILED

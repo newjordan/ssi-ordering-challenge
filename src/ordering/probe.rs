@@ -5952,3 +5952,70 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn probe_simplicial() {
+    let corpus = crate::corpus::corpus();
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut better = 0;
+    let mut same = 0;
+    let mut worse = 0;
+    let mut max_time = 0.0f64;
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        let t0 = Instant::now();
+        let perm = super::simplicial::simplicial_amd_order(pat);
+        let secs = t0.elapsed().as_secs_f64();
+        if secs > max_time {
+            max_time = secs;
+        }
+        assert!(is_bijection(&perm, n), "simplicial order is not a bijection on {}", name);
+
+        let mine = flops_of(&sp, &perm) as f64;
+        let ratio = mine / base;
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+
+        if mine < base * 0.999999 {
+            better += 1;
+            println!("SIMP_WIN: {:<30} n={:<6} nnz={:<8} ratio={:.4} time={:.4}s", name, n, pat.nnz(), ratio, secs);
+        } else if (mine - base).abs() <= 1.0 {
+            same += 1;
+        } else {
+            worse += 1;
+            println!("SIMP_LOSS: {:<30} n={:<6} nnz={:<8} ratio={:.4} time={:.4}s", name, n, pat.nnz(), ratio, secs);
+        }
+    }
+
+    println!(
+        "\n--- SIMPLICIAL STANDALONE RESULTS --- \nBetter: {}  Same: {}  Worse: {}  Worst time: {:.4}s \nlt_1k={:.4} mid_1k_10k={:.4} gt_10k={:.4} \nGeomean Flops Ratio vs AMD = {:.6}",
+        better,
+        same,
+        worse,
+        max_time,
+        (log_sums[0] / counts[0] as f64).exp(),
+        (log_sums[1] / counts[1] as f64).exp(),
+        (log_sums[2] / counts[2] as f64).exp(),
+        aggregate(&log_sums, &counts)
+    );
+}
+
