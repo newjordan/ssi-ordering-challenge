@@ -1349,7 +1349,20 @@ fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize) -> bool {
     // `gasprod_sarawak81` win, 0.9934→0.9198, needed the full grid at seed
     // #2 exactly; it is now largely captured by the frontier's own rgreedy
     // policy work anyway.)
-    let _ = hub_safe;
+    // Regime A discriminator (0032, fleet-i): the hub-safe, non-near-forest
+    // half of the `nnz <= 20k` band. A full-grid-vs-light A/B over ALL of
+    // regime A on both corpora (probe_fleet_i_fullgrid) found every full-grid
+    // WINNER hub-safe at density >= 3 (eval-proxy n=2545/nnz=11146
+    // 0.332885->0.262729; dev gasprod_sarawak16 0.982329->0.913645) and every
+    // LOSER either hub-heavy (`max_deg*50 > n`: dev netmod_kar1, proxy
+    // n=1758/n=186 rows — the 0022 downstream-seeding regression class) or
+    // near-forest sparse (`nnz < 3n`: dev rsyn0820m04m +0.028, st_e31 —
+    // EternaPeptix's structural-tie shape one band up). Added cost is bounded
+    // by regime A's own ceiling: 33 in-cell proxy rows, worst add +0.056 s
+    // local on the winner itself, every other add <= 0.032 s.
+    if nnz <= 20_000 && nnz >= 3 * n && hub_safe {
+        return true;
+    }
     false
 }
 
@@ -2845,6 +2858,28 @@ fn order_with_options(
             consider!(move || feral_amf::amf_order_opts(&core, &opts_05_sparse).map(|(p, ..)| p));
         }
 
+    }
+
+    // ULTRA-DENSE NO-DENSE-AMD ARM (experiment 0030, winnable-band hunt on
+    // the reconstructed eval corpus). The heavy no-dense-AMD pass is ceilinged
+    // at `HEAVY_AMDND_MAX_NNZ` (700k) and the D dense selectors stop at
+    // `D_WIDE_MAX_NNZ` (1M), which leaves the ultra-dense heavy cell
+    // (nnz >= 100n) with no deferral-style candidate at all. Measured there
+    // (isolated, trusted scorer): n=2587/nnz=921k/density 356 improves
+    // 0.9719 -> 0.9556 (+0.016 s) and n=9016/nnz=1.045M/density 116 improves
+    // 0.06898 -> 0.06809 (+0.036 s); every deg/count-ranked strip and
+    // AMF/AMD-alpha alternative scored worse on both. The density >= 100
+    // floor keeps the pass out of the 20-100 bands, where the same probe
+    // measured zero wins (idx146/287/398/476/253/392 census rows), and the
+    // nnz ceiling bounds the pass's cost at the measured 0.036 s while
+    // admitting the 1.045M-nnz winner the 1M D ceiling excludes. Routed
+    // through `consider`, so strictly-improving under the AMD floor.
+    if (400_000..1_200_000).contains(&nnz) && nnz >= 100usize.saturating_mul(n) {
+        let opts_nd_ultra = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        consider!(move || feral_amd::amd_order_opts(&core, &opts_nd_ultra).map(|(p, ..)| p));
     }
 
     // Medium-size extras: cheap here, pure upside layered over the AMD floor.
@@ -5458,6 +5493,12 @@ fn order_with_options(
         // hub-free sub-10k class per 0027: in both regimes the extra round
         // runs only when round 2 strictly improved (the loop breaks on
         // non-improvement below).
+        // (0032 fleet-i measured and REJECTED widening the third round to the
+        // sparse (100k, 350k] half: 9 rows improve but by only −0.0002 to
+        // −0.001 ln each (−1.4e-5 of score in total) while the round costs
+        // +0.09–0.21 s on rows already at 1.0–1.3 s local — and the grader is
+        // ~2.6× on rgreedy-style work. Do not re-tread without a cheaper
+        // round.)
         let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
             || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
         {
@@ -5650,7 +5691,22 @@ fn order_with_options(
     // Terminal completion-lattice descent. Late portfolio phases can create a
     // chordal completion the early MINL family never saw. Descend that final
     // completion in the measured sparse envelope and dense pooling cell.
+    // 0032 (fleet-i) sparse-gt cell, 30k < n <= 50k ∧ nnz <= 170k ∧ nnz < 10n:
+    // the 0030 census's winnable sparse gt_10k mass sits just above the old
+    // n ceiling. Measured on the eval proxy: n≈44.9k/nnz≈160k twins
+    // 0.549608→0.538018 and 0.548431→0.537539 (plus two −0.0006/−0.0016
+    // riders), −0.044 ln total, for +0.15–0.16 s local on rows at 0.87 s.
+    // The 170k nnz ceiling cuts the measured near-zero-value cost rows above
+    // it (n=43.7k/nnz=172k: −0.00025 for +0.126 s); the n>30k floor keeps the
+    // (n≤30k, 100k<nnz) rows out (both measured members changed nothing at
+    // +0.05 s each). Wider variants (nnz≤200k, no n floor) measured and cut.
     let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
+        // MID-DENSITY WIDENING (fleet-h, experiment 0031): the 100k..300k slice
+        // of the 20 < nnz/n < 50 density band, measured cell-by-cell on the
+        // reconstructed eval corpus (gams03 0.8379→0.8005, pooling_sppb2pq
+        // 0.6102→0.5919, pooling_sppc0pq/tp, pooling_sppb0pq; ≈−1.6e-4 proxy).
+        || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
+        || (n > 30_000 && n <= 50_000 && nnz <= 170_000 && nnz < 10 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {

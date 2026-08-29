@@ -376,3 +376,27 @@ pub(crate) fn phase_take() -> Vec<(&'static str, f64)> {
         Err(_) => Vec::new(),
     }
 }
+
+/// TEST-ONLY attribution sink: `order()` records `best_flops` after each
+/// phase, so a probe can read off WHICH phase produced the final incumbent
+/// (the last entry whose flops strictly improved on its predecessor).
+/// Same shape and rules as [`PHASE_SECS`]: compiled out of the shipped
+/// binary, never read by `order()` itself.
+#[cfg(test)]
+pub(crate) static PHASE_BEST: std::sync::Mutex<Vec<(&'static str, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn attrib_mark(label: &'static str, flops: u64) {
+    if let Ok(mut v) = PHASE_BEST.lock() {
+        v.push((label, flops));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn attrib_take() -> Vec<(&'static str, u64)> {
+    match PHASE_BEST.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => Vec::new(),
+    }
+}

@@ -5952,3 +5952,686 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+/// Corpus loader for the sprint-5 probes: honors `$SSI_CORPUS_FILE` (the
+/// candidate-worker test shim's `corpus()` hardcodes the dev corpus and
+/// ignores the env var the root-crate loader respects).
+fn census_corpus() -> Vec<(String, Pattern)> {
+    match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p)).expect("load SSI_CORPUS_FILE")
+        }
+        _ => crate::corpus::corpus(),
+    }
+}
+
+/// WINNABLE-BAND CENSUS (sprint 5, experiment 0030). For every corpus matrix
+/// (respects `$SSI_CORPUS_FILE` — set it to the reconstructed eval corpus for
+/// the graded census), print one TSV row: name, bucket, n, nnz, density,
+/// ratio vs the AMD baseline, `order()` wall time, and the ATTRIBUTION —
+/// which phase of `order()` produced the final incumbent (last strict
+/// improvement in the `parallel::PHASE_BEST` trail, test-only hook).
+///
+/// EternaPeptix's finding (note 7e6d24f): ties at ratio >= 0.99 are
+/// structural near-forests, the winnable mass is the 0.93-0.99 band. Rows in
+/// that band are marked `BAND` for offline filtering.
+///
+/// `SSI_CORPUS_FILE=... cargo test --release -- --ignored --nocapture --test-threads=1 probe_winnable_band`
+#[test]
+#[ignore]
+fn probe_winnable_band() {
+    let corpus = census_corpus();
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok()
+    );
+    println!("CEN\tname\tbucket\tn\tnnz\tdensity\tratio\tsecs\twinner\tband");
+    // `SSI_PROBE_SHARD="i/m"` processes matrices with idx % m == i (same
+    // convention as `probe_telos`); aggregate the TSV offline.
+    let (shard_i, shard_m) = std::env::var("SSI_PROBE_SHARD")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('/')?;
+            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+        })
+        .unwrap_or((0, 1));
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    for (idx, (name, pat)) in corpus.iter().enumerate() {
+        if idx % shard_m != shard_i {
+            continue;
+        }
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let Some(core) = feral_ordering_core::CscPattern::new(n, &cp, &ri) else {
+            continue;
+        };
+        let Ok(amd) = feral_amd::amd_order(&core) else {
+            continue;
+        };
+        let base = flops_of(&sp, &amd.into_iter().map(|x| x as usize).collect::<Vec<_>>()) as f64;
+        let _ = parallel::attrib_take();
+        let t0 = Instant::now();
+        let perm = order(pat);
+        let secs = t0.elapsed().as_secs_f64();
+        let f = flops_of(&sp, &perm) as f64;
+        let ratio = f / base;
+        // Attribution: walk the phase trail; the winner is the label of the
+        // last entry that strictly improved on the running minimum.
+        let trail = parallel::attrib_take();
+        let mut winner = "0.anchor";
+        let mut run_min = u64::MAX;
+        for (label, fl) in &trail {
+            if *fl < run_min {
+                run_min = *fl;
+                winner = label;
+            }
+        }
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        let band = if (0.93..0.99).contains(&ratio) { "BAND" } else { "" };
+        println!(
+            "CEN\t{name}\t{}\t{n}\t{nnz}\t{:.2}\t{:.6}\t{:.3}\t{winner}\t{band}",
+            BUCKET_NAMES[b],
+            nnz as f64 / n as f64,
+            ratio,
+            secs
+        );
+    }
+    let mut per_bucket = [0.0f64; 3];
+    for b in 0..3 {
+        if counts[b] > 0 {
+            per_bucket[b] = (log_sums[b] / counts[b] as f64).exp();
+        }
+    }
+    println!(
+        "CENSUM\tscore={:.6}\tlt={:.4}({}) mid={:.4}({}) gt={:.4}({})",
+        aggregate(&log_sums, &counts),
+        per_bucket[0], counts[0], per_bucket[1], counts[1], per_bucket[2], counts[2]
+    );
+}
+
+/// BAND-HEADROOM HUNT (sprint 5, experiment 0030). For each matrix named in
+/// `SSI_PROBE_MATRICES` (comma-separated), score the crown's published band
+/// prescriptions and close variants as ISOLATED alternative candidates
+/// against the full `order()` incumbent, all through the trusted scorer:
+///
+///   - whole-matrix AMF over a dense_alpha grid;
+///   - whole-matrix aggressive/non-aggressive AMD over an alpha grid;
+///   - raw DegSqrt(0.75) quotient-metric ordering;
+///   - degree-ranked strip k + {AMD, AMD(1.0) non-aggr, AMF(1.5), DegSqrt(0.75)};
+///   - incumbent-count-ranked strip k + {AMD, DegSqrt(0.75)};
+///   - the 50-100-density DegSqrt cascade (k=16/192/384, exact-count re-rank).
+///
+/// Each variant row prints label, flops ratio vs AMD base, isolated wall
+/// time, and WIN/tie vs the incumbent. Timing-safety data and the win table
+/// feed the shipped gates directly.
+///
+/// `SSI_CORPUS_FILE=... SSI_PROBE_MATRICES=a,b cargo test --release -- --ignored --nocapture --test-threads=1 probe_band_variants`
+#[test]
+#[ignore]
+fn probe_band_variants() {
+    // Targets by corpus INDEX (`SSI_PROBE_IDX="10,33,..."`) — the
+    // reconstructed corpus carries no names — or by name (`SSI_PROBE_MATRICES`).
+    let corpus = census_corpus();
+    let mut targets: Vec<usize> = Vec::new();
+    if let Ok(s) = std::env::var("SSI_PROBE_IDX") {
+        for part in s.split(',') {
+            if let Ok(i) = part.trim().parse::<usize>() {
+                targets.push(i);
+            }
+        }
+    }
+    if let Ok(s) = std::env::var("SSI_PROBE_MATRICES") {
+        for part in s.split(',') {
+            let nm = part.trim();
+            if let Some(i) = corpus.iter().position(|(n, _)| n == nm) {
+                targets.push(i);
+            } else if !nm.is_empty() {
+                println!("VAR\t{nm}\tNOT-FOUND");
+            }
+        }
+    }
+    assert!(!targets.is_empty(), "set SSI_PROBE_IDX or SSI_PROBE_MATRICES");
+    for &tidx in &targets {
+        let Some((raw_name, pat)) = corpus.get(tidx) else {
+            println!("VAR\tidx{tidx}\tOUT-OF-RANGE");
+            continue;
+        };
+        let tname = if raw_name.is_empty() {
+            format!("idx{tidx}")
+        } else {
+            raw_name.clone()
+        };
+        let tname = &tname;
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let Some(core) = feral_ordering_core::CscPattern::new(n, &cp, &ri) else {
+            continue;
+        };
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let t0 = Instant::now();
+        let inc_perm = order(pat);
+        let inc_secs = t0.elapsed().as_secs_f64();
+        let inc_flops = flops_of(&sp, &inc_perm);
+        println!(
+            "\nVAR\t{tname}\tn={n} nnz={nnz} density={:.1} bucket={} incumbent_ratio={:.6} order_secs={:.3}",
+            nnz as f64 / n as f64,
+            BUCKET_NAMES[bucket(n)],
+            inc_flops as f64 / base,
+            inc_secs
+        );
+
+        // Rankings shared by the strip variants.
+        let mut deg_ranked: Vec<usize> = (0..n).collect();
+        deg_ranked.sort_unstable_by(|&a, &b| {
+            let da = sp.col_ptr[a + 1] - sp.col_ptr[a];
+            let db = sp.col_ptr[b + 1] - sp.col_ptr[b];
+            db.cmp(&da).then(a.cmp(&b))
+        });
+        let permuted = permute_pattern(&sp, &inc_perm);
+        let etree = feral::ordering::elimination_tree::EliminationTree::from_pattern(&permuted);
+        let counts = feral::symbolic::column_counts_gnp(&permuted, &etree);
+        let mut cnt_by_v = vec![0usize; n];
+        for (pos, &v) in inc_perm.iter().enumerate() {
+            cnt_by_v[v] = counts[pos];
+        }
+        let mut cnt_ranked: Vec<usize> = (0..n).collect();
+        cnt_ranked.sort_unstable_by(|&a, &b| cnt_by_v[b].cmp(&cnt_by_v[a]).then(a.cmp(&b)));
+
+        let mut report = |label: String, perm: Option<Vec<usize>>, secs: f64| {
+            match perm {
+                Some(p) if is_bijection(&p, n) => {
+                    let f = flops_of(&sp, &p);
+                    let verdict = if f < inc_flops { "WIN" } else { "tie" };
+                    println!(
+                        "VAR\t{tname}\t{label}\t{:.6}\t{:.3}s\t{verdict}",
+                        f as f64 / base,
+                        secs
+                    );
+                }
+                _ => println!("VAR\t{tname}\t{label}\tFAIL\t{:.3}s\t-", secs),
+            }
+        };
+
+        // Whole-matrix AMF alpha grid.
+        for a in [0.5f64, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5] {
+            let opts = feral_amf::AmfOptions { dense_alpha: a, ..Default::default() };
+            let t0 = Instant::now();
+            let p = feral_amf::amf_order_opts(&core, &opts)
+                .ok()
+                .map(|(p, ..)| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            report(format!("amf_a{a}"), p, t0.elapsed().as_secs_f64());
+        }
+        // Whole-matrix AMD alpha grid.
+        for (aggr, a) in [(true, 0.5f64), (true, 0.75), (true, 1.0), (true, 2.0), (false, 1.0), (false, -1.0)] {
+            let opts = feral_amd::AmdOptions { aggressive: aggr, dense_alpha: a };
+            let t0 = Instant::now();
+            let p = feral_amd::amd_order_opts(&core, &opts)
+                .ok()
+                .map(|(p, ..)| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            report(format!("amd_{}a{a}", if aggr { "ag" } else { "na" }), p, t0.elapsed().as_secs_f64());
+        }
+        // Raw DegSqrt(0.75).
+        {
+            let t0 = Instant::now();
+            let p = custom_metrics::order_variant(&core, 0.75, true, custom_metrics::ScoreVariant::DegSqrt)
+                .ok()
+                .map(|p| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            report("degsqrt_a075".into(), p, t0.elapsed().as_secs_f64());
+        }
+        // Strip k over both rankings and four sub-orderers.
+        let sub_amd = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+        let sub_amd_na1 = |c: &feral_ordering_core::CscPattern| {
+            let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: 1.0 };
+            feral_amd::amd_order_opts(c, &o).ok().map(|(p, ..)| p)
+        };
+        let sub_amf15 = |c: &feral_ordering_core::CscPattern| {
+            let o = feral_amf::AmfOptions { dense_alpha: 1.5, ..Default::default() };
+            feral_amf::amf_order_opts(c, &o).ok().map(|(p, ..)| p)
+        };
+        let sub_degsqrt = |c: &feral_ordering_core::CscPattern| {
+            custom_metrics::order_variant(c, 0.75, true, custom_metrics::ScoreVariant::DegSqrt).ok()
+        };
+        let subs: [(&str, &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>); 4] = [
+            ("amd", &sub_amd),
+            ("amdna1", &sub_amd_na1),
+            ("amf15", &sub_amf15),
+            ("degsqrt", &sub_degsqrt),
+        ];
+        for (rank_name, ranked) in [("deg", &deg_ranked), ("cnt", &cnt_ranked)] {
+            for &k in &[32usize, 64, 128, 192, 384, 1024] {
+                if k >= n / 2 {
+                    break;
+                }
+                for (sub_name, sub) in &subs {
+                    let t0 = Instant::now();
+                    let p = strip_general_v2(&sp, ranked, k, sub);
+                    report(format!("strip_{rank_name}{k}_{sub_name}"), p, t0.elapsed().as_secs_f64());
+                }
+            }
+        }
+        // The 50-100 density DegSqrt cascade (k=16/192/384, exact re-rank).
+        {
+            let t0 = Instant::now();
+            let raw = custom_metrics::order_variant(&core, 0.75, true, custom_metrics::ScoreVariant::DegSqrt)
+                .ok()
+                .map(|p| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            let mut cur = raw;
+            if let Some(mut perm) = cur.take() {
+                let mut ok = true;
+                for k in [16usize, 192, 384] {
+                    if k >= n {
+                        break;
+                    }
+                    let permuted = permute_pattern(&sp, &perm);
+                    let etree =
+                        feral::ordering::elimination_tree::EliminationTree::from_pattern(&permuted);
+                    let counts = feral::symbolic::column_counts_gnp(&permuted, &etree);
+                    let mut cbv = vec![0usize; n];
+                    for (pos, &v) in perm.iter().enumerate() {
+                        cbv[v] = counts[pos];
+                    }
+                    let mut rk: Vec<usize> = (0..n).collect();
+                    rk.sort_unstable_by(|&a, &b| cbv[b].cmp(&cbv[a]).then(a.cmp(&b)));
+                    match strip_general_v2(&sp, &rk, k, &sub_degsqrt) {
+                        Some(p) => perm = p,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                cur = if ok { Some(perm) } else { None };
+            }
+            report("degsqrt_cascade".into(), cur, t0.elapsed().as_secs_f64());
+        }
+    }
+}
+
+
+/// FLEET-H (0031) — corpus-flexible timing/score probe.
+///
+/// The candidate-worker package's test corpus shim is FIXED to the dev corpus
+/// (`candidate-worker/src/main.rs`), so despite older doc comments,
+/// `crate::corpus::corpus()` does NOT respect `$SSI_CORPUS_FILE` here. This
+/// probe loads the corpus itself: `$SSI_CORPUS_FILE` if set (e.g. the
+/// reconstructed eval corpus), else the dev shim.
+///
+/// Modes:
+///   * default — full corpus, one pass per matrix, per-matrix TSV
+///     (`secs  name  n  nnz  ratio`) + buckets + score, exactly the
+///     `probe_timing_and_score` format.
+///   * `$SSI_PROBE_ONLY` set (comma-separated exact matrix names) — targeted
+///     mode: only those matrices, THREE timed passes each (order() is
+///     deterministic; min-of-3 damps box noise), ratio from the first.
+#[test]
+#[ignore]
+fn probe_fleet_h() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?}, targeted={})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok(),
+        only.is_some()
+    );
+
+    let mut rows: Vec<(f64, String, usize, usize, f64)> = Vec::new();
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        if let Some(list) = &only {
+            // Reconstructed-corpus lines carry blank names; match either the
+            // exact name or an `n:nnz` key.
+            let key = format!("{}:{}", n, pat.nnz());
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+
+        let reps = if only.is_some() { 3 } else { 1 };
+        let mut secs = f64::INFINITY;
+        let mut perm = Vec::new();
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            perm = order(pat);
+            secs = secs.min(t0.elapsed().as_secs_f64());
+        }
+        let mine = flops_of(&sp, &perm);
+        let ratio = mine as f64 / base as f64;
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        rows.push((secs, name.clone(), n, pat.nnz(), ratio));
+    }
+
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("\n--- every order() call, slowest first (TSV) ---");
+    println!("secs\tmatrix\tn\tnnz\tratio");
+    for (secs, name, n, nnz, ratio) in rows.iter() {
+        println!("{secs:.4}\t{name}\t{n}\t{nnz}\t{ratio:.6}");
+    }
+    println!("\n--- per-bucket ---");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<8} count={:<5} geomean={:.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("SCORE = {:.6}", aggregate(&log_sums, &counts));
+    if let Some(r0) = rows.first() {
+        println!("WORST order() = {:.3} s ({})", r0.0, r0.1);
+    }
+}
+
+/// FLEET-H (0031) — isolated relabelled-AMF census over the D_WIDE window.
+/// For every corpus matrix with nnz in [400k,1M) and 20 < nnz/n < 50, compare
+/// the CURRENT full `order()` result against relabelled-AMF at alpha in
+/// {0.5,0.75,1.0,1.25,1.5,2.0,2.5} x seeds 1..=8 (the 0026 deferred recipe's
+/// full grid). Answers definitively whether ANY (seed, alpha) pair still has
+/// value on this tree before sizing a shipped block.
+#[test]
+#[ignore]
+fn probe_fleet_h_dwide_census() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if !(400_000..1_000_000).contains(&nnz) || nnz <= 20 * n || nnz >= 50 * n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let incumbent = flops_of(&sp, &order(pat));
+        let mut best = (f64::INFINITY, 0.0f64, 0u64);
+        println!("\n{name} n={n} nnz={nnz} incumbent_flops={incumbent}");
+        for &alpha in &[0.5f64, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5] {
+            for seed in 1u64..=8 {
+                let q = relabel(n, seed);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+                    continue;
+                };
+                let amf_opts = feral_amf::AmfOptions {
+                    dense_alpha: alpha,
+                    ..Default::default()
+                };
+                let Ok((pb, ..)) = feral_amf::amf_order_opts(&bcore, &amf_opts) else {
+                    continue;
+                };
+                let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                let f = flops_of(&sp, &cand);
+                let rel = f as f64 / incumbent as f64;
+                if rel < best.0 {
+                    best = (rel, alpha, seed);
+                }
+                if rel < 1.0 {
+                    println!("  WIN alpha={alpha} seed={seed} rel={rel:.6}");
+                }
+            }
+        }
+        println!("  best rel={:.6} (alpha={} seed={})", best.0, best.1, best.2);
+    }
+}
+
+
+/// FLEET-I (0032) — corpus-flexible timing/score probe (probe_fleet_h's
+/// pattern: the candidate-worker test corpus shim is FIXED to dev, so this
+/// loads `$SSI_CORPUS_FILE` itself when set).
+///
+/// Modes:
+///   * default — full corpus, one pass per matrix, per-matrix TSV
+///     (`secs  name  n  nnz  ratio`) + buckets + score.
+///   * `$SSI_PROBE_ONLY` (comma-separated names or `n:nnz` keys) — targeted:
+///     THREE timed passes each (min-of-3 damps box noise), ratio from the
+///     first.
+#[test]
+#[ignore]
+fn probe_fleet_i() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?}, targeted={})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok(),
+        only.is_some()
+    );
+
+    let mut rows: Vec<(f64, String, usize, usize, f64)> = Vec::new();
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        if let Some(list) = &only {
+            let key = format!("{}:{}", n, pat.nnz());
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+
+        let reps = if only.is_some() { 3 } else { 1 };
+        let mut secs = f64::INFINITY;
+        let mut perm = Vec::new();
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            perm = order(pat);
+            secs = secs.min(t0.elapsed().as_secs_f64());
+        }
+        let mine = flops_of(&sp, &perm);
+        let ratio = mine as f64 / base as f64;
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        rows.push((secs, name.clone(), n, pat.nnz(), ratio));
+    }
+
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("\n--- every order() call, slowest first (TSV) ---");
+    println!("secs\tmatrix\tn\tnnz\tratio");
+    for (secs, name, n, nnz, ratio) in rows.iter() {
+        println!("{secs:.4}\t{name}\t{n}\t{nnz}\t{ratio:.6}");
+    }
+    println!("\n--- per-bucket ---");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<8} count={:<5} geomean={:.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("SCORE = {:.6}", aggregate(&log_sums, &counts));
+    if let Some(r0) = rows.first() {
+        println!("WORST order() = {:.3} s ({})", r0.0, r0.1);
+    }
+}
+
+/// FLEET-I (0032) — TELOS Regime-A full-grid extras A/B on the env corpus.
+///
+/// For every matrix in extras Regime A (`nnz <= 20_000`, the only regime
+/// where `telos_extra_fullgrid` still returns false AND the full grid differs
+/// from the light one — Regime C's Tier-B schedule IS the light grid), run
+/// the whole `order()` under three configs:
+///   gate — shipped (light extras, K from the gate)
+///   fg   — `TELOS_EXTRA_FULLGRID` on, K from the gate (=2)
+///   fg3  — full grid + K=3 (`TELOS_EXTRA_OVERRIDE`)
+/// TSV: name, n, nnz, maxdeg, ratio and secs per config. Aggregate deltas vs
+/// `gate` close the output. `SSI_PROBE_ONLY` (names or `n:nnz`) targets rows.
+#[test]
+#[ignore]
+fn probe_fleet_i_fullgrid() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    println!("FGAB\tname\tn\tnnz\tmaxdeg\tr_gate\tr_fg\tr_fg3\ts_gate\ts_fg\ts_fg3");
+    let mut dln_fg = [0.0f64; 3];
+    let mut dln_fg3 = [0.0f64; 3];
+    let mut better = [0usize; 2];
+    let mut worse = [0usize; 2];
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if nnz == 0 || nnz > 20_000 {
+            continue;
+        }
+        if let Some(list) = &only {
+            let key = format!("{}:{}", n, nnz);
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let max_deg = probe_max_deg(pat);
+
+        let mut ratios = [0.0f64; 3];
+        let mut secs = [0.0f64; 3];
+        for (i, (fg, k)) in [(false, None), (true, None), (true, Some(3usize))]
+            .into_iter()
+            .enumerate()
+        {
+            TELOS_EXTRA_FULLGRID.with(|c| c.set(fg));
+            TELOS_EXTRA_OVERRIDE.with(|c| c.set(k));
+            let t0 = Instant::now();
+            let perm = order(pat);
+            secs[i] = t0.elapsed().as_secs_f64();
+            ratios[i] = flops_of(&sp, &perm) as f64 / base;
+        }
+        TELOS_EXTRA_FULLGRID.with(|c| c.set(false));
+        TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
+
+        let b = bucket(n);
+        dln_fg[b] += (ratios[1] / ratios[0]).ln();
+        dln_fg3[b] += (ratios[2] / ratios[0]).ln();
+        for (j, r) in [ratios[1], ratios[2]].into_iter().enumerate() {
+            if r < ratios[0] - 1e-15 {
+                better[j] += 1;
+            } else if r > ratios[0] + 1e-15 {
+                worse[j] += 1;
+            }
+        }
+        println!(
+            "FGAB\t{name}\t{n}\t{nnz}\t{max_deg}\t{:.6}\t{:.6}\t{:.6}\t{:.3}\t{:.3}\t{:.3}",
+            ratios[0], ratios[1], ratios[2], secs[0], secs[1], secs[2]
+        );
+    }
+    println!("\n--- aggregate vs gate ---");
+    println!(
+        "fg : better={} worse={} dln lt={:+.6} mid={:+.6} gt={:+.6}",
+        better[0], worse[0], dln_fg[0], dln_fg[1], dln_fg[2]
+    );
+    println!(
+        "fg3: better={} worse={} dln lt={:+.6} mid={:+.6} gt={:+.6}",
+        better[1], worse[1], dln_fg3[0], dln_fg3[1], dln_fg3[2]
+    );
+}
