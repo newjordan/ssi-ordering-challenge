@@ -1271,11 +1271,38 @@ pub(crate) fn subtree_refine(
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
                             // seed to sample an independent subtree basin.
-                            let rng_seed = if n >= 10_000 && k == 1 {
+                            let mut rng_seed = if n >= 10_000 && k == 1 {
                                 0xD1B5_4A32_D192_ED03
                             } else {
                                 stream_rng(k)
                             };
+                            // Round two otherwise repeats byte-for-byte on an
+                            // unchanged block. D1 is diversified everywhere;
+                            // diversify stream 0 on alternating top-32 ranks,
+                            // retaining the promoted trajectory on the other
+                            // half. No trajectories or work are added.
+                            if n >= 10_000 && k == 1 && cfg.round == 1 {
+                                rng_seed ^= 0xA076_1D64_78BD_642F;
+                            }
+                            if n >= 10_000
+                                && k == 0
+                                && cfg.round == 1
+                                && block_rank & 1 == 1
+                            {
+                                rng_seed ^= 0xE703_7ED1_A0B4_28DB;
+                            }
+                            // 0030: rounds that repeat a seed byte-for-byte on an
+                            // unchanged block are wasted work. Equal-work diversification:
+                            // every outer round >= 1 below 10k (both streams), and the
+                            // third round everywhere, get a round-keyed seed.
+                            if n < 10_000 && cfg.round >= 1 {
+                                rng_seed ^= 0x2545_F491_4F6C_DD1Du64
+                                    .wrapping_mul(cfg.round as u64 * 2 + 1);
+                            }
+                            if n >= 10_000 && cfg.round >= 2 {
+                                rng_seed ^= 0x3C6E_F372_FE94_F82Bu64
+                                    .wrapping_mul(cfg.round as u64 * 2 + 1);
+                            }
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1338,4 +1365,6 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Zero-based outer RGSUB round, used only to diversify an equal-work seed.
+    pub(crate) round: usize,
 }
