@@ -3209,9 +3209,9 @@ fn order_with_options(
         });
 
         // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
-        // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
+        // matter (>=2200 owned vertices, <=18k block-nnz so a restart stays
         // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
-        // local flops, largest-block-first under a 24-restart global budget.
+        // local flops, largest-block-first under a 1-restart global budget.
         // Decomposition shrinks the problem, so this reaches blocks the
         // whole-graph relabel multi-start is gated out of on the big gt_10k
         // matrices. Adds crudeoil_lee1_07 (0.9032->0.8781) and syn30m03m
@@ -3225,7 +3225,7 @@ fn order_with_options(
         if nnz <= 60_000 {
             consider!(move || {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    biconn::biconn_heavy_order(pattern, 1, 2200, 18_000),
                 )
             });
         }
@@ -6969,7 +6969,7 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     }
     let degree: Vec<usize> = adj.iter().map(|a| a.len()).collect();
 
-    const ND_LEAF: usize = 200;
+    const ND_LEAF: usize = 700;
 
     let mut order: Vec<usize> = vec![0usize; n];
     let mut mark: Vec<bool> = vec![false; n]; // membership in the current subset
@@ -6978,7 +6978,7 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
 
     // Hard work budget: caps total per-subset scanning at O(n), so no adversarial
     // (e.g. highly disconnected) input can drive quadratic blow-up.
-    let mut budget: i64 = 64 * n as i64 + 4096;
+    let mut budget: i64 = 16 * n as i64 + 4096;
 
     // Scratch global->local map for AMD-on-induced-leaf ordering; -1 everywhere
     // between leaves. Allocated only when the AMD-leaf variant is requested.
