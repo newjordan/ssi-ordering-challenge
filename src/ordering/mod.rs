@@ -1510,6 +1510,54 @@ fn minl_off() -> bool {
     false
 }
 
+/// N7 TEST-ONLY capture of the exact incumbent immediately before and after
+/// the shipped terminal P50 block. It lets the probe start pair/triple work
+/// from the real current production basin without duplicating the long
+/// portfolio pipeline. This state and both permutation clones are absent from
+/// non-test builds.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalP50Snapshot {
+    pub(crate) before_perm: Vec<usize>,
+    pub(crate) before_flops: u64,
+    pub(crate) after_perm: Vec<usize>,
+    pub(crate) after_flops: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_P50_SNAPSHOT: std::cell::RefCell<Option<TerminalP50Snapshot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_terminal_p50_snapshot() -> Option<TerminalP50Snapshot> {
+    TERMINAL_P50_SNAPSHOT.with(|slot| slot.borrow_mut().take())
+}
+
+/// N7 TEST-ONLY A/B control and exact production-hook call counter. The
+/// non-test branch is a constant `true`, so neither control exists in the
+/// shipped worker and the production gate keeps no test seam.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static POST_P50_WINDOW_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+    pub(crate) static POST_P50_WINDOW_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[inline]
+fn post_p50_window_enabled() -> bool {
+    POST_P50_WINDOW_ENABLED.with(|cell| cell.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+const fn post_p50_window_enabled() -> bool {
+    true
+}
+
 /// Deterministic 64-bit mixer (SplitMix64). Used only to derive relabelings from
 /// a fixed seed, so every run produces the identical sequence — the determinism
 /// gate requires the two `order()` runs to agree byte-for-byte.
@@ -5754,10 +5802,9 @@ fn order_with_options(
     // hub gate as the rgreedy mid band above (`max_deg * 50 <= n`) — the
     // phase replays the elimination game, whose per-sweep cost is set by the
     // largest hub, and the extension band gets no slack-floor spending, so
-    // the ops budget is the only new cost. This phase is TERMINAL: nothing
-    // runs after it, so unlike the rgreedy mid band it carries zero
-    // downstream-reseed risk — a strict accept here is monotone on the final
-    // score by construction.
+    // the ops budget is the only new cost. This was terminal when introduced;
+    // the later P50 phase can now replace its incumbent. N7 preserves this
+    // established pass byte-for-byte and repairs only a strict post-P50 basin.
     // The ceiling is `rgreedy::MAX_N` (12 000, the bitset allocation guard —
     // `Game::build_adj` returns None above it, so a higher gate would be a
     // silent no-op). That reaches 4 dev `gt_10k` matrices (weight 0.40 over
@@ -5800,10 +5847,11 @@ fn order_with_options(
         }
     }
 
-    // FINAL, after adjacent-pair descent: move a bounded number of currently
+    // After adjacent-pair descent, move a bounded number of currently
     // simplicial lower-degree neighbours forward across short non-adjacent
     // windows. The helper validates the bijection and admits only a canonical
-    // ScoreWorkspace strict improvement.
+    // ScoreWorkspace strict improvement. P50 may later enter a different
+    // completion basin; N7 handles that basin separately below.
     if let Some((candidate, candidate_flops)) = final_simplicial_promotion(
         pattern,
         &scoring_pat,
@@ -5907,6 +5955,9 @@ fn order_with_options(
         || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
         || (n > 30_000 && n <= 50_000 && nnz <= 170_000 && nnz < 10 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
+    let terminal_p50_before_flops = best_flops;
+    #[cfg(test)]
+    let terminal_p50_before_perm = best_perm.clone();
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {
             for cand in [Some(mcs), amd].into_iter().flatten() {
@@ -5920,6 +5971,52 @@ fn order_with_options(
             }
         }
 
+    }
+    #[cfg(test)]
+    TERMINAL_P50_SNAPSHOT.with(|slot| {
+        *slot.borrow_mut() = Some(TerminalP50Snapshot {
+            before_perm: terminal_p50_before_perm,
+            before_flops: terminal_p50_before_flops,
+            after_perm: best_perm.clone(),
+            after_flops: best_flops,
+        });
+    });
+
+    // N7: the phases historically described as terminal pair/simplicial
+    // repair now precede terminal P50. A strict P50 adoption therefore enters
+    // a completion basin those local phases have never seen. Re-spend one
+    // bounded 48M local budget in that new basin: two pair sweeps, pair
+    // fixed-point certification, and the exact triple escape all share the
+    // same cumulative Game::ops counter. Triple exhaustion preserves the
+    // completed pair result; only a trusted strict whole-score improvement is
+    // admitted here.
+    const POST_P50_WINDOW_SWEEPS: usize = 2;
+    const POST_P50_WINDOW_OPS_BUDGET: i64 = 48_000_000;
+    let post_p50_window_gate = best_flops < terminal_p50_before_flops
+        && (1_000..=3_000).contains(&n)
+        && nnz > 0
+        && nnz <= 20_000
+        && max_deg <= n / 50
+        && post_p50_window_enabled();
+    if post_p50_window_gate {
+        #[cfg(test)]
+        POST_P50_WINDOW_CALLS.with(|cell| cell.set(cell.get() + 1));
+        if let Some(cand) = rgreedy::adjacent_pair_then_triple_descent(
+            n,
+            &pattern.col_ptr,
+            &pattern.row_idx,
+            &best_perm,
+            POST_P50_WINDOW_SWEEPS,
+            POST_P50_WINDOW_OPS_BUDGET,
+        ) {
+            if is_bijection(&cand, n) {
+                let f = ws.flops(&scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
+        }
     }
 
     // Re-rank by each accepted start's exact column counts before every peel,

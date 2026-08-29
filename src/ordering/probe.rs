@@ -6636,6 +6636,264 @@ fn probe_fleet_i_fullgrid() {
     );
 }
 
+fn n7_shape_gate(pat: &Pattern) -> (bool, usize) {
+    let n = pat.n;
+    let nnz = pat.nnz();
+    let max_deg = (0..n)
+        .map(|v| pat.col_ptr[v + 1] - pat.col_ptr[v])
+        .max()
+        .unwrap_or(0);
+    (
+        (1_000..=3_000).contains(&n)
+            && nnz > 0
+            && nnz <= 20_000
+            && max_deg <= n / 50,
+        max_deg,
+    )
+}
+
+fn n7_order_with_hook_mode(
+    pat: &Pattern,
+    enabled: bool,
+) -> (Vec<usize>, TerminalP50Snapshot, usize) {
+    POST_P50_WINDOW_ENABLED.with(|cell| cell.set(enabled));
+    POST_P50_WINDOW_CALLS.with(|cell| cell.set(0));
+    let perm = order(pat);
+    let snap = take_terminal_p50_snapshot().expect("terminal P50 snapshot missing");
+    let calls = POST_P50_WINDOW_CALLS.with(|cell| cell.get());
+    POST_P50_WINDOW_ENABLED.with(|cell| cell.set(true));
+    (perm, snap, calls)
+}
+
+/// REQUIRED negative gate: a shape-admitted row whose terminal P50 does not
+/// strictly change the incumbent must never call N7, and the exact-a3c output
+/// must stay byte-identical with the test-only hook switch on or off.
+#[test]
+#[ignore]
+fn probe_n7_p50_nonstrict_skips_hook_byte_identically() {
+    let corpus = crate::corpus::corpus();
+    for (name, pat) in &corpus {
+        let (shape_gate, _) = n7_shape_gate(pat);
+        if !shape_gate {
+            continue;
+        }
+
+        let (off, off_snap, off_calls) = n7_order_with_hook_mode(pat, false);
+        assert_eq!(off_calls, 0, "{name}: disabled N7 hook was called");
+        if off_snap.after_flops != off_snap.before_flops {
+            continue;
+        }
+
+        let (on, on_snap, on_calls) = n7_order_with_hook_mode(pat, true);
+        let (again, again_snap, again_calls) = n7_order_with_hook_mode(pat, true);
+        assert_eq!(on_calls, 0, "{name}: non-strict P50 called N7");
+        assert_eq!(again_calls, 0, "{name}: repeated non-strict P50 called N7");
+        assert_eq!(on, off, "{name}: non-strict hook-on changed exact-a3c output");
+        assert_eq!(again, on, "{name}: non-strict output was nondeterministic");
+        assert_eq!(on_snap.before_perm, off_snap.before_perm);
+        assert_eq!(on_snap.after_perm, off_snap.after_perm);
+        assert_eq!(on_snap.before_flops, off_snap.before_flops);
+        assert_eq!(on_snap.after_flops, off_snap.after_flops);
+        assert_eq!(again_snap.before_perm, on_snap.before_perm);
+        assert_eq!(again_snap.after_perm, on_snap.after_perm);
+        println!(
+            "N7-NONSTRICT\t{name}\tn={}\tnnz={}\tflops={}\tcalls=0\tbyte_identical=true",
+            pat.n,
+            pat.nnz(),
+            off_snap.after_flops,
+        );
+        return;
+    }
+    panic!("N7 required gate missing: no shape-admitted P50 non-strict row");
+}
+
+/// REQUIRED non-gate identity: test-only N7 enablement must not alter an
+/// exact-a3c row outside the structural selector, and two enabled runs must be
+/// byte-identical.
+#[test]
+#[ignore]
+fn probe_n7_nongate_preserves_exact_a3c_byte_identity() {
+    let corpus = crate::corpus::corpus();
+    let (name, pat) = corpus
+        .iter()
+        .find(|(_, pat)| pat.n > 0 && pat.n < 1_000 && !n7_shape_gate(pat).0)
+        .expect("public corpus must contain a small non-gate row");
+    let (off, off_snap, off_calls) = n7_order_with_hook_mode(pat, false);
+    let (on, on_snap, on_calls) = n7_order_with_hook_mode(pat, true);
+    let (again, again_snap, again_calls) = n7_order_with_hook_mode(pat, true);
+    assert_eq!((off_calls, on_calls, again_calls), (0, 0, 0));
+    assert_eq!(on, off, "{name}: non-gate hook-on changed exact-a3c output");
+    assert_eq!(again, on, "{name}: non-gate output was nondeterministic");
+    assert_eq!(on_snap.before_perm, off_snap.before_perm);
+    assert_eq!(on_snap.after_perm, off_snap.after_perm);
+    assert_eq!(again_snap.before_perm, on_snap.before_perm);
+    assert_eq!(again_snap.after_perm, on_snap.after_perm);
+    println!(
+        "N7-NONGATE\t{name}\tn={}\tnnz={}\tcalls=0\tbyte_identical=true",
+        pat.n,
+        pat.nnz(),
+    );
+}
+
+/// N7 cheapest gate: exact current production pipeline on the four N6 witness
+/// rows, then an equal-budget comparison from the strict terminal-P50
+/// incumbent. The production pair helper and its probe equivalent must agree
+/// byte-for-byte; pair and triple together share one cumulative 48M ops cap.
+#[test]
+#[ignore]
+fn probe_n7_equal_budget_post_p50_triple() {
+    const TARGETS: [&str; 4] = [
+        "chimera_selby-c16-01",
+        "rsyn0840m",
+        "rsyn0830hfsg",
+        "rsyn0820m02m",
+    ];
+    const SWEEPS: usize = 2;
+    const BUDGET: i64 = 48_000_000;
+
+    let corpus = crate::corpus::corpus();
+    let mut seen_targets = 0usize;
+    let mut strict_beyond_pair = 0usize;
+    println!(
+        "N7\tname\tn\tnnz\tmaxdeg\tpre_p50\tp50\tp50_perm_changed\tpair\ttriple\tproduction\thook_calls\tpair_ops\ttotal_ops\tpair_fixed\twitnesses\tselected\tlocal_gain\torder_ms\tpair_ms\tcombo_ms"
+    );
+
+    for target in TARGETS {
+        let (name, pat) = corpus
+            .iter()
+            .find(|(name, _)| name == target)
+            .unwrap_or_else(|| panic!("target {target} missing from exact dev corpus"));
+        seen_targets += 1;
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let (shape_gate, max_deg) = n7_shape_gate(pat);
+        assert!(shape_gate, "{name}: outside N7 shape gate");
+
+        let sp = scoring_pattern(pat);
+        let t_order = Instant::now();
+        let (full, snap, hook_calls) = n7_order_with_hook_mode(pat, true);
+        let order_ms = t_order.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(flops_of(&sp, &snap.before_perm), snap.before_flops);
+        assert_eq!(flops_of(&sp, &snap.after_perm), snap.after_flops);
+        assert!(
+            snap.after_flops < snap.before_flops,
+            "{name}: terminal P50 was not a strict production-path win"
+        );
+        assert_ne!(
+            snap.after_perm, snap.before_perm,
+            "{name}: strict P50 score change must enter a distinct permutation basin"
+        );
+        assert_eq!(hook_calls, 1, "{name}: production N7 hook call count");
+        let t_pair = Instant::now();
+        let pair_production = rgreedy::adjacent_pair_descent(
+            n,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &snap.after_perm,
+            SWEEPS,
+            BUDGET,
+        );
+        let pair_ms = t_pair.elapsed().as_secs_f64() * 1_000.0;
+        let (pair_probe, pair_ops) = rgreedy::adjacent_pair_probe_stats(
+            n,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &snap.after_perm,
+            SWEEPS,
+            BUDGET,
+        );
+        assert_eq!(
+            pair_probe, pair_production,
+            "{name}: probe pair replay diverged from production helper"
+        );
+        let pair_perm = pair_production
+            .clone()
+            .unwrap_or_else(|| snap.after_perm.clone());
+        assert!(is_bijection(&pair_perm, n));
+        let pair_flops = flops_of(&sp, &pair_perm);
+        assert!(pair_flops <= snap.after_flops, "{name}: pair regressed P50");
+
+        let t_combo = Instant::now();
+        let combo = rgreedy::adjacent_pair_then_triple_stats(
+            n,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &snap.after_perm,
+            SWEEPS,
+            BUDGET,
+        );
+        let combo_ms = t_combo.elapsed().as_secs_f64() * 1_000.0;
+        let combo_again = rgreedy::adjacent_pair_then_triple_stats(
+            n,
+            &pat.col_ptr,
+            &pat.row_idx,
+            &snap.after_perm,
+            SWEEPS,
+            BUDGET,
+        );
+        assert_eq!(combo, combo_again, "{name}: combined replay is nondeterministic");
+        let (combo_perm_opt, pair_fixed, witnesses, selected, local_gain, total_ops) = combo;
+        let combo_perm = combo_perm_opt.unwrap_or_else(|| snap.after_perm.clone());
+        assert!(is_bijection(&combo_perm, n));
+        let combo_flops = flops_of(&sp, &combo_perm);
+        assert!(
+            combo_flops <= pair_flops,
+            "{name}: combined result failed to preserve the pair floor"
+        );
+        if total_ops > BUDGET {
+            assert_eq!(
+                combo_perm, pair_perm,
+                "{name}: triple exhaustion did not preserve the pair result"
+            );
+            assert!(!pair_fixed);
+        }
+        if combo_flops < pair_flops {
+            assert!(pair_fixed, "{name}: triple win without a certified pair fixed point");
+            assert!(witnesses > 0 && selected > 0 && local_gain > 0);
+            assert!(total_ops <= BUDGET, "{name}: strict win exceeded shared budget");
+            assert_eq!(
+                pair_flops - combo_flops,
+                local_gain,
+                "{name}: exact local gain disagrees with trusted whole score"
+            );
+            strict_beyond_pair += 1;
+        }
+
+        // The production hook must be exactly the independently replayed
+        // shared-budget result, subject only to its trusted strict score gate.
+        let expected_full = if combo_flops < snap.after_flops {
+            &combo_perm
+        } else {
+            &snap.after_perm
+        };
+        assert_eq!(
+            &full, expected_full,
+            "{name}: production post-P50 hook diverged from the exact replay"
+        );
+        assert_eq!(
+            flops_of(&sp, &full),
+            snap.after_flops.min(combo_flops),
+            "{name}: production trusted-score adoption mismatch"
+        );
+
+        println!(
+            "N7\t{name}\t{n}\t{nnz}\t{max_deg}\t{}\t{}\ttrue\t{}\t{}\t{}\t{hook_calls}\t{pair_ops}\t{total_ops}\t{pair_fixed}\t{witnesses}\t{selected}\t{local_gain}\t{order_ms:.3}\t{pair_ms:.3}\t{combo_ms:.3}",
+            snap.before_flops,
+            snap.after_flops,
+            pair_flops,
+            combo_flops,
+            flops_of(&sp, &full),
+        );
+    }
+
+    assert_eq!(seen_targets, TARGETS.len());
+    println!("N7-SUMMARY\tstrict_beyond_pair={strict_beyond_pair}/{}", TARGETS.len());
+    assert!(
+        strict_beyond_pair >= 1,
+        "N7 NO-GO: no strict whole-score win beyond equal-budget pair"
+    );
+}
+
 
 /// FLEET-J (0033) — systematic METIS seed census, the mechanism behind the
 /// last two frontier promotions (chainyoda's D_WIDE seed-2 arm, mellowcroc's
