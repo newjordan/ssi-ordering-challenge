@@ -2,7 +2,8 @@
 //!
 //! The existing MINL pass revisits every surviving fill edge for a fixed
 //! number of rounds. This sibling pass records *why* a fill edge could not
-//! be deleted. For a chordal graph `H`, a fill edge `uv` is not deletable
+//! be deleted. When `MINL_AFTER_RGSUB`, the caller feeds the filled pattern
+//! of the RGSUB order (same API: `adj`/`fill`/`scan_order`). For a chordal graph `H`, a fill edge `uv` is not deletable
 //! exactly when two vertices `x,y` in `N_H(u) ∩ N_H(v)` are nonadjacent.
 //! The four-cycle `u-x-v-y-u` then has `uv` as its unique chord. That witness
 //! remains valid until one of its four supporting fill edges is deleted, so
@@ -123,12 +124,15 @@ impl WatchLists {
 }
 
 /// Return the fill-edge id for an undirected pair, if the pair was fill in
-/// the starting completion. `fill` is produced by the caller in lexicographic
-/// `(u,v)` order, so a binary search is deterministic and allocation-free.
+/// the starting completion. `lex` is a permutation of `0..fill.len()` sorted
+/// by `fill[i]` so the lookup works whether the caller stored fill in lex
+/// order (early MINL) or in elimination-discovery order (post-RGSUB).
 #[inline]
-fn fill_edge_id(fill: &[(u32, u32)], a: u32, b: u32) -> Option<usize> {
+fn fill_edge_id(fill: &[(u32, u32)], lex: &[u32], a: u32, b: u32) -> Option<usize> {
     let edge = if a < b { (a, b) } else { (b, a) };
-    fill.binary_search(&edge).ok()
+    lex.binary_search_by(|&i| fill[i as usize].cmp(&edge))
+        .ok()
+        .map(|p| lex[p] as usize)
 }
 
 /// Check whether the sorted common-neighbor set is a clique. On failure,
@@ -216,12 +220,18 @@ fn try_delete_with_witness(
 
 /// Event-driven sibling of the existing round-based MINL scan.
 ///
-/// `scan_order` must contain fill-edge ids (normally the existing
-/// cheapest-degree-sum order). The routine deletes only fill edges for which
-/// the local chordality test succeeds, and returns early/fail-closed on any
-/// hard cap. If it drains the queue without a cap, every surviving fill edge
-/// has a live unique-chord four-cycle witness, hence the resulting chordal
-/// completion is inclusion-minimal.
+/// `fill` is the fill-edge list of a chordal completion. When the compile
+/// knob `MINL_AFTER_RGSUB` is set, the caller passes the completion of the
+/// RGSUB (`subtree_refine`) order — not the pre-PHARMAKOS incumbent. That
+/// list may arrive in lex order or in elimination-discovery order; a lex
+/// index is built so witness-support lookup stays O(log m) either way.
+/// `scan_order` must contain fill-edge ids into that slice (normally
+/// cheapest-degree-sum, with RGSUB elimination-rank as the caller tie-break).
+/// The routine deletes only fill edges for which the local chordality test
+/// succeeds, and returns early/fail-closed on any hard cap. If it drains the
+/// queue without a cap, every surviving fill edge has a live unique-chord
+/// four-cycle witness, hence the resulting chordal completion is
+/// inclusion-minimal.
 pub(super) fn watcher_minimalize(
     adj: &mut [Vec<u32>],
     fill: &[(u32, u32)],
@@ -239,6 +249,10 @@ pub(super) fn watcher_minimalize(
             ..WatcherResult::default()
         };
     };
+    // Post-RGSUB filled patterns are not required to store `fill` in
+    // lexicographic `(u,v)` order. Index once so support lookup is exact.
+    let mut lex: Vec<u32> = (0..m as u32).collect();
+    lex.sort_unstable_by(|&i, &j| fill[i as usize].cmp(&fill[j as usize]));
     let mut alive = vec![true; m];
     let mut queued = vec![false; m];
     let mut queue = VecDeque::with_capacity(m);
@@ -271,7 +285,7 @@ pub(super) fn watcher_minimalize(
                 let supports = [(u, x), (v, x), (u, y), (v, y)];
                 let mut slot = 0usize;
                 for &(a, b) in &supports {
-                    let Some(support) = fill_edge_id(fill, a, b) else {
+                    let Some(support) = fill_edge_id(fill, &lex, a, b) else {
                         continue; // original edge: this support is permanent
                     };
                     if alive[support] {
@@ -450,6 +464,26 @@ mod tests {
         let result = watcher_minimalize(&mut adj, &fill, &scan, 1_000_000, usize::MAX);
         assert_eq!(result.removed, 2);
         assert_eq!(result.tests, 3); // blocked, support deleted, then wake/retest
+        assert!(!result.exhausted);
+        assert_minimal_completion(&original, &adj);
+    }
+
+    #[test]
+    fn watcher_accepts_post_rgsub_fill_not_lex_sorted() {
+        // Same chordal completion as the wake test, but `fill` is stored in
+        // reverse (elimination-discovery) order — the shape the post-RGSUB
+        // caller may pass. Support lookup must still wake 1-4 after 2-4 dies.
+        let original_edges = [(0, 2), (1, 2), (1, 3), (3, 4)];
+        let mut original = vec![vec![false; 5]; 5];
+        for &(u, v) in &original_edges {
+            original[u][v] = true;
+            original[v][u] = true;
+        }
+        let (mut adj, mut fill) = fill_from_order(&original, &[0, 3, 1, 4, 2]);
+        fill.reverse();
+        let scan = cheapest_scan(&adj, &fill);
+        let result = watcher_minimalize(&mut adj, &fill, &scan, 1_000_000, usize::MAX);
+        assert_eq!(result.removed, 2);
         assert!(!result.exhausted);
         assert_minimal_completion(&original, &adj);
     }

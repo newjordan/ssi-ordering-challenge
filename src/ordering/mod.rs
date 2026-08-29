@@ -1015,6 +1015,10 @@ const WATCH_MINL_MAX_N: usize = 30_000;
 const WATCH_MINL_MAX_FILL: usize = 145_000;
 const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
 const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
+/// Defer the MINL scan (`watcher_minimalize` / `minl_mcs_peo`) until after
+/// RGSUB (`subtree_refine`). One pass on the RGSUB-refined perm/fill; the
+/// early TELOS-era MINL sibling is skipped so this is not a second descent.
+const MINL_AFTER_RGSUB: bool = true;
 
 /// COMPONENT B — ORBIT-BATCHED COMPLETION-LATTICE DESCENT (Noether priming
 /// round 4, `noether.md` §2.2 "Component B"; source doc:
@@ -2536,26 +2540,11 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
-            if nnz >= D_WIDE_MAX_DENSITY * n {
-                // Above the D_WIDE density ceiling, a low-alpha DegSqrt
-                // quotient pass is both cheaper and materially more diverse
-                // than the AMD pass it replaces. Keeping this one-for-one
-                // preserves the accepted candidate count and timing envelope.
-                consider!(move || custom_metrics::order_variant(
-                    &core,
-                    0.75,
-                    true,
-                    custom_metrics::ScoreVariant::DegSqrt,
-                ));
-            } else {
-                let amd_opts_075 = feral_amd::AmdOptions {
-                    aggressive: true,
-                    dense_alpha: 0.75,
-                };
-                consider!(move || {
-                    feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p)
-                });
-            }
+            let amd_opts_075 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 0.75,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p));
             if nnz < D_WIDE_MAX_DENSITY * n {
                 let opts_20 = feral_amf::AmfOptions {
                     dense_alpha: 2.0,
@@ -4253,13 +4242,8 @@ fn order_with_options(
 #[cfg(test)]
     parallel::phase_mark("5.telos", _tp5);
     // Snapshot of the incumbent BEFORE either completion-lattice descent
-    // phase runs. The MINL block below may update `best_perm` in place;
-    // Component B (further below) deliberately starts from THIS pre-descent
-    // snapshot rather than MINL's (possibly already-minimalized) result, so
-    // the two are SIBLING candidates over the identical starting completion
-    // — see the `ORBIT_*` constants' doc comment for why that matters (an
-    // already-minimalized graph has little left for the orbit-batched scan
-    // to find, which would hide Component B's real throughput advantage).
+    // phase runs. With `MINL_AFTER_RGSUB` the MINL scan is deferred until
+    // after `subtree_refine`; Component B still starts from THIS snapshot.
     let pre_orbit_perm = best_perm.clone();
 
     // ── COMPLETION-LATTICE DESCENT — see the `MINL_*` constants' doc
@@ -4299,179 +4283,9 @@ fn order_with_options(
     }
     for base_desc in desc_bases {
     let mut dtasks: Vec<parallel::PermFn> = Vec::new();
-    if nnz > 0 && nnz < MINL_MAX_NNZ && !minl_off() {
-        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
-            #[cfg(test)]
-            parallel::phase_mark("minl.filled_graph", _t);
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            // Filled-graph adjacency (sorted, original ids) and sorted
-            // A-adjacency for fill-edge classification.
-            let mut adj: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    fri[fcp[v] as usize..fcp[v + 1] as usize]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .collect()
-                })
-                .collect();
-            let asort: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    let mut c: Vec<u32> = scoring_pat.row_idx
-                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .filter(|&x| x as usize != v)
-                        .collect();
-                    c.sort_unstable();
-                    c
-                })
-                .collect();
-            let mut fill: Vec<(u32, u32)> = Vec::new();
-            for u in 0..n {
-                for &wv in &adj[u] {
-                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
-                        fill.push((u as u32, wv));
-                    }
-                }
-            }
-            // Scan CHEAPEST-FIRST: the op budget is finite and the per-edge
-            // check cost is ~deg(u)+deg(v), so processing in ascending
-            // degree-sum order spends the budget where removals are
-            // densest and cheapest (fat-clique edges sort last and are
-            // dropped by exhaustion instead of draining the budget up
-            // front — measured: id-order lost the gams03/gams04/arki0009
-            // wins to exactly that drain). Counting sort by degree-sum:
-            // exact, stable (ties keep (u,v) id order), O(E + n).
-            #[cfg(test)]
-            parallel::phase_mark("minl.build_adj_fill", _t);
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            let scan_order: Vec<u32> = {
-                let mut keys: Vec<usize> = Vec::with_capacity(fill.len());
-                let mut maxk = 0usize;
-                for &(u, v) in &fill {
-                    let k = adj[u as usize].len() + adj[v as usize].len();
-                    maxk = maxk.max(k);
-                    keys.push(k);
-                }
-                let mut cnt = vec![0u32; maxk + 2];
-                for &k in &keys {
-                    cnt[k + 1] += 1;
-                }
-                for i in 1..cnt.len() {
-                    cnt[i] += cnt[i - 1];
-                }
-                let mut out = vec![0u32; fill.len()];
-                for (ei, &k) in keys.iter().enumerate() {
-                    out[cnt[k] as usize] = ei as u32;
-                    cnt[k] += 1;
-                }
-                out
-            };
-            #[cfg(test)]
-            parallel::phase_mark("minl.scan_order", _t);
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            let mut ops = MINL_OPS_BUDGET;
-            let mut alive = vec![true; fill.len()];
-            let mut removed_total = 0usize;
-            'rounds: for _round in 0..MINL_MAX_ROUNDS {
-                let mut removed_this = 0usize;
-                for &ei in &scan_order {
-                    let ei = ei as usize;
-                    if !alive[ei] {
-                        continue;
-                    }
-                    if ops < 0 {
-                        break 'rounds;
-                    }
-                    let (u, v) = fill[ei];
-                    if !minl_try_delete_edge(&mut adj, u, v, &mut ops, MINL_MAX_COMMON) {
-                        continue;
-                    }
-                    alive[ei] = false;
-                    removed_this += 1;
-                }
-                if removed_this == 0 {
-                    break;
-                }
-                removed_total += removed_this;
-            }
-            #[cfg(test)]
-            parallel::phase_mark("minl.delete_rounds", _t);
-            if removed_total == 0 {
-                return None;
-            }
-            #[cfg(test)]
-            let _t = std::time::Instant::now();
-            let peo = minl_mcs_peo(n, &adj);
-            #[cfg(test)]
-            parallel::phase_mark("minl.mcs_peo", _t);
-            Some(peo)
-        }));
-
-        // Proven witness-driven sibling from the previous promoted frontier.
-        // The new four-thread carrier runs it concurrently with ordinary MINL
-        // and ORBIT, restoring its independent completion basin without adding
-        // their wall times serially.
-        dtasks.push(Box::new(move || -> Option<Vec<usize>> {
-            let (fcp, fri) = filled_graph(scoring_pat, base_desc, MINL_MAX_LNNZ)?;
-            let mut adj: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    fri[fcp[v] as usize..fcp[v + 1] as usize]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .collect()
-                })
-                .collect();
-            let asort: Vec<Vec<u32>> = (0..n)
-                .map(|v| {
-                    let mut c: Vec<u32> = scoring_pat.row_idx
-                        [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .filter(|&x| x as usize != v)
-                        .collect();
-                    c.sort_unstable();
-                    c
-                })
-                .collect();
-            let mut fill: Vec<(u32, u32)> = Vec::new();
-            for u in 0..n {
-                for &wv in &adj[u] {
-                    if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
-                        fill.push((u as u32, wv));
-                    }
-                }
-            }
-            if n > WATCH_MINL_MAX_N
-                || fill.is_empty()
-                || fill.len() > WATCH_MINL_MAX_FILL
-                || fill.len().saturating_mul(5) < fri.len()
-            {
-                return None;
-            }
-            let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
-            ids.sort_unstable_by_key(|&i| {
-                let (u, v) = fill[i as usize];
-                (adj[u as usize].len() + adj[v as usize].len(), i)
-            });
-            let result = watcher_minimalize(
-                &mut adj,
-                &fill,
-                &ids,
-                WATCH_MINL_OPS_BUDGET,
-                WATCH_MINL_MAX_COMMON,
-            );
-            if result.removed == 0 {
-                return None;
-            }
-            Some(minl_mcs_peo(n, &adj))
-        }));
+    if nnz > 0 && nnz < MINL_MAX_NNZ && !minl_off() && !MINL_AFTER_RGSUB {
+        dtasks.push(Box::new(move || minl_round_peo(scoring_pat, base_desc, n)));
+        dtasks.push(Box::new(move || minl_watch_peo(scoring_pat, base_desc, n)));
     }
 
     // ── COMPONENT B: ORBIT-BATCHED COMPLETION-LATTICE DESCENT — see the
@@ -5031,6 +4845,27 @@ fn order_with_options(
         }
     }
 
+    // ── MINL-POST-RGSUB: one completion-lattice descent on the RGSUB order ──
+    // The early TELOS-era MINL sibling is skipped when `MINL_AFTER_RGSUB`.
+    // Watcher + round scan run as a 2-task batch over the *same* post-RGSUB
+    // fill — not a second pass, not extra TELOS rounds / seeds / descents.
+    if MINL_AFTER_RGSUB && nnz > 0 && nnz < MINL_MAX_NNZ && !minl_off() {
+        #[cfg(test)]
+        let _tp_minl_rg = std::time::Instant::now();
+        let base = best_perm.clone();
+        let mut dtasks: Vec<parallel::PermFn> = Vec::new();
+        dtasks.push(Box::new({
+            let base = base.clone();
+            move || minl_round_peo(scoring_pat, &base, n)
+        }));
+        dtasks.push(Box::new(move || minl_watch_peo(scoring_pat, &base, n)));
+        let mut dres = parallel::run_perms(&dtasks, scoring_pat, n, nnz, best_flops);
+        drop(dtasks);
+        parallel::accept(&mut dres, &mut best_flops, &mut best_perm, |_| {});
+        #[cfg(test)]
+        parallel::phase_mark("6b.minl_post_rgsub", _tp_minl_rg);
+    }
+
     // Strict terminal complement to RGSUB: locally orient adjacent pivots by
     // exact current degree, then admit only through the trusted global scorer.
     //
@@ -5191,6 +5026,173 @@ fn pharmakos_terminal_reorder(sp: &ScoringPattern, in_s: &[bool]) -> Option<Vec<
     let tail: Vec<usize> = (0..n).filter(|&v| in_s[v]).collect(); // already ascending
     perm.extend(tail);
     Some(perm)
+}
+
+/// Build the filled-graph adjacency and the fill-edge list of `perm`.
+/// Shared by the round-scan and watcher MINL candidates.
+fn minl_filled_adj(
+    scoring_pat: &ScoringPattern,
+    perm: &[usize],
+    n: usize,
+) -> Option<(Vec<Vec<u32>>, Vec<(u32, u32)>, usize)> {
+    let (fcp, fri) = filled_graph(scoring_pat, perm, MINL_MAX_LNNZ)?;
+    let adj: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            fri[fcp[v] as usize..fcp[v + 1] as usize]
+                .iter()
+                .map(|&x| x as u32)
+                .collect()
+        })
+        .collect();
+    let asort: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            let mut c: Vec<u32> = scoring_pat.row_idx
+                [scoring_pat.col_ptr[v]..scoring_pat.col_ptr[v + 1]]
+                .iter()
+                .map(|&x| x as u32)
+                .filter(|&x| x as usize != v)
+                .collect();
+            c.sort_unstable();
+            c
+        })
+        .collect();
+    let mut fill: Vec<(u32, u32)> = Vec::new();
+    for u in 0..n {
+        for &wv in &adj[u] {
+            if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                fill.push((u as u32, wv));
+            }
+        }
+    }
+    Some((adj, fill, fri.len()))
+}
+
+/// Round-based MINL on the completion of `perm`. Used both at the historical
+/// post-TELOS site (when `!MINL_AFTER_RGSUB`) and once after RGSUB.
+fn minl_round_peo(scoring_pat: &ScoringPattern, perm: &[usize], n: usize) -> Option<Vec<usize>> {
+    #[cfg(test)]
+    let _t = std::time::Instant::now();
+    let (mut adj, fill, _fri_len) = minl_filled_adj(scoring_pat, perm, n)?;
+    #[cfg(test)]
+    parallel::phase_mark("minl.filled_graph", _t);
+    if fill.is_empty() {
+        return None;
+    }
+    #[cfg(test)]
+    let _t = std::time::Instant::now();
+    // Scan CHEAPEST-FIRST: the op budget is finite and the per-edge check
+    // cost is ~deg(u)+deg(v). Counting sort by degree-sum: exact, stable
+    // (ties keep (u,v) id order), O(E + n).
+    let scan_order: Vec<u32> = {
+        let mut keys: Vec<usize> = Vec::with_capacity(fill.len());
+        let mut maxk = 0usize;
+        for &(u, v) in &fill {
+            let k = adj[u as usize].len() + adj[v as usize].len();
+            maxk = maxk.max(k);
+            keys.push(k);
+        }
+        let mut cnt = vec![0u32; maxk + 2];
+        for &k in &keys {
+            cnt[k + 1] += 1;
+        }
+        for i in 1..cnt.len() {
+            cnt[i] += cnt[i - 1];
+        }
+        let mut out = vec![0u32; fill.len()];
+        for (ei, &k) in keys.iter().enumerate() {
+            out[cnt[k] as usize] = ei as u32;
+            cnt[k] += 1;
+        }
+        out
+    };
+    #[cfg(test)]
+    parallel::phase_mark("minl.scan_order", _t);
+    #[cfg(test)]
+    let _t = std::time::Instant::now();
+    let mut ops = MINL_OPS_BUDGET;
+    let mut alive = vec![true; fill.len()];
+    let mut removed_total = 0usize;
+    'rounds: for _round in 0..MINL_MAX_ROUNDS {
+        let mut removed_this = 0usize;
+        for &ei in &scan_order {
+            let ei = ei as usize;
+            if !alive[ei] {
+                continue;
+            }
+            if ops < 0 {
+                break 'rounds;
+            }
+            let (u, v) = fill[ei];
+            if !minl_try_delete_edge(&mut adj, u, v, &mut ops, MINL_MAX_COMMON) {
+                continue;
+            }
+            alive[ei] = false;
+            removed_this += 1;
+        }
+        if removed_this == 0 {
+            break;
+        }
+        removed_total += removed_this;
+    }
+    #[cfg(test)]
+    parallel::phase_mark("minl.delete_rounds", _t);
+    if removed_total == 0 {
+        return None;
+    }
+    #[cfg(test)]
+    let _t = std::time::Instant::now();
+    let peo = minl_mcs_peo(n, &adj);
+    #[cfg(test)]
+    parallel::phase_mark("minl.mcs_peo", _t);
+    Some(peo)
+}
+
+/// Watcher MINL on the completion of `perm`. When `MINL_AFTER_RGSUB`, `perm`
+/// is the RGSUB order and the sparse-fill ratio gate is dropped so a
+/// successful subtree refine cannot skip the only remaining MINL pass.
+fn minl_watch_peo(scoring_pat: &ScoringPattern, perm: &[usize], n: usize) -> Option<Vec<usize>> {
+    let (mut adj, fill, fri_len) = minl_filled_adj(scoring_pat, perm, n)?;
+    let sparse_fill = !MINL_AFTER_RGSUB && fill.len().saturating_mul(5) < fri_len;
+    if n > WATCH_MINL_MAX_N
+        || fill.is_empty()
+        || fill.len() > WATCH_MINL_MAX_FILL
+        || sparse_fill
+    {
+        return None;
+    }
+    let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
+    if MINL_AFTER_RGSUB {
+        // Tie-break cheapest-first by later elimination rank in the RGSUB
+        // order: separator fill (eliminated late) is tested after cheap
+        // leaf fill, matching the post-RGSUB completion's structure.
+        let mut rank = vec![0usize; n];
+        for (k, &v) in perm.iter().enumerate() {
+            if v < n {
+                rank[v] = k;
+            }
+        }
+        ids.sort_unstable_by_key(|&i| {
+            let (u, v) = fill[i as usize];
+            let late = rank[u as usize].max(rank[v as usize]);
+            (adj[u as usize].len() + adj[v as usize].len(), late, i)
+        });
+    } else {
+        ids.sort_unstable_by_key(|&i| {
+            let (u, v) = fill[i as usize];
+            (adj[u as usize].len() + adj[v as usize].len(), i)
+        });
+    }
+    let result = watcher_minimalize(
+        &mut adj,
+        &fill,
+        &ids,
+        WATCH_MINL_OPS_BUDGET,
+        WATCH_MINL_MAX_COMMON,
+    );
+    if result.removed == 0 {
+        return None;
+    }
+    Some(minl_mcs_peo(n, &adj))
 }
 
 /// Exact clique check on sorted adjacency for the completion-lattice
