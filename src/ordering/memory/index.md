@@ -39,14 +39,19 @@ these to the next scoring win, at zero extra measurement cost:
   submission's public Actions log; [0005](experiments/0005-eval-fail-density-regate.md)
   has the mining commands. 500 matrices, ties 111/47/33 per bucket. Target eval,
   not dev extrapolation.
-- ⭐ **THE EVAL CORPUS ITSELF IS RECONSTRUCTED — STOP EXTRAPOLATING FROM DEV.**
+- ⭐ **THE EVAL CORPUS ITSELF IS RECONSTRUCTED — 500/500 oracle-exact (round 2), STOP EXTRAPOLATING FROM DEV.**
   Dev and eval share **exactly ONE matrix** on `(n, nnz)`. The eval names are
-  MINLPLib instances and `flops(AMD)` is an exact oracle, so **427 of 500 are
-  verified bit-for-bit**. The shipped code that graded 0.8844 scores **0.8831**
-  on them — 0.15% error, all buckets tracking. Measure changes directly:
+  MINLPLib instances and `flops(AMD)` is an exact oracle, so **all 500 are
+  verified bit-for-bit** (round 2, [0024](experiments/0024-eval-corpus-reconstruction-round2.md);
+  round 1 was 427/500). The promoted frontier tree (`37131d5`) scores **0.822960**
+  on them vs **0.822958 graded — 0.0002% error** (round-1 error was 0.15%).
+  Measure changes directly:
   `SSI_CORPUS_FILE=~/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl cargo run --release --offline --locked`
-  See [0010](experiments/0010-parallel-research-session.md). Regenerate for a new
-  round with the scripts in that directory.
+  (or `probe_timing_and_score` under the same env). Regenerate for a new
+  round with the scripts in that directory — but FIRST check the Actions log
+  still prints the per-matrix table (it stopped doing so after 2026-08-22;
+  see the README there). Fresh target lists from the census + calibration:
+  ties 134 (96/24/14 per bucket), responder/leverage lists in the same dir.
 - ⚠️ **THE CAP IS TIGHTER THAN IT LOOKS.** Identical code passed the enforced-cap
   test twice and FAILED a third run. A green cap test is weak evidence; a red one
   is strong. No candidate can make the score worse (verified: zero of 500 graded
@@ -108,6 +113,14 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0024-eval-corpus-reconstruction-round2.md](experiments/0024-eval-corpus-reconstruction-round2.md) - **INFRASTRUCTURE, complete.** Round-2 eval reconstruction: 500/500 oracle-exact, 0.0002% calibration on the promoted `37131d5` tree; fixed-var elimination + exact-AD conventions found by dev bit-for-bit debugging (227→298/300); census provenance risk documented (grader stopped printing per-matrix tables after 2026-08-22); fresh tie/responder lists; bank re-priced 14 KEEP / 9 DISCOUNT / 2 SUPERSEDED.
+- **HYPOTHESIS BANK (2026-08-28, out-of-repo at the mission dir `hypotheses/`)** — 129 surviving
+  hypotheses (198 raw, 12 domains, all 5 depth categories), 25 selected by EV with recorded
+  rationale; top leads summarized in [open-questions.md](open-questions.md). The bank is
+  mission-dir only so the submission archive stays lean; the log line for 2026-08-28 records
+  the mine, the frontier move chain (0.828335 `1c8eb4e` → 0.822958 `37131d5`), and the
+  corrected dead-end attribution of the 36 memory-conflicting hypotheses (11 of 36 reference
+  the six recorded dead ends; 25 reference other experiment pages as regime arguments).
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:

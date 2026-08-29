@@ -7,6 +7,38 @@ it, rather than deleting it — a resolved question is a useful signpost.
 
 ## Active
 
+- [ ] **HYPOTHESIS BANK MINED (2026-08-28) — work from the shortlist, not from scratch.**
+      12 parallel domain generators produced 198 raw hypotheses; 129 survive dedup
+      (incl. 67 merged cross-domain near-duplicates) across 12 domains and all 5 depth
+      categories; 3 selector agents EV-priced all 129 and the top 25 are selected with
+      recorded rationale. Bank lives OUT of the repo (mission dir `hypotheses/`:
+      `hypotheses.json`, `INDEX.md`, `CONTEXT.md`). **⚠️ Frontier moved during and
+      after the mine: newjordan `1c8eb4e` 0.828335 → newjordan `65329e3` 0.824774 →
+      Emphasonic `f39f03d` 0.824406 → pepedesigner `37131d5` 0.822958 (2026-08-29) —
+      re-price incremental leads against ~0.823, structural leads gain relative value.**
+      Attribution correction (2026-08-29, supersedes the earlier claim): of the 36
+      hypotheses carrying memory-conflict annotations, only **11** reference the six
+      recorded dead ends (0012/0014/0016/0017/0018/0020); the other **25** reference
+      other experiment pages (0002, 0005-0010, 0015) — mostly as *regime arguments*
+      for why a previously measured negative does not apply to a different regime.
+      None of the 36 are selected. Top leads, one line each (ids refer to the bank):
+      (1) **H-114** reinvest reclaimed seconds into gt_10k heavy candidates via a
+      per-matrix unused-budget gate (EV 0.0015, top-priced);
+      (2) **H-109/H-110** partial-sum abort in exact GNP scoring + gate-wall re-derivation
+      audit — cheap portfolio-wide time reclaims that fund everything else;
+      (3) **H-117/H-118/H-124** STRIP-family extensions (recursive STRIP, quotient-graph
+      STRIP for dense-vertex stars, per-articulation-block STRIP) — the 0017 "STRIP
+      shape" (existing family, new blind-class coverage) at gt_10k weight;
+      (4) **H-112** reallocate multistart budget across families by measured hit rate
+      (needs **H-111**, the argmin-hit-rate census, first);
+      (5) **H-086** claim the 0019 leftovers (crudeoil_lee4_10, chimera_lga-01) via a
+      provably-FAIL-safe `nnz<=6n` guard carve-out — one of {H-019, H-059, H-086}, ship
+      exactly one;
+      (6) **H-071** TELOS top-K-seed selection (0020 lead; one of {H-024, H-067, H-071});
+      (7) **H-005** tie-prediction early exit (0015 lead, proposed independently by 11
+      domains — the single most-converged idea in the bank);
+      (8) **H-045** Hessian-block-first ordering for heavy KKT (redo category, gt_10k).
+      Full ranked list with EV/p_real/rationale/flags in the bank's `INDEX.md`.
 - [x] **Structured relabelings, not random ones.** RESOLVED by
       [0006](experiments/0006-hillclimb-phase.md): at EQUAL budget every
       hill-climb schedule loses to i.i.d. random (0.8775-0.8787 vs 0.876511).
