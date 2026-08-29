@@ -4335,6 +4335,19 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+            // FLEET-K (0034): 0033 measured seed 26 on the original carrier,
+            // but pinned seeds rot as the surrounding portfolio grows (cell A
+            // had to be re-pinned from seed 2 to seed 0 in vibecodooor's
+            // 3f497f6 commit). Add seed 0 as a free second candidate inside
+            // the same tight cell so the strict best-of picks whichever seed
+            // still wins; cost is one extra metis_order_full call on a single
+            // (n, nnz, max_deg) window (~0.2 s local on a 0.6 s incumbent).
+            let opts0 = feral_metis::MetisOptions {
+                seed: 0,
+                niparts: 16,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts0).map(|(p, ..)| p));
         }
         if cell_c {
             let opts = feral_metis::MetisOptions {
