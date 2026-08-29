@@ -259,6 +259,12 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   64 seeds on the winners) → three pinned cells (14100:477382 floor240+imb0.05 s55 → 0.4246×;
   9953:287612 niparts16 s26 → 0.5825×; 23173:893304 imb0.05 s26 → 0.2032×). 65/69 matrices: METIS
 
+- [0034-cell-c-seed12.md](experiments/0034-cell-c-seed12.md) — **DEV WIN
+  (−0.001457, 0.812602→0.811145)**: re-census of the public twins inside 0033's
+  pinned METIS cells found `max_imbalance=0.05, seed=12` improves cell C's dev
+  matrix end-to-end by 20.5% versus its current incumbent; one extra fixed-seed
+  candidate, same narrow gate, strict exact-score acceptance.
+
 - [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
   pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
