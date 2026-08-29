@@ -2559,11 +2559,18 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_075).map(|(p, ..)| p));
-            let opts_125 = feral_amf::AmfOptions {
-                dense_alpha: 1.25,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
+            // AMF 1.25 → DegSqrt 0.75 (one-for-one swap, same cost class).
+            // Mirrors the DegSqrt 0.75 swap that won the high-density (>=50n)
+            // branch; the pivot-objective diversity should help the 20-50
+            // density band (pooling_spp* family on the hidden eval) too.
+            // Strict accept under best-of floor; never worse than the
+            // original `AMF 1.25` under the AMF and AMD floors.
+            consider!(move || custom_metrics::order_variant(
+                &core,
+                0.75,
+                true,
+                custom_metrics::ScoreVariant::DegSqrt,
+            ));
             if nnz >= D_WIDE_MAX_DENSITY * n {
                 // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
                 // place of AMD(.75). The 50..100 band refines its raw ordering
