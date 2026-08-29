@@ -2847,6 +2847,28 @@ fn order_with_options(
 
     }
 
+    // ULTRA-DENSE NO-DENSE-AMD ARM (experiment 0030, winnable-band hunt on
+    // the reconstructed eval corpus). The heavy no-dense-AMD pass is ceilinged
+    // at `HEAVY_AMDND_MAX_NNZ` (700k) and the D dense selectors stop at
+    // `D_WIDE_MAX_NNZ` (1M), which leaves the ultra-dense heavy cell
+    // (nnz >= 100n) with no deferral-style candidate at all. Measured there
+    // (isolated, trusted scorer): n=2587/nnz=921k/density 356 improves
+    // 0.9719 -> 0.9556 (+0.016 s) and n=9016/nnz=1.045M/density 116 improves
+    // 0.06898 -> 0.06809 (+0.036 s); every deg/count-ranked strip and
+    // AMF/AMD-alpha alternative scored worse on both. The density >= 100
+    // floor keeps the pass out of the 20-100 bands, where the same probe
+    // measured zero wins (idx146/287/398/476/253/392 census rows), and the
+    // nnz ceiling bounds the pass's cost at the measured 0.036 s while
+    // admitting the 1.045M-nnz winner the 1M D ceiling excludes. Routed
+    // through `consider`, so strictly-improving under the AMD floor.
+    if (400_000..1_200_000).contains(&nnz) && nnz >= 100usize.saturating_mul(n) {
+        let opts_nd_ultra = feral_amd::AmdOptions {
+            aggressive: false,
+            dense_alpha: -1.0,
+        };
+        consider!(move || feral_amd::amd_order_opts(&core, &opts_nd_ultra).map(|(p, ..)| p));
+    }
+
     // Medium-size extras: cheap here, pure upside layered over the AMD floor.
     if n < MEDIUM_MAX_N && nnz < MEDIUM_MAX_NNZ {
         // Slightly more aggressive dense handling — wins on some dense-ish
@@ -5633,6 +5655,11 @@ fn order_with_options(
     // chordal completion the early MINL family never saw. Descend that final
     // completion in the measured sparse envelope and dense pooling cell.
     let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
+        // MID-DENSITY WIDENING (fleet-h, experiment 0031): the 100k..300k slice
+        // of the 20 < nnz/n < 50 density band, measured cell-by-cell on the
+        // reconstructed eval corpus (gams03 0.8379→0.8005, pooling_sppb2pq
+        // 0.6102→0.5919, pooling_sppc0pq/tp, pooling_sppb0pq; ≈−1.6e-4 proxy).
+        || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {
