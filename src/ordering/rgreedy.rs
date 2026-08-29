@@ -1200,9 +1200,12 @@ pub(crate) fn subtree_refine(
             .map(|t| {
                 sc.spawn(move || {
                     let mut local: Vec<u32> = vec![u32::MAX; n];
-                    let mut touched: Vec<usize> = Vec::new();
-                    let mut verts: Vec<usize> = Vec::new();
-                    let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
+                    let mut touched: Vec<usize> = Vec::with_capacity(cfg.max_sub.min(n));
+                    let mut verts: Vec<usize> = Vec::with_capacity(cfg.max_sub.min(n));
+                    let mut adj0: Vec<u64> = Vec::new();
+                    let mut seed: Vec<usize> = Vec::with_capacity(cfg.max_s);
+                    let mut got: Vec<(usize, Vec<usize>)> =
+                        Vec::with_capacity(blocks_ro.len().div_ceil(nthreads));
                     let mut bi = t;
                     while bi < blocks_ro.len() {
                         let block_rank = bi;
@@ -1210,60 +1213,67 @@ pub(crate) fn subtree_refine(
                         bi += nthreads;
                         let ssz = b + 1 - a;
                         verts.clear();
-                        for &c in touched.iter() {
-                            local[c] = u32::MAX;
-                        }
+                        let mut z = 0;
+                        while z < touched.len() { local[touched[z]] = u32::MAX; z += 1; }
                         touched.clear();
-                        // S first, in incumbent block order: the seed order is
-                        // then the identity, and local id i is position a + i.
-                        for &v in &perm_ro[a..=b] {
-                            local[v] = verts.len() as u32;
+                        let mut q = a;
+                        while q <= b {
+                            let v = perm_ro[q];
+                            local[v] = (q - a) as u32;
                             touched.push(v);
                             verts.push(v);
+                            q += 1;
                         }
-                        // Boundary: original-graph neighbours of S outside S.
-                        for i in 0..ssz {
+                        let mut i = 0;
+                        while i < ssz {
                             let v = verts[i];
-                            for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
+                            let mut e = col_ptr[v];
+                            let ee = col_ptr[v + 1];
+                            while e < ee {
+                                let u = row_idx[e];
                                 if u < n && local[u] == u32::MAX {
                                     local[u] = verts.len() as u32;
                                     touched.push(u);
                                     verts.push(u);
                                 }
+                                e += 1;
                             }
+                            i += 1;
                         }
                         let m = verts.len();
                         if m > cfg.max_sub || m > MAX_N {
                             continue;
                         }
 
-                        // Induced adjacency over S u boundary, as bitsets.
                         let w = m.div_ceil(64);
-                        let mut adj0 = vec![0u64; m * w];
-                        for (li, &v) in verts.iter().enumerate() {
-                            for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
-                                if u >= n {
-                                    continue;
-                                }
+                        adj0.resize(m * w, 0);
+                        adj0[..m * w].fill(0);
+                        let mut li = 0;
+                        while li < m {
+                            let v = verts[li];
+                            let mut e = col_ptr[v];
+                            let ee = col_ptr[v + 1];
+                            while e < ee {
+                                let u = row_idx[e];
+                                e += 1;
+                                if u >= n { continue; }
                                 let lu = local[u];
-                                if lu == u32::MAX || lu as usize == li {
-                                    continue;
-                                }
+                                if lu == u32::MAX || lu as usize == li { continue; }
                                 let lu = lu as usize;
-                                adj0[li * w + (lu >> 6)] |= 1u64 << (lu & 63);
-                                adj0[lu * w + (li >> 6)] |= 1u64 << (li & 63);
+                                let x = li * w + (lu >> 6);
+                                let y = lu * w + (li >> 6);
+                                adj0[x] |= 1u64 << (lu & 63);
+                                adj0[y] |= 1u64 << (li & 63);
                             }
+                            li += 1;
                         }
 
-                        // The block's exact contribution to the global objective.
-                        let seed_flops: u64 = counts[a..=b]
-                            .iter()
-                            .map(|&c| {
-                                let c = c as u64;
-                                c * c
-                            })
-                            .sum();
-                        let seed: Vec<usize> = (0..ssz).collect();
+                        let mut seed_flops = 0u64;
+                        q = a;
+                        while q <= b { let c = counts[q] as u64; seed_flops += c * c; q += 1; }
+                        seed.clear();
+                        i = 0;
+                        while i < ssz { seed.push(i); i += 1; }
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         let first_stream =
                             usize::from(split_ranked_streams && block_rank >= 32);
@@ -1271,11 +1281,14 @@ pub(crate) fn subtree_refine(
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
                             // seed to sample an independent subtree basin.
-                            let rng_seed = if n >= 10_000 && k == 1 {
+                            let mut rng_seed = if n >= 10_000 && k == 1 {
                                 0xD1B5_4A32_D192_ED03
                             } else {
                                 stream_rng(k)
                             };
+                            if n >= 10_000 && k == 1 && cfg.round == 1 {
+                                rng_seed ^= 0xA076_1D64_78BD_642F;
+                            }
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1338,4 +1351,6 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Outer RGSUB round; used for equal-work D1 basin diversification.
+    pub(crate) round: usize,
 }
