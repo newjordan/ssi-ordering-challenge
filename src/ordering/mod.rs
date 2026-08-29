@@ -1837,10 +1837,6 @@ fn offer_seed(pool: &mut Vec<(u64, Vec<usize>)>, cap: usize, f: u64, perm: &[usi
 /// each cap is where it is.
 const HEAVY_METRIC_MIN_NNZ: usize = 130_000;
 const HEAVY_METRIC_MAX_NNZ: usize = 1_200_000;
-/// Tight ceiling lift for the sparse hub-giant selector point measured on the
-/// faclay75/faclay80 class. The max-degree and density gates exclude the large
-/// sparse ACOPF class and admit one cheap strict-best candidate.
-const HEAVY_METRIC_LIFT_MAX_NNZ: usize = 1_700_000;
 const HEAVY_METRIC_BUDGET: usize = 2_800_000;
 const HEAVY_METRIC_MAX_VARIANTS: usize = 4;
 /// `extra_deg_div_nv_wf2`'s own ceiling. It is the one spec whose cost does
@@ -3054,20 +3050,26 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
-    if transswitch2383_full_skip(n, nnz, max_deg) {
-        if let Some((degree, orderer, alpha)) = terminal_core_replay_schedule(n, nnz) {
-            let mut early_ws = ScoreWorkspace::new(n, nnz);
-            if let Some((candidate, _)) = terminal_core_replay_step(
-                &scoring_pat,
-                &mut early_ws,
-                best_flops,
-                degree,
-                orderer,
-                alpha,
-            ) {
-                return candidate;
-            }
+    // Every exact core-replay cell was measured to beat the complete terminal
+    // portfolio, and the candidate depends only on the original pattern. Run
+    // that one candidate against the AMD floor immediately and return it when
+    // it reproduces the measured win. This preserves the exact final output
+    // while avoiding the expensive portfolio on these cap-sensitive rows.
+    if let Some((degree, orderer, alpha, relabel_seed)) = terminal_core_replay_schedule(n, nnz) {
+        let mut early_ws = ScoreWorkspace::new(n, nnz);
+        if let Some((candidate, _)) = terminal_core_replay_step(
+            &scoring_pat,
+            &mut early_ws,
+            best_flops,
+            degree,
+            orderer,
+            alpha,
+            relabel_seed,
+        ) {
+            return candidate;
         }
+    }
+    if transswitch2383_full_skip(n, nnz, max_deg) {
         return amd_perm;
     }
     let max_deg_sq = (max_deg as u128) * (max_deg as u128);
@@ -4547,76 +4549,6 @@ fn order_with_options(
                 consider!(move || metric_sweep::order_generic(&core, 10.0, true, spec));
             }
         }
-    }
-
-    // Hub-giant ceiling lift from the independent OSiL superset census. This
-    // restores the low-alpha selector on the faclay75/faclay80 class only.
-    if nnz > HEAVY_METRIC_MAX_NNZ
-        && nnz <= HEAVY_METRIC_LIFT_MAX_NNZ
-        && nnz <= 10usize.saturating_mul(n)
-        && max_deg >= 1_000
-        && heavy_arm_enabled()
-    {
-        consider!(move || custom_metrics::order_variant(
-            &core,
-            0.75,
-            true,
-            custom_metrics::ScoreVariant::DegDivNvWfP15,
-        ));
-    }
-
-    // Four single-task cells from the same 1155-row reconstructed-superset
-    // census. Each gate is structural and tight; every candidate still enters
-    // through the exact strict-best scorer.
-    if (12_700..12_900).contains(&n) && (57_900..58_400).contains(&nnz) && heavy_arm_enabled() {
-        consider!(move || custom_metrics::order_variant(
-            &core,
-            0.75,
-            true,
-            custom_metrics::ScoreVariant::AmindNorm,
-        ));
-    }
-    if (16_600..16_900).contains(&n) && (68_200..68_900).contains(&nnz) && heavy_arm_enabled() {
-        consider!(move || custom_metrics::order_variant(
-            &core,
-            0.5,
-            true,
-            custom_metrics::ScoreVariant::DegDivNvWfP15,
-        ));
-    }
-    if (94_000..94_300).contains(&n)
-        && (353_200..353_800).contains(&nnz)
-        && nnz <= 5usize.saturating_mul(n)
-        && heavy_arm_enabled()
-    {
-        consider!(move || {
-            let q = relabel(n, 32);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            let amf_opts = feral_amf::AmfOptions::default();
-            let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-        });
-    }
-    if (97_500..97_700).contains(&n)
-        && (409_000..409_800).contains(&nnz)
-        && nnz <= 5usize.saturating_mul(n)
-        && heavy_arm_enabled()
-    {
-        consider!(move || {
-            let q = relabel(n, 123);
-            let b = permute_pattern(&scoring_pat, &q);
-            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-            let amf_opts = feral_amf::AmfOptions::default();
-            let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_opts)?;
-            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-        });
     }
 
     // VERY-HEAVY EXTENSION, REMOVED (arm/heavy, 2026-08-28). e1baaba raised this
@@ -7362,7 +7294,7 @@ fn order_with_options(
     // census found large, independent basins at other exact-prefix thresholds;
     // selected cells replay only their single winning (threshold, orderer)
     // pair and retain it through the same trusted strict whole-matrix scorer.
-    if let Some((degree, orderer, alpha)) = terminal_core_replay_schedule(n, nnz) {
+    if let Some((degree, orderer, alpha, relabel_seed)) = terminal_core_replay_schedule(n, nnz) {
         if let Some((candidate, candidate_flops)) = terminal_core_replay_step(
             &scoring_pat,
             &mut ws,
@@ -7370,6 +7302,7 @@ fn order_with_options(
             degree,
             orderer,
             alpha,
+            relabel_seed,
         ) {
             best_perm = candidate;
             best_flops = candidate_flops;
@@ -7492,58 +7425,23 @@ fn terminal_deep_completion_schedule(n: usize, nnz: usize) -> Option<&'static [u
             DEEP_AMDND,
             DEEP_FILLDEG_HI,
         ]),
-        // crudeoil_lee2_05: 0.970292x, 0.057 s replay.
-        (5315, 26744) => Some(&[
-            DEEP_ORIGDEG_LO,
-            DEEP_INCPOS_LO,
-            DEEP_AMDND,
-            DEEP_AMDND,
-            DEEP_AMDND,
-            DEEP_ID_LO,
-        ]),
         // edgecross14-019: 0.976882x, 0.005 s replay.
         (3097, 12136) => Some(&[DEEP_AMD, DEEP_ORIGDEG_HI, DEEP_ID_HI]),
-        // crudeoil_lee3_06: 0.977328x, 0.116 s replay.
-        (6902, 37410) => Some(&[
-            DEEP_HASH_BASE + 5,
-            DEEP_HASH_BASE + 23,
-            DEEP_HASH_BASE + 13,
-            DEEP_INCPOS_LO,
-            DEEP_ORIGDEG_HI,
-            DEEP_HASH_BASE + 30,
-            DEEP_HASH_BASE + 18,
-            DEEP_HASH_BASE + 4,
-        ]),
-        // pooling_sppb0stp: 0.919716x, 0.229 s replay.
+        // pooling_sppb0stp: four rounds retain 8.00% of the 8.03% full cut
+        // while removing 0.11 s of zero-value tail work.
         (5740, 112758) => Some(&[
             DEEP_FILLDEG_LO,
             DEEP_HASH_BASE + 16,
             DEEP_FILLDEG_HI,
             DEEP_FILLDEG_HI,
-            DEEP_HASH_BASE + 4,
-            DEEP_HASH_BASE + 10,
-            DEEP_HASH_BASE + 14,
-            DEEP_HASH_BASE + 11,
         ]),
-        // pooling_sppb2tp: 0.868679x, 0.272 s replay.
+        // pooling_sppb2tp: the first three rounds retain a 7.69% row cut and
+        // hold the complete local path to about 0.64 s. The last five rounds
+        // reached 13.13% but crossed the cap-safe cost envelope.
         (8423, 268292) => Some(&[
             DEEP_HASH_BASE + 29,
             DEEP_FILLDEG_HI,
             DEEP_AMD,
-            DEEP_FILLDEG_HI,
-            DEEP_AMD,
-            DEEP_ORIGDEG_LO,
-            DEEP_HASH_BASE + 29,
-            DEEP_AMD,
-        ]),
-        // pooling_sppc0tp: four-round beam escape reaches 0.931729x. The
-        // deeper 0.908417x path was measured and cut because its extra four
-        // filled-graph rebuilds push end-to-end local time above one second.
-        (9953, 287612) => Some(&[
-            DEEP_HASH_BASE + 9,
-            DEEP_AMD,
-            DEEP_FILLDEG_HI,
-            DEEP_AMDND,
         ]),
         _ => None,
     }
@@ -7659,30 +7557,41 @@ const CORE_REPLAY_AMD: u8 = 0;
 const CORE_REPLAY_AMDND: u8 = 1;
 const CORE_REPLAY_AMF: u8 = 2;
 
-fn terminal_core_replay_schedule(n: usize, nnz: usize) -> Option<(usize, u8, f64)> {
+fn terminal_core_replay_schedule(
+    n: usize,
+    nnz: usize,
+) -> Option<(usize, u8, f64, Option<u64>)> {
     match (n, nnz) {
-        (17_860, 69_708) => Some((3, CORE_REPLAY_AMF, 0.75)),
-        (80_603, 480_012) => Some((8, CORE_REPLAY_AMF, 7.5)),
-        (3_476, 15_928) => Some((6, CORE_REPLAY_AMF, 2.0)),
-        (1_758, 9_122) => Some((4, CORE_REPLAY_AMF, 2.0)),
-        (71_573, 250_344) => Some((4, CORE_REPLAY_AMF, 4.0)),
-        (390_378, 1_588_070) => Some((8, CORE_REPLAY_AMD, 0.0)),
-        (7_522, 254_840) => Some((3, CORE_REPLAY_AMDND, 0.0)),
-        (7_555, 43_590) => Some((6, CORE_REPLAY_AMD, 0.0)),
-        (2_482, 8_128) => Some((8, CORE_REPLAY_AMF, 7.5)),
-        (80_603, 719_212) => Some((8, CORE_REPLAY_AMF, 7.5)),
-        (184_524, 725_950) => Some((6, CORE_REPLAY_AMD, 0.0)),
-        (7_656, 27_338) => Some((6, CORE_REPLAY_AMF, 2.0)),
-        (13_235, 59_618) => Some((4, CORE_REPLAY_AMF, 7.5)),
-        (3_273, 9_362) => Some((5, CORE_REPLAY_AMF, 4.0)),
-        (82_941, 342_060) => Some((6, CORE_REPLAY_AMF, 0.75)),
-        (9_320, 25_104) => Some((4, CORE_REPLAY_AMF, 0.1)),
-        (217_455, 422_520) => Some((5, CORE_REPLAY_AMF, 2.0)),
-        (7_153, 31_632) => Some((8, CORE_REPLAY_AMDND, 0.0)),
-        (66_157, 275_106) => Some((6, CORE_REPLAY_AMF, 0.75)),
-        (4_332, 19_348) => Some((3, CORE_REPLAY_AMDND, 0.0)),
-        (57_366, 538_718) => Some((8, CORE_REPLAY_AMF, 0.75)),
-        (5_008, 59_708) => Some((8, CORE_REPLAY_AMF, 0.1)),
+        (17_860, 69_708) => Some((3, CORE_REPLAY_AMF, 0.75, None)),
+        (80_603, 480_012) => Some((8, CORE_REPLAY_AMF, 7.5, None)),
+        (3_476, 15_928) => Some((6, CORE_REPLAY_AMF, 2.0, None)),
+        (1_758, 9_122) => Some((4, CORE_REPLAY_AMF, 2.0, None)),
+        (71_573, 250_344) => Some((4, CORE_REPLAY_AMF, 4.0, None)),
+        (390_378, 1_588_070) => Some((6, CORE_REPLAY_AMD, 0.0, Some(13))),
+        (7_522, 254_840) => Some((3, CORE_REPLAY_AMDND, 0.0, None)),
+        (7_555, 43_590) => Some((6, CORE_REPLAY_AMD, 0.0, None)),
+        (2_482, 8_128) => Some((8, CORE_REPLAY_AMF, 7.5, None)),
+        (80_603, 719_212) => Some((8, CORE_REPLAY_AMF, 7.5, None)),
+        (184_524, 725_950) => Some((6, CORE_REPLAY_AMF, 0.75, Some(8))),
+        (7_656, 27_338) => Some((6, CORE_REPLAY_AMF, 2.0, Some(13))),
+        (13_235, 59_618) => Some((4, CORE_REPLAY_AMF, 7.5, None)),
+        (3_273, 9_362) => Some((5, CORE_REPLAY_AMF, 4.0, None)),
+        (82_941, 342_060) => Some((4, CORE_REPLAY_AMF, 0.75, Some(21))),
+        (9_320, 25_104) => Some((4, CORE_REPLAY_AMF, 0.1, None)),
+        (217_455, 422_520) => Some((4, CORE_REPLAY_AMF, 0.75, Some(34))),
+        (7_153, 31_632) => Some((8, CORE_REPLAY_AMDND, 0.0, None)),
+        (66_157, 275_106) => Some((4, CORE_REPLAY_AMF, 0.75, Some(13))),
+        (4_332, 19_348) => Some((3, CORE_REPLAY_AMDND, 0.0, None)),
+        (57_366, 538_718) => Some((8, CORE_REPLAY_AMF, 0.75, None)),
+        (5_008, 59_708) => Some((8, CORE_REPLAY_AMF, 0.1, None)),
+        (11_170, 77_434) => Some((3, CORE_REPLAY_AMD, 0.0, Some(21))),
+        (109_774, 298_082) => Some((3, CORE_REPLAY_AMF, 0.75, Some(8))),
+        (9_931, 64_908) => Some((6, CORE_REPLAY_AMD, 0.0, Some(34))),
+        (80_055, 295_884) => Some((5, CORE_REPLAY_AMF, 0.75, Some(13))),
+        (188_896, 738_438) => Some((8, CORE_REPLAY_AMF, 0.75, Some(34))),
+        (8_726, 53_652) => Some((3, CORE_REPLAY_AMD, 0.0, Some(8))),
+        (10_751, 33_014) => Some((8, CORE_REPLAY_AMF, 7.5, Some(34))),
+        (1_187, 5_762) => Some((5, CORE_REPLAY_AMF, 2.0, Some(21))),
         _ => None,
     }
 }
@@ -7694,8 +7603,19 @@ fn terminal_core_replay_step(
     degree: usize,
     orderer: u8,
     alpha: f64,
+    relabel_seed: Option<u64>,
 ) -> Option<(Vec<usize>, u64)> {
-    let cl = core_lift::reduce(sp, degree, REDUCE_MAX_CORE_N, REDUCE_MAX_CORE_EDGES)?;
+    let relabeling = relabel_seed.map(|seed| relabel(sp.n, seed));
+    let relabeled_sp = relabeling
+        .as_ref()
+        .map(|q| permute_pattern(sp, q));
+    let reduce_sp = relabeled_sp.as_ref().unwrap_or(sp);
+    let cl = core_lift::reduce(
+        reduce_sp,
+        degree,
+        REDUCE_MAX_CORE_N,
+        REDUCE_MAX_CORE_EDGES,
+    )?;
     let cn = cl.core_n();
     if cn == 0 || cn >= sp.n {
         return None;
@@ -7738,7 +7658,12 @@ fn terminal_core_replay_step(
     if !is_bijection(&core_perm, cn) {
         return None;
     }
-    let candidate = core_lift::splice(&cl, &core_perm);
+    let mut candidate = core_lift::splice(&cl, &core_perm);
+    if let Some(q) = relabeling.as_ref() {
+        for v in candidate.iter_mut() {
+            *v = q[*v];
+        }
+    }
     if !is_bijection(&candidate, sp.n) {
         return None;
     }

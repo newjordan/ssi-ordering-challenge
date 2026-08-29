@@ -253,10 +253,27 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
 - [open-questions.md](open-questions.md) — the research queue.
 
 - [0041-c9-residual-superset-exfill.md](experiments/0041-c9-residual-superset-exfill.md) —
-  **STAGED WIN on promoted c9 main**: five narrow reconstructed-superset arms,
+  **FAILED CAP; superseded by 0044**: five reconstructed-superset arms,
   bounded exact minimum-local-fill, one terminal no-dense AMD realization, and an
-  output-neutral parallel duplicate-score memo. Dev **0.810482**, worst order()
-  **0.937 s**, active tests 57/57; hidden residual estimate clears c9's 10 bp bar.
+  output-neutral parallel duplicate-score memo. The broad arms and memo were
+  inherited by 0042/0043 and are removed in the repaired stack.
+
+- [0042-deep-completion-basins.md](experiments/0042-deep-completion-basins.md) —
+  **FAILED CAP; mechanism retained selectively in 0044.** Repeated terminal
+  completion realizations expose very large basins; 0044 prices every accepted
+  round and keeps five rows at 2.31%–29.35% cuts while removing slow tails.
+
+- [0043-exact-prefix-core-replay.md](experiments/0043-exact-prefix-core-replay.md) —
+  **FAILED CAP through inherited 0041 layer; mechanism retained in 0044.** Exact
+  structural replay of measured prefix/core basins, now moved to an early-return
+  path so known winners skip the general portfolio.
+
+- [0044-cap-repair-relabelled-core.md](experiments/0044-cap-repair-relabelled-core.md) —
+  **CAP-REPAIRED WIN, dev 0.810911.** Removes every broad/output-neutral 0041
+  addition, trims deep replay to its percentage-scale front, early-returns exact
+  core winners, and adds 14 relabelled-core improvements/replacements. All new
+  complete paths measure at or below ~0.65 s; active tests 66/66, hard-cap 5/5,
+  full 300-matrix harness clean.
 
 - [0032-fleet-i.md](experiments/0032-fleet-i.md) — **WIN (v2 proxy −0.000314 + −0.000168)**: TELOS Regime-A full-grid discriminator (hub_safe ∧ nnz≥3n) + terminal-MINL sparse-gt cell (30k<n≤50k ∧ nnz≤170k ∧ d<10); rgsub round-3 widening killed (kill-proof at site).
 
