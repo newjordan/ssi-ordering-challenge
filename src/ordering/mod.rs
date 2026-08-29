@@ -7762,6 +7762,9 @@ fn terminal_core_successor_schedule(n: usize, nnz: usize) -> Option<&'static [u8
             DEEP_INCPOS_LO,
             DEEP_FILLDEG_LO,
         ]),
+        // The direct D20/relabel-55 core winner compounds cheaply from 1.79%
+        // to a 2.44% total row cut; later oracle rounds were sub-0.06 points.
+        (7_555, 43_590) => Some(&[DEEP_ID_HI, DEEP_FILLDEG_HI]),
         _ => None,
     }
 }
@@ -7778,7 +7781,9 @@ fn terminal_core_replay_schedule(
         (71_573, 250_344) => Some((4, CORE_REPLAY_AMF, 4.0, None)),
         (390_378, 1_588_070) => Some((6, CORE_REPLAY_AMD, 0.0, Some(13))),
         (7_522, 254_840) => Some((3, CORE_REPLAY_AMDND, 0.0, None)),
-        (7_555, 43_590) => Some((6, CORE_REPLAY_AMD, 0.0, None)),
+        // A direct high-threshold prefix enters a new basin beyond the old
+        // D6/AMD core: 30,818,920 -> 30,267,833 exact whole-pattern flops.
+        (7_555, 43_590) => Some((20, CORE_REPLAY_AMF, 4.0, Some(55))),
         (2_482, 8_128) => Some((8, CORE_REPLAY_AMF, 7.5, None)),
         (80_603, 719_212) => Some((8, CORE_REPLAY_AMF, 7.5, None)),
         (184_524, 725_950) => Some((6, CORE_REPLAY_AMF, 0.75, Some(8))),
