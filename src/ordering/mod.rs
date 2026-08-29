@@ -3041,16 +3041,20 @@ fn order_with_options(
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_order(pattern))
         });
+        // AMD-per-block crown path — best-of floor so ND-core is zero-downside
+        // on matrices where AMD-on-the-core still wins (e.g. gabriel10).
+        consider!(move || {
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_amd_order(pattern))
+        });
 
         // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
-        // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
+        // matter (>=200 owned vertices, <=180k block-nnz so a restart stays
         // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
         // local flops, largest-block-first under a 24-restart global budget.
-        // Decomposition shrinks the problem, so this reaches blocks the
-        // whole-graph relabel multi-start is gated out of on the big gt_10k
-        // matrices. Adds crudeoil_lee1_07 (0.9032->0.8781) and syn30m03m
-        // (0.9977->0.9957) over plain biconn; worst isolated cost 0.368s
-        // (nuclear104). Restart 0 is plain AMD, so per-block quality >= plain
+        // The largest bicomp that clears the same gates is ND-cored instead of
+        // relabelled. Decomposition shrinks the problem, so this reaches blocks
+        // the whole-graph relabel multi-start is gated out of on the big gt_10k
+        // matrices. Restart 0 is plain AMD, so per-block quality >= plain
         // biconn; best-of floor makes the composed candidate zero-downside.
         // CAP-SAFETY (round-2 merge): heavy variant gated at nnz <= 60k —
         // its measured wins (crudeoil_lee1_07, syn30m03m) are far below this,
@@ -3059,7 +3063,7 @@ fn order_with_options(
         if nnz <= 60_000 {
             consider!(move || {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    biconn::biconn_heavy_order(pattern, 24, 200, 180_000),
                 )
             });
         }
@@ -6475,7 +6479,10 @@ fn nd_order(pattern: &Pattern) -> Vec<i32> {
 /// hybrid). The two are DISTINCT candidates routed through the best-of floor,
 /// so the AMD-leaf variant can only lower a matrix's ratio, never raise it —
 /// only its (bounded) time is at stake.
-fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
+///
+/// `pub(crate)` so `biconn`'s ND-core arm can run this on one bicomp's
+/// induced subgraph without inventing a second ND module.
+pub(crate) fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     let n = pattern.n;
 
     // Symmetric adjacency (exclude self-loops; dedup for accurate degrees).

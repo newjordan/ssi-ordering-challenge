@@ -64,11 +64,53 @@ fn build_adj(pattern: &Pattern) -> Vec<Vec<u32>> {
     adj
 }
 
+/// ND-core gates: skip tiny bicomps (AMD on a 2-vertex bridge is the right
+/// answer) and skip blocks whose induced nnz would blow the 2 s cap. The
+/// largest bicomp that clears both is ordered with the crate's nested-
+/// dissection arm (`nd_order_impl`); every other block stays AMD.
+const MIN_BLOCK: usize = 200;
+const BLOCK_NNZ_CAP: usize = 180_000;
+
+/// Nested-dissection on the induced subgraph of `owned` (parent articulation
+/// already stripped). `None` if the block fails `MIN_BLOCK` / `BLOCK_NNZ_CAP`
+/// or ND returns a non-bijection — caller falls back to per-block AMD.
+fn nd_core_perm(pattern: &Pattern, owned: &[u32]) -> Option<Vec<usize>> {
+    let m = owned.len();
+    if m < MIN_BLOCK {
+        return None;
+    }
+    let n = pattern.n;
+    let mut keep = vec![false; n];
+    for &v in owned {
+        keep[v as usize] = true;
+    }
+    let sub = super::nested_subgraph::induced_keep(pattern, &keep);
+    if sub.local_to_global.len() < MIN_BLOCK || sub.row_idx.len() > BLOCK_NNZ_CAP {
+        return None;
+    }
+    let sub_pat = sub.to_pattern();
+    let local = super::nd_order_impl(&sub_pat, true);
+    if local.len() != sub.local_to_global.len() {
+        return None;
+    }
+    Some(
+        local
+            .iter()
+            .map(|&x| sub.local_to_global[x as usize])
+            .collect(),
+    )
+}
+
 /// Iterative Tarjan biconnected components, returned as edge lists (one list
 /// per component, edges as `(u, v)` off-diagonal pairs in pop order).
 /// Iterative (explicit stacks) because the corpus reaches n ≈ 340k and a
 /// path graph's block-cut tree is ~n deep — recursion would overflow the
 /// worker's stack. Deterministic given sorted adjacency.
+///
+/// Downstream ND-core (`MIN_BLOCK` / `BLOCK_NNZ_CAP`) skips tiny components
+/// and components whose induced nnz exceeds the cap; Tarjan itself still
+/// returns every bicomp so the articulation-deferred composition stays a
+/// bijection.
 fn biconnected_components(adj: &[Vec<u32>]) -> Vec<Vec<(u32, u32)>> {
     let n = adj.len();
     const NONE: u32 = u32::MAX;
@@ -148,7 +190,22 @@ fn biconnected_components(adj: &[Vec<u32>]) -> Vec<Vec<(u32, u32)>> {
 /// Biconnected-decomposition ordering. Returns `perm[k]` = original index
 /// eliminated k-th (a bijection of `0..n`). See the module doc for the
 /// construction and its rationale.
+///
+/// The largest bicomp that clears `MIN_BLOCK` / `BLOCK_NNZ_CAP` is ordered
+/// with nested dissection (`nd_order_impl` AMD-leaves); every other block
+/// stays feral AMD. Articulation vertices remain deferred to their parent
+/// block — same composition as the AMD-only crown path.
 pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
+    biconn_order_ex(pattern, true)
+}
+
+/// Crown AMD-per-block path (no ND-core). Kept as a separate best-of
+/// candidate so ND-core is zero-downside on matrices where AMD-on-core wins.
+pub(crate) fn biconn_amd_order(pattern: &Pattern) -> Vec<i32> {
+    biconn_order_ex(pattern, false)
+}
+
+fn biconn_order_ex(pattern: &Pattern, nd_core: bool) -> Vec<i32> {
     let n = pattern.n;
     if n == 0 {
         return Vec::new();
@@ -177,6 +234,18 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
         }
         comp_verts.push(verts);
     }
+
+    // Largest bicomp (ties: lowest id) — the ND-core, if it clears the gates.
+    let largest_b = {
+        let mut best = 0usize;
+        for b in 1..nc {
+            let (bs, ls) = (comp_verts[b].len(), comp_verts[best].len());
+            if bs > ls {
+                best = b;
+            }
+        }
+        best
+    };
 
     // Root each connected component's block-cut tree at its LARGEST block
     // (ties: lowest id) so the dense core is eliminated last. BFS assigns
@@ -290,6 +359,12 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
             continue;
         }
         owned.sort_unstable();
+        if nd_core && b == largest_b {
+            if let Some(nd_perm) = nd_core_perm(pattern, &owned) {
+                perm.extend(nd_perm);
+                continue;
+            }
+        }
         gen = gen.wrapping_add(1);
         // (gen can wrap only after 4G blocks; not reachable on this corpus.)
         for (li, &v) in owned.iter().enumerate() {
@@ -409,6 +484,16 @@ pub fn biconn_heavy_order(
         comp_verts.push(verts);
     }
 
+    let largest_b = {
+        let mut best = 0usize;
+        for b in 1..nc {
+            if comp_verts[b].len() > comp_verts[best].len() {
+                best = b;
+            }
+        }
+        best
+    };
+
     const NONE: u32 = u32::MAX;
     let mut parent_ap = vec![NONE; nc];
     let mut depth = vec![0u32; nc];
@@ -502,6 +587,11 @@ pub fn biconn_heavy_order(
             if owned_sz < min_block || comps[b].len() > block_nnz_cap {
                 continue;
             }
+            // ND-core consumes the largest eligible bicomp; spend the relabel
+            // budget on the remaining blocks instead of double-ordering it.
+            if b == largest_b && owned_sz >= MIN_BLOCK {
+                continue;
+            }
             let give = budget.min(EXTRA_CAP);
             extra_of[b] = give;
             budget -= give;
@@ -536,6 +626,12 @@ pub fn biconn_heavy_order(
             continue;
         }
         owned.sort_unstable();
+        if b == largest_b {
+            if let Some(nd_perm) = nd_core_perm(pattern, &owned) {
+                perm.extend(nd_perm);
+                continue;
+            }
+        }
         gen = gen.wrapping_add(1);
         for (li, &v) in owned.iter().enumerate() {
             tok[v as usize] = gen;
@@ -788,5 +884,30 @@ mod tests {
         let b = biconn_order(&pat);
         assert_eq!(a, b);
         assert_bijection(&a, base + 5);
+    }
+
+    #[test]
+    fn nd_core_on_large_biconnected_mesh() {
+        // 16×16 grid: one bicomp, n=256 >= MIN_BLOCK, nnz well under the cap
+        // — exercises NestedSubgraphBuilder + nd_order_impl on the core.
+        let side = 16;
+        let mut edges = Vec::new();
+        for r in 0..side {
+            for c in 0..side {
+                let v = r * side + c;
+                if c + 1 < side {
+                    edges.push((v, v + 1));
+                }
+                if r + 1 < side {
+                    edges.push((v, v + side));
+                }
+            }
+        }
+        let pat = Pattern::from_edges(side * side, &edges);
+        let perm = biconn_order(&pat);
+        assert_bijection(&perm, side * side);
+        let amd = biconn_amd_order(&pat);
+        assert_bijection(&amd, side * side);
+        assert_eq!(biconn_order(&pat), perm);
     }
 }

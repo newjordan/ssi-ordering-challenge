@@ -180,6 +180,41 @@ impl<'a> NestedSubgraphBuilder<'a> {
     }
 }
 
+impl InducedSubgraph {
+    /// Materialize this induced subgraph as a [`Pattern`] in local numbering,
+    /// ready for `nd_order` / `nd_order_impl` / AMD.
+    pub(crate) fn to_pattern(&self) -> Pattern {
+        Pattern {
+            n: self.local_to_global.len(),
+            col_ptr: self.col_ptr.iter().map(|&x| x as usize).collect(),
+            row_idx: self.row_idx.iter().map(|&x| x as usize).collect(),
+        }
+    }
+}
+
+/// Induced subgraph on an explicit kept set, via [`NestedSubgraphBuilder`]:
+/// excluded vertices are a prefix of a deterministic ranking (ascending id),
+/// `k_max = n - |keep|`, so the builder's first emit is exactly the vertex-
+/// induced subgraph of `keep`. Local numbering is ascending global id.
+pub(crate) fn induced_keep(pattern: &Pattern, keep: &[bool]) -> InducedSubgraph {
+    let n = pattern.n;
+    debug_assert_eq!(keep.len(), n);
+    let mut ranking = Vec::with_capacity(n);
+    for v in 0..n {
+        if !keep[v] {
+            ranking.push(v);
+        }
+    }
+    let k_excl = ranking.len();
+    for v in 0..n {
+        if keep[v] {
+            ranking.push(v);
+        }
+    }
+    let (_builder, sub) = NestedSubgraphBuilder::new(pattern, &ranking, k_excl);
+    sub
+}
+
 /// From-scratch reference builder: filter the full pattern for `ranking[..k]`
 /// excluded, independent of [`NestedSubgraphBuilder`]'s incremental state.
 /// Used ONLY to cross-check the incremental builder; not on any hot path.
