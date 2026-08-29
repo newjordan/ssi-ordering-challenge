@@ -2307,6 +2307,11 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
+    let md2 = (max_deg as u128) * (max_deg as u128);
+    let d05 = max_deg <= 16 || 4 * md2 <= n as u128;
+    let d2 = max_deg <= 16 || md2 <= 4 * n as u128;
+    let d25 = max_deg <= 16 || 4 * md2 <= 25 * n as u128;
+    let d5 = max_deg <= 16 || md2 <= 25 * n as u128;
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -2434,16 +2439,21 @@ fn order_with_options(
         // heavies. See memory/experiments/0011 (RCA session).
         const D_MAX_NNZ: usize = 400_000;
         if nnz < D_MAX_NNZ {
-            let opts_25 = feral_amf::AmfOptions {
-                dense_alpha: 2.5,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
-            let opts_05 = feral_amf::AmfOptions {
-                dense_alpha: 0.5,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
+            if nnz >= 200_000 && d25 {
+                let s = &metric_sweep::EXTRA_METRICS[1];
+                consider!(move || metric_sweep::order_generic(&core, 10.0, true, s));
+            } else {
+                let o = feral_amf::AmfOptions { dense_alpha: 2.5, ..Default::default() };
+                consider!(move || feral_amf::amf_order_opts(&core, &o).map(|(p, ..)| p));
+            }
+            if nnz >= 200_000 && d05 {
+                consider!(move || custom_metrics::order_variant(
+                    &core, 10.0, true, custom_metrics::ScoreVariant::SqDiv,
+                ));
+            } else {
+                let o = feral_amf::AmfOptions { dense_alpha: 0.5, ..Default::default() };
+                consider!(move || feral_amf::amf_order_opts(&core, &o).map(|(p, ..)| p));
+            }
         }
 
         // D WIDE-REACH RECOVERY (RCA follow-up, `probe_win_d_map`): the flat
@@ -2531,37 +2541,48 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_075).map(|(p, ..)| p));
-            let opts_125 = feral_amf::AmfOptions {
-                dense_alpha: 1.25,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
             if nnz >= D_WIDE_MAX_DENSITY * n {
-                // Above the D_WIDE density ceiling, a low-alpha DegSqrt
-                // quotient pass is both cheaper and materially more diverse
-                // than the AMD pass it replaces. Keeping this one-for-one
-                // preserves the accepted candidate count and timing envelope.
+                if nnz <= HEAVY_METRIC_DEAD_MAX_NNZ {
+                    let s = &metric_sweep::EXTRA_METRICS[9];
+                    consider!(move || metric_sweep::order_generic(&core, 2.5, true, s));
+                } else {
+                    consider!(move || custom_metrics::order_variant(
+                        &core, 10.0, true, custom_metrics::ScoreVariant::SqDiv,
+                    ));
+                }
+            } else {
+                let o = feral_amf::AmfOptions { dense_alpha: 1.25, ..Default::default() };
+                consider!(move || feral_amf::amf_order_opts(&core, &o).map(|(p, ..)| p));
+            }
+            if nnz >= D_WIDE_MAX_DENSITY * n {
                 consider!(move || custom_metrics::order_variant(
                     &core,
                     0.75,
                     true,
                     custom_metrics::ScoreVariant::DegSqrt,
                 ));
+            } else if nnz < HEAVY_METRIC_GIANT_MIN_NNZ {
+                consider!(move || custom_metrics::order_variant(
+                    &core, 0.75, true, custom_metrics::ScoreVariant::DegSqrt,
+                ));
             } else {
-                let amd_opts_075 = feral_amd::AmdOptions {
-                    aggressive: true,
-                    dense_alpha: 0.75,
-                };
-                consider!(move || {
-                    feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p)
-                });
+                consider!(move || custom_metrics::order_variant(
+                    &core, 10.0, true, custom_metrics::ScoreVariant::SqDiv,
+                ));
             }
             if nnz < D_WIDE_MAX_DENSITY * n {
-                let opts_20 = feral_amf::AmfOptions {
-                    dense_alpha: 2.0,
-                    ..Default::default()
-                };
-                consider!(move || feral_amf::amf_order_opts(&core, &opts_20).map(|(p, ..)| p));
+                if nnz <= HEAVY_METRIC_DEAD_MAX_NNZ {
+                    let s = &metric_sweep::EXTRA_METRICS[9];
+                    consider!(move || metric_sweep::order_generic(&core, 2.5, true, s));
+                } else if nnz < HEAVY_METRIC_GIANT_MIN_NNZ {
+                    consider!(move || custom_metrics::order_variant(
+                        &core, 10.0, true, custom_metrics::ScoreVariant::SqDiv,
+                    ));
+                } else {
+                    consider!(move || custom_metrics::order_variant(
+                        &core, 0.75, true, custom_metrics::ScoreVariant::DegSqrt,
+                    ));
+                }
             }
         }
 
@@ -2598,19 +2619,24 @@ fn order_with_options(
     if n < MEDIUM_MAX_N && nnz < MEDIUM_MAX_NNZ {
         // Slightly more aggressive dense handling — wins on some dense-ish
         // problems; can never lose thanks to the default-AMD floor.
-        let amd_opts5 = feral_amd::AmdOptions {
-            aggressive: true,
-            dense_alpha: 5.0,
-        };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_opts5).map(|(p, ..)| p));
+        if nnz >= 200_000 && d5 {
+            let s = &metric_sweep::EXTRA_METRICS[9];
+            consider!(move || metric_sweep::order_generic(&core, 10.0, true, s));
+        } else {
+            let o = feral_amd::AmdOptions { aggressive: true, dense_alpha: 5.0 };
+            consider!(move || feral_amd::amd_order_opts(&core, &o).map(|(p, ..)| p));
+        }
 
         // Even tighter dense handling — catches dense-ish mediums the α5/α10
         // variants miss. Trivially cheap in this size regime.
-        let amd_opts2 = feral_amd::AmdOptions {
-            aggressive: true,
-            dense_alpha: 2.0,
-        };
-        consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
+        if nnz >= 200_000 && d2 {
+            consider!(move || custom_metrics::order_variant(
+                &core, 5.0, true, custom_metrics::ScoreVariant::SqPure,
+            ));
+        } else {
+            let o = feral_amd::AmdOptions { aggressive: true, dense_alpha: 2.0 };
+            consider!(move || feral_amd::amd_order_opts(&core, &o).map(|(p, ..)| p));
+        }
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
         // session, `probe_variant_drop_score_cost`): measured 0 unique wins
@@ -2624,11 +2650,14 @@ fn order_with_options(
 
         // Tighter-dense AMF (α2) — a distinct AMF ordering for dense-ish mediums
         // that the α5/α10 AMF variants miss. Time-trivial at this size.
-        let amf_opts2 = feral_amf::AmfOptions {
-            dense_alpha: 2.0,
-            ..Default::default()
-        };
-        consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        if nnz >= 200_000 && d2 {
+            consider!(move || custom_metrics::order_variant(
+                &core, 0.75, true, custom_metrics::ScoreVariant::DegSqrt,
+            ));
+        } else {
+            let o = feral_amf::AmfOptions { dense_alpha: 2.0, ..Default::default() };
+            consider!(move || feral_amf::amf_order_opts(&core, &o).map(|(p, ..)| p));
+        }
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
         // add unique wins beyond the existing α{-1,2,5,10} set. Gated to genuinely
@@ -3271,7 +3300,11 @@ fn order_with_options(
             HEAVY_METRIC_MAX_VARIANTS
         };
         let k = (HEAVY_METRIC_BUDGET / nnz).clamp(1, HEAVY_METRIC_MAX_VARIANTS).min(band_cap);
-        for &(name, alpha) in HEAVY_METRIC_ORDER.iter().take(k) {
+        for &(name, alpha0) in HEAVY_METRIC_ORDER.iter().take(k) {
+            let alpha = if nnz >= HEAVY_METRIC_GIANT_MIN_NNZ
+                && nnz > 20 * n
+                && name == "extra_deg2_div_nv_wf05"
+            { 2.5 } else { alpha0 };
             match name {
                 "cm_sqdiv" => consider!(move || custom_metrics::order_variant(
                     &core,
@@ -4745,10 +4778,17 @@ fn order_with_options(
     const RGREEDY_SLACK_MIN_N: usize = 64;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
+    const RGREEDY_SLACK_MID_NARROW: i64 = 800_000_000;
+    let narrow_mid_pep = nnz <= RGREEDY_PEP_MAX_NNZ
+        && (nnz <= n.saturating_mul(2)
+            || (n.saturating_mul(4) <= nnz
+                && nnz.saturating_mul(2) <= n.saturating_mul(9)));
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
+    } else if narrow_mid_pep {
+        RGREEDY_SLACK_MID_NARROW
     } else {
         RGREEDY_SLACK_MID
     };
@@ -4974,6 +5014,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -4990,7 +5031,20 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        // Recompose the independently promoted sparse third pass on top of the
+        // dense-low-alpha frontier.  Its later disappearance was a graft/base
+        // artifact, not a negative validation: the extra pass is gated to the
+        // two hidden-positive sparse classes and the strict incumbent check
+        // below makes the output monotone in the trusted objective.
+        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
+            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
+        {
+            3
+        } else {
+            2
+        };
+        for round in 0..rgsub_rounds {
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5015,7 +5069,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                round_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);

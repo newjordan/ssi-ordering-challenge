@@ -90,7 +90,7 @@ pub(crate) const MAX_N: usize = 12_000;
 /// bottom.
 const SCAN_MAX_N: usize = 1_500;
 
-#[inline]
+#[inline(always)]
 fn xs64(s: &mut u64) -> u64 {
     let mut x = *s;
     x ^= x << 13;
@@ -101,7 +101,7 @@ fn xs64(s: &mut u64) -> u64 {
 }
 
 /// Uniform in `0..m` (m > 0), via the standard rejection-free multiply-shift.
-#[inline]
+#[inline(always)]
 fn below(s: &mut u64, m: u32) -> u32 {
     ((xs64(s) >> 32) * (m as u64) >> 32) as u32
 }
@@ -170,17 +170,21 @@ impl<'a> Game<'a> {
         }
         let w = n.div_ceil(64);
         let mut adj0 = vec![0u64; n * w];
-        for v in 0..n {
-            let (lo, hi) = (col_ptr[v], col_ptr[v + 1]);
-            for &r in &row_idx[lo..hi] {
-                if r >= n {
-                    return None;
-                }
+        let mut v = 0;
+        while v < n {
+            let vb = v * w;
+            let mut e = col_ptr[v];
+            let ee = col_ptr[v + 1];
+            while e < ee {
+                let r = row_idx[e];
+                e += 1;
+                if r >= n { return None; }
                 if r != v {
-                    adj0[v * w + (r >> 6)] |= 1u64 << (r & 63);
+                    adj0[vb + (r >> 6)] |= 1u64 << (r & 63);
                     adj0[r * w + (v >> 6)] |= 1u64 << (v & 63);
                 }
             }
+            v += 1;
         }
         Some(adj0)
     }
@@ -216,11 +220,21 @@ impl<'a> Game<'a> {
             return None;
         }
         let mut deg0 = vec![0u32; n];
-        for (v, d) in deg0.iter_mut().enumerate() {
-            *d = adj0[v * w..v * w + w]
-                .iter()
-                .map(|word| word.count_ones())
-                .sum();
+        let mut v = 0;
+        while v < n {
+            let b = v * w;
+            let mut k = 0;
+            let mut d = 0u32;
+            while k + 4 <= w {
+                d += adj0[b + k].count_ones()
+                    + adj0[b + k + 1].count_ones()
+                    + adj0[b + k + 2].count_ones()
+                    + adj0[b + k + 3].count_ones();
+                k += 4;
+            }
+            while k < w { d += adj0[b + k].count_ones(); k += 1; }
+            deg0[v] = d;
+            v += 1;
         }
         Some(Game {
             n,
@@ -250,16 +264,19 @@ impl<'a> Game<'a> {
         self.bhead.fill(-1);
         self.livelist.clear();
         self.deg.copy_from_slice(&self.deg0);
-        for v in 0..self.n {
-            let d = self.deg[v];
-            if v >= self.nelim {
-                continue; // permanently live: never a pivot, never bucketed
-            }
-            if self.use_buckets {
+        if self.use_buckets {
+            let mut v = 0;
+            while v < self.nelim {
+                let d = self.deg[v];
                 self.blink(v, d as usize);
-            } else {
+                v += 1;
+            }
+        } else {
+            let mut v = 0;
+            while v < self.nelim {
                 self.pos[v] = self.livelist.len() as u32;
                 self.livelist.push(v as u32);
+                v += 1;
             }
         }
         self.mind = 0;
@@ -272,7 +289,7 @@ impl<'a> Game<'a> {
         self.ops += (2 * self.n * self.w + 8 * self.n) as i64;
     }
 
-    #[inline]
+    #[inline(always)]
     fn blink(&mut self, v: usize, d: usize) {
         let h = self.bhead[d];
         self.bnext[v] = h;
@@ -283,7 +300,7 @@ impl<'a> Game<'a> {
         self.bhead[d] = v as i32;
     }
 
-    #[inline]
+    #[inline(always)]
     fn bunlink(&mut self, v: usize, d: usize) {
         let p = self.bprev[v];
         let nx = self.bnext[v];
@@ -300,7 +317,7 @@ impl<'a> Game<'a> {
     /// Advance `mind` to the smallest non-empty bucket. Amortized O(1) per
     /// elimination over a whole run: `mind` only ever moves up here, and only
     /// ever moves down by the explicit `min` in `eliminate`.
-    #[inline]
+    #[inline(always)]
     fn advance_mind(&mut self) {
         let mut d = self.mind;
         while d < self.n && self.bhead[d] < 0 {
@@ -313,34 +330,35 @@ impl<'a> Game<'a> {
     /// Eliminate `v`, returning its column count `c = 1 + |N(v)|`.
     fn eliminate(&mut self, v: usize) -> u64 {
         let w = self.w;
-        self.tmp.copy_from_slice(&self.adj[v * w..v * w + w]);
-        // Materialize N(v).
+        let vb = v * w;
+        self.tmp.copy_from_slice(&self.adj[vb..vb + w]);
         self.nlist.clear();
-        for k in 0..w {
+        let mut k = 0;
+        while k < w {
             let mut word = self.tmp[k];
             while word != 0 {
                 let b = word.trailing_zeros() as usize;
                 word &= word - 1;
-                self.nlist.push((k * 64 + b) as u32);
+                self.nlist.push(((k << 6) + b) as u32);
             }
+            k += 1;
         }
-        let c = self.nlist.len() as u64 + 1;
+        let nl = self.nlist.len();
+        let c = nl as u64 + 1;
         let vw = v >> 6;
-        // `v` leaves the live set first: it is never in `N(v)`, so the
-        // neighbour loop below cannot touch its bucket links.
         let vbit = 1u64 << (v & 63);
-        // Clique N(v): each u in N(v) absorbs N(v), minus itself and minus v.
-        for i in 0..self.nlist.len() {
+        let mut i = 0;
+        while i < nl {
             let u = self.nlist[i] as usize;
             let base = u * w;
             let mut d = 0u32;
-            for k in 0..w {
+            k = 0;
+            while k < w {
                 let nv = self.adj[base + k] | self.tmp[k];
                 self.adj[base + k] = nv;
                 d += nv.count_ones();
+                k += 1;
             }
-            // `tmp` contains u (u ∈ N(v)) and `adj[u]` contained v; both are
-            // now set and both must go — hence the `-2`.
             self.adj[base + (u >> 6)] &= !(1u64 << (u & 63));
             self.adj[base + vw] &= !vbit;
             let nd = d - 2;
@@ -355,11 +373,10 @@ impl<'a> Game<'a> {
                 }
             }
             self.deg[u] = nd;
+            i += 1;
         }
-        self.ops += ((self.nlist.len() + 1) * (3 * w + 6) + 24) as i64;
-        for k in 0..w {
-            self.adj[v * w + k] = 0;
-        }
+        self.ops += ((nl + 1) * (3 * w + 6) + 24) as i64;
+        self.adj[vb..vb + w].fill(0);
         if self.use_buckets {
             self.bunlink(v, self.deg[v] as usize);
         } else {
@@ -377,22 +394,26 @@ impl<'a> Game<'a> {
     /// Number of fill edges eliminating `v` would create (its deficiency).
     fn deficiency(&mut self, v: usize) -> u32 {
         let w = self.w;
-        self.tmp.copy_from_slice(&self.adj[v * w..v * w + w]);
+        let vb = v * w;
+        self.tmp.copy_from_slice(&self.adj[vb..vb + w]);
         let mut missing: u32 = 0;
-        for k in 0..w {
+        let mut k = 0;
+        while k < w {
             let mut word = self.tmp[k];
             while word != 0 {
                 let b = word.trailing_zeros() as usize;
                 word &= word - 1;
-                let u = k * 64 + b;
+                let u = (k << 6) + b;
                 let base = u * w;
                 let mut m = 0u32;
-                for q in 0..w {
+                let mut q = 0;
+                while q < w {
                     m += (self.tmp[q] & !self.adj[base + q]).count_ones();
+                    q += 1;
                 }
-                // `u` itself is in `tmp` and never in `adj[u]`.
                 missing += m - 1;
             }
+            k += 1;
         }
         self.ops += ((self.deg[v] as usize + 1) * (2 * w + 4)) as i64;
         missing / 2
@@ -1200,9 +1221,12 @@ pub(crate) fn subtree_refine(
             .map(|t| {
                 sc.spawn(move || {
                     let mut local: Vec<u32> = vec![u32::MAX; n];
-                    let mut touched: Vec<usize> = Vec::new();
-                    let mut verts: Vec<usize> = Vec::new();
-                    let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
+                    let mut touched: Vec<usize> = Vec::with_capacity(cfg.max_sub.min(n));
+                    let mut verts: Vec<usize> = Vec::with_capacity(cfg.max_sub.min(n));
+                    let mut adj0: Vec<u64> = Vec::new();
+                    let mut seed: Vec<usize> = Vec::with_capacity(cfg.max_s);
+                    let mut got: Vec<(usize, Vec<usize>)> =
+                        Vec::with_capacity(blocks_ro.len().div_ceil(nthreads));
                     let mut bi = t;
                     while bi < blocks_ro.len() {
                         let block_rank = bi;
@@ -1210,60 +1234,67 @@ pub(crate) fn subtree_refine(
                         bi += nthreads;
                         let ssz = b + 1 - a;
                         verts.clear();
-                        for &c in touched.iter() {
-                            local[c] = u32::MAX;
-                        }
+                        let mut z = 0;
+                        while z < touched.len() { local[touched[z]] = u32::MAX; z += 1; }
                         touched.clear();
-                        // S first, in incumbent block order: the seed order is
-                        // then the identity, and local id i is position a + i.
-                        for &v in &perm_ro[a..=b] {
-                            local[v] = verts.len() as u32;
+                        let mut q = a;
+                        while q <= b {
+                            let v = perm_ro[q];
+                            local[v] = (q - a) as u32;
                             touched.push(v);
                             verts.push(v);
+                            q += 1;
                         }
-                        // Boundary: original-graph neighbours of S outside S.
-                        for i in 0..ssz {
+                        let mut i = 0;
+                        while i < ssz {
                             let v = verts[i];
-                            for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
+                            let mut e = col_ptr[v];
+                            let ee = col_ptr[v + 1];
+                            while e < ee {
+                                let u = row_idx[e];
                                 if u < n && local[u] == u32::MAX {
                                     local[u] = verts.len() as u32;
                                     touched.push(u);
                                     verts.push(u);
                                 }
+                                e += 1;
                             }
+                            i += 1;
                         }
                         let m = verts.len();
                         if m > cfg.max_sub || m > MAX_N {
                             continue;
                         }
 
-                        // Induced adjacency over S u boundary, as bitsets.
                         let w = m.div_ceil(64);
-                        let mut adj0 = vec![0u64; m * w];
-                        for (li, &v) in verts.iter().enumerate() {
-                            for &u in &row_idx[col_ptr[v]..col_ptr[v + 1]] {
-                                if u >= n {
-                                    continue;
-                                }
+                        adj0.resize(m * w, 0);
+                        adj0[..m * w].fill(0);
+                        let mut li = 0;
+                        while li < m {
+                            let v = verts[li];
+                            let mut e = col_ptr[v];
+                            let ee = col_ptr[v + 1];
+                            while e < ee {
+                                let u = row_idx[e];
+                                e += 1;
+                                if u >= n { continue; }
                                 let lu = local[u];
-                                if lu == u32::MAX || lu as usize == li {
-                                    continue;
-                                }
+                                if lu == u32::MAX || lu as usize == li { continue; }
                                 let lu = lu as usize;
-                                adj0[li * w + (lu >> 6)] |= 1u64 << (lu & 63);
-                                adj0[lu * w + (li >> 6)] |= 1u64 << (li & 63);
+                                let x = li * w + (lu >> 6);
+                                let y = lu * w + (li >> 6);
+                                adj0[x] |= 1u64 << (lu & 63);
+                                adj0[y] |= 1u64 << (li & 63);
                             }
+                            li += 1;
                         }
 
-                        // The block's exact contribution to the global objective.
-                        let seed_flops: u64 = counts[a..=b]
-                            .iter()
-                            .map(|&c| {
-                                let c = c as u64;
-                                c * c
-                            })
-                            .sum();
-                        let seed: Vec<usize> = (0..ssz).collect();
+                        let mut seed_flops = 0u64;
+                        q = a;
+                        while q <= b { let c = counts[q] as u64; seed_flops += c * c; q += 1; }
+                        seed.clear();
+                        i = 0;
+                        while i < ssz { seed.push(i); i += 1; }
                         let mut best: Option<(Vec<usize>, u64)> = None;
                         let first_stream =
                             usize::from(split_ranked_streams && block_rank >= 32);
@@ -1271,11 +1302,14 @@ pub(crate) fn subtree_refine(
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
                             // seed to sample an independent subtree basin.
-                            let rng_seed = if n >= 10_000 && k == 1 {
+                            let mut rng_seed = if n >= 10_000 && k == 1 {
                                 0xD1B5_4A32_D192_ED03
                             } else {
                                 stream_rng(k)
                             };
+                            if n >= 10_000 && k == 1 && cfg.round == 1 {
+                                rng_seed ^= 0xA076_1D64_78BD_642F;
+                            }
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1338,4 +1372,6 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Outer RGSUB round; used for equal-work D1 basin diversification.
+    pub(crate) round: usize,
 }
