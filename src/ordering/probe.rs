@@ -4431,6 +4431,47 @@ fn probe_rgreedy() {
         "added secs (all in-gate): p50={:.3} p90={:.3} p99={:.3} MAX={:.3}",
         pct(0.5), pct(0.9), pct(0.99), secs[secs.len() - 1]
     );
+    // Density bins: where does the phase's value actually live?
+    const DB: [(usize, usize, &str); 5] = [
+        (0, 5, "<=5"),
+        (5, 15, "5-15"),
+        (15, 30, "15-30"),
+        (30, 100, "30-100"),
+        (100, usize::MAX, ">100"),
+    ];
+    println!("\n--- value by density (nnz/n) ---");
+    println!("{:<8} {:>5} {:>5} {:>11} {:>11} {:>8} {:>8}", "bin", "mats", "wins", "sum_ln", "score", "p50 s", "max s");
+    for (lo, hi, nm) in DB {
+        let sel: Vec<&Row> = rows
+            .iter()
+            .filter(|r| {
+                let d = r.nnz / r.n.max(1);
+                d >= lo && d < hi
+            })
+            .collect();
+        if sel.is_empty() {
+            continue;
+        }
+        let mut lnd = 0.0f64;
+        let mut wins = 0usize;
+        let mut sv: Vec<f64> = Vec::new();
+        let mut sc = 0.0f64;
+        for r in &sel {
+            sv.push(r.secs);
+            if r.rg < r.port {
+                wins += 1;
+                let d = (r.rg as f64 / r.port as f64).ln();
+                lnd += d;
+                let b = bucket(r.n);
+                sc += d * BUCKET_WEIGHTS[b] * [0.8937, 0.8713, 0.7502][b] / [147.0, 108.0, 45.0][b];
+            }
+        }
+        sv.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "{:<8} {:>5} {:>5} {:>11.5} {:>11.6} {:>8.3} {:>8.3}",
+            nm, sel.len(), wins, lnd, sc, sv[sv.len() / 2], sv[sv.len() - 1]
+        );
+    }
     let mut ties_before = [0usize; 3];
     let mut ties_broken = [0usize; 3];
     for r in &rows {
@@ -5484,7 +5525,7 @@ fn probe_rank_modes() {
         for m in 0..4u8 {
             let t = Instant::now();
             let (_p, f) =
-                telos_descend(&sp, nnz, &inc, inc_f, rounds, prio, passes, peel, m);
+                telos_descend(&sp, nnz, &inc, inc_f, rounds, prio, passes, peel, m, None);
             let s = t.elapsed().as_secs_f64();
             secs[m as usize] += s;
             if s > worst[m as usize] {
@@ -5563,6 +5604,7 @@ fn probe_heavy_descent() {
                 prio.len(),
                 peel,
                 0,
+                None,
             );
             let s = t.elapsed().as_secs_f64();
             println!(
@@ -5692,263 +5734,400 @@ fn probe_minl_value() {
     println!("total secs ON={t_on:.2} OFF={t_off:.2}   worst ON={w_on:.3} OFF={w_off:.3}");
 }
 
-/// TOP-K TELOS SWEEP (experiment 0021, from 0020's seed-sensitivity finding).
-/// For every matrix inside the TELOS nnz gate, run the WHOLE `order()` at
-/// several extra-seed counts K (via the `TELOS_EXTRA_OVERRIDE` test hook; the
-/// shipped gate stays untouched) and report the final flops ratio and wall
-/// time at each K. The ratio columns are exact and load-independent; the
-/// SECONDS columns carry the recorded ~1.6x run-to-run variance plus any
-/// concurrent load — size the shipped gate from an isolated re-measurement of
-/// the chosen config, never from a contended sweep (0004/0019 rule).
+// ── arm/sched: COST-BUDGET SCHEDULER MEASUREMENT ────────────────────────────
+
+/// Per-family cost census for [`super::sched::plan_budget`]'s cost model.
 ///
-/// Env: `SSI_TOPK_KS=0,1,3,7` (default) picks the K grid;
-/// `SSI_PROBE_SHARD=i/m` shards the corpus; `SSI_MAX_PROBE_NNZ` caps nnz.
+/// One instrumented `order()` per matrix yields, at once: the total wall time,
+/// each sequential phase's wall time (`parallel::phase_mark` hooks) and each
+/// PORTFOLIO FAMILY's summed CPU time (the per-task `TaskMark` guard, tagged
+/// by the `cur_fam` label the `consider!` macro attaches). Output is a wide
+/// TSV that the fit script consumes.
+///
+/// `SSI_SCHED_MIN_NNZ` (default 0) and `SSI_SCHED_MIN_N` select the tier;
+/// `SSI_SCHED_REPS` (default 2) takes the MIN over repetitions to suppress the
+/// shared box's noise.
 #[test]
 #[ignore]
-fn probe_topk_telos() {
-    let shard = std::env::var("SSI_PROBE_SHARD")
+fn probe_sched_cost() {
+    let min_nnz: usize = std::env::var("SSI_SCHED_MIN_NNZ")
         .ok()
-        .and_then(|s| {
-            let (a, b) = s.split_once('/')?;
-            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
-        })
-        .unwrap_or((0, 1));
-    // K entries are extra-seed counts for the TELOS_EXTRA_OVERRIDE hook; the
-    // special value -1 means "no override" — i.e. measure the SHIPPED gate.
-    let ks: Vec<Option<usize>> = std::env::var("SSI_TOPK_KS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let min_n: usize = std::env::var("SSI_SCHED_MIN_N")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|x| {
-                    let t = x.trim();
-                    if t == "-1" {
-                        None
-                    } else {
-                        Some(t.parse().unwrap())
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| vec![Some(0), Some(1), Some(3), Some(7)]);
-    let max_nnz: usize = std::env::var("SSI_MAX_PROBE_NNZ")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let reps: usize = std::env::var("SSI_SCHED_REPS")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(TELOS_MAX_NNZ);
-    // Optional comma-separated exact-name filter for targeted sweeps.
-    let name_filter: Option<Vec<String>> = std::env::var("SSI_PROBE_MATRIX")
-        .ok()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
-    // SSI_TOPK_FULLGRID=1: extra descents use the full telos_schedule grid
-    // (the graded-FAIL variant) instead of the shipped light grid — for
-    // measuring how much deep-basin value remains before gate hunting.
-    TELOS_EXTRA_FULLGRID.with(|c| {
-        c.set(
-            std::env::var("SSI_TOPK_FULLGRID")
-                .map(|v| v == "1")
-                .unwrap_or(false),
-        )
-    });
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let corpus = crate::corpus::corpus();
-
-    let klabel = |k: &Option<usize>| match k {
-        Some(v) => v.to_string(),
-        None => "gate".to_string(),
-    };
-    let mut hdr = String::from("TOPK\tmatrix\tn\tnnz\tmaxdeg");
-    for k in &ks {
-        hdr.push_str(&format!("\tr@{}", klabel(k)));
-    }
-    for k in &ks {
-        hdr.push_str(&format!("\ts@{}", klabel(k)));
-    }
-    println!("{hdr}");
-
-    // Per-K aggregate vs the K=0 column: matrices strictly improved / worsened
-    // and the summed ln-ratio delta (negative = better), per bucket.
-    let mut better = vec![[0usize; 3]; ks.len()];
-    let mut worse = vec![[0usize; 3]; ks.len()];
-    let mut dln = vec![[0.0f64; 3]; ks.len()];
-
-    for (idx, (name, pat)) in corpus.iter().enumerate() {
-        if idx % shard.1 != shard.0 {
+    let mut all_labels: Vec<String> = Vec::new();
+    let mut rows: Vec<(String, usize, usize, usize, f64, Vec<(String, f64)>)> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        if n == 0 || nnz < min_nnz || n < min_n {
             continue;
         }
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let mut best_total = f64::INFINITY;
+        let mut best_marks: Vec<(String, f64)> = Vec::new();
+        for _ in 0..reps {
+            let _ = parallel::phase_take();
+            let t0 = Instant::now();
+            let _ = order(pat);
+            let total = t0.elapsed().as_secs_f64();
+            let marks = parallel::phase_take();
+            let mut agg: std::collections::BTreeMap<String, f64> =
+                std::collections::BTreeMap::new();
+            for (l, s) in marks {
+                if l.starts_with("minl.") {
+                    continue;
+                }
+                *agg.entry(l.to_string()).or_insert(0.0) += s;
+            }
+            if total < best_total {
+                best_total = total;
+                best_marks = agg.into_iter().collect();
+            }
+        }
+        for (l, _) in &best_marks {
+            if !all_labels.contains(l) {
+                all_labels.push(l.clone());
+            }
+        }
+        rows.push((name.clone(), n, nnz, max_deg, best_total, best_marks));
+    }
+    all_labels.sort();
+    println!("\n--- SCHED COST CENSUS (TSV) ---");
+    print!("matrix\tn\tnnz\tmax_deg\ttotal");
+    for l in &all_labels {
+        print!("\t{l}");
+    }
+    println!();
+    for (name, n, nnz, max_deg, total, marks) in &rows {
+        print!("{name}\t{n}\t{nnz}\t{max_deg}\t{total:.5}");
+        for l in &all_labels {
+            let v = marks
+                .iter()
+                .find(|(k, _)| k == l)
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0);
+            print!("\t{v:.5}");
+        }
+        println!();
+    }
+    println!("--- END SCHED COST CENSUS ---");
+}
+
+/// ABLATION: for each family, run the whole selected tier with that family's
+/// bit CLEARED and record the wall-time saved and the flops given up. This is
+/// the value prior (`ln(flops_off / flops_on) >= 0`) and the ground-truth
+/// wall-clock saving the cost model is checked against.
+///
+/// `SSI_ABL_MIN_SECS` (default 0.40) selects the tier by measured full-run
+/// time; `SSI_ABL_TOPK` (default 45) caps it.
+#[test]
+#[ignore]
+fn probe_sched_ablate() {
+    let min_secs: f64 = std::env::var("SSI_ABL_MIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.40);
+    let topk: usize = std::env::var("SSI_ABL_TOPK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45);
+    let reps: usize = std::env::var("SSI_ABL_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let corpus = crate::corpus::corpus();
+
+    // Pass 1: time the full portfolio on everything, pick the slow tier.
+    let mut timed: Vec<(f64, usize)> = Vec::new();
+    for (i, (_, pat)) in corpus.iter().enumerate() {
+        if pat.n == 0 {
+            continue;
+        }
+        let t0 = Instant::now();
+        let _ = order(pat);
+        timed.push((t0.elapsed().as_secs_f64(), i));
+    }
+    timed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    timed.retain(|r| r.0 >= min_secs);
+    timed.truncate(topk);
+    println!("\n--- SCHED ABLATION: {} matrices ---", timed.len());
+    println!("matrix\tn\tnnz\tfamily\tfull_s\toff_s\tsaved_s\tdln_flops");
+
+    for &(_, idx) in &timed {
+        let (name, pat) = &corpus[idx];
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        // Full run, min of two.
+        let mut full_s = f64::INFINITY;
+        let mut full_f = 0u64;
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            let p = order(pat);
+            let s = t0.elapsed().as_secs_f64();
+            if s < full_s {
+                full_s = s;
+            }
+            full_f = flops_of(&sp, &p);
+        }
+        for bit in 0..super::sched::NUM_FAMILIES {
+            let mask = super::sched::F_ALL & !(1u32 << bit);
+            super::sched::OVERRIDE.with(|c| c.set(Some(mask)));
+            let mut off_s = f64::INFINITY;
+            let mut off_f = 0u64;
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                let p = order(pat);
+                let s = t0.elapsed().as_secs_f64();
+                if s < off_s {
+                    off_s = s;
+                }
+                off_f = flops_of(&sp, &p);
+            }
+            super::sched::OVERRIDE.with(|c| c.set(None));
+            let dln = (off_f as f64 / full_f as f64).ln();
+            println!(
+                "{name}\t{n}\t{nnz}\t{}\t{full_s:.5}\t{off_s:.5}\t{:.5}\t{dln:.6}",
+                super::sched::FAMILY_NAMES[bit],
+                full_s - off_s
+            );
+        }
+    }
+    println!("--- END SCHED ABLATION ---");
+}
+
+/// What plan did the scheduler pick, and how good was its prediction?
+///
+/// For every matrix over `SSI_SCHED_REPORT_MIN` seconds (default 0.30) prints
+/// the families the budget dropped, the pass-count scale, the predicted total
+/// with and without the plan, and the MEASURED wall time both ways in the same
+/// process — plus the exact flops both ways, so the score cost of the trim is
+/// visible per matrix. `SSI_SCHED_BUDGET` overrides `sched::BUDGET_SECS` so a
+/// whole budget curve can be priced from one build.
+#[test]
+#[ignore]
+fn probe_sched_report() {
+    let min_secs: f64 = std::env::var("SSI_SCHED_REPORT_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.30);
+    let corpus = crate::corpus::corpus();
+    println!("\n--- SCHED REPORT (budget = {:.3} model-s) ---", {
+        std::env::var("SSI_SCHED_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(super::sched::BUDGET_SECS)
+    });
+    println!("matrix\tn\tnnz\tfull_s\tplan_s\tpred_full\tpred_plan\tscale\tdln_flops\tdropped");
+    let (mut tot_full, mut tot_plan) = (0.0f64, 0.0f64);
+    let (mut worst_full, mut worst_plan) = (0.0f64, 0.0f64);
+    let (mut wf, mut wp) = (String::new(), String::new());
+    let mut changed = 0usize;
+    for (name, pat) in &corpus {
         let n = pat.n;
         if n == 0 {
             continue;
         }
         let nnz = pat.nnz();
-        if nnz == 0 || nnz >= TELOS_MAX_NNZ || nnz >= max_nnz {
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let sp = scoring_pattern(pat);
+        // Unscheduled reference: force the full mask through the same override
+        // the ablation probe uses.
+        super::sched::OVERRIDE.with(|c| c.set(Some(super::sched::F_ALL)));
+        let t0 = Instant::now();
+        let pf = order(pat);
+        let full_s = t0.elapsed().as_secs_f64();
+        let full_f = flops_of(&sp, &pf);
+        super::sched::OVERRIDE.with(|c| c.set(None));
+        let t0 = Instant::now();
+        let pp = order(pat);
+        let plan_s = t0.elapsed().as_secs_f64();
+        let plan_f = flops_of(&sp, &pp);
+        tot_full += full_s;
+        tot_plan += plan_s;
+        if full_s > worst_full {
+            worst_full = full_s;
+            wf = name.clone();
+        }
+        if plan_s > worst_plan {
+            worst_plan = plan_s;
+            wp = name.clone();
+        }
+        let plan = super::sched::plan_budget(n, nnz, max_deg);
+        let dropped: Vec<&str> = (0..super::sched::NUM_FAMILIES)
+            .filter(|b| !plan.on(1u32 << b))
+            .map(|b| super::sched::FAMILY_NAMES[b])
+            .collect();
+        if !dropped.is_empty() || plan.scale() < super::sched::SCALE_FULL {
+            changed += 1;
+        }
+        if full_s < min_secs && dropped.is_empty() {
             continue;
         }
-        if let Some(f) = &name_filter {
-            if !f.iter().any(|x| x == name) {
-                continue;
-            }
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core)
-                .unwrap()
-                .into_iter()
-                .map(|x| x as usize)
-                .collect::<Vec<_>>(),
-        ) as f64;
-        let max_deg = probe_max_deg(pat);
-
-        let mut ratios: Vec<f64> = Vec::with_capacity(ks.len());
-        let mut secs: Vec<f64> = Vec::with_capacity(ks.len());
-        for &k in &ks {
-            TELOS_EXTRA_OVERRIDE.with(|c| c.set(k));
-            let t0 = Instant::now();
-            let perm = order(pat);
-            secs.push(t0.elapsed().as_secs_f64());
-            ratios.push(flops_of(&sp, &perm) as f64 / base);
-        }
-        TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
-
-        let b = bucket(n);
-        for (i, &r) in ratios.iter().enumerate() {
-            if r < ratios[0] - 1e-15 {
-                better[i][b] += 1;
-            } else if r > ratios[0] + 1e-15 {
-                worse[i][b] += 1;
-            }
-            dln[i][b] += (r / ratios[0]).ln();
-        }
-
-        let mut row = format!("TOPK\t{name}\t{n}\t{nnz}\t{max_deg}");
-        for r in &ratios {
-            row.push_str(&format!("\t{r:.6}"));
-        }
-        for s in &secs {
-            row.push_str(&format!("\t{s:.4}"));
-        }
-        println!("{row}");
-    }
-
-    println!("\n--- aggregate vs the first K column (per bucket: better/worse, sum dln) ---");
-    for (i, k) in ks.iter().enumerate() {
-        for b in 0..3 {
-            println!(
-                "K={}\t{}\tbetter={}\tworse={}\tsum_dln={:+.6}",
-                klabel(k),
-                BUCKET_NAMES[b],
-                better[i][b],
-                worse[i][b],
-                dln[i][b]
-            );
-        }
-    }
-}
-
-/// RINGPACK-CLASS MULTISTART ATTRIBUTION (0015 revisited on the 0021 tree):
-/// for the named matrices (default: the corpus worst case `ringpack_30_2` and
-/// its hub-band neighbor `popdynm200`), print final flops ratio and isolated
-/// time at relabel_cap ∈ {MAX, 4, 1, 0}. If the ratio is identical at cap 1
-/// (or 0), the multistart (and at 0, the hill-climb too) contributes nothing
-/// to that matrix's score and its spend is pure cap risk — the trim evidence
-/// 0015 recorded, re-verified on the current tree before shipping any trim.
-/// `SSI_PROBE_MATRIX` selects other matrices.
-#[test]
-#[ignore]
-fn probe_ringpack_ms() {
-    let names: Vec<String> = std::env::var("SSI_PROBE_MATRIX")
-        .ok()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-        .unwrap_or_else(|| vec!["ringpack_30_2".into(), "popdynm200".into()]);
-    let corpus = crate::corpus::corpus();
-    println!("MS\tmatrix\tcap\tratio\tsecs");
-    for (name, pat) in corpus.iter() {
-        if !names.iter().any(|x| x == name) {
-            continue;
-        }
-        let sp = scoring_pattern(pat);
-        let (cp, ri) = core_of(pat);
-        let core = feral_ordering_core::CscPattern::new(pat.n, &cp, &ri).unwrap();
-        let base = flops_of(
-            &sp,
-            &feral_amd::amd_order(&core)
-                .unwrap()
-                .into_iter()
-                .map(|x| x as usize)
-                .collect::<Vec<_>>(),
-        ) as f64;
-        for cap in [usize::MAX, 4, 1, 0] {
-            let t0 = Instant::now();
-            let perm = order_with_relabel_cap(pat, cap);
-            let secs = t0.elapsed().as_secs_f64();
-            let r = flops_of(&sp, &perm) as f64 / base;
-            let cs = if cap == usize::MAX { "MAX".to_string() } else { cap.to_string() };
-            println!("MS\t{name}\t{cs}\t{r:.6}\t{secs:.4}");
-        }
-    }
-}
-
-/// MERGE ABLATION (0022 on the parallel-watcher frontier): full-corpus score
-/// under three configs on THIS tree — (a) extras off + hub trim off (= the
-/// merged frontier's own behavior, the baseline the promotions graded), (b)
-/// extras off + trim on (the trim's isolated effect — must be score-neutral),
-/// (c) shipped (trim + gated top-K extras). Flops-only; per-config worst time
-/// is also printed but under whatever load the run has.
-#[test]
-#[ignore]
-fn probe_merged_ablation() {
-    let corpus = crate::corpus::corpus();
-    for (label, extras_off, trim_off) in [
-        ("base(no-trim,no-extras)", true, true),
-        ("trim-only", true, false),
-        ("shipped", false, false),
-    ] {
-        let mut log_sums = [0.0f64; 3];
-        let mut counts = [0usize; 3];
-        let mut worst = (0.0f64, String::new());
-        for (name, pat) in &corpus {
-            let n = pat.n;
-            if n == 0 {
-                continue;
-            }
-            let sp = scoring_pattern(pat);
-            let (cp, ri) = core_of(pat);
-            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
-            let base = flops_of(
-                &sp,
-                &feral_amd::amd_order(&core)
-                    .unwrap()
-                    .into_iter()
-                    .map(|x| x as usize)
-                    .collect::<Vec<_>>(),
-            ) as f64;
-            if extras_off {
-                TELOS_EXTRA_OVERRIDE.with(|c| c.set(Some(0)));
-            } else {
-                TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
-            }
-            HUB_GATEWALL_OFF.with(|c| c.set(trim_off));
-            let t0 = Instant::now();
-            let perm = order(pat);
-            let secs = t0.elapsed().as_secs_f64();
-            let ratio = flops_of(&sp, &perm) as f64 / base;
-            let b = bucket(n);
-            log_sums[b] += ratio.ln();
-            counts[b] += 1;
-            if secs > worst.0 {
-                worst = (secs, name.clone());
-            }
-        }
-        TELOS_EXTRA_OVERRIDE.with(|c| c.set(None));
-        HUB_GATEWALL_OFF.with(|c| c.set(false));
+        let pred_full = super::sched::predict_secs(
+            super::sched::F_ALL,
+            super::sched::SCALE_FULL,
+            n,
+            nnz,
+            max_deg,
+        );
+        let pred_plan = super::sched::predict_secs(plan.bits(), plan.scale(), n, nnz, max_deg);
+        let dln = (plan_f as f64 / full_f as f64).ln();
         println!(
-            "ABL\t{label}\tscore={:.6}\tlt={:.4} mid={:.4} gt={:.4}\tworst={:.3}s({})",
-            aggregate(&log_sums, &counts),
-            (log_sums[0] / counts[0] as f64).exp(),
-            (log_sums[1] / counts[1] as f64).exp(),
-            (log_sums[2] / counts[2] as f64).exp(),
-            worst.0,
-            worst.1
+            "{name}\t{n}\t{nnz}\t{full_s:.4}\t{plan_s:.4}\t{pred_full:.4}\t{pred_plan:.4}\t{}\t{dln:.6}\t{}",
+            plan.scale(),
+            dropped.join(",")
         );
     }
+    println!(
+        "\nplans changed: {changed}/{}   corpus secs {:.1} -> {:.1}   worst {:.3} ({wf}) -> {:.3} ({wp})",
+        corpus.len(),
+        tot_full,
+        tot_plan,
+        worst_full,
+        worst_plan
+    );
+}
+
+/// Cross-check `sched::fires` (the gate mirror) against the family timings
+/// actually observed by `probe_sched_cost`. Any disagreement above 0.1 ms is a
+/// real desynchronisation between the mirror and `order_with_options`'s gates.
+#[test]
+#[ignore]
+fn probe_sched_gates() {
+    let corpus = crate::corpus::corpus();
+    let mut bad = 0usize;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let _ = parallel::phase_take();
+        let _ = order(pat);
+        let marks = parallel::phase_take();
+        let mut seen: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for (l, s) in marks {
+            if let Some(f) = l.strip_prefix("cand.") {
+                *seen.entry(f.to_string()).or_insert(0.0) += s;
+            }
+        }
+        for b in 0..super::sched::NUM_FAMILIES {
+            let fam = super::sched::FAMILY_NAMES[b];
+            let Some(obs) = seen.get(fam) else { continue };
+            let pred = super::sched::predict_secs(1u32 << b, super::sched::SCALE_FULL, n, nnz, max_deg)
+                > super::sched::predict_secs(0, super::sched::SCALE_FULL, n, nnz, max_deg);
+            if !pred && *obs > 1e-4 {
+                println!("MISMATCH {name} n={n} nnz={nnz} {fam}: mirror says OFF, observed {obs:.4}s");
+                bad += 1;
+            }
+        }
+    }
+    println!("gate-mirror mismatches above 0.1 ms: {bad}");
+    assert_eq!(bad, 0, "sched::fires desynchronised from order_with_options");
+}
+
+/// Determinism + parallel identity under the scheduler.
+///
+/// (1) `order()` run twice must be byte-identical — the rule the grader
+/// enforces, and the one a cost-BUDGET scheduler could plausibly break if any
+/// part of the plan read wall-clock time. (2) The same `order()` forced onto
+/// the sequential path (`parallel::FORCE_SEQUENTIAL`) must produce the same
+/// permutation, which is the parallel arm's identity invariant re-checked with
+/// the plan in the loop.
+#[test]
+#[ignore]
+fn probe_sched_identity() {
+    let corpus = crate::corpus::corpus();
+    let mut bad_rep = 0usize;
+    let mut bad_par = 0usize;
+    for (name, pat) in &corpus {
+        if pat.n == 0 {
+            continue;
+        }
+        let a = order(pat);
+        let b = order(pat);
+        if a != b {
+            println!("NON-DETERMINISTIC {name}");
+            bad_rep += 1;
+        }
+        parallel::FORCE_SEQUENTIAL.with(|c| c.set(true));
+        let c = order(pat);
+        parallel::FORCE_SEQUENTIAL.with(|c| c.set(false));
+        if a != c {
+            println!("PARALLEL != SEQUENTIAL {name}");
+            bad_par += 1;
+        }
+    }
+    println!("determinism failures: {bad_rep}; parallel-identity failures: {bad_par}");
+    assert_eq!(bad_rep, 0);
+    assert_eq!(bad_par, 0);
+}
+
+/// A/B for the list game: on every band matrix, run the list game directly
+/// against the SHIPPED order()'s flops and report strict wins + isolated time.
+#[test]
+#[ignore]
+fn probe_sparse_game_ab() {
+    let corpus = crate::corpus::corpus();
+    let mut wins = 0usize;
+    let mut worst = 0.0f64;
+    println!("matrix\tn\tnnz\tseed_f\tsg_f\tdelta\tsecs");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n <= 3_000 || n > 10_000 || pat.nnz() > 60_000 {
+            continue;
+        }
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        if max_deg > (n / 50).max(1) {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let perm = order(pat);
+        let seed_f = flops_of(&sp, &perm);
+        let Some(mut game) =
+            sparse_game::ListGame::build(n, &pat.col_ptr, &pat.row_idx)
+        else {
+            continue;
+        };
+        let t0 = Instant::now();
+        let r = game.search(&perm, seed_f, 100_000_000, 0x9E37_79B9_7F4A_7C15);
+        let secs = t0.elapsed().as_secs_f64();
+        worst = worst.max(secs);
+        if let Some((_, f)) = r {
+            if f < seed_f {
+                wins += 1;
+            }
+            println!(
+                "{name}\t{n}\t{}\t{seed_f}\t{f}\t{}\t{secs:.3}",
+                pat.nnz(),
+                f as i64 - seed_f as i64
+            );
+        } else {
+            println!("{name}\t{n}\t{}\t{seed_f}\t-\t-\t{secs:.3}", pat.nnz());
+        }
+    }
+    println!("sparse_game: {wins} strict wins, worst isolated {worst:.3}s");
 }
