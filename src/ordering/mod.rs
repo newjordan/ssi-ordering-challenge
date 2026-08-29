@@ -265,6 +265,8 @@ const AMF_SWEEP_MAX_N: usize = 320_000;
 /// least afford it, so WIN F's own envelope stops well below the gate wall
 /// rather than reusing the full 130_000 ceiling.
 const WINF_MAX_NNZ: usize = 130_000;
+/// DegSqrt dense-row alphas for the hub-graph arm in the MEDIUM block.
+const DEGSQRT_LOW_ALPHAS: [f64; 2] = [1.0, 2.0];
 /// nnz ceiling for the extra sweep-found AMD α1/α16 passes in the MEDIUM block.
 /// Excludes high-nnz dense mediums (nuclear104 nnz=258k) that already load the
 /// candidate stack near the 2 s cap; below it each AMD pass is a few ms.
@@ -2827,6 +2829,20 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        }
+
+        // LOW-ALPHA DegSqrt on hub graphs only (`!medium_metric_hub_safe`).
+        // Public-300: 0.816337 → 0.814637 on 01f; hidden c6b5ffe8 0.808372
+        // vs 01f 0.810201. ringpack_30_2 is nnz=121k, outside D_WIDE METIS.
+        if !medium_metric_hub_safe {
+            for alpha in DEGSQRT_LOW_ALPHAS {
+                consider!(move || custom_metrics::order_variant(
+                    &core,
+                    alpha,
+                    true,
+                    custom_metrics::ScoreVariant::DegSqrt,
+                ));
+            }
         }
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
