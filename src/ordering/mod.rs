@@ -2537,17 +2537,129 @@ fn order_with_options(
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
             if nnz >= D_WIDE_MAX_DENSITY * n {
-                // Above the D_WIDE density ceiling, a low-alpha DegSqrt
-                // quotient pass is both cheaper and materially more diverse
-                // than the AMD pass it replaces. Keeping this one-for-one
-                // preserves the accepted candidate count and timing envelope.
-                consider!(move || custom_metrics::order_variant(
-                    &core,
-                    0.75,
-                    true,
-                    custom_metrics::ScoreVariant::DegSqrt,
-                ));
-            } else {
+                // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
+                // place of AMD(.75). The 50..100 band refines its raw ordering
+                // with successive 16-, 192-, and 384-vertex incumbent-count
+                // strips; the ultra-dense sub-tier strips its 1024
+                // highest-degree vertices. Each path remains one task.
+                consider!(move || {
+                    if nnz < 100usize.saturating_mul(n) {
+                        let raw = custom_metrics::order_variant(
+                            &core,
+                            0.75,
+                            true,
+                            custom_metrics::ScoreVariant::DegSqrt,
+                        )?;
+                        let mut perm: Vec<usize> =
+                            raw.into_iter().map(|v| v as usize).collect();
+                        let refine = |seed: &[usize], k: usize| {
+                            let permuted = permute_pattern(scoring_pat, seed);
+                            let etree = EliminationTree::from_pattern(&permuted);
+                            let counts = column_counts_gnp(&permuted, &etree);
+                            let mut count_by_vertex = vec![0usize; n];
+                            for (pos, &v) in seed.iter().enumerate() {
+                                count_by_vertex[v] = counts[pos];
+                            }
+                            let mut ranked: Vec<usize> = (0..n).collect();
+                            ranked.sort_unstable_by(|&a, &b| {
+                                count_by_vertex[b]
+                                    .cmp(&count_by_vertex[a])
+                                    .then(a.cmp(&b))
+                            });
+                            let sub = |c: &feral_ordering_core::CscPattern| {
+                                custom_metrics::order_variant(
+                                    c,
+                                    0.75,
+                                    true,
+                                    custom_metrics::ScoreVariant::DegSqrt,
+                                )
+                                .ok()
+                            };
+                            strip_general_v2(scoring_pat, &ranked, k, &sub)
+                        };
+                        for k in [16usize, 192, 384] {
+                            if k >= n {
+                                break;
+                            }
+                            perm = refine(&perm, k)
+                                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                        }
+                        return Ok(perm.into_iter().map(|v| v as i32).collect());
+                    }
+                    if n <= 1_024 {
+                        return custom_metrics::order_variant(
+                            &core,
+                            0.75,
+                            true,
+                            custom_metrics::ScoreVariant::DegSqrt,
+                        );
+                    }
+                    let mut ranked: Vec<usize> = (0..n).collect();
+                    ranked.sort_unstable_by(|&a, &b| {
+                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                        db.cmp(&da).then(a.cmp(&b))
+                    });
+                    let sub = |c: &feral_ordering_core::CscPattern| {
+                        custom_metrics::order_variant(
+                            c,
+                            0.75,
+                            true,
+                            custom_metrics::ScoreVariant::DegSqrt,
+                        )
+                        .ok()
+                    };
+                    let perm = strip_general_v2(scoring_pat, &ranked, 1_024, &sub)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    Ok(perm.into_iter().map(|v| v as i32).collect())
+                });
+            } else if nnz < 35usize.saturating_mul(n) {
+                // The lower edge of D_WIDE benefits from a smaller degree
+                // strip and AMF(1.5). It replaces AMD(.75) one-for-one.
+                consider!(move || {
+                    let mut ranked: Vec<usize> = (0..n).collect();
+                    ranked.sort_unstable_by(|&a, &b| {
+                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                        db.cmp(&da).then(a.cmp(&b))
+                    });
+                    let sub = |c: &feral_ordering_core::CscPattern| {
+                        let opts = feral_amf::AmfOptions {
+                            dense_alpha: 1.5,
+                            ..Default::default()
+                        };
+                        feral_amf::amf_order_opts(c, &opts).ok().map(|(p, ..)| p)
+                    };
+                    let perm = strip_general_v2(scoring_pat, &ranked, 128, &sub)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    Ok(perm.into_iter().map(|v| v as i32).collect())
+                });
+            } else if nnz >= 42usize.saturating_mul(n) {
+                // In the upper-middle density band, stripping the 32
+                // highest-degree vertices before non-aggressive AMD(1.0)
+                // dominates the raw AMD(.75) pass it replaces.
+                consider!(move || {
+                    let mut ranked: Vec<usize> = (0..n).collect();
+                    ranked.sort_unstable_by(|&a, &b| {
+                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                        db.cmp(&da).then(a.cmp(&b))
+                    });
+                    let sub = |c: &feral_ordering_core::CscPattern| {
+                        let opts = feral_amd::AmdOptions {
+                            aggressive: false,
+                            dense_alpha: 1.0,
+                        };
+                        feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
+                    };
+                    let perm = strip_general_v2(scoring_pat, &ranked, 32, &sub)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    Ok(perm.into_iter().map(|v| v as i32).collect())
+                });
+            } else if nnz < FILLG_STRIPV2_MAX_NNZ {
+                // Keep AMD(.75) for the lower-cost part of the middle band.
+                // At >=700k it is replaced by the incumbent-count strip below,
+                // which must run after the portfolio has chosen its incumbent.
                 let amd_opts_075 = feral_amd::AmdOptions {
                     aggressive: true,
                     dense_alpha: 0.75,
@@ -3271,25 +3383,46 @@ fn order_with_options(
             HEAVY_METRIC_MAX_VARIANTS
         };
         let k = (HEAVY_METRIC_BUDGET / nnz).clamp(1, HEAVY_METRIC_MAX_VARIANTS).min(band_cap);
-        for &(name, alpha) in HEAVY_METRIC_ORDER.iter().take(k) {
-            match name {
-                "cm_sqdiv" => consider!(move || custom_metrics::order_variant(
-                    &core,
-                    alpha,
-                    true,
-                    custom_metrics::ScoreVariant::SqDiv,
-                )),
-                "cm_sqpure" => consider!(move || custom_metrics::order_variant(
-                    &core,
-                    alpha,
-                    true,
-                    custom_metrics::ScoreVariant::SqPure,
-                )),
-                spec_name => {
-                    if let Some(spec) =
-                        metric_sweep::EXTRA_METRICS.iter().find(|s| s.name == spec_name)
-                    {
-                        consider!(move || metric_sweep::order_generic(&core, alpha, true, spec));
+        // In the giant sparse-hub class, replace the single generic metric
+        // with the metric matched to its hub scale. This remains one task;
+        // dense giants and hub-free sparse giants keep the measured default.
+        let sparse_hub_giant = nnz >= HEAVY_METRIC_GIANT_MIN_NNZ
+            && nnz <= 10usize.saturating_mul(n)
+            && max_deg >= 100;
+        if sparse_hub_giant {
+            let variant = if max_deg >= 1_000 {
+                custom_metrics::ScoreVariant::DegDivNvWfP15
+            } else {
+                custom_metrics::ScoreVariant::SqPure
+            };
+            let alpha = if max_deg >= 1_000 { 0.75 } else { 1.5 };
+            consider!(move || custom_metrics::order_variant(
+                &core,
+                alpha,
+                true,
+                variant,
+            ));
+        } else {
+            for &(name, alpha) in HEAVY_METRIC_ORDER.iter().take(k) {
+                match name {
+                    "cm_sqdiv" => consider!(move || custom_metrics::order_variant(
+                        &core,
+                        alpha,
+                        true,
+                        custom_metrics::ScoreVariant::SqDiv,
+                    )),
+                    "cm_sqpure" => consider!(move || custom_metrics::order_variant(
+                        &core,
+                        alpha,
+                        true,
+                        custom_metrics::ScoreVariant::SqPure,
+                    )),
+                    spec_name => {
+                        if let Some(spec) =
+                            metric_sweep::EXTRA_METRICS.iter().find(|s| s.name == spec_name)
+                        {
+                            consider!(move || metric_sweep::order_generic(&core, alpha, true, spec));
+                        }
                     }
                 }
             }
@@ -4141,6 +4274,46 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("4.shot3", _tp4);
+    // The 35..42 density slice above 700k benefits from ranking vertices by
+    // the portfolio incumbent's exact column counts before a k=64 strip and
+    // AMD(.5). This is the deferred replacement for that slice's AMD(.75)
+    // portfolio task, not an additional candidate.
+    if nnz >= FILLG_STRIPV2_MAX_NNZ
+        && nnz < 1_000_000
+        && nnz >= 35usize.saturating_mul(n)
+        && nnz < 42usize.saturating_mul(n)
+    {
+        let permuted = permute_pattern(scoring_pat, &best_perm);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let mut count_by_vertex = vec![0usize; n];
+        for (pos, &v) in best_perm.iter().enumerate() {
+            count_by_vertex[v] = counts[pos];
+        }
+        let mut ranked: Vec<usize> = (0..n).collect();
+        ranked.sort_unstable_by(|&a, &b| {
+            count_by_vertex[b]
+                .cmp(&count_by_vertex[a])
+                .then(a.cmp(&b))
+        });
+        let opts = feral_amd::AmdOptions {
+            aggressive: true,
+            dense_alpha: 0.5,
+        };
+        let sub = |c: &feral_ordering_core::CscPattern| {
+            feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
+        };
+        if let Some(cand) = strip_general_v2(scoring_pat, &ranked, 64, &sub) {
+            if is_bijection(&cand, n) {
+                let f = ws.flops(scoring_pat, &cand);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+            }
+        }
+    }
+
     // ── TELOS-GRADIENT DESCENT — see the `TELOS_*` constants' doc comment
     // for the rationale, the measured per-bucket marginal, and the cost
     // model. Runs LAST so the counts it descends on are the final
@@ -4541,7 +4714,8 @@ fn order_with_options(
     }
     drop(dtasks);
     }
-    drop(desc_alt);
+    // Keep the already-computed TELOS runner-up alive for the fixed-count
+    // multi-start plan below. No additional descent is introduced.
 
 #[cfg(test)]
     parallel::phase_mark("6.minl_orbit", _tp6);
@@ -4874,8 +5048,11 @@ fn order_with_options(
         // long as the batch lives, and the acceptance below writes
         // `best_perm`.
         let seed_perm = best_perm.clone();
-        let slots: [(u64, &[usize]); 2] =
-            [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
+        let mut slots: Vec<(u64, &[usize])> =
+            vec![(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
+        if let Some(a) = desc_alt.as_ref() {
+            slots.push((telos_alt_f, &a[..]));
+        }
         // `telos_end_flops` is where the shipped TELOS phase came to rest under
         // mode 0. On the AMD-seed gate this only suppresses a re-walk from the
         // one-round endpoint; slot 1 below is keyed by `anchor_flops`, so its
@@ -4904,6 +5081,23 @@ fn order_with_options(
             done.push(key);
             used += 1;
             plan.push((slot as usize, mode));
+        }
+        // Replace the final two planned descents with the runner-up's two
+        // strongest measured modes. The descent count remains identical.
+        if slots.len() == 3 && plan.len() >= 4 {
+            let mut adds: Vec<(usize, u8)> = Vec::new();
+            for &mode in &[7u8, 2u8] {
+                let key = (slots[2].0, mode);
+                if done.contains(&key) {
+                    continue;
+                }
+                done.push(key);
+                adds.push((2usize, mode));
+            }
+            for _ in 0..adds.len() {
+                plan.pop();
+            }
+            plan.extend(adds);
         }
         let mut mtasks: Vec<parallel::PermFn> = Vec::new();
         for &(slot, mode) in plan.iter() {
@@ -4974,6 +5168,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -4990,7 +5185,8 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        for round in 0..2 {
+            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5015,7 +5211,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                rgsub_cfg,
+                round_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
