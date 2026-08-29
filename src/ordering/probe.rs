@@ -5952,3 +5952,580 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+// // DIVERSITY GRID SWEEP (session 20260829T1145Z-n1-push)
+//
+// Rationale: the shipped custom-metric portfolio (11 `ScoreVariant` + 15
+// `EXTRA_METRICS`) was selected from a 42-point grid that varied ONLY the
+// score-formula shape (`deg_pow`, `nv_pow`, `wf_weight`, `wf_pow`,
+// `degme_weight`, `perverse`). Three axes of `order_generic` were never
+// crossed with that grid and are fixed at one value at every shipped call
+// site:
+//   * `dense_alpha` — always 10.0 (yet the AMD/AMF relabel arms ship
+//     [10,5,2,16] / [5,2.5,10,1], i.e. alpha diversity already pays there);
+//   * `aggressive`  — always true;
+//   * `bucket_div`  — always 8 (the score-quantization stride, i.e. the
+//     tie-break granularity; `metric_sweep`'s own doc says it was "only varied
+//     in the dedicated tie-break sub-sweep, never crossed with the main grid").
+//
+// This probe measures the MARGINAL value of each new grid point against the
+// REAL shipped `order()` portfolio (not against AMD alone), which is the
+// baseline `memory/experiments/0010` flagged as the correct one. It prints one
+// row per (candidate, matrix) pair where the candidate STRICTLY beats the
+// shipped portfolio, so offline greedy forward-selection is exact.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Base formula shapes drawn from the shipped set (the 7 win-F `ScoreVariant`
+/// shapes re-expressed as `MetricSpec`, plus the strongest `EXTRA_METRICS`).
+/// Crossed below with the three unswept axes.
+fn grid_base_specs() -> Vec<metric_sweep::MetricSpec> {
+    use metric_sweep::MetricSpec;
+    let mk = |name: &'static str,
+              deg_pow: f64,
+              nv_pow: f64,
+              wf_weight: f64,
+              wf_pow: f64,
+              degme_weight: f64| MetricSpec {
+        name,
+        deg_pow,
+        nv_pow,
+        wf_weight,
+        wf_pow,
+        degme_weight,
+        perverse: false,
+        bucket_div: 8,
+        jitter: 0,
+        seed: 0,
+    };
+    vec![
+        mk("deg1_nv1", 1.00, 1.00, 0.00, 1.00, 0.00), // AMD-ish loose degree / nv
+        mk("deg2_nv1", 2.00, 1.00, 0.00, 1.00, 0.00), // SqDiv
+        mk("deg2_nv0", 2.00, 0.00, 0.00, 1.00, 0.00), // SqPure
+        mk("deg05_nv0", 0.50, 0.00, 0.00, 1.00, 0.00), // DegSqrt
+        mk("deg075_nv0", 0.75, 0.00, 0.00, 1.00, 0.00),
+        mk("deg125_nv0", 1.25, 0.00, 0.00, 1.00, 0.00),
+        mk("deg3_nv1", 3.00, 1.00, 0.00, 1.00, 0.00),
+        mk("deg15_nv1", 1.50, 1.00, 0.00, 1.00, 0.00),
+        mk("deg1_nv1_wf05", 1.00, 1.00, 0.50, 1.00, 0.00),
+        mk("deg1_nv0_wf1", 1.00, 0.00, 1.00, 1.00, 0.00),
+        mk("deg1_nv1_degme2", 1.00, 1.00, 0.00, 1.00, 2.00),
+        mk("deg2_nv1_degme05", 2.00, 1.00, 0.00, 1.00, 0.50),
+    ]
+}
+
+/// The full cross-product this probe evaluates. `(label, alpha, aggressive,
+/// spec)`. Shipped combinations (alpha 10.0, aggressive true, bucket_div 8)
+/// are EXCLUDED for the shapes already in the portfolio — they add nothing.
+fn grid_points() -> Vec<(String, f64, bool, metric_sweep::MetricSpec)> {
+    // `SSI_GRID_SET` selects which axes to sweep: "alpha" (dense_alpha and
+    // aggressive), "jitter" (seeded randomized-restart perturbation of the
+    // pivot score), or "both" (default).
+    let set = std::env::var("SSI_GRID_SET").unwrap_or_else(|_| "both".into());
+    let want_alpha = set == "alpha" || set == "both";
+    let want_jitter = set == "jitter" || set == "both";
+    let mut out = Vec::new();
+    if want_jitter {
+        // RANDOMIZED-RESTART axis. The shipped portfolio has exactly ONE
+        // ordering per formula; here each (amplitude, seed) is a different
+        // draw from the same formula's neighborhood, which is the diversity
+        // shape that paid in the exact elimination game (rgreedy) but has
+        // never been tried at quotient-graph cost.
+        for (bname, deg_pow, nv_pow) in [("deg1_nv1", 1.0f64, 1.0f64), ("deg2_nv1", 2.0, 1.0)] {
+            for amp in [16u32, 48, 96] {
+                for seed in 0u64..6 {
+                    let spec = metric_sweep::MetricSpec {
+                        name: bname,
+                        deg_pow,
+                        nv_pow,
+                        wf_weight: 0.0,
+                        wf_pow: 1.0,
+                        degme_weight: 0.0,
+                        perverse: false,
+                        bucket_div: 8,
+                        jitter: amp,
+                        seed,
+                    };
+                    out.push((format!("j{amp}s{seed}|{bname}"), 10.0, true, spec));
+                }
+            }
+        }
+    }
+    if !want_alpha {
+        return out;
+    }
+    for base in grid_base_specs() {
+        // Axis 1: dense_alpha (shipped: 10.0 only).
+        for alpha in [-1.0f64, 1.0, 2.0, 5.0, 20.0] {
+            out.push((
+                format!("a{alpha}|{}", base.name),
+                alpha,
+                true,
+                base,
+            ));
+        }
+        // Axis 2: aggressive absorption off (shipped: true only).
+        out.push((format!("nag|{}", base.name), 10.0, false, base));
+        // Axis 3: aggressive off CROSSED with a non-default alpha -- the two
+        // cheap axes together, since neither is in the shipped grid.
+        for alpha in [2.0f64, 20.0] {
+            out.push((format!("nag_a{alpha}|{}", base.name), alpha, false, base));
+        }
+        // NOTE: the `bucket_div` axis is deliberately ABSENT. Measured, not
+        // assumed: `b2|deg3_nv1` (bucket_div=2, deg_pow=3) does not terminate
+        // on himmel11 (n=14, nnz=60) -- the coarse stride crowds every vertex
+        // into the saturated top bucket and the vendor pivot scan stops making
+        // progress. A non-terminating candidate cannot be bounded from inside
+        // this probe (no preemption), so the whole axis is excluded until it
+        // can be measured in a preemptible harness. `metric_sweep`'s own doc
+        // already warns this stride was "never crossed with the main grid".
+
+    }
+    out
+}
+
+/// Marginal-value sweep of the unswept `order_generic` axes against the real
+/// shipped portfolio. Emits TSV:
+///   `BASE  <matrix> <n> <nnz> <bucket> <inc_ratio> <inc_flops> <amd_flops>`
+///   `WIN   <label> <matrix> <cand_flops> <gain_ln>`
+///   `COST  <label> <total_secs> <matrices>`
+/// `gain_ln` is `ln(inc_flops) - ln(cand_flops)`, i.e. the reduction in the
+/// per-matrix log-ratio the candidate would deliver if selected — additive in
+/// the bucket geomean, so offline greedy selection is exact arithmetic.
+///
+/// `SSI_GRID_MAX_NNZ` (default 130_000, the shipped `WINF_MAX_NNZ`) bounds
+/// which matrices are evaluated; set it higher to price a gate widening.
+#[test]
+#[ignore]
+fn probe_diversity_grid() {
+    let corpus = crate::corpus::corpus();
+    let max_nnz: usize = std::env::var("SSI_GRID_MAX_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(130_000);
+    let min_nnz: usize = std::env::var("SSI_GRID_MIN_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let points = grid_points();
+    println!("GRIDPOINTS\t{}", points.len());
+    let mut cost = vec![0.0f64; points.len()];
+    let mut panicked = vec![0usize; points.len()];
+    let mut skipped = vec![0usize; points.len()];
+    let mut seen = 0usize;
+    // Per-point cumulative wall budget. `metric_sweep`'s own doc warns that a
+    // wide-dynamic-range score formula can hit a COST CLIFF (the coarse score
+    // buckets crowd and the pivot scan degenerates); one such point stalled an
+    // earlier run of this probe for minutes on an n=1131 matrix. Two guards:
+    // matrices are visited in ASCENDING nnz order so a cliff shows up on a
+    // cheap matrix first, and a point that burns its budget is dropped for the
+    // rest of the sweep. Both are reported, so a dropped point is visible
+    // rather than silently missing.
+    // `SSI_GRID_TRACE=1` prints the (candidate, matrix) pair BEFORE running it
+    // and flushes, so a non-terminating grid point is identified by the last
+    // line of the log rather than guessed at.
+    let trace = std::env::var("SSI_GRID_TRACE").ok().as_deref() == Some("1");
+    let point_budget: f64 = std::env::var("SSI_GRID_POINT_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0);
+    // Silence the per-panic backtrace spam; the counts are reported instead.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let mut ordered: Vec<&(String, Pattern)> = corpus
+        .iter()
+        .filter(|(_, p)| p.n > 0 && p.nnz() < max_nnz && p.nnz() >= min_nnz)
+        .collect();
+    ordered.sort_by_key(|(_, p)| p.nnz());
+
+    for (name, pat) in ordered {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        seen += 1;
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd_flops = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+        let inc_perm = order(pat);
+        let inc_flops = flops_of(&sp, &inc_perm);
+        let inc_ratio = inc_flops as f64 / amd_flops as f64;
+        println!(
+            "BASE\t{name}\t{n}\t{nnz}\t{}\t{inc_ratio:.6}\t{inc_flops}\t{amd_flops}",
+            BUCKET_NAMES[bucket(n)]
+        );
+
+        for (i, (label, alpha, aggressive, spec)) in points.iter().enumerate() {
+            if cost[i] > point_budget {
+                skipped[i] += 1;
+                continue;
+            }
+            if trace {
+                println!("TRY\t{label}\t{name}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            let t0 = Instant::now();
+            // Vendor quotient-graph bookkeeping can panic on some off-grid
+            // option combinations (observed: an index-out-of-bounds at
+            // algo.rs:1443). The shipped `consider!` already wraps every
+            // candidate in `catch_unwind`, so a panicking point is contained
+            // in production too -- but we still want to KNOW which ones do it
+            // rather than lose the whole sweep, so catch and record here.
+            let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                metric_sweep::order_generic(&core, *alpha, *aggressive, spec)
+            }));
+            cost[i] += t0.elapsed().as_secs_f64();
+            let raw = match raw {
+                Ok(r) => r,
+                Err(_) => {
+                    panicked[i] += 1;
+                    continue;
+                }
+            };
+            let perm: Vec<usize> = match raw {
+                Ok(p) => p.into_iter().map(|x| x as usize).collect(),
+                Err(_) => continue,
+            };
+            if !is_bijection(&perm, n) {
+                continue;
+            }
+            let f = flops_of(&sp, &perm);
+            if f < inc_flops {
+                let gain = (inc_flops as f64).ln() - (f as f64).ln();
+                println!("WIN\t{label}\t{name}\t{f}\t{gain:.8}");
+            }
+        }
+    }
+    std::panic::set_hook(prev_hook);
+    for (i, (label, ..)) in points.iter().enumerate() {
+        println!(
+            "COST\t{label}\t{:.4}\t{seen}\t{}\t{}",
+            cost[i], panicked[i], skipped[i]
+        );
+    }
+    println!("GRIDDONE\tmatrices={seen}\tmax_nnz={max_nnz}\tmin_nnz={min_nnz}");
+}
+// ONE-MATRIX SAMPLING LOOP (session 20260829T1145Z-n1-push): repeatedly run
+// order() on the matrix named by SSI_ONE_MATRIX so an external profiler
+// (macOS `sample`) can attribute wall time to phases. Ignored by default.
+#[test]
+#[ignore]
+fn probe_one_matrix_loop() {
+    let name_want = std::env::var("SSI_ONE_MATRIX").unwrap_or_else(|_| "crudeoil_pooling_ct3".into());
+    let reps: usize = std::env::var("SSI_ONE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let corpus = crate::corpus::corpus();
+    for (name, pat) in &corpus {
+        if *name != name_want { continue; }
+        println!("matrix {} n={} nnz={}", name, pat.n, pat.nnz());
+        for r in 0..reps {
+            let t = Instant::now();
+            let p = order(pat);
+            println!("rep {} secs {:.3} len {}", r, t.elapsed().as_secs_f64(), p.len());
+        }
+        return;
+    }
+    panic!("matrix {} not in dev corpus", name_want);
+}
+// EXACT BOUNDED-WINDOW SUBSET DP (session 20260829T1145Z-n1-push, seat probe):
+// cheapest falsifier for SEAT-codex-sol-max.md proposal 1. Takes order(pat)'s
+// incumbent as the seed permutation and, over two non-overlapping tilings
+// (offsets 0 and k/2), exactly re-orders each contiguous block of k seed
+// positions via the exact_dp.rs set-state subset DP played on the LIVE
+// residual elimination graph: F[S ∪ {v}] = min(F[S] + (1 + deg_GS(v))²).
+// The residual graph after eliminating a set is order-independent, so a
+// window's local Σ(1+deg)² reduction is an equal GLOBAL reduction; committed
+// wins must therefore reproduce as true flops_of() gains, which is verified
+// per matrix at the end (WDPMISMATCH would flag a broken invariant).
+// Windows with |B ∪ N_live(B)| > 512 are skipped and counted. Base gate only:
+// 1_000 <= n <= 4_000, nnz <= 60_000.
+// Env: SSI_WDP_K (default 6), SSI_WDP_MAX_U (default 512), SSI_WDP_BUDGET_S
+// (default 600; wall time only decides WHERE the sweep stops — checked
+// between matrices, never inside the algorithm, so results per matrix are
+// deterministic).
+#[test]
+#[ignore]
+fn probe_window_dp() {
+    use std::collections::{HashMap, HashSet};
+
+    let k = envu("SSI_WDP_K", 6).max(2).min(16);
+    let max_u = envu("SSI_WDP_MAX_U", 512);
+    let budget_s: f64 = std::env::var("SSI_WDP_BUDGET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600.0);
+
+    // Live elimination game on hash-set adjacency. Gate matrices are small
+    // (n <= 4_000), so the O(d²) clique insertion per pivot is affordable.
+    // HashSet iteration order is nondeterministic but only ever feeds
+    // set-valued results (bitsets, sorted vecs), so the probe stays
+    // deterministic.
+    fn build_live(pat: &Pattern) -> Vec<HashSet<u32>> {
+        let mut g: Vec<HashSet<u32>> = vec![HashSet::new(); pat.n];
+        for v in 0..pat.n {
+            for &r in &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]] {
+                if r != v {
+                    g[v].insert(r as u32);
+                    g[r].insert(v as u32);
+                }
+            }
+        }
+        g
+    }
+    fn eliminate(g: &mut [HashSet<u32>], v: usize) {
+        let nbrs: Vec<u32> = g[v].iter().copied().collect();
+        for &u in &nbrs {
+            g[u as usize].remove(&(v as u32));
+        }
+        g[v].clear();
+        for i in 0..nbrs.len() {
+            for j in (i + 1)..nbrs.len() {
+                g[nbrs[i] as usize].insert(nbrs[j]);
+                g[nbrs[j] as usize].insert(nbrs[i]);
+            }
+        }
+    }
+
+    // One tiling pass: replay the game from scratch, DP-optimize every full
+    // window of k consecutive positions starting at `offset`, commit a window
+    // reorder only on STRICT local cost reduction. Tie-break is deterministic
+    // and lexicographic: pivots are relaxed in ascending global vertex id
+    // with strict `<` updates, so among equal-cost transitions the smallest
+    // id wins. Returns (windows_tried, windows_skipped_width, improved).
+    fn sweep(
+        pat: &Pattern,
+        perm: &mut [usize],
+        k: usize,
+        offset: usize,
+        max_u: usize,
+    ) -> (usize, usize, usize) {
+        let n = pat.n;
+        let mut g = build_live(pat);
+        let (mut tried, mut skipped, mut improved) = (0usize, 0usize, 0usize);
+        for i in 0..offset.min(n) {
+            eliminate(&mut g, perm[i]);
+        }
+        let mut p = offset;
+        while p + k <= n {
+            let b: Vec<usize> = perm[p..p + k].to_vec();
+            // U = B ∪ N_live(B), compressed to ascending local ids.
+            let mut u: Vec<u32> = b.iter().map(|&x| x as u32).collect();
+            for &v in &b {
+                u.extend(g[v].iter().copied());
+            }
+            u.sort_unstable();
+            u.dedup();
+            if u.len() > max_u {
+                skipped += 1;
+                for i in p..p + k {
+                    eliminate(&mut g, perm[i]);
+                }
+                p += k;
+                continue;
+            }
+            tried += 1;
+            let words = (u.len() + 63) / 64;
+            let lid: HashMap<u32, usize> =
+                u.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+            // Per window vertex: U-bitset of live neighbours, k-bit mask of
+            // window-internal adjacency, and its own bit position in U.
+            let mut adjw = vec![vec![0u64; words]; k];
+            let mut badj = vec![0u32; k];
+            let mut bpos = vec![0usize; k];
+            for (j, &v) in b.iter().enumerate() {
+                bpos[j] = lid[&(v as u32)];
+                for &w in &g[v] {
+                    let q = lid[&w];
+                    adjw[j][q / 64] |= 1u64 << (q % 64);
+                }
+            }
+            for j in 0..k {
+                for j2 in 0..k {
+                    if j != j2 && g[b[j]].contains(&(b[j2] as u32)) {
+                        badj[j] |= 1u32 << j2;
+                    }
+                }
+            }
+            // Connected components of G[S] among the window vertices, with
+            // their U-bitset boundaries — the exact_dp.rs component-boundary
+            // formulation, widened from u32 masks to word bitsets over U.
+            let comps_of = |smask: u32| -> Vec<(u32, Vec<u64>)> {
+                let mut out = Vec::new();
+                let mut rem = smask;
+                while rem != 0 {
+                    let start = rem.trailing_zeros();
+                    let mut stack = 1u32 << start;
+                    let mut comp = 0u32;
+                    let mut nbr = vec![0u64; words];
+                    while stack != 0 {
+                        let j = stack.trailing_zeros() as usize;
+                        let jb = 1u32 << j;
+                        stack &= !jb;
+                        if comp & jb != 0 {
+                            continue;
+                        }
+                        comp |= jb;
+                        for w in 0..words {
+                            nbr[w] |= adjw[j][w];
+                        }
+                        stack |= badj[j] & smask & !comp;
+                    }
+                    rem &= !comp;
+                    out.push((comp, nbr));
+                }
+                out
+            };
+            // Exact pivot charge (1 + live fill degree)² for eliminating
+            // window vertex j out of eliminated window subset smask. All fill
+            // neighbours of j after eliminating S ⊆ B lie inside U, so the
+            // U-bitsets carry the FULL live degree, not an approximation.
+            let trans = |smask: u32, j: usize, comps: &[(u32, Vec<u64>)]| -> u64 {
+                let mut reach = adjw[j].clone();
+                for (cm, cn) in comps {
+                    if badj[j] & cm != 0 {
+                        for w in 0..words {
+                            reach[w] |= cn[w];
+                        }
+                    }
+                }
+                // Drop eliminated window vertices and the pivot itself.
+                let mut dead = smask | (1u32 << j);
+                while dead != 0 {
+                    let j2 = dead.trailing_zeros() as usize;
+                    dead &= dead - 1;
+                    reach[bpos[j2] / 64] &= !(1u64 << (bpos[j2] % 64));
+                }
+                let deg: u32 = reach.iter().map(|w| w.count_ones()).sum();
+                let c = (deg + 1) as u64;
+                c * c
+            };
+            // Exact cost of the seed order inside this window.
+            let mut seed_cost = 0u64;
+            {
+                let mut smask = 0u32;
+                for j in 0..k {
+                    let comps = comps_of(smask);
+                    seed_cost += trans(smask, j, &comps);
+                    smask |= 1u32 << j;
+                }
+            }
+            // Subset DP over the window.
+            let states = 1usize << k;
+            let mut f = vec![u64::MAX; states];
+            let mut choice = vec![0u8; states];
+            f[0] = 0;
+            let mut order_js: Vec<usize> = (0..k).collect();
+            order_js.sort_by_key(|&j| b[j]);
+            for s in 0..states {
+                if f[s] == u64::MAX {
+                    continue;
+                }
+                let smask = s as u32;
+                let comps = comps_of(smask);
+                for &j in &order_js {
+                    if smask & (1u32 << j) != 0 {
+                        continue;
+                    }
+                    let cost = f[s] + trans(smask, j, &comps);
+                    let ns = s | (1usize << j);
+                    if cost < f[ns] {
+                        f[ns] = cost;
+                        choice[ns] = j as u8;
+                    }
+                }
+            }
+            if f[states - 1] < seed_cost {
+                improved += 1;
+                let mut rev = Vec::with_capacity(k);
+                let mut s = states - 1;
+                while s != 0 {
+                    let j = choice[s] as usize;
+                    rev.push(b[j]);
+                    s &= !(1usize << j);
+                }
+                rev.reverse();
+                perm[p..p + k].copy_from_slice(&rev);
+            }
+            // Advance the game past the window (any order gives the same
+            // residual; use the committed one).
+            for i in p..p + k {
+                eliminate(&mut g, perm[i]);
+            }
+            p += k;
+        }
+        (tried, skipped, improved)
+    }
+
+    let corpus = crate::corpus::corpus();
+    let mut gate: Vec<&(String, Pattern)> = corpus
+        .iter()
+        .filter(|(_, p)| p.n >= 1_000 && p.n <= 4_000 && p.nnz() <= 60_000)
+        .collect();
+    gate.sort_by_key(|(_, p)| p.nnz());
+
+    let t0 = Instant::now();
+    println!(
+        "WDP\tk={k}\tmax_u={max_u}\tbudget_s={budget_s}\tgate_matrices={}",
+        gate.len()
+    );
+    println!("name\tn\tnnz\twindows_tried\twindows_skipped_width\twindows_improved\tseed_flops\tnew_flops\trel_gain");
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (mut done, mut improved_m, mut panics) = (0usize, 0usize, 0usize);
+    let mut stopped = false;
+    let mut sum_ln = 0.0f64;
+    for (name, pat) in &gate {
+        if t0.elapsed().as_secs_f64() > budget_s {
+            stopped = true;
+            break;
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sp = scoring_pattern(pat);
+            let seed = order(pat);
+            let seed_flops = flops_of(&sp, &seed);
+            let mut perm = seed.clone();
+            let (t1, s1, i1) = sweep(pat, &mut perm, k, 0, max_u);
+            let (t2, s2, i2) = sweep(pat, &mut perm, k, k / 2, max_u);
+            assert!(is_bijection(&perm, pat.n), "window DP broke the bijection");
+            let new_flops = flops_of(&sp, &perm);
+            (t1 + t2, s1 + s2, i1 + i2, seed_flops, new_flops)
+        }));
+        done += 1;
+        match res {
+            Ok((wt, ws, wi, sf, nf)) => {
+                let rel = 1.0 - nf as f64 / sf as f64;
+                if nf < sf {
+                    improved_m += 1;
+                }
+                sum_ln += (nf as f64 / sf as f64).ln();
+                println!(
+                    "{name}\t{}\t{}\t{wt}\t{ws}\t{wi}\t{sf}\t{nf}\t{rel:.6}",
+                    pat.n,
+                    pat.nnz()
+                );
+                if wi > 0 && nf >= sf {
+                    // A committed strict local win MUST show up globally.
+                    println!("WDPMISMATCH\t{name}\tcommitted={wi}\tbut new_flops >= seed_flops");
+                }
+            }
+            Err(_) => {
+                panics += 1;
+                println!("{name}\t{}\t{}\tPANIC", pat.n, pat.nnz());
+            }
+        }
+    }
+    std::panic::set_hook(prev_hook);
+    println!(
+        "WDPSUMMARY\tmatrices={done}/{}\timproved={improved_m}\tpanics={panics}\tsum_ln_ratio={sum_ln:.8}\telapsed_s={:.1}\tstopped_early={stopped}",
+        gate.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    // All gate matrices sit in the 1k_10k bucket; the orchestrator folds
+    // sum_ln_ratio into that bucket's geomean offline for the score delta.
+}
