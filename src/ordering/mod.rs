@@ -4335,6 +4335,18 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+            // FLEET-K2 (0038): a second METIS variant inside cell_a. The
+            // 0033 floor240+imb0.05+s55 winner — a default-floor sibling
+            // (coarsen_floor=120, the library default) is cheaper on the
+            // worst-case time axis and may reach a different basin now that
+            // the surrounding portfolio (vibecodooor's macro-RGSUB and
+            // Inah-choi's completion repass) has changed the cell's neighbours.
+            // Cost: one extra metis_order_full call on a single matrix.
+            let opts_default = feral_metis::MetisOptions {
+                seed: 0,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts_default).map(|(p, ..)| p));
         }
         if cell_b {
             let opts = feral_metis::MetisOptions {
