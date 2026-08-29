@@ -2485,6 +2485,25 @@ fn order_with_options(
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
     // heavy orderings as the prior safe run.)
+    // ULTRA-GIANT ARM v2 (2026-08-29, second attempt after 9d6ce866 was
+    // rejected at +0.000915). The sparse ACOPF giants (activsg70k n=2.05M
+    // nnz=7.14M, activsg25k n=740k nnz=2.58M) sit above every candidate
+    // envelope, so they run the AMD anchor alone at ratio 1.000. One AMF
+    // α5 candidate on that class measured 1.000 → 0.826 (1.52 s) and
+    // 1.000 → 0.921 (0.56 s) on the reconstructed masters. v1 gated at
+    // nnz > 1.4M and was rejected for a tiny net loss — the wider gate
+    // also fired on mid-giants (nnz 1.4-2.5M) where the extra pass only
+    // added portfolio load. v2 tightens to nnz > 2.5M: exactly the two
+    // measured winners, nothing else. Dev-empty at any of these bounds
+    // (max dev pattern nnz is 1.38M).
+    if nnz > 2_500_000 && nnz <= 4 * n {
+        let opts = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
+        consider!(move || feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p));
+    }
+
     if n < AMF_MAX_N && nnz < AMF_MAX_NNZ {
         let opts = feral_amf::AmfOptions {
             dense_alpha: 5.0,
