@@ -5952,3 +5952,179 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+/// TWIN-RATE CENSUS (0022j groundwork): how far does indistinguishable-vertex
+/// compression (adjacent twins N[u]==N[v] ∪ independent twins N(u)==N(v))
+/// shrink each dev matrix? The payoff hypothesis is ADMISSION, not ordering
+/// quality (a compressed-AMD candidate measured dev-zero — AMD compresses
+/// internally): a matrix whose compressed n crosses under an exact-engine
+/// gate (rgreedy engine MAX_N=12_000, RGREEDY_MAX_N=3_000 tier, MINFILL 4k)
+/// becomes searchable by engines that currently cannot touch it.
+#[test]
+#[ignore]
+fn probe_twin_rate() {
+    let corpus = crate::corpus::corpus();
+    println!("TWIN\tmatrix\tn\tnnz\tm_compressed\tratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n < 1000 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for closed in [true, false] {
+            let mut keys: Vec<Vec<u32>> = Vec::with_capacity(n);
+            for v in 0..n {
+                let mut k: Vec<u32> = pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .filter(|&x| x as usize != v)
+                    .collect();
+                if closed {
+                    k.push(v as u32);
+                }
+                k.sort_unstable();
+                keys.push(k);
+            }
+            let mut ord: Vec<usize> = (0..n).collect();
+            ord.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]).then(a.cmp(&b)));
+            let mut i = 0usize;
+            while i < n {
+                let v = ord[i];
+                let mut j = i + 1;
+                while j < n && keys[ord[j]] == keys[v] {
+                    let a = find(&mut parent, v);
+                    let b = find(&mut parent, ord[j]);
+                    if a != b {
+                        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                        parent[hi] = lo;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+        }
+        let mut roots = std::collections::HashSet::new();
+        for v in 0..n {
+            roots.insert(find(&mut parent, v));
+        }
+        let m = roots.len();
+        println!("TWIN\t{name}\t{n}\t{nnz}\t{m}\t{:.2}", m as f64 / n as f64);
+    }
+}
+
+/// PERIOD-STRUCTURE DETECTOR (0022i groundwork): KKT patterns from
+/// time-expanded problems (unitcommit/transswitch/powerflow/supplychain —
+/// the class with the most eval ties) should be near-block-Toeplitz with a
+/// consecutive-id period. For each candidate period p (divisors of n in a
+/// plausible range), measure the fraction of edges (u,v) whose translate
+/// (u+p, v+p) is also an edge. A high translate-invariance fraction at some
+/// p means the structure is real and a period-replicated ordering candidate
+/// is worth building; a low one closes the lane for pennies.
+#[test]
+#[ignore]
+fn probe_period() {
+    let names: Vec<String> = std::env::var("SSI_PROBE_MATRIX")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+    let corpus = crate::corpus::corpus();
+    println!("PERIOD\tmatrix\tn\tnnz\tbest_p\tinvariance\tsecond_p\tsecond_inv");
+    for (name, pat) in &corpus {
+        if !names.is_empty() && !names.iter().any(|x| x == name) {
+            continue;
+        }
+        let n = pat.n;
+        if n < 200 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        // Edge set for O(1) membership.
+        let mut edges: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::with_capacity(nnz);
+        for v in 0..n {
+            for &u in &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]] {
+                edges.insert((u as u32, v as u32));
+            }
+        }
+        // Candidate periods: divisors-ish of n in [8, n/4], plus round
+        // numbers scaled to n. Score translate invariance on a sample.
+        let mut cands: Vec<usize> = Vec::new();
+        for p in 2..=((n as f64).sqrt() as usize + 1) {
+            if n % p == 0 {
+                let q = n / p;
+                for c in [p, q] {
+                    if c >= 8 && c <= n / 4 {
+                        cands.push(c);
+                    }
+                }
+            }
+        }
+        cands.sort_unstable();
+        cands.dedup();
+        let mut scored: Vec<(f64, usize)> = Vec::new();
+        for &p in &cands {
+            let mut hit = 0usize;
+            let mut tot = 0usize;
+            for v in 0..n.saturating_sub(p) {
+                for &u in &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]] {
+                    let u = u as usize;
+                    if u + p < n {
+                        tot += 1;
+                        if edges.contains(&((u + p) as u32, (v + p) as u32)) {
+                            hit += 1;
+                        }
+                    }
+                }
+            }
+            if tot > 0 {
+                scored.push((hit as f64 / tot as f64, p));
+            }
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        let (b_inv, b_p) = scored.first().copied().unwrap_or((0.0, 0));
+        let (s_inv, s_p) = scored.get(1).copied().unwrap_or((0.0, 0));
+        println!("PERIOD\t{name}\t{n}\t{nnz}\t{b_p}\t{b_inv:.3}\t{s_p}\t{s_inv:.3}");
+    }
+}
+
+/// ANCHOR-FILL CENSUS (0022g groundwork): for every dev matrix, the anchor's
+/// exact fill `anchor_lnnz = Σ amd_counts` and max column count — the cost
+/// covariates the review identified as the ones every recent cap death was
+/// invisible to. Output is the data from which fill-keyed gate constants get
+/// derived at equal admitted cost. Cheap: one AMD + one GNP pass per matrix.
+#[test]
+#[ignore]
+fn probe_anchor_fill() {
+    let corpus = crate::corpus::corpus();
+    println!("FILL\tmatrix\tn\tnnz\tmax_deg\tanchor_lnnz\tanchor_maxcol\tfill_ratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd = feral_amd::amd_order(&core).unwrap();
+        let perm: Vec<usize> = amd.into_iter().map(|x| x as usize).collect();
+        let permuted = permute_pattern(&sp, &perm);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let lnnz: u64 = counts.iter().map(|&c| c as u64).sum();
+        let maxcol: usize = counts.iter().copied().max().unwrap_or(0);
+        let md = probe_max_deg(pat);
+        println!(
+            "FILL\t{name}\t{n}\t{nnz}\t{md}\t{lnnz}\t{maxcol}\t{:.2}",
+            lnnz as f64 / nnz.max(1) as f64
+        );
+    }
+}
