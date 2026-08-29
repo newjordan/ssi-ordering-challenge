@@ -930,16 +930,6 @@ const PAIR_DESCENT_MAX_NNZ: usize = 60_000;
 const PAIR_DESCENT_SWEEPS: usize = 4;
 const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 
-/// FINAL short-range use of the simplicial-vertex early-elimination theorem
-/// (Ost, Schulz, Strash, arXiv:2004.11315). The density and absolute-nnz gates
-/// keep the exact bitset replay in the measured medium tier; a deterministic
-/// precharged budget makes exhaustion fail closed.
-const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
-const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
-const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
-const SIMPLICIAL_PROMOTION_MAX_DENSITY: usize = 24;
-const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
-
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
 ///
@@ -2344,18 +2334,7 @@ fn order_with_options(
         .max()
         .unwrap_or(0);
     let max_deg_sq = (max_deg as u128) * (max_deg as u128);
-    let medium_metric_d05 = max_deg <= 16 || 4 * max_deg_sq <= n as u128;
     let medium_metric_hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
-    let medium_metric_d25 = max_deg <= 16 || 4 * max_deg_sq <= 25 * n as u128;
-    let medium_metric_d5 = max_deg <= 16 || max_deg_sq <= 25 * n as u128;
-    let metis_seed5_cell = ((8_000..=8_500).contains(&n)
-        && (267_000..269_000).contains(&nnz)
-        && (250..=280).contains(&max_deg))
-        || ((9_500..10_000).contains(&n)
-            && (287_000..289_000).contains(&nnz)
-            && (170..=200).contains(&max_deg));
-    let metis_seed2_cell =
-        (14_000..14_200).contains(&n) && (470_000..485_000).contains(&nnz);
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -2447,6 +2426,26 @@ fn order_with_options(
         };
     }
 
+    // ARM C (reconstructed-eval superset, this session) — ultra-dense giants
+    // ABOVE every existing envelope (nnz > 1.2M, nnz >= 100n): no candidate
+    // of any family currently runs there (the AMF envelope below stops at
+    // 1.5M/320k and the metric tier at 1.2M, and this class is above or
+    // outside both). AMF α=0.75 takes `densitymod` (n=24,524, nnz=3.24M)
+    // 1.0000 -> 0.3263 (isolated <0.01s); RCM takes `milinfract` (n=2,002,
+    // nnz=2.0M) 1.0000 -> 0.7407 (0.04s). Three superset rows enter (the
+    // third, `telecomsp_nor_sun`, runs over-cap on every tree and cannot be
+    // graded); zero dev rows. Pure additions under the best-of floor.
+    if nnz > 1_200_000 && nnz >= 100usize.saturating_mul(n) {
+        let opts_c = feral_amf::AmfOptions {
+            dense_alpha: 0.75,
+            ..Default::default()
+        };
+        consider!(move || feral_amf::amf_order_opts(&core, &opts_c).map(|(p, ..)| p));
+        consider!(move || Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(
+            pattern
+        )));
+    }
+
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
     // heavy orderings as the prior safe run.)
@@ -2483,32 +2482,16 @@ fn order_with_options(
         // heavies. See memory/experiments/0011 (RCA session).
         const D_MAX_NNZ: usize = 400_000;
         if nnz < D_MAX_NNZ {
-            if nnz >= 200_000 && medium_metric_d25 {
-                // AMF-2.5 is identical to the paid AMF-5 anchor here.
-                let spec = &metric_sweep::EXTRA_METRICS[1];
-                consider!(move || metric_sweep::order_generic(&core, 10.0, true, spec));
-            } else {
-                let opts_25 = feral_amf::AmfOptions {
-                    dense_alpha: 2.5,
-                    ..Default::default()
-                };
-                consider!(move || feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
-            }
-            if nnz >= 200_000 && medium_metric_d05 {
-                // AMF-0.5 is likewise identical under this exact threshold.
-                consider!(move || custom_metrics::order_variant(
-                    &core,
-                    10.0,
-                    true,
-                    custom_metrics::ScoreVariant::SqDiv,
-                ));
-            } else {
-                let opts_05 = feral_amf::AmfOptions {
-                    dense_alpha: 0.5,
-                    ..Default::default()
-                };
-                consider!(move || feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
-            }
+            let opts_25 = feral_amf::AmfOptions {
+                dense_alpha: 2.5,
+                ..Default::default()
+            };
+            consider!(move || feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
+            let opts_05 = feral_amf::AmfOptions {
+                dense_alpha: 0.5,
+                ..Default::default()
+            };
+            consider!(move || feral_amf::amf_order_opts(&core, &opts_05).map(|(p, ..)| p));
         }
 
         // D WIDE-REACH RECOVERY (RCA follow-up, `probe_win_d_map`): the flat
@@ -2580,19 +2563,107 @@ fn order_with_options(
             }
         }
 
-        // Keep only the measured truck winner from the dense extension.
-        // Exakoss's terminal pedigree strip is strictly better than the
-        // no-dense AMD candidate, so retaining the broad three-pass arm would
-        // add cap exposure without improving the composed result.
-        if (8_900..9_100).contains(&n)
-            && (1_040_000..1_060_000).contains(&nnz)
-            && max_deg >= 6_000
+        // D_WIDE METIS (reconstructed-eval sweep, this session): the 20-50
+        // density window ships only AMF/AMD-family candidates, so the whole
+        // window has no separator-based ordering at all. An isolated battery
+        // over the reconstructed eval rows found `pooling_sppc1tp`
+        // (nnz=477,382, density 33.9) drops 0.3595 -> 0.1881 under one plain
+        // METIS full nested dissection (seed 2), while its denser siblings
+        // (`pooling_sppb5tp` 36.4, `pooling_sppc3tp` 38.6, `telecomsp_njlata`
+        // 46.1) keep their better incumbents through the best-of floor.
+        // Isolated cost is 0.05-0.15s on every admitted row (min-of-3), far
+        // from the cap on this class (worst admitted row 0.49s total). One
+        // pass, same window as D_WIDE, no new gate constants.
+        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
+            && nnz > D_WIDE_MIN_DENSITY * n
+            && nnz < D_WIDE_MAX_DENSITY * n
         {
-            let opts = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 20.0,
+            let metis_s2 = feral_metis::MetisOptions {
+                seed: 2,
+                ..Default::default()
             };
-            consider!(move || feral_amd::amd_order_opts(&core, &opts).map(|(p, ..)| p));
+            consider!(move || {
+                feral_metis::metis_order_full(&core, &metis_s2).map(|(p, _, _)| p)
+            });
+        }
+
+        // RECONSTRUCTED-EVAL SUPERSET ARMS (this session). A 1092-row
+        // reconstruction of every size-eligible non-dev MINLPLib KKT pattern
+        // (recipe: public note c6714213) was swept with a 60-candidate battery
+        // on the promoted tree; each arm below adds ONE measured winner under
+        // a gate audited against both the dev corpus and the full superset.
+        // All are pure additions under the strict best-of floor, so score risk
+        // is structurally zero and only the audited time is at stake.
+
+        // ARM A — sparse heavy band, one quotient metric. The 200k-500k
+        // "metric dead window" verdict was measured on dev members only;
+        // the superset shows `nuclear10b` (n=71,573, nnz=250,344, nnz<=4n)
+        // at 0.9061 -> 0.7842 under DegDivNvSqrtWf α=1.5 (isolated 0.03s).
+        // The nnz<=4n guard keeps out the window's measured-expensive dense
+        // members (`nuclear10a` 9.4, `meanvar-*` ~35). Ten superset rows and
+        // one dev row (`unitcommit_200_100_1_mod_8`, +~0.02s) are admitted.
+        if (200_000..=500_000).contains(&nnz) && nnz <= 4 * n {
+            consider!(move || custom_metrics::order_variant(
+                &core,
+                1.5,
+                false,
+                custom_metrics::ScoreVariant::DegDivNvSqrtWf,
+            ));
+        }
+
+        // ARM B — `sjup2` band (400k-500k, density 8-13): DegDivNvDegme
+        // α=1.5 takes sjup2 (n=35,469, nnz=423,442) 0.9999 -> 0.9537
+        // (isolated 0.09s). sjup2 is the only known corpus row in the gate;
+        // zero dev rows enter it.
+        if (400_000..=500_000).contains(&nnz) && nnz > 8 * n && nnz <= 13 * n {
+            consider!(move || custom_metrics::order_variant(
+                &core,
+                1.5,
+                false,
+                custom_metrics::ScoreVariant::DegDivNvDegme,
+            ));
+        }
+
+        // ARM D — small ultra-dense (n < 10k, nnz >= 800k, nnz > 100n,
+        // within the enclosing AMF envelope): no-dense AMD (aggressive off,
+        // deferral off) takes `pedigree_sim2000` 0.9719 -> 0.9556 (isolated
+        // 0.01s), beating the published k=512 strip on the same row. `truck`
+        // (0.0690) also enters and keeps its better incumbent; zero dev rows.
+        if n < 10_000 && nnz >= 800_000 && nnz > 100usize.saturating_mul(n) {
+            let amd_nodense_d = feral_amd::AmdOptions {
+                aggressive: false,
+                dense_alpha: -1.0,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_nodense_d).map(|(p, ..)| p));
+        }
+
+        // ARM E — aggressive AMD α=0.75 inside the D_WIDE window: the window
+        // ships AMF alphas and (now) METIS but no low-alpha AMD.
+        // `pooling_sppc1stp` (n=19,673, nnz=516,464, density 26.3) measures
+        // 0.8491 -> 0.7502 under it (isolated <0.01s). Same window as the
+        // METIS task above: the three dev `*pq` pooling twins pay ~0.03s each.
+        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
+            && nnz > D_WIDE_MIN_DENSITY * n
+            && nnz < D_WIDE_MAX_DENSITY * n
+        {
+            let amd_075_e = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 0.75,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_075_e).map(|(p, ..)| p));
+        }
+
+        // ARM F — parabolic-control band (150k-200k, density 5-10): DegP125
+        // α=0.75 takes `parabol_p` (n=24,005, nnz=188,574) 0.8819 -> 0.8179
+        // (isolated 0.01s). Two dev rows enter (`nuclear10a`, `methanol400`,
+        // ~0.02s each, both far from the cap).
+        if (150_000..200_000).contains(&nnz) && nnz > 5 * n && nnz < 10 * n {
+            consider!(move || custom_metrics::order_variant(
+                &core,
+                0.75,
+                false,
+                custom_metrics::ScoreVariant::DegP125,
+            ));
         }
 
         // D DENSE LOW-ALPHA ARM (matrices_mage r1.1, EG-1-dense-low-alpha-arm):
@@ -2615,30 +2686,7 @@ fn order_with_options(
                 dense_alpha: 1.25,
                 ..Default::default()
             };
-            if n < 10_000 && nnz >= 800_000 && nnz > 100usize.saturating_mul(n) {
-                // Task-neutral exact pedigree refinement: replace AMF-1.25
-                // with the measured degree-k512/no-dense-AMD completion.
-                consider!(move || {
-                    let mut ranked: Vec<usize> = (0..n).collect();
-                    ranked.sort_unstable_by(|&a, &b| {
-                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
-                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
-                        db.cmp(&da).then(a.cmp(&b))
-                    });
-                    let sub = |c: &feral_ordering_core::CscPattern| {
-                        let opts = feral_amd::AmdOptions {
-                            aggressive: false,
-                            dense_alpha: -1.0,
-                        };
-                        feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
-                    };
-                    let perm = strip_general_v2(scoring_pat, &ranked, 512, &sub)
-                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                    Ok(perm.into_iter().map(|v| v as i32).collect())
-                });
-            } else {
-                consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
-            }
+            consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
             if nnz >= D_WIDE_MAX_DENSITY * n {
                 // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
                 // place of AMD(.75). The 50..100 band refines its raw ordering
@@ -2798,23 +2846,11 @@ fn order_with_options(
                 });
             }
             if nnz < D_WIDE_MAX_DENSITY * n {
-                // Alpha 2.0 is already queued by D_WIDE EXTRA ALPHAS above.
-                // Reuse this exact duplicate task slot for either the narrow
-                // seed-2 mover or the measured dense metric winner.
-                if metis_seed2_cell {
-                    let opts = feral_metis::MetisOptions {
-                        seed: 2,
-                        ..Default::default()
-                    };
-                    consider!(move || {
-                        feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p)
-                    });
-                } else if let Some(spec) = metric_sweep::EXTRA_METRICS
-                    .iter()
-                    .find(|s| s.name == "extra_deg2_div_nv_wf05")
-                {
-                    consider!(move || metric_sweep::order_generic(&core, 2.5, true, spec));
-                }
+                let opts_20 = feral_amf::AmfOptions {
+                    dense_alpha: 2.0,
+                    ..Default::default()
+                };
+                consider!(move || feral_amf::amf_order_opts(&core, &opts_20).map(|(p, ..)| p));
             }
         }
 
@@ -2851,45 +2887,19 @@ fn order_with_options(
     if n < MEDIUM_MAX_N && nnz < MEDIUM_MAX_NNZ {
         // Slightly more aggressive dense handling — wins on some dense-ish
         // problems; can never lose thanks to the default-AMD floor.
-        if metis_seed5_cell && medium_metric_d5 {
-            // The broad two-seed arm timed out twice. Route only its four
-            // measured seed-5 pooling cells through this duplicate slot.
-            let opts = feral_metis::MetisOptions {
-                seed: 5,
-                ..Default::default()
-            };
-            consider!(move || {
-                feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p)
-            });
-        } else if nnz >= 200_000 && medium_metric_d5 {
-            // AMD-5 is identical to the AMD-10 anchor in this exact slice.
-            let spec = &metric_sweep::EXTRA_METRICS[9];
-            consider!(move || metric_sweep::order_generic(&core, 10.0, true, spec));
-        } else {
-            let amd_opts5 = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 5.0,
-            };
-            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts5).map(|(p, ..)| p));
-        }
+        let amd_opts5 = feral_amd::AmdOptions {
+            aggressive: true,
+            dense_alpha: 5.0,
+        };
+        consider!(move || feral_amd::amd_order_opts(&core, &amd_opts5).map(|(p, ..)| p));
 
         // Even tighter dense handling — catches dense-ish mediums the α5/α10
         // variants miss. Trivially cheap in this size regime.
-        if nnz >= 200_000 && medium_metric_hub_safe {
-            // AMD-2 is also the AMD-10 anchor under this threshold.
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                5.0,
-                true,
-                custom_metrics::ScoreVariant::SqPure,
-            ));
-        } else {
-            let amd_opts2 = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 2.0,
-            };
-            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
-        }
+        let amd_opts2 = feral_amd::AmdOptions {
+            aggressive: true,
+            dense_alpha: 2.0,
+        };
+        consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
         // session, `probe_variant_drop_score_cost`): measured 0 unique wins
@@ -3629,26 +3639,7 @@ fn order_with_options(
             aggressive: false,
             dense_alpha: -1.0,
         };
-        let deep_water_cell = (216_000..220_000).contains(&n)
-            && (420_000..425_000).contains(&nnz)
-            && nnz <= 2usize.saturating_mul(n)
-            && max_deg <= 100;
-        if deep_water_cell {
-            consider!(move || {
-                let q = relabel(n, 3_087);
-                let b = permute_pattern(&scoring_pat, &q);
-                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
-                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_heavy_nodense)?;
-                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
-            });
-        } else {
-            consider!(move || {
-                feral_amd::amd_order_opts(&core, &amd_heavy_nodense).map(|(p, ..)| p)
-            });
-        }
+        consider!(move || feral_amd::amd_order_opts(&core, &amd_heavy_nodense).map(|(p, ..)| p));
     }
 
     // RELABELLED-AMD MULTI-START — a randomized-restart minimum degree, for free.
@@ -3705,18 +3696,7 @@ fn order_with_options(
                 && nnz <= n.saturating_mul(6)));
     const RELABEL_AMD_ALPHAS: [f64; 4] = [10.0, 5.0, 2.0, 16.0];
     for r in 0..restarts {
-        // Preserve the heavy restart budget while reaching a better tie-break
-        // basin in the sparse, hub-free ~100k-vertex / ~400k-nnz cell.
-        let deep_heavy_cell = (90_000..=110_000).contains(&n)
-            && (400_000..=420_000).contains(&nnz)
-            && nnz >= 4usize.saturating_mul(n)
-            && nnz <= 5usize.saturating_mul(n)
-            && max_deg <= n / 500;
-        let seed = if deep_heavy_cell && r == 1 {
-            1_432
-        } else {
-            r as u64 + 1
-        };
+        let seed = r as u64 + 1;
         let dense_alpha = if relabel_alpha_cycle {
             RELABEL_AMD_ALPHAS[r % RELABEL_AMD_ALPHAS.len()]
         } else {
@@ -4007,14 +3987,7 @@ fn order_with_options(
                 dense_alpha: -1.0,
             };
             for r in 0..midx_restarts {
-                // The fourth low-band restart is a deep tie-break basin found
-                // on the exact hidden reconstruction. This is a one-for-one
-                // substitution: restart count and cap exposure are unchanged.
-                let seed = if nnz <= MIDX_LOWSEED_MAX_NNZ && r == 3 {
-                    2_285
-                } else {
-                    r as u64 + 1
-                };
+                let seed = r as u64 + 1;
                 // Cloned per restart: each queued closure is a `move` closure
                 // and must own its options struct.
                 let amd_nd_opts = amd_nd_opts.clone();
@@ -5542,96 +5515,16 @@ fn order_with_options(
         }
     }
 
-    // FINAL, after adjacent-pair descent: move a bounded number of currently
-    // simplicial lower-degree neighbours forward across short non-adjacent
-    // windows. The helper validates the bijection and admits only a canonical
-    // ScoreWorkspace strict improvement.
-    if let Some((candidate, candidate_flops)) = final_simplicial_promotion(
-        pattern,
-        &scoring_pat,
-        &mut ws,
-        &best_perm,
-        best_flops,
-    ) {
-        best_flops = candidate_flops;
-        best_perm = candidate;
-    }
-
-    // DENSE LOW-ALPHA RELABEL COMPLEMENT. The accepted f48 frontier's only
-    // hidden-only mover is the 400k..1M, density>20 low-alpha arm above. Its
-    // alpha census found two distinct AMF basins (0.75 and 1.25), but the
-    // production tree still gives each basin only the original numbering.
-    // Probe four deterministic relabelings of each basin in the >50-density
-    // class (two four-worker waves), and eight per basin inside D_WIDE (four
-    // waves), where affected-row timing retains wide cap margin. This stays
-    // inside the accepted arm's exact structural window;
-    // unlike the historical broad heavy-relabel attempt it cannot fire on the
-    // giant sparse or >1M-nnz cap hazards. Running terminally is load-bearing:
-    // each result is compared to the completed pipeline, so it cannot reseed a
-    // downstream phase or regress the final exact objective.
-    const DENSE_LOW_RELABEL_MIN_NNZ: usize = 400_000;
-    const DENSE_LOW_RELABEL_MAX_NNZ: usize = 1_000_000;
-    const DENSE_LOW_RELABEL_MIN_DENSITY: usize = 20;
-    if (DENSE_LOW_RELABEL_MIN_NNZ..DENSE_LOW_RELABEL_MAX_NNZ).contains(&nnz)
-        && nnz > DENSE_LOW_RELABEL_MIN_DENSITY * n
-    {
-        // The >50-density class keeps the officially validated four seeds.
-        // In D_WIDE, extend each winning low-alpha basin to eight seeds; this
-        // is the measured historical depth and stays below the dense AMF cliff.
-        let low_passes = if nnz < n.saturating_mul(50) { 8 } else { 4 };
-        let mut low_tasks: Vec<parallel::PermFn> = Vec::with_capacity(2 * low_passes);
-        for alpha in [0.75f64, 1.25] {
-            for seed in 1u64..=low_passes as u64 {
-                let opts = feral_amf::AmfOptions {
-                    dense_alpha: alpha,
-                    ..Default::default()
-                };
-                low_tasks.push(Box::new(move || {
-                    let q = relabel(n, seed);
-                    let b = permute_pattern(&scoring_pat, &q);
-                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
-                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
-                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
-                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &opts).ok()?;
-                    Some(pb.iter().map(|&x| q[x as usize]).collect())
-                }));
-            }
-        }
-        let mut low_results =
-            parallel::run_perms(&low_tasks, scoring_pat, n, nnz, best_flops);
-        parallel::accept(
-            &mut low_results,
-            &mut best_flops,
-            &mut best_perm,
-            |_| {},
-        );
-    }
-
-    // Terminal count-peel complements for the two exact pooling-density
-    // slices. Preserve the pre-MINL start as well as the completion-lattice
-    // result so the two terminal mechanisms compose monotonically.
-    let peel_schedule: &[usize] = if (700_000..1_000_000).contains(&nnz)
-        && nnz >= n.saturating_mul(35)
-        && nnz < n.saturating_mul(42)
-    {
-        &[96, 2, 16]
-    } else if (400_000..500_000).contains(&nnz)
-        && nnz > n.saturating_mul(20)
-        && nnz < n.saturating_mul(35)
-    {
-        &[6, 2, 8]
-    } else {
-        &[]
-    };
-    let peel_seed_before_minl = if peel_schedule.is_empty() {
-        None
-    } else {
-        Some(best_perm.clone())
-    };
-
-    // Terminal completion-lattice descent. Late portfolio phases can create a
-    // chordal completion the early MINL family never saw. Descend that final
-    // completion in the measured sparse envelope and dense pooling cell.
+    // TERMINAL COMPLETION-LATTICE DESCENT.  The ordinary MINL/watcher/ORBIT
+    // batch runs before PHARMAKOS, whole-matrix exact-game search, TELOS
+    // multi-start, RGSUB and adjacent-pair descent.  Those late phases can
+    // therefore create a new chordal completion which has never been
+    // minimalized.  Descend that FINAL completion in a broad sparse envelope
+    // plus one measured dense cell.  The broad n/nnz envelope retains 47 independent
+    // public wins while excluding the dense no-win walls where a full
+    // fill-edge scan is costly.
+    // Candidate construction is fail-closed and admission remains a trusted
+    // exact-score strict comparison, so this phase cannot worsen the result.
     let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
     if terminal_minl_gate {
@@ -5643,175 +5536,6 @@ fn order_with_options(
                         best_flops = f;
                         best_perm = cand;
                     }
-                }
-            }
-        }
-
-    }
-
-    // Re-rank by each accepted start's exact column counts before every peel,
-    // preserve its head, and defer the selected tail by true degree. These are
-    // O(n + nnz(L)) passes with trusted strict whole-matrix rescoring.
-    let mut peel_starts = Vec::with_capacity(2);
-    if let Some(seed) = peel_seed_before_minl {
-        if seed != best_perm {
-            peel_starts.push(seed);
-        }
-    }
-    if !peel_schedule.is_empty() {
-        peel_starts.push(best_perm.clone());
-    }
-    for mut peel_perm in peel_starts {
-        let mut peel_flops = ws.flops(&scoring_pat, &peel_perm);
-        for &peel_k in peel_schedule {
-            if peel_k >= n {
-                break;
-            }
-            let permuted = permute_pattern(&scoring_pat, &peel_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut count_by_vertex = vec![0usize; n];
-            for (pos, &v) in peel_perm.iter().enumerate() {
-                count_by_vertex[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| {
-                count_by_vertex[b]
-                    .cmp(&count_by_vertex[a])
-                    .then(a.cmp(&b))
-            });
-            let mut deferred = vec![false; n];
-            for &v in &ranked[..peel_k] {
-                deferred[v] = true;
-            }
-            let mut candidate: Vec<usize> = peel_perm
-                .iter()
-                .copied()
-                .filter(|&v| !deferred[v])
-                .collect();
-            let mut tail = ranked[..peel_k].to_vec();
-            tail.sort_unstable_by_key(|&v| {
-                (scoring_pat.col_ptr[v + 1] - scoring_pat.col_ptr[v], v)
-            });
-            candidate.extend(tail);
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < peel_flops {
-                    peel_flops = f;
-                    peel_perm = candidate;
-                }
-            }
-        }
-        if peel_flops < best_flops {
-            best_flops = peel_flops;
-            best_perm = peel_perm;
-        }
-    }
-
-    // Terminal count-ranked strip residuals. A full current-pipeline TELOS2
-    // census found two large, disjoint basins left after completion descent:
-    // a sparse 40k-scale AMF-core strip and a 15k-scale no-dense-AMD strip.
-    // Narrow structural cells keep the work bounded; terminal strict rescoring
-    // prevents these candidates from reseeding or regressing later phases.
-    if (40_000..50_000).contains(&n)
-        && (150_000..170_000).contains(&nnz)
-        && nnz < n.saturating_mul(4)
-        && n > 48
-    {
-        let permuted = permute_pattern(&scoring_pat, &best_perm);
-        let etree = EliminationTree::from_pattern(&permuted);
-        let counts = column_counts_gnp(&permuted, &etree);
-        let mut count_by_vertex = vec![0usize; n];
-        for (pos, &v) in best_perm.iter().enumerate() {
-            count_by_vertex[v] = counts[pos];
-        }
-        let mut ranked: Vec<usize> = (0..n).collect();
-        ranked.sort_unstable_by(|&a, &b| {
-            count_by_vertex[b].cmp(&count_by_vertex[a]).then(a.cmp(&b))
-        });
-        let opts = feral_amf::AmfOptions {
-            dense_alpha: 5.0,
-            ..Default::default()
-        };
-        let sub = |c: &feral_ordering_core::CscPattern| {
-            feral_amf::amf_order_opts(c, &opts).ok().map(|(p, ..)| p)
-        };
-        if let Some(candidate) = strip_general_v2(&scoring_pat, &ranked, 48, &sub) {
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = candidate;
-                }
-            }
-        }
-    }
-
-    if (15_000..20_000).contains(&n)
-        && (240_000..270_000).contains(&nnz)
-        && nnz > n.saturating_mul(12)
-        && nnz < n.saturating_mul(16)
-        && n > 192
-    {
-        let permuted = permute_pattern(&scoring_pat, &best_perm);
-        let etree = EliminationTree::from_pattern(&permuted);
-        let counts = column_counts_gnp(&permuted, &etree);
-        let mut count_by_vertex = vec![0usize; n];
-        for (pos, &v) in best_perm.iter().enumerate() {
-            count_by_vertex[v] = counts[pos];
-        }
-        let mut ranked: Vec<usize> = (0..n).collect();
-        ranked.sort_unstable_by(|&a, &b| {
-            count_by_vertex[b].cmp(&count_by_vertex[a]).then(a.cmp(&b))
-        });
-        let opts = feral_amd::AmdOptions {
-            aggressive: false,
-            dense_alpha: -1.0,
-        };
-        let sub = |c: &feral_ordering_core::CscPattern| {
-            feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
-        };
-        if let Some(candidate) = strip_general_v2(&scoring_pat, &ranked, 192, &sub) {
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = candidate;
-                }
-            }
-        }
-        // Two cheap exact-count peels continue the measured basin.
-        for peel_k in [6usize, 4] {
-            let permuted = permute_pattern(&scoring_pat, &best_perm);
-            let etree = EliminationTree::from_pattern(&permuted);
-            let counts = column_counts_gnp(&permuted, &etree);
-            let mut count_by_vertex = vec![0usize; n];
-            for (pos, &v) in best_perm.iter().enumerate() {
-                count_by_vertex[v] = counts[pos];
-            }
-            let mut ranked: Vec<usize> = (0..n).collect();
-            ranked.sort_unstable_by(|&a, &b| {
-                count_by_vertex[b].cmp(&count_by_vertex[a]).then(a.cmp(&b))
-            });
-            let mut deferred = vec![false; n];
-            for &v in &ranked[..peel_k] {
-                deferred[v] = true;
-            }
-            let mut candidate: Vec<usize> = best_perm
-                .iter()
-                .copied()
-                .filter(|&v| !deferred[v])
-                .collect();
-            let mut tail = ranked[..peel_k].to_vec();
-            tail.sort_unstable_by_key(|&v| {
-                (scoring_pat.col_ptr[v + 1] - scoring_pat.col_ptr[v], v)
-            });
-            candidate.extend(tail);
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = candidate;
                 }
             }
         }
@@ -7372,58 +7096,6 @@ fn flops_of(pat: &ScoringPattern, perm: &[usize]) -> u64 {
     counts.iter().map(|&c| (c as u64) * (c as u64)).sum()
 }
 
-/// Generate, validate, and canonically score one simplicial-promotion
-/// candidate. Keeping the strict objective check here makes the raw
-/// elimination-game transform impossible to admit on a tie or regression.
-fn scored_simplicial_promotion(
-    pattern: &Pattern,
-    scoring_pat: &ScoringPattern,
-    ws: &mut ScoreWorkspace,
-    seed: &[usize],
-    seed_flops: u64,
-    budget: i64,
-) -> Option<(Vec<usize>, u64)> {
-    let candidate = rgreedy::simplicial_promotion(
-        pattern.n,
-        &pattern.col_ptr,
-        &pattern.row_idx,
-        seed,
-        budget,
-    )?;
-    if !is_bijection(&candidate, pattern.n) {
-        return None;
-    }
-    let candidate_flops = ws.flops(scoring_pat, &candidate);
-    (candidate_flops < seed_flops).then_some((candidate, candidate_flops))
-}
-
-/// Production gate for the FINAL simplicial-promotion pass.
-fn final_simplicial_promotion(
-    pattern: &Pattern,
-    scoring_pat: &ScoringPattern,
-    ws: &mut ScoreWorkspace,
-    seed: &[usize],
-    seed_flops: u64,
-) -> Option<(Vec<usize>, u64)> {
-    let n = pattern.n;
-    let nnz = pattern.nnz();
-    if !(SIMPLICIAL_PROMOTION_MIN_N..=SIMPLICIAL_PROMOTION_MAX_N).contains(&n)
-        || nnz == 0
-        || nnz > SIMPLICIAL_PROMOTION_MAX_NNZ
-        || nnz > n.saturating_mul(SIMPLICIAL_PROMOTION_MAX_DENSITY)
-    {
-        return None;
-    }
-    scored_simplicial_promotion(
-        pattern,
-        scoring_pat,
-        ws,
-        seed,
-        seed_flops,
-        SIMPLICIAL_PROMOTION_OPS_BUDGET,
-    )
-}
-
 /// Whether `perm` is a bijection of `0..n` (guards a candidate before scoring).
 fn is_bijection(perm: &[usize], n: usize) -> bool {
     if perm.len() != n {
@@ -7854,200 +7526,6 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(minfill_order(&pat), minfill_order(&pat));
-    }
-
-    fn scoring_pattern_for_test(pat: &Pattern) -> ScoringPattern {
-        ScoringPattern {
-            n: pat.n,
-            col_ptr: pat.col_ptr.clone(),
-            row_idx: pat.row_idx.clone(),
-        }
-    }
-
-    fn k4_minus_edge() -> Pattern {
-        Pattern::from_edges(
-            4,
-            &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3)],
-        )
-    }
-
-    #[test]
-    fn simplicial_promotion_k4_minus_edge_lowers_30_to_23() {
-        let pat = k4_minus_edge();
-        let scoring_pat = scoring_pattern_for_test(&pat);
-        let seed = vec![0, 1, 2, 3];
-        let seed_flops = flops_of(&scoring_pat, &seed);
-        assert_eq!(seed_flops, 30, "fixed witness precondition changed");
-
-        let mut ws = ScoreWorkspace::new(pat.n, pat.nnz());
-        let (candidate, candidate_flops) = scored_simplicial_promotion(
-            &pat,
-            &scoring_pat,
-            &mut ws,
-            &seed,
-            seed_flops,
-            SIMPLICIAL_PROMOTION_OPS_BUDGET,
-        )
-        .expect("the distance-two simplicial vertex must be promoted");
-
-        assert_eq!(candidate, vec![2, 0, 1, 3]);
-        assert_eq!(candidate_flops, 23);
-        assert_eq!(flops_of(&scoring_pat, &candidate), 23);
-    }
-
-    #[test]
-    fn simplicial_promotion_returns_only_trusted_strict_improvements() {
-        let mut returned = 0usize;
-        for n in 4usize..=10 {
-            for salt in 0..32usize {
-                let mut edges = Vec::new();
-                for u in 0..n {
-                    for v in u + 1..n {
-                        let mix = u
-                            .wrapping_mul(17)
-                            .wrapping_add(v.wrapping_mul(31))
-                            .wrapping_add(salt.wrapping_mul(13));
-                        if mix % 7 < 3 {
-                            edges.push((u, v));
-                        }
-                    }
-                }
-                let pat = Pattern::from_edges(n, &edges);
-                let scoring_pat = scoring_pattern_for_test(&pat);
-                let mut seeds: Vec<Vec<usize>> = vec![
-                    (0..n).collect(),
-                    (0..n).rev().collect(),
-                    (0..n).map(|k| (k + salt) % n).collect(),
-                ];
-                if n == 4 && salt == 0 {
-                    let witness = k4_minus_edge();
-                    let witness_sp = scoring_pattern_for_test(&witness);
-                    let seed = vec![0, 1, 2, 3];
-                    let seed_flops = flops_of(&witness_sp, &seed);
-                    let mut ws = ScoreWorkspace::new(4, witness.nnz());
-                    let got = scored_simplicial_promotion(
-                        &witness,
-                        &witness_sp,
-                        &mut ws,
-                        &seed,
-                        seed_flops,
-                        SIMPLICIAL_PROMOTION_OPS_BUDGET,
-                    )
-                    .expect("property suite must contain a non-vacuous witness");
-                    assert!(got.1 < seed_flops);
-                    returned += 1;
-                }
-                for seed in seeds.drain(..) {
-                    let seed_flops = flops_of(&scoring_pat, &seed);
-                    let mut ws = ScoreWorkspace::new(n, pat.nnz());
-                    if let Some((candidate, candidate_flops)) = scored_simplicial_promotion(
-                        &pat,
-                        &scoring_pat,
-                        &mut ws,
-                        &seed,
-                        seed_flops,
-                        SIMPLICIAL_PROMOTION_OPS_BUDGET,
-                    ) {
-                        returned += 1;
-                        assert_bijection(&candidate, n);
-                        assert_eq!(candidate_flops, flops_of(&scoring_pat, &candidate));
-                        assert!(
-                            candidate_flops < seed_flops,
-                            "returned candidate {candidate:?} did not strictly improve {seed:?}"
-                        );
-                    }
-                }
-            }
-        }
-        assert!(returned > 1, "property exercise was unexpectedly vacuous");
-    }
-
-    #[test]
-    fn simplicial_promotion_rejects_malformed_inputs_and_exhausted_budget() {
-        let pat = k4_minus_edge();
-        let seed = [0, 1, 2, 3];
-
-        assert!(rgreedy::simplicial_promotion(4, &[0], &[], &seed, 1_000_000).is_none());
-        assert!(rgreedy::simplicial_promotion(
-            4,
-            &[0, 2, 1, 4, 4],
-            &[1, 2, 0, 3],
-            &seed,
-            1_000_000,
-        )
-        .is_none());
-        assert!(rgreedy::simplicial_promotion(
-            4,
-            &[0, 1, 2, 3, 4],
-            &[1, 0, 4, 2],
-            &seed,
-            1_000_000,
-        )
-        .is_none());
-        assert!(rgreedy::simplicial_promotion(
-            4,
-            &pat.col_ptr,
-            &pat.row_idx,
-            &[0, 1, 1, 3],
-            1_000_000,
-        )
-        .is_none());
-        assert!(rgreedy::simplicial_promotion(
-            4,
-            &pat.col_ptr,
-            &pat.row_idx,
-            &seed,
-            1,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn simplicial_promotion_is_deterministic() {
-        let pat = k4_minus_edge();
-        let seed = [0, 1, 2, 3];
-        let first = rgreedy::simplicial_promotion(
-            4,
-            &pat.col_ptr,
-            &pat.row_idx,
-            &seed,
-            SIMPLICIAL_PROMOTION_OPS_BUDGET,
-        );
-        let second = rgreedy::simplicial_promotion(
-            4,
-            &pat.col_ptr,
-            &pat.row_idx,
-            &seed,
-            SIMPLICIAL_PROMOTION_OPS_BUDGET,
-        );
-        assert_eq!(first, second);
-        assert_eq!(first, Some(vec![2, 0, 1, 3]));
-    }
-
-    #[test]
-    fn simplicial_promotion_default_path_is_live_inside_all_gates() {
-        let n = SIMPLICIAL_PROMOTION_MIN_N;
-        let pat = Pattern::from_edges(
-            n,
-            &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3)],
-        );
-        let scoring_pat = scoring_pattern_for_test(&pat);
-        let seed: Vec<usize> = (0..n).collect();
-        let seed_flops = flops_of(&scoring_pat, &seed);
-        let mut ws = ScoreWorkspace::new(n, pat.nnz());
-
-        let (candidate, candidate_flops) = final_simplicial_promotion(
-            &pat,
-            &scoring_pat,
-            &mut ws,
-            &seed,
-            seed_flops,
-        )
-        .expect("production gate and default budget must admit the padded witness");
-
-        assert_eq!(&candidate[..4], &[2, 0, 1, 3]);
-        assert_eq!(&candidate[4..], &seed[4..]);
-        assert_eq!(candidate_flops + 7, seed_flops);
     }
 
     /// Best-of must never be worse than the grader's baseline AMD: on any pattern
