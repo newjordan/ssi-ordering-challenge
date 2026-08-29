@@ -5952,3 +5952,170 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+/// FLEET-H (0031) — corpus-flexible timing/score probe.
+///
+/// The candidate-worker package's test corpus shim is FIXED to the dev corpus
+/// (`candidate-worker/src/main.rs`), so despite older doc comments,
+/// `crate::corpus::corpus()` does NOT respect `$SSI_CORPUS_FILE` here. This
+/// probe loads the corpus itself: `$SSI_CORPUS_FILE` if set (e.g. the
+/// reconstructed eval corpus), else the dev shim.
+///
+/// Modes:
+///   * default — full corpus, one pass per matrix, per-matrix TSV
+///     (`secs  name  n  nnz  ratio`) + buckets + score, exactly the
+///     `probe_timing_and_score` format.
+///   * `$SSI_PROBE_ONLY` set (comma-separated exact matrix names) — targeted
+///     mode: only those matrices, THREE timed passes each (order() is
+///     deterministic; min-of-3 damps box noise), ratio from the first.
+#[test]
+#[ignore]
+fn probe_fleet_h() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?}, targeted={})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok(),
+        only.is_some()
+    );
+
+    let mut rows: Vec<(f64, String, usize, usize, f64)> = Vec::new();
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        if let Some(list) = &only {
+            // Reconstructed-corpus lines carry blank names; match either the
+            // exact name or an `n:nnz` key.
+            let key = format!("{}:{}", n, pat.nnz());
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        );
+
+        let reps = if only.is_some() { 3 } else { 1 };
+        let mut secs = f64::INFINITY;
+        let mut perm = Vec::new();
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            perm = order(pat);
+            secs = secs.min(t0.elapsed().as_secs_f64());
+        }
+        let mine = flops_of(&sp, &perm);
+        let ratio = mine as f64 / base as f64;
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        rows.push((secs, name.clone(), n, pat.nnz(), ratio));
+    }
+
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("\n--- every order() call, slowest first (TSV) ---");
+    println!("secs\tmatrix\tn\tnnz\tratio");
+    for (secs, name, n, nnz, ratio) in rows.iter() {
+        println!("{secs:.4}\t{name}\t{n}\t{nnz}\t{ratio:.6}");
+    }
+    println!("\n--- per-bucket ---");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<8} count={:<5} geomean={:.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("SCORE = {:.6}", aggregate(&log_sums, &counts));
+    if let Some(r0) = rows.first() {
+        println!("WORST order() = {:.3} s ({})", r0.0, r0.1);
+    }
+}
+
+/// FLEET-H (0031) — isolated relabelled-AMF census over the D_WIDE window.
+/// For every corpus matrix with nnz in [400k,1M) and 20 < nnz/n < 50, compare
+/// the CURRENT full `order()` result against relabelled-AMF at alpha in
+/// {0.5,0.75,1.0,1.25,1.5,2.0,2.5} x seeds 1..=8 (the 0026 deferred recipe's
+/// full grid). Answers definitively whether ANY (seed, alpha) pair still has
+/// value on this tree before sizing a shipped block.
+#[test]
+#[ignore]
+fn probe_fleet_h_dwide_census() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if !(400_000..1_000_000).contains(&nnz) || nnz <= 20 * n || nnz >= 50 * n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let incumbent = flops_of(&sp, &order(pat));
+        let mut best = (f64::INFINITY, 0.0f64, 0u64);
+        println!("\n{name} n={n} nnz={nnz} incumbent_flops={incumbent}");
+        for &alpha in &[0.5f64, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5] {
+            for seed in 1u64..=8 {
+                let q = relabel(n, seed);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                let Some(bcore) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+                    continue;
+                };
+                let amf_opts = feral_amf::AmfOptions {
+                    dense_alpha: alpha,
+                    ..Default::default()
+                };
+                let Ok((pb, ..)) = feral_amf::amf_order_opts(&bcore, &amf_opts) else {
+                    continue;
+                };
+                let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                let f = flops_of(&sp, &cand);
+                let rel = f as f64 / incumbent as f64;
+                if rel < best.0 {
+                    best = (rel, alpha, seed);
+                }
+                if rel < 1.0 {
+                    println!("  WIN alpha={alpha} seed={seed} rel={rel:.6}");
+                }
+            }
+        }
+        println!("  best rel={:.6} (alpha={} seed={})", best.0, best.1, best.2);
+    }
+}

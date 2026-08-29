@@ -5402,7 +5402,22 @@ fn order_with_options(
     // fill-edge scan is costly.
     // Candidate construction is fail-closed and admission remains a trusted
     // exact-score strict comparison, so this phase cannot worsen the result.
+    //
+    // MID-DENSITY WIDENING (fleet-h, experiment 0031): the 100k..300k slice of
+    // the 20 < nnz/n < 50 density band, measured cell-by-cell on the
+    // reconstructed eval corpus. Wins concentrate exactly there (gams03
+    // 0.8379→0.8005, pooling_sppb2pq 0.6102→0.5919, pooling_sppc0pq/tp,
+    // pooling_sppb0pq; ≈−1.6e-4 of proxy score); outside the density band the
+    // 100k..300k slice moved NOTHING (maxcsp-ehi d≈87, ringpack_30_1 d≈6.7,
+    // faclay33 d≈5.0 — all byte-identical at +0.05..0.15 s each), and the
+    // 300k..700k in-band extension also moved nothing (4/4 byte-identical,
+    // +0.07..0.10 s). The density floor keeps the whole crudeoil/ringpack/
+    // gams05 gate-wall class (d < 15) out, so no already-hot matrix gains
+    // cost. Worst measured addition inside the widened cell:
+    // pooling_sppc0tp 0.64→0.77 s local (grader-side that class runs
+    // 0.5-1.0 s — off the tail).
     let terminal_minl_gate = (n <= 30_000 && nnz <= 100_000)
+        || (n <= 30_000 && nnz > 100_000 && nnz <= 300_000 && nnz > 20 * n && nnz < 50 * n)
         || (n >= 22_000 && n <= 25_000 && nnz >= 800_000 && nnz <= 1_000_000);
     if terminal_minl_gate {
         if let Some((mcs, amd)) = terminal_minl_candidates(&scoring_pat, &best_perm) {

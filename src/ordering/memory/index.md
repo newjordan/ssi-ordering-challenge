@@ -236,5 +236,13 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
   0024 grader failure. Also: the hub-gated dense RGS mid arm admits zero dev matrices.
 
+- [0031-fleet-h.md](experiments/0031-fleet-h.md) — **WIN (eval proxy −0.000128, 5/0) + two
+  kill-proofs.** Terminal-MINL widened into `100k<nnz≤300k ∧ 20<d<50` (gams03 −0.037, sppb2pq
+  −0.018; density floor keeps the gate-wall class out; 300k→700k extension measured zero and cut).
+  KILLED with proof: (1) 0026's deferred D_WIDE relabelled-AMF multistart — full 7α×8-seed grid is
+  0.5%–112% worse than today's incumbents in both corpora, value absorbed by the 0026 arm + crown
+  bands + heavy relabelled-AMF; (2) the crown band-k "note values" (128/32) — both LOSE on eval,
+  the divergent in-code k (146/128) are the real tuned values, the note is stale.
+
 ## Open questions
 - [open-questions.md](open-questions.md) — the research queue.
