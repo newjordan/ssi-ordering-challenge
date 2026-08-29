@@ -5692,6 +5692,73 @@ fn probe_minl_value() {
     println!("total secs ON={t_on:.2} OFF={t_off:.2}   worst ON={w_on:.3} OFF={w_off:.3}");
 }
 
+/// Price only the descending degree-sum watcher sibling. The test-only switch
+/// removes that fourth descent task while preserving ordinary MINL, the
+/// cheapest-first watcher, ORBIT, and every downstream phase, so this is an
+/// end-to-end marginal comparison rather than an isolated microbenchmark.
+#[test]
+#[ignore]
+fn probe_reverse_watcher_value() {
+    let corpus = crate::corpus::corpus();
+    let mut log_on = [0.0f64; 3];
+    let mut log_off = [0.0f64; 3];
+    let mut cnt = [0usize; 3];
+    let mut wins: Vec<(String, usize, usize, f64, f64, f64, f64)> = Vec::new();
+    let (mut t_on, mut t_off) = (0.0f64, 0.0f64);
+    let (mut w_on, mut w_off) = (0.0f64, 0.0f64);
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+
+        REVERSE_WATCH_OFF.with(|c| c.set(false));
+        let t = Instant::now();
+        let p_on = order(pat);
+        let s_on = t.elapsed().as_secs_f64();
+        REVERSE_WATCH_OFF.with(|c| c.set(true));
+        let t = Instant::now();
+        let p_off = order(pat);
+        let s_off = t.elapsed().as_secs_f64();
+        REVERSE_WATCH_OFF.with(|c| c.set(false));
+
+        assert!(is_bijection(&p_on, n));
+        assert!(is_bijection(&p_off, n));
+        let r_on = flops_of(&sp, &p_on) as f64 / base;
+        let r_off = flops_of(&sp, &p_off) as f64 / base;
+        let b = bucket(n);
+        log_on[b] += r_on.ln();
+        log_off[b] += r_off.ln();
+        cnt[b] += 1;
+        t_on += s_on;
+        t_off += s_off;
+        w_on = w_on.max(s_on);
+        w_off = w_off.max(s_off);
+        if (r_on - r_off).abs() > 1e-12 {
+            wins.push((name.clone(), n, pat.nnz(), r_off, r_on, s_off, s_on));
+        }
+    }
+    println!("\nmatrices where reverse watcher changes the answer: {}", wins.len());
+    println!("matrix\tn\tnnz\tr_off\tr_on\ts_off\ts_on");
+    for (m, n, nnz, ro, rn, so, sn) in &wins {
+        println!("{m}\t{n}\t{nnz}\t{ro:.4}\t{rn:.4}\t{so:.3}\t{sn:.3}");
+    }
+    println!("\nscore reverse watcher ON  = {:.6}", aggregate(&log_on, &cnt));
+    println!("score reverse watcher OFF = {:.6}", aggregate(&log_off, &cnt));
+    println!("total secs ON={t_on:.2} OFF={t_off:.2}   worst ON={w_on:.3} OFF={w_off:.3}");
+}
+
 /// TOP-K TELOS SWEEP (experiment 0021, from 0020's seed-sensitivity finding).
 /// For every matrix inside the TELOS nnz gate, run the WHOLE `order()` at
 /// several extra-seed counts K (via the `TELOS_EXTRA_OVERRIDE` test hook; the

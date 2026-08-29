@@ -169,7 +169,7 @@ mod alloc_probe;
 mod custom_metrics;
 
 mod minl_watch;
-use minl_watch::watcher_minimalize;
+use minl_watch::{degree_sum_scan_order, watcher_minimalize};
 
 /// Generic quotient-graph pivot-score family (shot C) — SHIPPED, not
 /// test-gated. `order_generic` drives a parameterized MetricSpec through
@@ -1458,6 +1458,27 @@ fn minl_off() -> bool {
 #[cfg(not(test))]
 #[inline(always)]
 fn minl_off() -> bool {
+    false
+}
+
+/// TEST-ONLY A/B switch for the descending degree-sum watcher sibling. The
+/// shipped build always enables it; probes can suppress only this fourth task
+/// while leaving ordinary MINL, the cheapest-first watcher, and ORBIT intact.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REVERSE_WATCH_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[inline]
+fn reverse_watch_off() -> bool {
+    REVERSE_WATCH_OFF.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn reverse_watch_off() -> bool {
     false
 }
 
@@ -4457,6 +4478,16 @@ fn order_with_options(
             }
             Some(minl_mcs_peo(n, &adj))
         }));
+
+        // Reverse-schedule watcher: a second sibling over the exact same
+        // pre-descent completion. This is the fourth task in the existing
+        // four-worker batch; it does not raise the thread cap. Its n gate is
+        // deliberately outside the closure, before `filled_graph` can run.
+        if n <= WATCH_MINL_MAX_N && !reverse_watch_off() {
+            dtasks.push(Box::new(move || {
+                reverse_watcher_completion_candidate(scoring_pat, base_desc)
+            }));
+        }
     }
 
     // ── COMPONENT B: ORBIT-BATCHED COMPLETION-LATTICE DESCENT — see the
@@ -5220,6 +5251,76 @@ fn minl_is_clique(adj: &[Vec<u32>], c: &[u32], ops: &mut i64) -> bool {
         }
     }
     true
+}
+
+/// Run one witness-driven deletion schedule and realize the resulting chordal
+/// completion with the canonical deterministic MCS PEO. Returning `None` when
+/// no edge was removed avoids an unnecessary trusted scoring pass.
+fn watcher_realize_completion(
+    mut adj: Vec<Vec<u32>>,
+    fill: &[(u32, u32)],
+    descending: bool,
+) -> Option<Vec<usize>> {
+    let scan_order = degree_sum_scan_order(&adj, fill, descending);
+    let result = watcher_minimalize(
+        &mut adj,
+        fill,
+        &scan_order,
+        WATCH_MINL_OPS_BUDGET,
+        WATCH_MINL_MAX_COMMON,
+    );
+    if result.removed == 0 {
+        return None;
+    }
+    Some(minl_mcs_peo(adj.len(), &adj))
+}
+
+/// Build and reverse-descend the incumbent completion. The `n` gate is
+/// intentionally checked before `filled_graph`, so out-of-envelope matrices
+/// pay none of the expensive completion-construction cost for this sibling.
+fn reverse_watcher_completion_candidate(
+    pat: &ScoringPattern,
+    base_perm: &[usize],
+) -> Option<Vec<usize>> {
+    let n = pat.n;
+    if n > WATCH_MINL_MAX_N {
+        return None;
+    }
+    let (fcp, fri) = filled_graph(pat, base_perm, MINL_MAX_LNNZ)?;
+    let adj: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            fri[fcp[v] as usize..fcp[v + 1] as usize]
+                .iter()
+                .map(|&x| x as u32)
+                .collect()
+        })
+        .collect();
+    let asort: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            let mut c: Vec<u32> = pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v + 1]]
+                .iter()
+                .map(|&x| x as u32)
+                .filter(|&x| x as usize != v)
+                .collect();
+            c.sort_unstable();
+            c
+        })
+        .collect();
+    let mut fill: Vec<(u32, u32)> = Vec::new();
+    for u in 0..n {
+        for &wv in &adj[u] {
+            if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                fill.push((u as u32, wv));
+            }
+        }
+    }
+    if fill.is_empty()
+        || fill.len() > WATCH_MINL_MAX_FILL
+        || fill.len().saturating_mul(5) < fri.len()
+    {
+        return None;
+    }
+    watcher_realize_completion(adj, &fill, true)
 }
 
 /// Maximum-cardinality search on sorted adjacency (O(n+m) bucket queue,
@@ -6932,6 +7033,133 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(minfill_order(&pat), minfill_order(&pat));
+    }
+
+    #[test]
+    fn reverse_watcher_realization_is_deterministic_and_bijective() {
+        let original_edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 3),
+            (1, 4),
+            (1, 5),
+            (2, 3),
+            (2, 4),
+        ];
+        let mut filled_edges = original_edges.to_vec();
+        filled_edges.extend([(1, 2), (3, 4)]);
+        let mut adj = vec![Vec::<u32>::new(); 6];
+        for &(u, v) in &filled_edges {
+            adj[u].push(v as u32);
+            adj[v].push(u as u32);
+        }
+        for row in &mut adj {
+            row.sort_unstable();
+        }
+        let fill = [(1u32, 2u32), (3u32, 4u32)];
+
+        let first = watcher_realize_completion(adj.clone(), &fill, true).unwrap();
+        let second = watcher_realize_completion(adj, &fill, true).unwrap();
+        assert_eq!(first, second);
+        assert_bijection(&first, 6);
+    }
+
+    #[test]
+    fn descent_acceptance_rejects_invalid_and_tied_reverse_candidates() {
+        let edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 3),
+            (1, 4),
+            (1, 5),
+            (2, 3),
+            (2, 4),
+        ];
+        let pat = Pattern::from_edges(6, &edges);
+        let scoring_pat = ScoringPattern {
+            n: 6,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        };
+        let filled_edges = [
+            (0u32, 1u32),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (1, 5),
+            (2, 3),
+            (2, 4),
+            (3, 4),
+        ];
+        let mut adj = vec![Vec::<u32>::new(); 6];
+        for &(u, v) in &filled_edges {
+            adj[u as usize].push(v);
+            adj[v as usize].push(u);
+        }
+        for row in &mut adj {
+            row.sort_unstable();
+        }
+        let reverse = watcher_realize_completion(adj, &[(1, 2), (3, 4)], true).unwrap();
+        let reverse_flops = flops_of(&scoring_pat, &reverse);
+        let invalid = vec![0usize; 6];
+
+        let tasks: Vec<parallel::PermFn> = vec![
+            Box::new(move || Some(invalid.clone())),
+            Box::new({
+                let reverse = reverse.clone();
+                move || Some(reverse.clone())
+            }),
+        ];
+        let mut tied = parallel::run_perms(&tasks, &scoring_pat, 6, pat.nnz(), reverse_flops);
+        assert!(tied[0].flops.is_none(), "non-bijection reached the scorer");
+        let mut tied_flops = reverse_flops;
+        let mut tied_best: Vec<usize> = (0..6).collect();
+        let tied_before = tied_best.clone();
+        assert!(!parallel::accept(
+            &mut tied,
+            &mut tied_flops,
+            &mut tied_best,
+            |_| {}
+        ));
+        assert_eq!(tied_flops, reverse_flops);
+        assert_eq!(tied_best, tied_before, "equal-score candidate was accepted");
+
+        let mut better = parallel::run_perms(
+            &tasks,
+            &scoring_pat,
+            6,
+            pat.nnz(),
+            reverse_flops + 1,
+        );
+        let mut better_flops = reverse_flops + 1;
+        let mut better_best: Vec<usize> = (0..6).collect();
+        assert!(parallel::accept(
+            &mut better,
+            &mut better_flops,
+            &mut better_best,
+            |_| {}
+        ));
+        assert_eq!(better_flops, reverse_flops);
+        assert_eq!(better_best, reverse);
+        assert_bijection(&better_best, 6);
+    }
+
+    #[test]
+    fn reverse_watcher_test_switch_toggles() {
+        REVERSE_WATCH_OFF.with(|off| {
+            off.set(false);
+            assert!(!reverse_watch_off());
+            off.set(true);
+            assert!(reverse_watch_off());
+            off.set(false);
+        });
     }
 
     /// Best-of must never be worse than the grader's baseline AMD: on any pattern

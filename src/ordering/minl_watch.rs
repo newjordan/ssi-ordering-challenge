@@ -214,6 +214,29 @@ fn try_delete_with_witness(
     DeleteResult::Deleted
 }
 
+/// Build a deterministic fill-edge scan schedule from the starting completion.
+/// Degree sums are computed once, before any deletion. Both directions break
+/// ties by ascending fill-edge id, so the queue is reproducible across runs.
+pub(super) fn degree_sum_scan_order(
+    adj: &[Vec<u32>],
+    fill: &[(u32, u32)],
+    descending: bool,
+) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
+    ids.sort_unstable_by(|&a, &b| {
+        let (au, av) = fill[a as usize];
+        let (bu, bv) = fill[b as usize];
+        let ak = adj[au as usize].len() + adj[av as usize].len();
+        let bk = adj[bu as usize].len() + adj[bv as usize].len();
+        if descending {
+            bk.cmp(&ak).then(a.cmp(&b))
+        } else {
+            ak.cmp(&bk).then(a.cmp(&b))
+        }
+    });
+    ids
+}
+
 /// Event-driven sibling of the existing round-based MINL scan.
 ///
 /// `scan_order` must contain fill-edge ids (normally the existing
@@ -452,6 +475,86 @@ mod tests {
         assert_eq!(result.tests, 3); // blocked, support deleted, then wake/retest
         assert!(!result.exhausted);
         assert_minimal_completion(&original, &adj);
+    }
+
+    #[test]
+    fn degree_sum_ties_keep_ascending_fill_id_in_both_directions() {
+        let adj = adjacency(4, &[(0, 1), (2, 3)]);
+        let fill = [(0, 1), (2, 3)];
+        assert_eq!(degree_sum_scan_order(&adj, &fill, false), vec![0, 1]);
+        assert_eq!(degree_sum_scan_order(&adj, &fill, true), vec![0, 1]);
+    }
+
+    #[test]
+    fn degree_sum_directions_reach_distinct_deterministic_minimal_completions() {
+        // This six-vertex completion has two competing removable diagonals.
+        // Deleting either first leaves the other as the unique chord of a
+        // four-cycle, so deletion order selects one of two inclusion-minimal
+        // completions. Their initial degree sums differ: fill id 0 (1-2) has
+        // sum 9 and fill id 1 (3-4) has sum 8.
+        let original_edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (1, 3),
+            (1, 4),
+            (1, 5),
+            (2, 3),
+            (2, 4),
+        ];
+        let mut original = vec![vec![false; 6]; 6];
+        for &(u, v) in &original_edges {
+            original[u][v] = true;
+            original[v][u] = true;
+        }
+        let (adj, fill) = fill_from_order(&original, &[0, 2, 3, 4, 1, 5]);
+        assert_eq!(fill, vec![(1, 2), (3, 4)]);
+
+        let cheapest = degree_sum_scan_order(&adj, &fill, false);
+        let reverse = degree_sum_scan_order(&adj, &fill, true);
+        assert_eq!(cheapest, vec![1, 0]);
+        assert_eq!(reverse, vec![0, 1]);
+
+        let mut cheap_adj = adj.clone();
+        let cheap_result = watcher_minimalize(
+            &mut cheap_adj,
+            &fill,
+            &cheapest,
+            1_000_000,
+            usize::MAX,
+        );
+        let mut reverse_adj = adj.clone();
+        let reverse_result = watcher_minimalize(
+            &mut reverse_adj,
+            &fill,
+            &reverse,
+            1_000_000,
+            usize::MAX,
+        );
+        assert_eq!(cheap_result.removed, 1);
+        assert_eq!(reverse_result.removed, 1);
+        assert_ne!(cheap_adj, reverse_adj);
+        assert!(has_edge(&cheap_adj, 1, 2));
+        assert!(!has_edge(&cheap_adj, 3, 4));
+        assert!(!has_edge(&reverse_adj, 1, 2));
+        assert!(has_edge(&reverse_adj, 3, 4));
+        assert_minimal_completion(&original, &cheap_adj);
+        assert_minimal_completion(&original, &reverse_adj);
+
+        // Fixed degree/id tie-breaking and queue order make the reverse result
+        // byte-identical across repeated realizations.
+        let mut repeated = adj;
+        let repeated_order = degree_sum_scan_order(&repeated, &fill, true);
+        let repeated_result = watcher_minimalize(
+            &mut repeated,
+            &fill,
+            &repeated_order,
+            1_000_000,
+            usize::MAX,
+        );
+        assert_eq!(repeated_result, reverse_result);
+        assert_eq!(repeated, reverse_adj);
     }
 
     #[test]
