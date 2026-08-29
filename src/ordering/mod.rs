@@ -913,6 +913,7 @@ fn telos_ms_count(cap: usize, n: usize, nnz: usize, max_deg: usize) -> usize {
     (TELOS_MS_WORK_BUDGET / est)
         .clamp(1, TELOS_MS_MAX_DESCENTS)
         .min(cap)
+        .saturating_sub(1)
 }
 
 const PAIR_DESCENT_MIN_N: usize = 1_000;
@@ -1773,13 +1774,14 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
     // here would make the regime a no-op. Its own `clamp(1, 800)` is the bound instead,
     // and it is sized against measured time rather than inherited from the cap.
     if restarts == 0 {
-        return heavy_multi.max(mid_multi).max(small_multi);
+        return heavy_multi.max(mid_multi).max(small_multi).saturating_sub(1);
     }
     restarts
         .max(heavy_multi)
         .max(mid_multi)
         .min(cap)
         .max(small_multi)
+        .saturating_sub(1)
 }
 
 /// STRIP TRANSFORM envelope. Delete the k densest (or highest-L-column-count)
@@ -2516,10 +2518,19 @@ fn order_with_options(
         // heavies. See memory/experiments/0011 (RCA session).
         const D_MAX_NNZ: usize = 400_000;
         if nnz < D_MAX_NNZ {
-            if nnz >= 200_000 && medium_metric_d25 {
-                // AMF-2.5 is identical to the paid AMF-5 anchor here.
-                let spec = &metric_sweep::EXTRA_METRICS[1];
-                consider!(move || metric_sweep::order_generic(&core, 10.0, true, spec));
+            if nnz >= 200_000 && medium_metric_d25 && nnz > 20 * n && nnz <= 50 * n {
+                if let Some(spec) = metric_sweep::EXTRA_METRICS
+                    .iter()
+                    .find(|s| s.name == "extra_deg2_div_nv_wf05")
+                {
+                    consider!(move || metric_sweep::order_generic(&core, 2.5, true, spec));
+                } else {
+                    let opts_25 = feral_amf::AmfOptions {
+                        dense_alpha: 2.5,
+                        ..Default::default()
+                    };
+                    consider!(move || feral_amf::amf_order_opts(&core, &opts_25).map(|(p, ..)| p));
+                }
             } else {
                 let opts_25 = feral_amf::AmfOptions {
                     dense_alpha: 2.5,
