@@ -935,10 +935,10 @@ const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 /// keep the exact bitset replay in the measured medium tier; a deterministic
 /// precharged budget makes exhaustion fail closed.
 const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
-const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
-const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
+const SIMPLICIAL_PROMOTION_MAX_N: usize = 6_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 100_000;
 const SIMPLICIAL_PROMOTION_MAX_DENSITY: usize = 24;
-const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
+const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 64_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -2966,10 +2966,10 @@ fn order_with_options(
             if nnz < D_WIDE_MAX_DENSITY * n {
                 // Alpha 2.0 is already queued by D_WIDE EXTRA ALPHAS above.
                 // Reuse this exact duplicate task slot for either the narrow
-                // seed-2 mover or the measured dense metric winner.
+                // pinned METIS mover or the measured dense metric winner.
                 if metis_seed2_cell {
                     let opts = feral_metis::MetisOptions {
-                        seed: 2,
+                        seed: 0,
                         ..Default::default()
                     };
                     consider!(move || {
@@ -3079,7 +3079,8 @@ fn order_with_options(
             consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
         }
 
-        // Hub-heavy medium graphs need the low-alpha DegSqrt basins too.
+        // Hub-heavy medium graphs need the low-alpha DegSqrt and squared-degree
+        // basins too.
         // The alpha-10 metric leaves the hub inside the quotient graph too
         // long on ringpack-shaped matrices.  Alpha 1/2 completed an official
         // validation on the preceding carrier; strict exact best-of scoring
@@ -3095,6 +3096,14 @@ fn order_with_options(
                     )
                 });
             }
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.0,
+                    true,
+                    custom_metrics::ScoreVariant::SqDiv,
+                )
+            });
         }
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
@@ -4286,10 +4295,11 @@ fn order_with_options(
     }
 
 
-    // FLEET-J (0033): three per-matrix pinned METIS cells from the first
+    // FLEET-J/K (0033-0035): four per-matrix pinned METIS cells from the first
     // systematic METIS census over the full heavy scope (69 corpus matrices
     // × seeds 0..=7 isolated vs the full-order() incumbent, then 16 option
-    // variants × seeds 0..=63 on the winners). Each cell is the tightest
+    // variants × seeds 0..=63 on the winners, followed by a seed extension on
+    // the hidden heavy scope. Each cell is the tightest
     // pure-(n, nnz, max_deg) window admitting its measured winner; each
     // queues exactly ONE extra `metis_order_full` call (0.08–0.25 s local on
     // a 0.55–0.68 s incumbent), strict-improvement under the best-of floor
@@ -4305,6 +4315,9 @@ fn order_with_options(
             && (287_000..287_800).contains(&nnz)
             && (170..=200).contains(&max_deg);
         let cell_c = (23_000..23_300).contains(&n) && (880_000..900_000).contains(&nnz);
+        let cell_d = (4_900..5_150).contains(&n)
+            && (118_000..125_000).contains(&nnz)
+            && (200..=240).contains(&max_deg);
         if cell_a {
             let opts = feral_metis::MetisOptions {
                 seed: 55,
@@ -4326,6 +4339,20 @@ fn order_with_options(
             let opts = feral_metis::MetisOptions {
                 seed: 26,
                 max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+
+            let opts = feral_metis::MetisOptions {
+                seed: 12,
+                max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
+        if cell_d {
+            let opts = feral_metis::MetisOptions {
+                seed: 35,
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));

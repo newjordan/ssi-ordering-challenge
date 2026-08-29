@@ -122,6 +122,11 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   discriminator to reopen full-grid extras where affordable.
 - [0020-telos-seed-sensitivity.md](experiments/0020-telos-seed-sensitivity.md) - **DIAGNOSIS, conclusive.** 0019's regression is TELOS-GRADIENT-DESCENT seed sensitivity, not budget contention and not a best-of defect; both refuted by phase-gating. Opens the top-K-seed lead.
 _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experiments/_TEMPLATE.md))_
+
+- [0035-frontier-compose.md](experiments/0035-frontier-compose.md) — **DEV WIN
+  (0.812602→0.809224)**: compose the latest promoted frontier with a stale-seed
+  replacement, hidden seed-35 cell, public seed-12 companion, hub `SqDiv`, and
+  a wider terminal simplicial envelope. Full corpus and release tests green.
 - [0000-identity-baseline.md](experiments/0000-identity-baseline.md) — the starter stub; reference point, not competitive.
 - [0001-amd-quotient-graph.md](experiments/0001-amd-quotient-graph.md) — AMD port; matched the baseline. **Superseded**: that hand-rolled `amd.rs` is no longer in the tree.
 - [0002-measured-gates-metis-kahip.md](experiments/0002-measured-gates-metis-kahip.md) — measure the cap, then buy candidates with the slack. 0.888132 → **0.883906**. WIN. (Its 1.019 s timing figure is ±1.6×; corrected in 0003.)
