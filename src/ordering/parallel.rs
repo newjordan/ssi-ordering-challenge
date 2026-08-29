@@ -49,6 +49,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 use super::scoring_ws::ScoreWorkspace;
 use super::{is_bijection, ScoringPattern};
@@ -208,6 +209,26 @@ fn run_generic(
     // Monotone shared upper bound on the final minimum. Only ever decreases.
     let gmin = AtomicU64::new(incumbent);
 
+    // Duplicate-flops memo. Portfolio arms frequently produce the same
+    // permutation, so avoid repeating the symbolic score. A double 64-bit
+    // fingerprint keeps the shared table compact on giant matrices.
+    let fmemo: Mutex<std::collections::HashMap<u128, u64>> =
+        Mutex::new(std::collections::HashMap::new());
+    let perm_hash = |perm: &[usize]| -> u128 {
+        let mut a: u64 = 0x243F_6A88_85A3_08D3;
+        let mut b: u64 = 0x1319_8A2E_0370_7344;
+        for (i, &v) in perm.iter().enumerate() {
+            let x = (v as u64).wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut z = x.wrapping_add(a).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z ^= z >> 31;
+            a = a.rotate_left(23) ^ z;
+            let mut y = x.wrapping_add(b).wrapping_mul(0x94D0_49BB_1331_11EB);
+            y ^= y >> 29;
+            b = b.rotate_left(17) ^ y;
+        }
+        ((a as u128) << 64) | b as u128
+    };
+
     let eval = |i: usize, ws: &mut Option<ScoreWorkspace>| -> CandOut {
         let Some(perm) = produce(i) else {
             return CandOut::default();
@@ -215,8 +236,19 @@ fn run_generic(
         if !is_bijection(&perm, n) {
             return CandOut::default();
         }
-        let w = ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
-        let f = w.flops(sp, &perm);
+        let h = perm_hash(&perm);
+        let cached = fmemo.lock().ok().and_then(|m| m.get(&h).copied());
+        let f = match cached {
+            Some(f) => f,
+            None => {
+                let w = ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
+                let f = w.flops(sp, &perm);
+                if let Ok(mut m) = fmemo.lock() {
+                    m.insert(h, f);
+                }
+                f
+            }
+        };
         let prev = gmin.fetch_min(f, AtomicOrdering::Relaxed);
         CandOut {
             flops: Some(f),
