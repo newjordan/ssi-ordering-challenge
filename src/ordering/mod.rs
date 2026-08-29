@@ -1624,7 +1624,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
         && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
         && max_deg <= n / 50
     {
-        (1_500_000 / nnz).clamp(1, 24)
+        (200_000 / nnz).clamp(1, 3).min((1_500_000 / nnz).clamp(1, 24))
     } else {
         0
     };
@@ -4904,19 +4904,7 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        // Third round re-restored (it was promoted in 0d475d2a and then wiped
-        // by a later graft whose base predated it), extended to the sparse
-        // hub-free sub-10k class per 0027: in both regimes the extra round
-        // runs only when round 2 strictly improved (the loop breaks on
-        // non-improvement below).
-        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
-            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
-        {
-            3
-        } else {
-            2
-        };
-        for round in 0..rgsub_rounds {
+        for round in 0..2 {
             let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
