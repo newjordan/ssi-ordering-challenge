@@ -1333,14 +1333,15 @@ pub(crate) fn subtree_refine(
         }
     }
 
-    // ── pick disjoint blocks, topmost-eligible first ────────────────────────
-    // Descending position order visits ancestors before descendants, so the
-    // first eligible node on any root-to-leaf path wins and everything below it
-    // is marked covered. Deterministic: a plain descending scan, no tie-breaks.
+    // ── pick candidate subtree blocks ───────────────────────────────────────
+    // The shipped policy visits ancestors before descendants and keeps the
+    // first eligible node on each root-to-leaf path. The nested-ranked research
+    // policy instead retains every eligible subtree here, then greedily packs
+    // the highest-ranked non-overlapping intervals below.
     let mut covered = vec![false; n];
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     for j in (0..n).rev() {
-        if covered[j] {
+        if !cfg.rank_nested_blocks && covered[j] {
             continue;
         }
         let sz = size[j] as usize;
@@ -1348,8 +1349,10 @@ pub(crate) fn subtree_refine(
             continue;
         }
         let a = j + 1 - sz;
-        for c in covered.iter_mut().take(j + 1).skip(a) {
-            *c = true;
+        if !cfg.rank_nested_blocks {
+            for c in covered.iter_mut().take(j + 1).skip(a) {
+                *c = true;
+            }
         }
         blocks.push((a, j));
         if !cfg.rank_blocks && blocks.len() >= cfg.max_blocks {
@@ -1376,12 +1379,28 @@ pub(crate) fn subtree_refine(
         } else {
             cfg.max_blocks
         };
-        blocks.extend(
-            ranked
-                .into_iter()
-                .take(ranked_limit)
-                .map(|(a, b, _)| (a, b)),
-        );
+        if cfg.rank_nested_blocks {
+            covered.fill(false);
+            for (a, b, _) in ranked {
+                if covered[a..=b].iter().any(|&c| c) {
+                    continue;
+                }
+                for c in covered.iter_mut().take(b + 1).skip(a) {
+                    *c = true;
+                }
+                blocks.push((a, b));
+                if blocks.len() >= ranked_limit {
+                    break;
+                }
+            }
+        } else {
+            blocks.extend(
+                ranked
+                    .into_iter()
+                    .take(ranked_limit)
+                    .map(|(a, b, _)| (a, b)),
+            );
+        }
     }
     if blocks.is_empty() {
         return 0;
@@ -1566,6 +1585,9 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Rank every eligible nested subtree before greedily packing disjoint
+    /// intervals, rather than ranking only topmost eligible subtrees.
+    pub(crate) rank_nested_blocks: bool,
     /// Zero-based outer RGSUB round, used only to diversify an equal-work seed.
     pub(crate) round: usize,
 }

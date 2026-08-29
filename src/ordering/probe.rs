@@ -7315,3 +7315,218 @@ fn probe_strip_v2() {
 fn core_dummy_alpha<'a>(c: &'a feral_ordering_core::CscPattern<'a>) -> feral_ordering_core::CscPattern<'a> {
     c.clone()
 }
+
+/// Compare macro-RGSUB block scales and nested-subtree ranking as a strict
+/// terminal complement to the complete shipped portfolio.
+#[test]
+#[ignore]
+fn probe_macro_rgsub_census() {
+    let corpus = crate::corpus::corpus();
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let variants = [
+        (
+            "nested_701_2400",
+            rgreedy::SubCfg {
+                min_s: 701,
+                max_s: 2_400,
+                max_sub: 6_000,
+                max_blocks: 32,
+                budget: 30_000_000,
+                streams: 2,
+                rank_blocks: true,
+                rank_nested_blocks: true,
+                round: 0,
+            },
+        ),
+        (
+            "maximal_2401_5000",
+            rgreedy::SubCfg {
+                min_s: 2_401,
+                max_s: 5_000,
+                max_sub: 10_000,
+                max_blocks: 16,
+                budget: 40_000_000,
+                streams: 2,
+                rank_blocks: true,
+                rank_nested_blocks: false,
+                round: 0,
+            },
+        ),
+        (
+            "nested_2401_5000",
+            rgreedy::SubCfg {
+                min_s: 2_401,
+                max_s: 5_000,
+                max_sub: 10_000,
+                max_blocks: 16,
+                budget: 40_000_000,
+                streams: 2,
+                rank_blocks: true,
+                rank_nested_blocks: true,
+                round: 0,
+            },
+        ),
+    ];
+
+    println!("MACRO\tmatrix\tn\tnnz\tvariant\thits\tsecs\tbefore\tafter\trel");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        let nnz = pat.nnz();
+        let max_deg = pat
+            .col_ptr
+            .windows(2)
+            .map(|p| p[1] - p[0])
+            .max()
+            .unwrap_or(0);
+        if n < 10_000 || nnz > 400_000 || nnz > n.saturating_mul(10) || max_deg > 200 {
+            continue;
+        }
+        if let Some(list) = &only {
+            let key = format!("{n}:{nnz}");
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+
+        let scoring_pat = scoring_pattern(pat);
+        let incumbent = order(pat);
+        let incumbent_flops = flops_of(&scoring_pat, &incumbent);
+        for &(label, cfg) in &variants {
+            let started = Instant::now();
+            let permuted = permute_pattern(&scoring_pat, &incumbent);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            if post.len() != n {
+                continue;
+            }
+            let mut post_of = vec![0usize; n];
+            for (k, &p) in post.iter().enumerate() {
+                post_of[p] = k;
+            }
+            let counts = column_counts_gnp(&permuted, &etree);
+            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+            let parent_post: Vec<i32> = post
+                .iter()
+                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                .collect();
+            let mut work: Vec<usize> = post.iter().map(|&p| incumbent[p]).collect();
+            let hits = rgreedy::subtree_refine(
+                n,
+                &pat.col_ptr,
+                &pat.row_idx,
+                &mut work,
+                &counts_post,
+                &parent_post,
+                cfg,
+            );
+            let candidate_flops = if hits > 0 && is_bijection(&work, n) {
+                flops_of(&scoring_pat, &work)
+            } else {
+                incumbent_flops
+            };
+            println!(
+                "MACRO\t{name}\t{n}\t{nnz}\t{label}\t{hits}\t{:.4}\t{incumbent_flops}\t{candidate_flops}\t{:.8}",
+                started.elapsed().as_secs_f64(),
+                candidate_flops as f64 / incumbent_flops as f64,
+            );
+        }
+
+        let started = Instant::now();
+        let mut combo = incumbent.clone();
+        let mut combo_flops = incumbent_flops;
+        let mut combo_hits = 0usize;
+        for &(_, cfg) in &variants[..2] {
+            let permuted = permute_pattern(&scoring_pat, &combo);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            if post.len() != n {
+                break;
+            }
+            let mut post_of = vec![0usize; n];
+            for (k, &p) in post.iter().enumerate() {
+                post_of[p] = k;
+            }
+            let counts = column_counts_gnp(&permuted, &etree);
+            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+            let parent_post: Vec<i32> = post
+                .iter()
+                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                .collect();
+            let mut work: Vec<usize> = post.iter().map(|&p| combo[p]).collect();
+            let hits = rgreedy::subtree_refine(
+                n,
+                &pat.col_ptr,
+                &pat.row_idx,
+                &mut work,
+                &counts_post,
+                &parent_post,
+                cfg,
+            );
+            if hits > 0 && is_bijection(&work, n) {
+                let f = flops_of(&scoring_pat, &work);
+                if f < combo_flops {
+                    combo = work;
+                    combo_flops = f;
+                    combo_hits += hits;
+                }
+            }
+        }
+        println!(
+            "MACRO\t{name}\t{n}\t{nnz}\tcombo_nested701_maximal2401\t{combo_hits}\t{:.4}\t{incumbent_flops}\t{combo_flops}\t{:.8}",
+            started.elapsed().as_secs_f64(),
+            combo_flops as f64 / incumbent_flops as f64,
+        );
+
+        let started = Instant::now();
+        let mut combo = incumbent.clone();
+        let mut combo_flops = incumbent_flops;
+        let mut combo_hits = 0usize;
+        for &variant_index in &[1usize, 0] {
+            let cfg = variants[variant_index].1;
+            let permuted = permute_pattern(&scoring_pat, &combo);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            if post.len() != n {
+                break;
+            }
+            let mut post_of = vec![0usize; n];
+            for (k, &p) in post.iter().enumerate() {
+                post_of[p] = k;
+            }
+            let counts = column_counts_gnp(&permuted, &etree);
+            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+            let parent_post: Vec<i32> = post
+                .iter()
+                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                .collect();
+            let mut work: Vec<usize> = post.iter().map(|&p| combo[p]).collect();
+            let hits = rgreedy::subtree_refine(
+                n,
+                &pat.col_ptr,
+                &pat.row_idx,
+                &mut work,
+                &counts_post,
+                &parent_post,
+                cfg,
+            );
+            if hits > 0 && is_bijection(&work, n) {
+                let f = flops_of(&scoring_pat, &work);
+                if f < combo_flops {
+                    combo = work;
+                    combo_flops = f;
+                    combo_hits += hits;
+                }
+            }
+        }
+        println!(
+            "MACRO\t{name}\t{n}\t{nnz}\tcombo_maximal2401_nested701\t{combo_hits}\t{:.4}\t{incumbent_flops}\t{combo_flops}\t{:.8}",
+            started.elapsed().as_secs_f64(),
+            combo_flops as f64 / incumbent_flops as f64,
+        );
+    }
+}

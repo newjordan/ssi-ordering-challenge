@@ -5684,6 +5684,7 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
+        rank_nested_blocks: false,
         round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
@@ -5759,62 +5760,57 @@ fn order_with_options(
                 break;
             }
         }
-    }
 
-    // MACRO-RGSUB. The promoted RGSUB search stops at subtree size 700. Search
-    // the immediately larger, disjoint 701..2400 band on sparse large
-    // matrices, ranked by exact incumbent contribution. On the grader-exact
-    // 500-row corpus this lowers the score 0.791285 -> 0.789898; the full
-    // order() remains below 1.13 s on the slower Nimbus timing host and below
-    // 0.69 s on the local critical-row replay. The deterministic word-op
-    // budget fails closed, and the trusted whole-matrix scorer below remains
-    // the final admission oracle.
-    const MACRO_RGSUB_CFG: rgreedy::SubCfg = rgreedy::SubCfg {
-        min_s: 701,
-        max_s: 2_400,
-        max_sub: 6_000,
-        max_blocks: 32,
-        budget: 30_000_000,
-        streams: 2,
-        rank_blocks: true,
-        round: 0,
-    };
-    if rgreedy_enabled
-        && n >= 10_000
-        && nnz > 0
-        && nnz <= 400_000
-        && nnz <= n.saturating_mul(10)
-        && max_deg <= 200
-    {
-        let permuted = permute_pattern(&scoring_pat, &best_perm);
-        let etree = EliminationTree::from_pattern(&permuted);
-        let post = etree.postorder();
-        if post.len() == n {
-            let mut post_of = vec![0usize; n];
-            for (k, &p) in post.iter().enumerate() {
-                post_of[p] = k;
-            }
-            let counts = column_counts_gnp(&permuted, &etree);
-            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
-            let parent_post: Vec<i32> = post
-                .iter()
-                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
-                .collect();
-            let mut work: Vec<usize> = post.iter().map(|&p| best_perm[p]).collect();
-            let hits = rgreedy::subtree_refine(
-                n,
-                &pattern.col_ptr,
-                &pattern.row_idx,
-                &mut work,
-                &counts_post,
-                &parent_post,
-                MACRO_RGSUB_CFG,
-            );
-            if hits > 0 && is_bijection(&work, n) {
-                let f = ws.flops(&scoring_pat, &work);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = work;
+        // MACRO-RGSUB: the ordinary rounds stop at 700 vertices, leaving
+        // coherent sparse-large etree subtrees immediately above that scale
+        // untouched. Search a ranked set of disjoint 701..2400-vertex blocks
+        // with deeper exact-game trajectories, then retain the result only
+        // after trusted whole-matrix rescoring.
+        if n >= 10_000
+            && nnz <= 400_000
+            && nnz <= n.saturating_mul(10)
+            && max_deg <= 200
+        {
+            let permuted = permute_pattern(&scoring_pat, &best_perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            if post.len() == n {
+                let mut post_of = vec![0usize; n];
+                for (k, &p) in post.iter().enumerate() {
+                    post_of[p] = k;
+                }
+                let counts = column_counts_gnp(&permuted, &etree);
+                let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+                let parent_post: Vec<i32> = post
+                    .iter()
+                    .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                    .collect();
+                let mut work: Vec<usize> = post.iter().map(|&p| best_perm[p]).collect();
+                let hits = rgreedy::subtree_refine(
+                    n,
+                    &pattern.col_ptr,
+                    &pattern.row_idx,
+                    &mut work,
+                    &counts_post,
+                    &parent_post,
+                    rgreedy::SubCfg {
+                        min_s: 701,
+                        max_s: 2_400,
+                        max_sub: 6_000,
+                        max_blocks: 32,
+                        budget: 30_000_000,
+                        streams: 2,
+                        rank_blocks: true,
+                        rank_nested_blocks: false,
+                        round: 0,
+                    },
+                );
+                if hits > 0 && is_bijection(&work, n) {
+                    let f = ws.flops(&scoring_pat, &work);
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = work;
+                    }
                 }
             }
         }
@@ -6161,6 +6157,77 @@ fn order_with_options(
                 }
             }
         }
+    }
+
+    // DEEP MACRO-RGSUB COMPLEMENT. The first macro pass searches only maximal
+    // 701..2400 subtrees before the later terminal phases. Rebuild the final
+    // incumbent's etree, search the next 2401..5000 scale first, then pack
+    // high-value nested 701..2400 subtrees that the maximal-only selector
+    // suppresses. The order is measured and load-bearing: large-first preserves
+    // basins that small-first can erase. Every pass remains a strict trusted
+    // whole-matrix improvement.
+    if n >= 10_000
+        && nnz <= 400_000
+        && nnz <= n.saturating_mul(10)
+        && max_deg <= 200
+    {
+        let mut run_terminal_macro = |cfg: rgreedy::SubCfg| {
+            let permuted = permute_pattern(&scoring_pat, &best_perm);
+            let etree = EliminationTree::from_pattern(&permuted);
+            let post = etree.postorder();
+            if post.len() != n {
+                return;
+            }
+            let mut post_of = vec![0usize; n];
+            for (k, &p) in post.iter().enumerate() {
+                post_of[p] = k;
+            }
+            let counts = column_counts_gnp(&permuted, &etree);
+            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+            let parent_post: Vec<i32> = post
+                .iter()
+                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                .collect();
+            let mut work: Vec<usize> = post.iter().map(|&p| best_perm[p]).collect();
+            let hits = rgreedy::subtree_refine(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &mut work,
+                &counts_post,
+                &parent_post,
+                cfg,
+            );
+            if hits > 0 && is_bijection(&work, n) {
+                let f = ws.flops(&scoring_pat, &work);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = work;
+                }
+            }
+        };
+        run_terminal_macro(rgreedy::SubCfg {
+            min_s: 2_401,
+            max_s: 5_000,
+            max_sub: 10_000,
+            max_blocks: 16,
+            budget: 40_000_000,
+            streams: 2,
+            rank_blocks: true,
+            rank_nested_blocks: false,
+            round: 0,
+        });
+        run_terminal_macro(rgreedy::SubCfg {
+            min_s: 701,
+            max_s: 2_400,
+            max_sub: 6_000,
+            max_blocks: 32,
+            budget: 30_000_000,
+            streams: 2,
+            rank_blocks: true,
+            rank_nested_blocks: true,
+            round: 0,
+        });
     }
 
     let _ = best_flops;
