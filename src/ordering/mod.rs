@@ -2447,6 +2447,20 @@ fn order_with_options(
         };
     }
 
+    // Ultra-dense giants above the normal selector envelopes have no useful
+    // non-anchor candidate. A reconstructed-corpus sweep found complementary
+    // AMF(0.75) and RCM wins in this narrow density class.
+    if nnz > 1_200_000 && nnz >= 100usize.saturating_mul(n) {
+        let opts = feral_amf::AmfOptions {
+            dense_alpha: 0.75,
+            ..Default::default()
+        };
+        consider!(move || feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p));
+        consider!(move || {
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
+        });
+    }
+
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
     // heavy orderings as the prior safe run.)
@@ -2578,6 +2592,56 @@ fn order_with_options(
                 };
                 consider!(move || feral_amf::amf_order_opts(&core, &opts_a).map(|(p, ..)| p));
             }
+        }
+
+        // Reconstructed-evaluation coverage gaps outside the existing metric
+        // gates. Each cell has a measured winner and excludes the expensive
+        // dense members that motivated the historical dead-window cuts.
+        if (200_000..=500_000).contains(&nnz) && nnz <= 4usize.saturating_mul(n) {
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.5,
+                    false,
+                    custom_metrics::ScoreVariant::DegDivNvSqrtWf,
+                )
+            });
+        }
+        if (400_000..=500_000).contains(&nnz)
+            && nnz > 8usize.saturating_mul(n)
+            && nnz <= 13usize.saturating_mul(n)
+        {
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.5,
+                    false,
+                    custom_metrics::ScoreVariant::DegDivNvDegme,
+                )
+            });
+        }
+        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
+            && nnz > D_WIDE_MIN_DENSITY * n
+            && nnz < D_WIDE_MAX_DENSITY * n
+        {
+            let opts = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 0.75,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &opts).map(|(p, ..)| p));
+        }
+        if (150_000..200_000).contains(&nnz)
+            && nnz > 5usize.saturating_mul(n)
+            && nnz < 10usize.saturating_mul(n)
+        {
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    0.75,
+                    false,
+                    custom_metrics::ScoreVariant::DegP125,
+                )
+            });
         }
 
         // Keep only the measured truck winner from the dense extension.
@@ -2916,6 +2980,22 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        }
+
+        // Low dense-row thresholds expose a distinct quotient-graph basin on
+        // hub-heavy medium graphs. The complement gate excludes every known
+        // cap-tail matrix while preserving the measured ringpack-family wins.
+        if !medium_metric_hub_safe {
+            for alpha in [1.0f64, 2.0] {
+                consider!(move || {
+                    custom_metrics::order_variant(
+                        &core,
+                        alpha,
+                        true,
+                        custom_metrics::ScoreVariant::DegSqrt,
+                    )
+                });
+            }
         }
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still

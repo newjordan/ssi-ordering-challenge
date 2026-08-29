@@ -108,6 +108,10 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+- [0031-hub-superset-composition.md](experiments/0031-hub-superset-composition.md) — **SUBMISSION
+  CARRIER, dev 0.813798→0.812112**: composes the twice-officially-confirmed
+  hub-low-alpha DegSqrt arm with five reconstructed-superset coverage gaps on
+  promoted `9001339`; all 300 rows and complete release/security/cap suites pass.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:
