@@ -790,3 +790,134 @@ mod tests {
         assert_bijection(&a, base + 5);
     }
 }
+
+#[cfg(test)]
+pub(crate) struct BiconnDecomp {
+    pub(crate) comps: Vec<Vec<(u32, u32)>>,
+    pub(crate) owned: Vec<Vec<u32>>,
+    pub(crate) block_order: Vec<usize>,
+    pub(crate) isolated: Vec<u32>,
+}
+
+#[cfg(test)]
+pub(crate) fn decompose(pattern: &Pattern) -> BiconnDecomp {
+    let n = pattern.n;
+    if n == 0 {
+        return BiconnDecomp {
+            comps: Vec::new(),
+            owned: Vec::new(),
+            block_order: Vec::new(),
+            isolated: Vec::new(),
+        };
+    }
+    let adj = build_adj(pattern);
+    let comps = biconnected_components(&adj);
+    let nc = comps.len();
+
+    let mut mark = vec![u32::MAX; n];
+    let mut comp_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut comp_verts: Vec<Vec<u32>> = Vec::with_capacity(nc);
+    for (c, edges) in comps.iter().enumerate() {
+        let mut verts = Vec::new();
+        for &(u, v) in edges {
+            for x in [u, v] {
+                let xu = x as usize;
+                if mark[xu] != c as u32 {
+                    mark[xu] = c as u32;
+                    verts.push(x);
+                    comp_of[xu].push(c as u32);
+                }
+            }
+        }
+        comp_verts.push(verts);
+    }
+
+    const NONE: u32 = u32::MAX;
+    let mut parent_ap = vec![NONE; nc];
+    let mut depth = vec![0u32; nc];
+    let mut visited = vec![false; nc];
+    {
+        let mut tree_blocks: Vec<u32> = Vec::new();
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        for start in 0..nc {
+            if visited[start] {
+                continue;
+            }
+            tree_blocks.clear();
+            visited[start] = true;
+            queue.push_back(start as u32);
+            while let Some(b) = queue.pop_front() {
+                tree_blocks.push(b);
+                for &v in &comp_verts[b as usize] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        if !visited[cb as usize] {
+                            visited[cb as usize] = true;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+            let mut root = tree_blocks[0];
+            for &b in &tree_blocks[1..] {
+                let (bs, rs) = (comp_verts[b as usize].len(), comp_verts[root as usize].len());
+                if bs > rs || (bs == rs && b < root) {
+                    root = b;
+                }
+            }
+            for &b in &tree_blocks {
+                depth[b as usize] = u32::MAX;
+            }
+            depth[root as usize] = 0;
+            parent_ap[root as usize] = NONE;
+            queue.push_back(root);
+            while let Some(b) = queue.pop_front() {
+                let bu = b as usize;
+                for &v in &comp_verts[bu] {
+                    if comp_of[v as usize].len() < 2 {
+                        continue;
+                    }
+                    for &cb in &comp_of[v as usize] {
+                        let cu = cb as usize;
+                        if depth[cu] == u32::MAX {
+                            depth[cu] = depth[bu] + 1;
+                            parent_ap[cu] = v;
+                            queue.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut block_order: Vec<usize> = (0..nc).collect();
+    block_order.sort_unstable_by(|&a, &b| depth[b].cmp(&depth[a]).then(a.cmp(&b)));
+
+    let mut isolated = Vec::new();
+    for v in 0..n {
+        if comp_of[v].is_empty() {
+            isolated.push(v as u32);
+        }
+    }
+
+    let mut owned: Vec<Vec<u32>> = Vec::with_capacity(nc);
+    for b in 0..nc {
+        let pa = parent_ap[b];
+        let mut o: Vec<u32> = comp_verts[b]
+            .iter()
+            .copied()
+            .filter(|&v| v != pa)
+            .collect();
+        o.sort_unstable();
+        owned.push(o);
+    }
+
+    BiconnDecomp {
+        comps,
+        owned,
+        block_order,
+        isolated,
+    }
+}

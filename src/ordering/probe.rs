@@ -7315,3 +7315,2508 @@ fn probe_strip_v2() {
 fn core_dummy_alpha<'a>(c: &'a feral_ordering_core::CscPattern<'a>) -> feral_ordering_core::CscPattern<'a> {
     c.clone()
 }
+
+/// FLEET-K — envelope census for the two newest frontier mechanisms plus the
+/// pinned metis-seed cells (probe_fleet_h's corpus pattern: loads
+/// `$SSI_CORPUS_FILE` itself; reconstructed rows carry blank names, keyed
+/// `n:nnz`).
+///
+/// Sections (each a TSV, one row per candidate measured against the FULL
+/// `order()` incumbent of the same matrix):
+///   * `SIMP` — simplicial-promotion envelope. Cells: `cur` (the shipped gate
+///     n∈[1k,4k] ∧ nnz≤60k ∧ d≤24 — measures second-pass/budget headroom on
+///     the already-promoted output), `n_ext` (4k,6k], `nnz_ext` (60k,100k],
+///     `dens_ext` d∈(24,32]. For every cell member the promotion runs from
+///     `order()`'s final output at budgets 32M and 64M; budget exhaustion
+///     inside `rgreedy::simplicial_promotion` returns None (whole candidate
+///     dropped), so a 64M-only success is exactly the budget-raise win.
+///   * `HUB` — hub-heavy medium class (n<60k ∧ nnz<400k ∧ max_deg>16 ∧
+///     max_deg²>4n, i.e. `!medium_metric_hub_safe`): DegSqrt α∈{0.5,4} and
+///     SqDiv α∈{0.5,1,2,4} — the unmeasured siblings of abbdacf's α1/α2
+///     DegSqrt arm.
+///   * `HUBX` — the same metric family OUTSIDE the medium window
+///     (n≥60k ∨ nnz≥400k, still hub-unsafe, nnz<1.2M to bound probe cost):
+///     DegSqrt α∈{0.5,1,2,4}, individually timed.
+///   * `SEED` — the two pinned metis_seed cells only (seed5: n∈[8000,8500] ∧
+///     nnz∈[267k,269k) ∧ deg∈[250,280] or n∈[9500,10000) ∧ nnz∈[287k,289k) ∧
+///     deg∈[170,200]; seed2: n∈[14000,14200) ∧ nnz∈[470k,485k)): the
+///     remaining seeds {0,1,3,4,6,7} plus the pinned seed as sanity.
+#[test]
+#[ignore]
+fn probe_fleet_k() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok()
+    );
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let max_deg_sq = (max_deg as u128) * (max_deg as u128);
+        let hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
+
+        let simp_cell: Option<&str> = if (1_000..=4_000).contains(&n) && nnz <= 24 * n {
+            if nnz <= 60_000 {
+                Some("cur")
+            } else if nnz <= 100_000 {
+                Some("nnz_ext")
+            } else {
+                None
+            }
+        } else if (4_001..=6_000).contains(&n) && nnz <= 60_000 && nnz <= 24 * n {
+            Some("n_ext")
+        } else if (4_001..=6_000).contains(&n)
+            && (60_001..=100_000).contains(&nnz)
+            && nnz <= 24 * n
+        {
+            Some("corner")
+        } else if (1_000..=4_000).contains(&n)
+            && nnz <= 60_000
+            && nnz > 24 * n
+            && nnz <= 32 * n
+        {
+            Some("dens_ext")
+        } else {
+            None
+        };
+        // `$SSI_PROBE_SECT=SIMP` (etc.) restricts to one section for fast
+        // re-census of a single mechanism.
+        let sect_only = std::env::var("SSI_PROBE_SECT").ok();
+        let want = |s: &str| sect_only.as_deref().is_none_or(|w| w == s);
+
+        let hub_med = n < 60_000 && nnz < 400_000 && !hub_safe && want("HUB");
+        let hub_ext =
+            (n >= 60_000 || nnz >= 400_000) && !hub_safe && nnz < 1_200_000 && want("HUBX");
+
+        let seed5_cell = ((8_000..=8_500).contains(&n)
+            && (267_000..269_000).contains(&nnz)
+            && (250..=280).contains(&max_deg))
+            || ((9_500..10_000).contains(&n)
+                && (287_000..289_000).contains(&nnz)
+                && (170..=200).contains(&max_deg));
+        let seed2_cell = (14_000..14_200).contains(&n) && (470_000..485_000).contains(&nnz);
+
+        let simp_cell = simp_cell.filter(|_| want("SIMP"));
+        let seed5_cell = seed5_cell && want("SEED");
+        let seed2_cell = seed2_cell && want("SEED");
+        if simp_cell.is_none() && !hub_med && !hub_ext && !seed5_cell && !seed2_cell {
+            continue;
+        }
+
+        let key = format!("{}:{}", n, nnz);
+        let label = if name.is_empty() { &key } else { name };
+        let sp = scoring_pattern(pat);
+        let t0 = Instant::now();
+        let perm0 = order(pat);
+        let order_secs = t0.elapsed().as_secs_f64();
+        let f0 = flops_of(&sp, &perm0);
+        if f0 == 0 {
+            continue;
+        }
+
+        if let Some(cell) = simp_cell {
+            let mut cols = Vec::new();
+            for &budget in &[32_000_000i64, 64_000_000] {
+                let t = Instant::now();
+                let got = rgreedy::simplicial_promotion(
+                    n,
+                    &pat.col_ptr,
+                    &pat.row_idx,
+                    &perm0,
+                    budget,
+                );
+                let secs = t.elapsed().as_secs_f64();
+                match got {
+                    Some(cand) => {
+                        let f = flops_of(&sp, &cand);
+                        cols.push(format!("{:.6}/{secs:.3}s", f as f64 / f0 as f64));
+                    }
+                    None => cols.push(format!("none/{secs:.3}s")),
+                }
+            }
+            println!(
+                "SIMP\t{cell}\t{label}\t{n}\t{nnz}\t{max_deg}\t{:.2}\t{order_secs:.3}\tb32={}\tb64={}",
+                nnz as f64 / n as f64,
+                cols[0],
+                cols[1]
+            );
+        }
+
+        if hub_med || hub_ext {
+            let (cp, ri) = core_of(pat);
+            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+            let sec = if hub_med { "HUB" } else { "HUBX" };
+            let specs: Vec<(custom_metrics::ScoreVariant, f64)> = if hub_med {
+                vec![
+                    (custom_metrics::ScoreVariant::DegSqrt, 0.5),
+                    (custom_metrics::ScoreVariant::DegSqrt, 4.0),
+                    (custom_metrics::ScoreVariant::SqDiv, 0.5),
+                    (custom_metrics::ScoreVariant::SqDiv, 1.0),
+                    (custom_metrics::ScoreVariant::SqDiv, 2.0),
+                    (custom_metrics::ScoreVariant::SqDiv, 4.0),
+                ]
+            } else {
+                vec![
+                    (custom_metrics::ScoreVariant::DegSqrt, 0.5),
+                    (custom_metrics::ScoreVariant::DegSqrt, 1.0),
+                    (custom_metrics::ScoreVariant::DegSqrt, 2.0),
+                    (custom_metrics::ScoreVariant::DegSqrt, 4.0),
+                ]
+            };
+            let mut cols = Vec::new();
+            for (variant, alpha) in specs {
+                let t = Instant::now();
+                let got = custom_metrics::order_variant(&core, alpha, true, variant);
+                let secs = t.elapsed().as_secs_f64();
+                match got {
+                    Ok(p) => {
+                        let cand: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                        let f = flops_of(&sp, &cand);
+                        cols.push(format!(
+                            "{variant:?}a{alpha}={:.6}/{secs:.3}s",
+                            f as f64 / f0 as f64
+                        ));
+                    }
+                    Err(_) => cols.push(format!("{variant:?}a{alpha}=err/{secs:.3}s")),
+                }
+            }
+            println!(
+                "{sec}\t{label}\t{n}\t{nnz}\t{max_deg}\t{order_secs:.3}\t{}",
+                cols.join("\t")
+            );
+        }
+
+        if seed5_cell || seed2_cell {
+            let (cp, ri) = core_of(pat);
+            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+            let pinned = if seed5_cell { 5 } else { 2 };
+            let mut cols = Vec::new();
+            for seed in [0u64, 1, 2, 3, 4, 5, 6, 7] {
+                let opts = feral_metis::MetisOptions {
+                    seed,
+                    ..Default::default()
+                };
+                let t = Instant::now();
+                let got = feral_metis::metis_order_full(&core, &opts);
+                let secs = t.elapsed().as_secs_f64();
+                match got {
+                    Ok((p, ..)) => {
+                        let cand: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                        let f = flops_of(&sp, &cand);
+                        cols.push(format!("s{seed}={:.6}/{secs:.3}s", f as f64 / f0 as f64));
+                    }
+                    Err(_) => cols.push(format!("s{seed}=err/{secs:.3}s")),
+                }
+            }
+            println!(
+                "SEED\tpin{pinned}\t{label}\t{n}\t{nnz}\t{max_deg}\t{order_secs:.3}\t{}",
+                cols.join("\t")
+            );
+        }
+    }
+}
+
+/// FLEET-L (0035) — AMF-alpha + DegSqrt/SqDiv variant census, fleet-j's 0033
+/// method replicated on the two selector families the mission assigns:
+///
+///   - `feral_amf::amf_order_opts` at dense_alpha ∈ {0.5, 0.75, 1.0, 1.25,
+///     1.5, 2.5, 5.0}, ORIGINAL numbering;
+///   - `custom_metrics::order_variant` at ScoreVariant::{DegSqrt, SqDiv} ×
+///     dense_alpha ∈ {0.5, 1.0, 2.0, 10.0}, aggressive = true.
+///
+/// Scope: every corpus matrix with `nnz >= 60_000` (all densities) plus the
+/// dense mid band `20_000 <= nnz < 60_000 && nnz >= 10n` (86 v2 rows). Per
+/// matrix: incumbent = one full timed `order()` scored by `flops_of` (the
+/// trusted scorer), then every variant ISOLATED, timed and scored against the
+/// incumbent. Loads `$SSI_CORPUS_FILE` itself (the candidate-worker test shim
+/// is dev-fixed); reconstructed rows carry blank names, keyed `n:nnz`.
+/// Shard knobs: `SSI_CEN_MIN_NNZ`/`SSI_CEN_MAX_NNZ`, `SSI_PROBE_KEYS`.
+#[test]
+#[ignore]
+fn probe_fleet_l_census() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let shard_min: usize = std::env::var("SSI_CEN_MIN_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let shard_max: usize = std::env::var("SSI_CEN_MAX_NNZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(usize::MAX);
+    println!("corpus: {} rows", corpus.len());
+    println!("CEN\tkey\tn\tnnz\tmaxdeg\tdens\tinc_secs\tinc_flops\tbest\tbest_rel\tcells");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        if !(nnz >= 60_000 || (nnz >= 20_000 && nnz >= 10 * n)) {
+            continue;
+        }
+        if nnz < shard_min || nnz >= shard_max {
+            continue;
+        }
+        if let Ok(keys) = std::env::var("SSI_PROBE_KEYS") {
+            let key = format!("{n}:{nnz}");
+            if !keys.split(',').any(|k| k.trim() == key || k.trim() == *name) {
+                continue;
+            }
+        }
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let t0 = Instant::now();
+        let perm = order(pat);
+        let inc_secs = t0.elapsed().as_secs_f64();
+        let inc = flops_of(&sp, &perm);
+        let mut cells: Vec<String> = Vec::new();
+        let mut best = (f64::INFINITY, String::new());
+        let mut score = |label: String, p: Option<Vec<usize>>, secs: f64| match p {
+            Some(cand) if is_bijection(&cand, n) => {
+                let f = flops_of(&sp, &cand);
+                let rel = f as f64 / inc as f64;
+                if rel < best.0 {
+                    best = (rel, label.clone());
+                }
+                cells.push(format!("{label}={rel:.4}/{secs:.3}"));
+            }
+            _ => cells.push(format!("{label}=ERR/{secs:.3}")),
+        };
+        for a in [0.5f64, 0.75, 1.0, 1.25, 1.5, 2.5, 5.0] {
+            let opts = feral_amf::AmfOptions {
+                dense_alpha: a,
+                ..Default::default()
+            };
+            let t1 = Instant::now();
+            let p = feral_amf::amf_order_opts(&core, &opts)
+                .ok()
+                .map(|(p, ..)| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+            score(format!("amf{a}"), p, t1.elapsed().as_secs_f64());
+        }
+        for (vl, v) in [
+            ("dsq", custom_metrics::ScoreVariant::DegSqrt),
+            ("sqd", custom_metrics::ScoreVariant::SqDiv),
+        ] {
+            for a in [0.5f64, 1.0, 2.0, 10.0] {
+                let t1 = Instant::now();
+                let p = custom_metrics::order_variant(&core, a, true, v)
+                    .ok()
+                    .map(|p| p.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+                score(format!("{vl}{a}"), p, t1.elapsed().as_secs_f64());
+            }
+        }
+        println!(
+            "CEN\t{name}|{n}:{nnz}\t{n}\t{nnz}\t{max_deg}\t{:.1}\t{inc_secs:.3}\t{inc}\t{}\t{:.4}\t{}",
+            nnz as f64 / n as f64,
+            best.1,
+            best.0,
+            cells.join(" ")
+        );
+    }
+}
+
+/// FLEET-L (0035) — relabel-seed sweep at chosen AMF alphas on the census
+/// winners. `$SSI_PROBE_KEYS` = comma-separated `n:nnz` keys,
+/// `$SSI_ALPHAS` = comma-separated dense_alpha values (default: the full
+/// census grid). For each key × alpha × relabel seed 1..=8: relabel →
+/// permute_pattern → amf_order_opts → compose (the DENSE_LOW_RELABEL pattern
+/// in mod.rs), scored against the full-order() incumbent. Seed 0 = original
+/// numbering (no relabel), for reference.
+#[test]
+#[ignore]
+fn probe_fleet_l_amf_relabel() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let keys: Vec<String> = std::env::var("SSI_PROBE_KEYS")
+        .expect("set SSI_PROBE_KEYS=n:nnz,...")
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    let alphas: Vec<f64> = std::env::var("SSI_ALPHAS")
+        .unwrap_or_else(|_| "0.5,0.75,1.0,1.25,1.5,2.5,5.0".into())
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let key = format!("{n}:{nnz}");
+        if !keys.iter().any(|k| *k == key || *k == *name) {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let inc = flops_of(&sp, &order(pat));
+        println!("\nREL {name}|{key} inc_flops={inc}");
+        for &a in &alphas {
+            let opts = feral_amf::AmfOptions {
+                dense_alpha: a,
+                ..Default::default()
+            };
+            let mut cells: Vec<String> = Vec::new();
+            let mut best = (f64::INFINITY, u64::MAX);
+            let mut worst_secs = 0.0f64;
+            for seed in 0u64..=8 {
+                let t1 = Instant::now();
+                let p: Option<Vec<usize>> = if seed == 0 {
+                    let (cp, ri) = core_of(pat);
+                    feral_ordering_core::CscPattern::new(n, &cp, &ri)
+                        .and_then(|core| feral_amf::amf_order_opts(&core, &opts).ok())
+                        .map(|(p, ..)| p.into_iter().map(|x| x as usize).collect())
+                } else {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(&sp, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                        .and_then(|bcore| feral_amf::amf_order_opts(&bcore, &opts).ok())
+                        .map(|(pb, ..)| pb.iter().map(|&x| q[x as usize]).collect())
+                };
+                let secs = t1.elapsed().as_secs_f64();
+                worst_secs = worst_secs.max(secs);
+                match p {
+                    Some(cand) if is_bijection(&cand, n) => {
+                        let rel = flops_of(&sp, &cand) as f64 / inc as f64;
+                        if rel < best.0 {
+                            best = (rel, seed);
+                        }
+                        cells.push(format!("s{seed}={rel:.4}"));
+                    }
+                    _ => cells.push(format!("s{seed}=ERR")),
+                }
+            }
+            println!(
+                "REL\t{key}\ta{a}\tbest_rel={:.4}\tbest_seed={}\tworst_pass_secs={:.3}\t{}",
+                best.0,
+                best.1,
+                worst_secs,
+                cells.join(" ")
+            );
+        }
+    }
+}
+
+/// FLEET-O idea #3 decisive census: how many DELETABLE fill edges remain in
+/// the incumbent's final completion? (Deletable = common neighbourhood is a
+/// clique — the exact local chordality-preserving criterion.) By the
+/// 4-cycle obstruction argument, edge slides are chordality-legal ONLY for
+/// deletable edges; if the final completion is at the deletion fixpoint the
+/// slide walk has zero legal moves.
+#[test]
+#[ignore]
+fn probe_fleet_o_deletable() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let inc_perm = order(pat);
+        let inc = flops_of(&sp, &inc_perm);
+        let Some((fcp, fri)) = filled_graph(&sp, &inc_perm, 2_400_000) else {
+            println!("{key}\t{name}\tSKIP lnnz");
+            continue;
+        };
+        let adj: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                fri[fcp[v] as usize..fcp[v + 1] as usize]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .collect()
+            })
+            .collect();
+        let asort: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .filter(|&x| x as usize != v)
+                    .collect();
+                c.sort_unstable();
+                c
+            })
+            .collect();
+        let mut nfill = 0usize;
+        let mut deletable = 0usize;
+        let mut budget_hit = 0usize;
+        for u in 0..n {
+            for &w in &adj[u] {
+                if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                    nfill += 1;
+                    // Common neighbourhood + clique check, generous per-edge
+                    // budget so "deletable" is measured, not budget-limited.
+                    let (au, av) = (&adj[u], &adj[w as usize]);
+                    let mut c: Vec<u32> = Vec::new();
+                    let (mut i, mut j) = (0usize, 0usize);
+                    while i < au.len() && j < av.len() {
+                        if au[i] < av[j] {
+                            i += 1;
+                        } else if au[i] > av[j] {
+                            j += 1;
+                        } else {
+                            c.push(au[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                    let mut ops: i64 = 10_000_000;
+                    if minl_is_clique(&adj, &c, &mut ops) {
+                        deletable += 1;
+                    } else if ops < 0 {
+                        budget_hit += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{key}\t{name}\tinc={inc}\tfill={nfill}\tdeletable={deletable}\tbudget_hit={budget_hit}"
+        );
+    }
+}
+
+/// FLEET-O idea #3 closure: score ceiling of DELETION descent run to fixpoint
+/// (generous budget) on rows where the shipped MINL budget starves, followed
+/// by MCS/AMD realization + trusted rescore. If even the fixpoint ceiling is
+/// below the ship bar, both the slide walk AND deletion-budget extension are
+/// dead on this class. `SSI_DELX_BUDGET` (default 1G ops).
+#[test]
+#[ignore]
+fn probe_fleet_o_delext() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let budget0: i64 = std::env::var("SSI_DELX_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000_000);
+    let min_n: usize = std::env::var("SSI_DELX_MIN_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n < min_n {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let inc_perm = order(pat);
+        let inc = flops_of(&sp, &inc_perm);
+        let t0 = Instant::now();
+        let Some((fcp, fri)) = filled_graph(&sp, &inc_perm, 2_400_000) else {
+            println!("{key}\t{name}\tSKIP lnnz");
+            continue;
+        };
+        let mut adj: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                fri[fcp[v] as usize..fcp[v + 1] as usize]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .collect()
+            })
+            .collect();
+        let asort: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .filter(|&x| x as usize != v)
+                    .collect();
+                c.sort_unstable();
+                c
+            })
+            .collect();
+        let mut fill: Vec<(u32, u32)> = Vec::new();
+        for u in 0..n {
+            for &w in &adj[u] {
+                if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                    fill.push((u as u32, w));
+                }
+            }
+        }
+        let mut ops = budget0;
+        let mut alive = vec![true; fill.len()];
+        let mut removed_total = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let mut removed_this = 0usize;
+            for ei in 0..fill.len() {
+                if ops < 0 {
+                    break;
+                }
+                if !alive[ei] {
+                    continue;
+                }
+                let (u, v) = fill[ei];
+                if minl_try_delete_edge(&mut adj, u, v, &mut ops, 2_000) {
+                    alive[ei] = false;
+                    removed_this += 1;
+                }
+            }
+            rounds += 1;
+            removed_total += removed_this;
+            if removed_this == 0 || ops < 0 {
+                break;
+            }
+        }
+        // Realize + trusted rescore.
+        let mut best_cand = inc;
+        let mut which = "none";
+        let elim = minl_mcs_peo(n, &adj);
+        if is_bijection(&elim, n) {
+            let f = flops_of(&sp, &elim);
+            if f < best_cand {
+                best_cand = f;
+                which = "mcs";
+            }
+        }
+        {
+            let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+            let mut ri: Vec<i32> = Vec::new();
+            cp.push(0);
+            for row in adj.iter() {
+                ri.extend(row.iter().map(|&v| v as i32));
+                cp.push(ri.len() as i32);
+            }
+            if let Some(p) = feral_ordering_core::CscPattern::new(n, &cp, &ri)
+                .and_then(|core| feral_amd::amd_order(&core).ok())
+            {
+                let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                if is_bijection(&p, n) {
+                    let f = flops_of(&sp, &p);
+                    if f < best_cand {
+                        best_cand = f;
+                        which = "amd";
+                    }
+                }
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let rel = best_cand as f64 / inc as f64;
+        println!(
+            "{key}\t{name}\tinc={inc}\tfill={}\tremoved={removed_total}\trounds={rounds}\tops_left={ops}\trel={rel:.6}\twhich={which}\tcost={secs:.3}s",
+            fill.len()
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FLEET-O (IDEAS #5) — FlowCutter Pareto vertex separators, kill-fast probe.
+//
+// Minimal deterministic FlowCutter (Hamann–Strasser shape): unit vertex
+// capacities via node splitting (v_in→v_out cap 1), incremental max-flow
+// with source/target-side piercing enumerating the Pareto (cut size,
+// balance) front, smallest cut at acceptable balance wins, recursive
+// nested dissection with AMD leaves, separators last. Hand-rolled, integer
+// only, fixed iteration order + id tie-breaks, op-capped.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One FlowCutter bisection of the graph `adj` (local ids, sorted lists).
+/// Returns (side_a, side_b, separator) or None if no acceptable cut.
+fn fc_bisect(
+    nv: usize,
+    adj: &[Vec<u32>],
+    ops: &mut i64,
+    max_cut: usize,
+) -> Option<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+    if nv < 8 {
+        return None;
+    }
+    // Split-graph arcs. Node ids: 2v = v_in, 2v+1 = v_out.
+    // Arc list: (to, cap) with residual pairing arc^1.
+    let mut head: Vec<i32> = vec![-1; 2 * nv];
+    let mut arc_to: Vec<u32> = Vec::new();
+    let mut arc_cap: Vec<i32> = Vec::new();
+    let mut arc_next: Vec<i32> = Vec::new();
+    let mut push_arc = |head: &mut Vec<i32>,
+                        arc_to: &mut Vec<u32>,
+                        arc_cap: &mut Vec<i32>,
+                        arc_next: &mut Vec<i32>,
+                        from: usize,
+                        to: usize,
+                        cap: i32| {
+        arc_to.push(to as u32);
+        arc_cap.push(cap);
+        arc_next.push(head[from]);
+        head[from] = (arc_to.len() - 1) as i32;
+    };
+    const INF: i32 = 1 << 28;
+    for v in 0..nv {
+        // internal arc v_in -> v_out cap 1 (+ residual 0)
+        push_arc(&mut head, &mut arc_to, &mut arc_cap, &mut arc_next, 2 * v, 2 * v + 1, 1);
+        push_arc(&mut head, &mut arc_to, &mut arc_cap, &mut arc_next, 2 * v + 1, 2 * v, 0);
+    }
+    for u in 0..nv {
+        for &w in &adj[u] {
+            let w = w as usize;
+            if w > u {
+                // u_out -> w_in INF and w_out -> u_in INF (+ residuals)
+                push_arc(&mut head, &mut arc_to, &mut arc_cap, &mut arc_next, 2 * u + 1, 2 * w, INF);
+                push_arc(&mut head, &mut arc_to, &mut arc_cap, &mut arc_next, 2 * w, 2 * u + 1, 0);
+                push_arc(&mut head, &mut arc_to, &mut arc_cap, &mut arc_next, 2 * w + 1, 2 * u, INF);
+                push_arc(&mut head, &mut arc_to, &mut arc_cap, &mut arc_next, 2 * u, 2 * w + 1, 0);
+            }
+        }
+    }
+    *ops -= (arc_to.len() + 4 * nv) as i64;
+    if *ops < 0 {
+        return None;
+    }
+
+    // Deterministic s,t: pseudo-peripheral pair via double BFS on `adj`.
+    let deg: Vec<usize> = adj.iter().map(|a| a.len()).collect();
+    let bfs_far = |start: usize| -> usize {
+        let mut dist = vec![u32::MAX; nv];
+        let mut q = vec![start as u32];
+        dist[start] = 0;
+        let mut h = 0;
+        let mut best = start;
+        let mut bd = 0u32;
+        while h < q.len() {
+            let u = q[h] as usize;
+            h += 1;
+            for &w in &adj[u] {
+                let w = w as usize;
+                if dist[w] == u32::MAX {
+                    dist[w] = dist[u] + 1;
+                    if dist[w] > bd || (dist[w] == bd && deg[w] < deg[best]) {
+                        bd = dist[w];
+                        best = w;
+                    }
+                    q.push(w as u32);
+                }
+            }
+        }
+        best
+    };
+    let s0 = (0..nv).min_by_key(|&v| (deg[v], v)).unwrap_or(0);
+    let s = bfs_far(s0);
+    let t = bfs_far(s);
+    if s == t {
+        return None;
+    }
+    *ops -= 4 * nv as i64;
+
+    // Source/target sets; piercing grows them. `in_s[v]` / `in_t[v]`.
+    let mut in_s = vec![false; nv];
+    let mut in_t = vec![false; nv];
+    in_s[s] = true;
+    in_t[t] = true;
+    // Make terminals uncapacitated internally.
+    // (Their internal arc index is 2*v for vertex v; cap arc id = 2*v.)
+    arc_cap[2 * s] = INF;
+    arc_cap[2 * t] = INF;
+
+    let mut flow = 0usize;
+    let mut best_cut: Option<(Vec<u32>, Vec<bool>, usize)> = None; // (sep, side_a_mask, size_a)
+    // Pick policy: 0 = smallest cut (tie: most balanced), 1 = best
+    // expansion (|sep| / min_side, exact integer cross-compare).
+    let pick: u8 = std::env::var("SSI_FC_PICK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let mut best_key = (u64::MAX, u64::MAX); // policy-dependent
+    let nn = 2 * nv;
+    let mut dist = vec![u32::MAX; nn];
+    let mut qbuf: Vec<u32> = Vec::with_capacity(nn);
+    let max_rounds = 4 * max_cut + 64;
+    for _round in 0..max_rounds {
+        if *ops < 0 || flow > max_cut {
+            break;
+        }
+        // Augment one unit at a time: BFS from all S out-nodes to any T
+        // in-node over residual arcs, storing parent arcs.
+        loop {
+            if *ops < 0 || flow > max_cut {
+                break;
+            }
+            for d in dist.iter_mut() {
+                *d = u32::MAX;
+            }
+            qbuf.clear();
+            let mut parent: Vec<i32> = vec![-1; nn];
+            for v in 0..nv {
+                if in_s[v] {
+                    dist[2 * v + 1] = 0;
+                    qbuf.push((2 * v + 1) as u32);
+                    // also allow entering from v_in (source side absorbs)
+                    dist[2 * v] = 0;
+                    qbuf.push((2 * v) as u32);
+                }
+            }
+            let mut h = 0usize;
+            let mut hit: i32 = -1;
+            'bfs: while h < qbuf.len() {
+                let u = qbuf[h] as usize;
+                h += 1;
+                let mut a = head[u];
+                while a >= 0 {
+                    let ai = a as usize;
+                    *ops -= 1;
+                    if arc_cap[ai] > 0 {
+                        let w = arc_to[ai] as usize;
+                        if dist[w] == u32::MAX {
+                            dist[w] = dist[u] + 1;
+                            parent[w] = a;
+                            let wv = w / 2;
+                            if in_t[wv] {
+                                hit = w as i32;
+                                break 'bfs;
+                            }
+                            qbuf.push(w as u32);
+                        }
+                    }
+                    a = arc_next[ai];
+                }
+            }
+            if hit < 0 {
+                break; // max flow reached for current S/T
+            }
+            // Walk back, decrement caps, increment residuals.
+            let mut w = hit as usize;
+            while parent[w] >= 0 {
+                let ai = parent[w] as usize;
+                arc_cap[ai] -= 1;
+                arc_cap[ai ^ 1] += 1;
+                // arc pairing: arcs pushed in pairs, fwd even? Not
+                // guaranteed by index parity per arc type — but we always
+                // pushed fwd immediately followed by its reverse, so the
+                // pair of arc i is i^1. (Holds by construction.)
+                let mut fromv = 0usize;
+                // find the arc tail: we don't store it; recover via paired
+                // arc's `to`.
+                fromv = arc_to[ai ^ 1] as usize;
+                w = fromv;
+                if dist[w] == 0 {
+                    break;
+                }
+            }
+            flow += 1;
+        }
+        if *ops < 0 || flow > max_cut {
+            break;
+        }
+        // Residual-reachable set from S (over split nodes).
+        for d in dist.iter_mut() {
+            *d = u32::MAX;
+        }
+        qbuf.clear();
+        for v in 0..nv {
+            if in_s[v] {
+                dist[2 * v] = 0;
+                qbuf.push((2 * v) as u32);
+                dist[2 * v + 1] = 0;
+                qbuf.push((2 * v + 1) as u32);
+            }
+        }
+        let mut h = 0usize;
+        while h < qbuf.len() {
+            let u = qbuf[h] as usize;
+            h += 1;
+            let mut a = head[u];
+            while a >= 0 {
+                let ai = a as usize;
+                *ops -= 1;
+                if arc_cap[ai] > 0 {
+                    let w = arc_to[ai] as usize;
+                    if dist[w] == u32::MAX {
+                        dist[w] = dist[u] + 1;
+                        qbuf.push(w as u32);
+                    }
+                }
+                a = arc_next[ai];
+            }
+        }
+        // Source side = v with v_in reachable; cut = v_in reachable,
+        // v_out not.
+        let mut side_a: Vec<bool> = vec![false; nv];
+        let mut sep: Vec<u32> = Vec::new();
+        let mut size_a = 0usize;
+        for v in 0..nv {
+            let rin = dist[2 * v] != u32::MAX;
+            let rout = dist[2 * v + 1] != u32::MAX;
+            if rin && rout {
+                side_a[v] = true;
+                size_a += 1;
+            } else if rin && !rout {
+                sep.push(v as u32);
+            }
+        }
+        let size_b = nv - size_a - sep.len();
+        if sep.is_empty() || size_b == 0 {
+            break; // degenerate — sides merged
+        }
+        let min_side = size_a.min(size_b);
+        let key = if pick == 0 {
+            (sep.len() as u64, (nv - min_side) as u64)
+        } else {
+            // expansion |sep|/min_side as a cross-multiplied rational:
+            // scale to keep ordering exact, tie-break on smaller |sep|.
+            (
+                (sep.len() as u64) * 1_000_000 / (min_side.max(1) as u64),
+                sep.len() as u64,
+            )
+        };
+        if key < best_key {
+            best_key = key;
+            best_cut = Some((sep.clone(), side_a.clone(), size_a));
+        }
+        if min_side * 10 >= nv * 4 {
+            break; // balanced enough — stop enumerating
+        }
+        // Pierce: grow the smaller side by one cut vertex (smallest id,
+        // preferring one whose out-node is NOT residual-co-reachable from
+        // T — cheap proxy: any; deterministic smallest id).
+        if size_a <= size_b {
+            let Some(&p) = sep.first() else { break };
+            let p = p as usize;
+            in_s[p] = true;
+            arc_cap[2 * p] = INF;
+        } else {
+            // grow T side: pick smallest-id vertex adjacent to B side of
+            // the cut — use sep vertex too (symmetric piercing on T).
+            let Some(&p) = sep.first() else { break };
+            let p = p as usize;
+            in_t[p] = true;
+            arc_cap[2 * p] = INF;
+        }
+    }
+    if std::env::var("SSI_FC_DEBUG").is_ok() {
+        match &best_cut {
+            Some((sep, _, size_a)) => println!(
+                "  fc_bisect nv={nv} flow={flow} best sep={} size_a={} ops_left={}",
+                sep.len(),
+                size_a,
+                *ops
+            ),
+            None => println!("  fc_bisect nv={nv} flow={flow} NO CUT ops_left={}", *ops),
+        }
+    }
+    let (sep, side_a, size_a) = best_cut?;
+    let size_b = nv - size_a - sep.len();
+    if size_a.min(size_b) * 20 < nv {
+        return None; // hopeless balance (<5%)
+    }
+    let mut a: Vec<u32> = Vec::with_capacity(size_a);
+    let mut b: Vec<u32> = Vec::with_capacity(size_b);
+    let mut in_sep = vec![false; nv];
+    for &v in &sep {
+        in_sep[v as usize] = true;
+    }
+    for v in 0..nv {
+        if in_sep[v] {
+            continue;
+        }
+        if side_a[v] {
+            a.push(v as u32);
+        } else {
+            b.push(v as u32);
+        }
+    }
+    Some((a, b, sep))
+}
+
+/// AMD on the induced subgraph `verts` (local ids into `adj`); returns the
+/// vertices in elimination order (subset permutation), ascending-id
+/// fallback.
+fn fc_leaf_amd(adj: &[Vec<u32>], verts: &[u32]) -> Vec<u32> {
+    let m = verts.len();
+    if m <= 2 {
+        return verts.to_vec();
+    }
+    let mut local = std::collections::HashMap::new();
+    for (i, &v) in verts.iter().enumerate() {
+        local.insert(v, i as u32);
+    }
+    let mut cp: Vec<i32> = Vec::with_capacity(m + 1);
+    let mut ri: Vec<i32> = Vec::new();
+    cp.push(0);
+    for &v in verts {
+        for &w in &adj[v as usize] {
+            if let Some(&lw) = local.get(&w) {
+                ri.push(lw as i32);
+            }
+        }
+        cp.push(ri.len() as i32);
+    }
+    match feral_ordering_core::CscPattern::new(m, &cp, &ri)
+        .and_then(|core| feral_amd::amd_order(&core).ok())
+    {
+        Some(p) => p.into_iter().map(|x| verts[x as usize]).collect(),
+        None => verts.to_vec(),
+    }
+}
+
+/// Recursive FlowCutter ND: returns vertices of `verts` in elimination
+/// order (interiors first, separator last).
+fn fc_nd_order(
+    adj: &[Vec<u32>],
+    verts: Vec<u32>,
+    ops: &mut i64,
+    leaf: usize,
+    max_cut: usize,
+    depth: usize,
+) -> Vec<u32> {
+    let m = verts.len();
+    if m <= leaf || depth == 0 || *ops < 0 {
+        return fc_leaf_amd(adj, &verts);
+    }
+    // Induced subgraph in local ids.
+    let mut local_of = std::collections::HashMap::new();
+    for (i, &v) in verts.iter().enumerate() {
+        local_of.insert(v, i as u32);
+    }
+    let mut sub: Vec<Vec<u32>> = vec![Vec::new(); m];
+    for (i, &v) in verts.iter().enumerate() {
+        for &w in &adj[v as usize] {
+            if let Some(&lw) = local_of.get(&w) {
+                sub[i].push(lw);
+            }
+        }
+        sub[i].sort_unstable();
+    }
+    *ops -= (2 * m) as i64;
+    match fc_bisect(m, &sub, ops, max_cut) {
+        Some((a, b, sep)) => {
+            let ga: Vec<u32> = a.iter().map(|&x| verts[x as usize]).collect();
+            let gb: Vec<u32> = b.iter().map(|&x| verts[x as usize]).collect();
+            let mut out = fc_nd_order(adj, ga, ops, leaf, max_cut, depth - 1);
+            out.extend(fc_nd_order(adj, gb, ops, leaf, max_cut, depth - 1));
+            // Separator last, refined by AMD on its induced subgraph.
+            out.extend(fc_leaf_amd(adj, &sep.iter().map(|&x| verts[x as usize]).collect::<Vec<_>>()));
+            out
+        }
+        None => fc_leaf_amd(adj, &verts),
+    }
+}
+
+/// fc_bisect unit sanity: 32x32 grid — expect a roughly column-shaped
+/// separator of ~32 vertices and balanced sides.
+#[test]
+#[ignore]
+fn probe_fleet_o_fc_grid() {
+    let side = 32usize;
+    let nv = side * side;
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); nv];
+    for r in 0..side {
+        for c in 0..side {
+            let v = r * side + c;
+            if c + 1 < side {
+                adj[v].push((v + 1) as u32);
+                adj[v + 1].push(v as u32);
+            }
+            if r + 1 < side {
+                adj[v].push((v + side) as u32);
+                adj[v + side].push(v as u32);
+            }
+        }
+    }
+    for a in adj.iter_mut() {
+        a.sort_unstable();
+    }
+    let mut ops: i64 = 200_000_000;
+    match fc_bisect(nv, &adj, &mut ops, 240) {
+        Some((a, b, sep)) => {
+            println!("grid: |A|={} |B|={} |sep|={} ops_left={ops}", a.len(), b.len(), sep.len());
+        }
+        None => println!("grid: fc_bisect returned None, ops_left={ops}"),
+    }
+}
+
+/// FLEET-O idea #5 kill probe: FlowCutter ND on 8 mid-size hub-rich rows,
+/// exact-scored vs the full incumbent. `SSI_FC_OPS` (default 600M),
+/// `SSI_FC_LEAF` (default 1024), `SSI_FC_MAXCUT` (default 240),
+/// `SSI_FC_DEPTH` (default 24).
+#[test]
+#[ignore]
+fn probe_fleet_o_flowcut() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let envn = |k: &str, d: i64| -> i64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let ops0 = envn("SSI_FC_OPS", 600_000_000);
+    let leaf = envn("SSI_FC_LEAF", 1024) as usize;
+    let max_cut = envn("SSI_FC_MAXCUT", 240) as usize;
+    let depth = envn("SSI_FC_DEPTH", 24) as usize;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let inc_perm = order(pat);
+        let inc = flops_of(&sp, &inc_perm);
+        let t0 = Instant::now();
+        let adj: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .filter(|&x| x as usize != v)
+                    .collect()
+            })
+            .collect();
+        let mut ops = ops0;
+        let perm32 = fc_nd_order(&adj, (0..n as u32).collect(), &mut ops, leaf, max_cut, depth);
+        let perm: Vec<usize> = perm32.into_iter().map(|x| x as usize).collect();
+        let secs = t0.elapsed().as_secs_f64();
+        if !is_bijection(&perm, n) {
+            println!("{key}\t{name}\tNOT A BIJECTION (bug)\tcost={secs:.3}s");
+            continue;
+        }
+        let f = flops_of(&sp, &perm);
+        let rel = f as f64 / inc as f64;
+        println!(
+            "{key}\t{name}\tinc={inc}\tfc={f}\trel={rel:.6}\tops_left={ops}\tcost={secs:.3}s"
+        );
+    }
+}
+
+/// FLEET-O idea #3 kill probe. Targeted rows (`SSI_PROBE_ONLY`, names or
+/// `n:nnz`), corpus via `SSI_CORPUS_FILE`. Knobs: `SSI_SLIDE_BUDGET` (ops,
+/// default 100M), `SSI_SLIDE_XCAND` (default 4), `SSI_SLIDE_ROUNDS` (default
+/// 6), `SSI_SLIDE_EDGES` (max ranked fill edges per round, default 4096),
+/// `SSI_SLIDE_LNNZ` (filled-graph cap, default 2.4M).
+#[test]
+#[ignore]
+fn probe_fleet_o_slide() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let envn = |k: &str, d: i64| -> i64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let budget0 = envn("SSI_SLIDE_BUDGET", 100_000_000);
+    let xcand = envn("SSI_SLIDE_XCAND", 4) as usize;
+    let rounds = envn("SSI_SLIDE_ROUNDS", 6) as usize;
+    let max_edges = envn("SSI_SLIDE_EDGES", 4096) as usize;
+    let max_lnnz = envn("SSI_SLIDE_LNNZ", 2_400_000) as usize;
+    println!(
+        "\nslide probe: budget={budget0} xcand={xcand} rounds={rounds} edges={max_edges} lnnz_cap={max_lnnz}"
+    );
+
+    let mut total_ln_win = 0.0f64;
+    let mut worst_cost = 0.0f64;
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let t0 = Instant::now();
+        let inc_perm = order(pat);
+        let inc_secs = t0.elapsed().as_secs_f64();
+        let inc = flops_of(&sp, &inc_perm);
+
+        let t1 = Instant::now();
+        let Some((fcp, fri)) = filled_graph(&sp, &inc_perm, max_lnnz) else {
+            println!("{key}\t{name}\tSKIP filled_graph (lnnz>{max_lnnz})");
+            continue;
+        };
+        let mut adj: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                fri[fcp[v] as usize..fcp[v + 1] as usize]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .collect()
+            })
+            .collect();
+        let asort: Vec<Vec<u32>> = (0..n)
+            .map(|v| {
+                let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                    .iter()
+                    .map(|&x| x as u32)
+                    .filter(|&x| x as usize != v)
+                    .collect();
+                c.sort_unstable();
+                c
+            })
+            .collect();
+        let nfill: usize = (0..n)
+            .map(|u| {
+                adj[u]
+                    .iter()
+                    .filter(|&&w| (w as usize) > u && asort[u].binary_search(&w).is_err())
+                    .count()
+            })
+            .sum();
+        let mut ops = budget0;
+        let res = fo_slide_greedy(n, &mut adj, &asort, &mut ops, rounds, xcand, max_edges);
+        let walk_secs = t1.elapsed().as_secs_f64();
+        worst_cost = worst_cost.max(walk_secs);
+        let Some((elim, fscore, accepted, checks)) = res else {
+            println!(
+                "{key}\t{name}\tinc={inc}\tfill={nfill}\tFAILED initial MCS/budget\twalk={walk_secs:.3}s"
+            );
+            continue;
+        };
+        // Realize + trusted rescore (MCS realization; AMD realization too).
+        let mut best_cand = inc;
+        let mut which = "none";
+        if is_bijection(&elim, n) {
+            let f = flops_of(&sp, &elim);
+            if f < best_cand {
+                best_cand = f;
+                which = "mcs";
+            }
+        }
+        {
+            let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
+            let mut ri: Vec<i32> = Vec::new();
+            cp.push(0);
+            for row in adj.iter() {
+                ri.extend(row.iter().map(|&v| v as i32));
+                cp.push(ri.len() as i32);
+            }
+            if let Some(p) = feral_ordering_core::CscPattern::new(n, &cp, &ri)
+                .and_then(|core| feral_amd::amd_order(&core).ok())
+            {
+                let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
+                if is_bijection(&p, n) {
+                    let f = flops_of(&sp, &p);
+                    if f < best_cand {
+                        best_cand = f;
+                        which = "amd";
+                    }
+                }
+            }
+        }
+        let rel = best_cand as f64 / inc as f64;
+        total_ln_win += rel.ln().min(0.0);
+        println!(
+            "{key}\t{name}\tinc={inc}\tfill={nfill}\tfscore={fscore}\taccepted={accepted}\tchecks={checks}\tops_left={ops}\trel={rel:.6}\twhich={which}\twalk={walk_secs:.3}s\tinc_t={inc_secs:.3}s"
+        );
+    }
+    println!("\nTOTAL_LN_WIN={total_ln_win:.6}  WORST_WALK_COST={worst_cost:.3}s");
+}
+
+/// FLEET-N kill-fast probe #1 (IDEAS #4) — core-restricted heavy metric pass
+/// on the faclay class. Premise: faclay's biconnected core is ~50% of n, so
+/// the ~1.1 s whole-matrix custom-metric pass chainyoda called publicly
+/// unaffordable fits at ~0.5 s if run CORE-ONLY inside the shipped biconn
+/// decomposition. Per target: (1) incumbent order() flops, (2) biconn_order
+/// end-to-end ratio (the ASSEMBLY overhead — 0036 showed this can eat any
+/// per-block win), (3) a metric sweep on the LARGEST block's induced
+/// subgraph vs AMD-on-core, all timed, (4) for every core variant that beats
+/// AMD-on-core, the FULL assembled ordering (decompose emission with the big
+/// block swapped to the variant) scored end-to-end vs the incumbent.
+/// Kill rule (mission): kill if no assembled candidate wins <0.005 ln total.
+/// Env: SSI_CORPUS_FILE, SSI_PROBE_ONLY (names or n:nnz keys).
+#[test]
+#[ignore]
+fn probe_fleet_n_faclay_core() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let sp = scoring_pattern(pat);
+        let t0 = Instant::now();
+        let incumbent = flops_of(&sp, &order(pat));
+        let t_ord = t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
+        let d = biconn::decompose(pat);
+        let t_dec = t0.elapsed().as_secs_f64();
+        println!(
+            "\n=== {name} [{key}] n={n} nnz={} incumbent={incumbent} order()={t_ord:.2}s decompose={t_dec:.3}s blocks={}",
+            pat.nnz(),
+            d.comps.len()
+        );
+
+        // Identify the largest block by owned-vertex count.
+        let mut big = 0usize;
+        for b in 1..d.comps.len() {
+            if d.owned[b].len() > d.owned[big].len() {
+                big = b;
+            }
+        }
+        let owned = &d.owned[big];
+        let m = owned.len();
+        println!("largest block: id={big} owned={m} ({:.3} of n)", m as f64 / n as f64);
+        if m < 64 {
+            println!("  core too small, skip");
+            continue;
+        }
+
+        // Build every block's induced subgraph order with plain AMD once
+        // (the biconn_order per-block path), caching the local orders so the
+        // per-variant full assembly below only recomputes the big block.
+        let mut tok = vec![0u32; n];
+        let mut loc = vec![0u32; n];
+        let mut gen = 0u32;
+        let mut build_block = |b: usize, tok: &mut Vec<u32>, loc: &mut Vec<u32>, gen: &mut u32|
+            -> Option<(Vec<i32>, Vec<i32>)> {
+            let ow = &d.owned[b];
+            let mb = ow.len();
+            *gen = gen.wrapping_add(1);
+            for (li, &v) in ow.iter().enumerate() {
+                tok[v as usize] = *gen;
+                loc[v as usize] = li as u32;
+            }
+            let mut col_ptr = vec![0i32; mb + 1];
+            for &(u, v) in &d.comps[b] {
+                if tok[u as usize] == *gen && tok[v as usize] == *gen {
+                    col_ptr[loc[u as usize] as usize + 1] += 1;
+                    col_ptr[loc[v as usize] as usize + 1] += 1;
+                }
+            }
+            for i in 0..mb {
+                col_ptr[i + 1] += col_ptr[i];
+            }
+            let mut row_idx = vec![0i32; col_ptr[mb] as usize];
+            let mut pos: Vec<usize> = col_ptr[..mb].iter().map(|&x| x as usize).collect();
+            for &(u, v) in &d.comps[b] {
+                if tok[u as usize] == *gen && tok[v as usize] == *gen {
+                    let (lu, lv) = (loc[u as usize] as usize, loc[v as usize] as usize);
+                    row_idx[pos[lu]] = lv as i32;
+                    pos[lu] += 1;
+                    row_idx[pos[lv]] = lu as i32;
+                    pos[lv] += 1;
+                }
+            }
+            for i in 0..mb {
+                let (lo, hi) = (col_ptr[i] as usize, col_ptr[i + 1] as usize);
+                row_idx[lo..hi].sort_unstable();
+            }
+            Some((col_ptr, row_idx))
+        };
+
+        // Per-block AMD local orders (in original vertex ids), keyed by block.
+        let nc = d.comps.len();
+        let mut amd_emit: Vec<Vec<u32>> = vec![Vec::new(); nc];
+        for b in 0..nc {
+            let ow = &d.owned[b];
+            let mb = ow.len();
+            if mb == 0 {
+                continue;
+            }
+            if mb == 1 {
+                amd_emit[b] = vec![ow[0]];
+                continue;
+            }
+            let Some((cp, ri)) = build_block(b, &mut tok, &mut loc, &mut gen) else {
+                amd_emit[b] = ow.clone();
+                continue;
+            };
+            match feral_ordering_core::CscPattern::new(mb, &cp, &ri)
+                .and_then(|c| feral_amd::amd_order(&c).ok())
+            {
+                Some(sub) => amd_emit[b] = sub.iter().map(|&x| ow[x as usize]).collect(),
+                None => amd_emit[b] = ow.clone(),
+            }
+        }
+
+        // Full assembly with a chosen big-block local order (local ids).
+        let assemble = |big_local: &[u32]| -> Vec<usize> {
+            let mut perm: Vec<usize> = Vec::with_capacity(n);
+            perm.extend(d.isolated.iter().map(|&v| v as usize));
+            for &b in &d.block_order {
+                if b == big {
+                    perm.extend(big_local.iter().map(|&x| d.owned[big][x as usize] as usize));
+                } else {
+                    perm.extend(amd_emit[b].iter().map(|&v| v as usize));
+                }
+            }
+            if perm.len() < n {
+                let mut seen = vec![false; n];
+                for &v in &perm {
+                    seen[v] = true;
+                }
+                for v in 0..n {
+                    if !seen[v] {
+                        perm.push(v);
+                    }
+                }
+            }
+            perm
+        };
+
+        // Reference: assembled all-AMD (== biconn_order) end-to-end.
+        let (cp, ri) = build_block(big, &mut tok, &mut loc, &mut gen).unwrap();
+        let bnnz = cp[m] as usize;
+        let spat = ScoringPattern {
+            n: m,
+            col_ptr: cp.iter().map(|&x| x as usize).collect(),
+            row_idx: ri.iter().map(|&x| x as usize).collect(),
+        };
+        let Some(core) = feral_ordering_core::CscPattern::new(m, &cp, &ri) else {
+            println!("  MALFORMED core");
+            continue;
+        };
+        let amd_local: Vec<u32> = amd_emit[big]
+            .iter()
+            .map(|&v| loc[v as usize])
+            .collect();
+        // amd_emit stores original ids; recover local ids via loc (tok/loc are
+        // from the LAST build_block call = big block, so loc is valid here).
+        let amd_local_us: Vec<usize> = amd_local.iter().map(|&x| x as usize).collect();
+        let amd_core_f = flops_of(&spat, &amd_local_us);
+        let full_amd = assemble(&amd_local);
+        let biconn_full_f = flops_of(&sp, &full_amd);
+        println!(
+            "core m={m} bnnz={bnnz}: amd_core_flops={amd_core_f}  biconn_assembled={biconn_full_f} ({:.4} vs incumbent)",
+            biconn_full_f as f64 / incumbent as f64
+        );
+
+        // Relabelled-AMD best-of-9 on the core, for reference.
+        let mut rel_best_f = amd_core_f;
+        let mut rel_best: Vec<u32> = amd_local.clone();
+        for r in 1u64..=8 {
+            let q = relabel(m, r);
+            let bpat = permute_pattern(&spat, &q);
+            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+            let Some(bc) = feral_ordering_core::CscPattern::new(m, &bcp, &bri) else {
+                continue;
+            };
+            let Ok(pb) = feral_amd::amd_order(&bc) else {
+                continue;
+            };
+            let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+            let f = flops_of(&spat, &cand);
+            if f < rel_best_f {
+                rel_best_f = f;
+                rel_best = cand.iter().map(|&x| x as u32).collect();
+            }
+        }
+        println!("  rel8_core={rel_best_f} ({:.4} vs amd_core)", rel_best_f as f64 / amd_core_f as f64);
+        if rel_best_f < amd_core_f {
+            let full = assemble(&rel_best);
+            let f = flops_of(&sp, &full);
+            println!("    rel8 assembled: {f} ({:.4} vs incumbent)", f as f64 / incumbent as f64);
+        }
+
+        // Metric sweep on the core.
+        use custom_metrics::ScoreVariant as SV;
+        let metric_points: Vec<(String, SV, f64)> = [
+            (SV::DegSqrt, vec![0.75, 2.0, 10.0]),
+            (SV::SqDiv, vec![1.0, 10.0]),
+            (SV::SqPure, vec![5.0]),
+            (SV::DegDivNvSqrtWf, vec![2.5, 10.0]),
+            (SV::DegDivNvDegme, vec![2.5, 10.0]),
+            (SV::DegP075, vec![2.5]),
+        ]
+        .into_iter()
+        .flat_map(|(v, alphas)| {
+            alphas
+                .into_iter()
+                .map(move |a| (format!("{v:?}_a{a}"), v, a))
+        })
+        .collect();
+
+        for (label, v, alpha) in &metric_points {
+            let t0 = Instant::now();
+            let res = custom_metrics::order_variant(&core, *alpha, true, *v);
+            let secs = t0.elapsed().as_secs_f64();
+            let Ok(p) = res else {
+                println!("  {label}\t{secs:.3}s\tFAIL");
+                continue;
+            };
+            let p_us: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+            let f = flops_of(&spat, &p_us);
+            let r_core = f as f64 / amd_core_f as f64;
+            if f < amd_core_f {
+                let local_u32: Vec<u32> = p.iter().map(|&x| x as u32).collect();
+                let full = assemble(&local_u32);
+                let ff = flops_of(&sp, &full);
+                println!(
+                    "  {label}\t{secs:.3}s\tcore={r_core:.4}\tassembled={:.4} vs incumbent  CORE-WIN",
+                    ff as f64 / incumbent as f64
+                );
+            } else {
+                println!("  {label}\t{secs:.3}s\tcore={r_core:.4}");
+            }
+        }
+
+        // AMF + no-dense-AMD points on the core.
+        for (label, aggressive, alpha) in [
+            ("amf_a075", true, 0.75f64),
+            ("amf_a15", true, 1.5),
+            ("amf_a50", true, 5.0),
+        ] {
+            let _ = aggressive;
+            let t0 = Instant::now();
+            let opts = feral_amf::AmfOptions {
+                dense_alpha: alpha,
+                ..Default::default()
+            };
+            let res = feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p);
+            let secs = t0.elapsed().as_secs_f64();
+            let Ok(p) = res else {
+                println!("  {label}\t{secs:.3}s\tFAIL");
+                continue;
+            };
+            let p_us: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+            let f = flops_of(&spat, &p_us);
+            let r_core = f as f64 / amd_core_f as f64;
+            if f < amd_core_f {
+                let local_u32: Vec<u32> = p.iter().map(|&x| x as u32).collect();
+                let full = assemble(&local_u32);
+                let ff = flops_of(&sp, &full);
+                println!(
+                    "  {label}\t{secs:.3}s\tcore={r_core:.4}\tassembled={:.4} vs incumbent  CORE-WIN",
+                    ff as f64 / incumbent as f64
+                );
+            } else {
+                println!("  {label}\t{secs:.3}s\tcore={r_core:.4}");
+            }
+        }
+        {
+            let t0 = Instant::now();
+            let opts = feral_amd::AmdOptions {
+                aggressive: false,
+                dense_alpha: -1.0,
+            };
+            let res = feral_amd::amd_order_opts(&core, &opts).map(|(p, ..)| p);
+            let secs = t0.elapsed().as_secs_f64();
+            if let Ok(p) = res {
+                let p_us: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                let f = flops_of(&spat, &p_us);
+                let r_core = f as f64 / amd_core_f as f64;
+                if f < amd_core_f {
+                    let local_u32: Vec<u32> = p.iter().map(|&x| x as u32).collect();
+                    let full = assemble(&local_u32);
+                    let ff = flops_of(&sp, &full);
+                    println!(
+                        "  amd_nodense\t{secs:.3}s\tcore={r_core:.4}\tassembled={:.4} vs incumbent  CORE-WIN",
+                        ff as f64 / incumbent as f64
+                    );
+                } else {
+                    println!("  amd_nodense\t{secs:.3}s\tcore={r_core:.4}");
+                }
+            }
+        }
+    }
+}
+
+/// FLEET-N kill-fast probe #2 (IDEAS #6) — DM/BTF two-phase on the detected
+/// constraint bipartite graph, detector-first. fleet-m's pre-probe (0036)
+/// measured B highly reducible (largest fine-DM block 0.0–0.4 of rows) and
+/// noted the fine blocks INTERLEAVE primal/dual — the property whose absence
+/// killed strict two-phase. This probe builds the actual candidate orderings:
+///   raw BTF emissions (slacks, fine blocks in topo / reverse-topo order with
+///   (primal,dual) pairs, unmatched primals/duals at the boundary choices)
+/// plus BTF-RELABELLED AMD (permute the whole pattern by the BTF order, run
+/// AMD, compose back — lets AMD interleave locally while the global sweep
+/// follows the BTF structure), scored end-to-end vs the full order()
+/// incumbent. Kill rule: no variant beats the incumbent on the
+/// unitcommit/watercontamination targets => kill idea #6.
+/// Env: SSI_CORPUS_FILE, SSI_PROBE_ONLY (names or n:nnz keys).
+#[test]
+#[ignore]
+fn probe_fleet_n_btf() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        // KKT layout detector (validated by fleet-m 0036).
+        let mut deg = vec![0u32; n];
+        let mut nbr1 = vec![u32::MAX; n];
+        let mut max_min_endpoint: i64 = -1;
+        for j in 0..n {
+            for &i in pat.col(j) {
+                if i > j && i < n {
+                    deg[j] += 1;
+                    deg[i] += 1;
+                    nbr1[j] = i as u32;
+                    nbr1[i] = j as u32;
+                    max_min_endpoint = max_min_endpoint.max(j as i64);
+                }
+            }
+        }
+        let d0 = (max_min_endpoint + 1) as usize;
+        let mut a = d0;
+        while a > 0 && deg[a - 1] == 1 && (nbr1[a - 1] as usize) >= d0 {
+            a -= 1;
+        }
+        let (np, ns, nd) = (a, d0 - a, n - d0);
+        let sp = scoring_pattern(pat);
+        let t0 = Instant::now();
+        let incumbent = flops_of(&sp, &order(pat));
+        let t_ord = t0.elapsed().as_secs_f64();
+        println!(
+            "\n=== {name} [{key}] n={n} nnz={} primal={np} slack={ns} dual={nd} incumbent={incumbent} order()={t_ord:.2}s",
+            pat.nnz()
+        );
+        if np == 0 || nd == 0 {
+            println!("  DETECT-FAIL");
+            continue;
+        }
+
+        // Bipartite B: rows = duals 0..nd (vertex d0+r), cols = primals 0..np.
+        let t0 = Instant::now();
+        let mut radj: Vec<Vec<u32>> = vec![Vec::new(); nd];
+        for j in 0..n {
+            for &i in pat.col(j) {
+                if i > j && i < n {
+                    let (u, v) = (j, i);
+                    if u < np && v >= d0 {
+                        radj[v - d0].push(u as u32);
+                    } else if v < np && u >= d0 {
+                        radj[u - d0].push(v as u32);
+                    }
+                }
+            }
+        }
+        for l in radj.iter_mut() {
+            l.sort_unstable();
+            l.dedup();
+        }
+        // Hopcroft–Karp (same as probe_fleet_m_dm_census).
+        const NIL: u32 = u32::MAX;
+        let mut mrow = vec![NIL; nd];
+        let mut mcol = vec![NIL; np];
+        let mut dist = vec![u32::MAX; nd];
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        loop {
+            queue.clear();
+            for r in 0..nd {
+                if mrow[r] == NIL {
+                    dist[r] = 0;
+                    queue.push_back(r as u32);
+                } else {
+                    dist[r] = u32::MAX;
+                }
+            }
+            let mut found = false;
+            while let Some(r) = queue.pop_front() {
+                for &c in &radj[r as usize] {
+                    let r2 = mcol[c as usize];
+                    if r2 == NIL {
+                        found = true;
+                    } else if dist[r2 as usize] == u32::MAX {
+                        dist[r2 as usize] = dist[r as usize] + 1;
+                        queue.push_back(r2);
+                    }
+                }
+            }
+            if !found {
+                break;
+            }
+            let mut aug_total = 0usize;
+            let mut it = vec![0u32; nd];
+            for r0 in 0..nd {
+                if mrow[r0] != NIL {
+                    continue;
+                }
+                let mut stack: Vec<u32> = vec![r0 as u32];
+                let mut path: Vec<(u32, u32)> = Vec::new();
+                it[r0] = 0;
+                let mut augmented = false;
+                while let Some(&r) = stack.last() {
+                    let ru = r as usize;
+                    let mut advanced = false;
+                    while (it[ru] as usize) < radj[ru].len() {
+                        let c = radj[ru][it[ru] as usize];
+                        it[ru] += 1;
+                        let r2 = mcol[c as usize];
+                        if r2 == NIL {
+                            path.push((r, c));
+                            for &(pr, pc) in path.iter().rev() {
+                                mrow[pr as usize] = pc;
+                                mcol[pc as usize] = pr;
+                            }
+                            augmented = true;
+                            break;
+                        }
+                        if dist[r2 as usize] == dist[ru] + 1 && (it[r2 as usize] as usize) == 0 {
+                            path.push((r, c));
+                            stack.push(r2);
+                            advanced = true;
+                            break;
+                        }
+                    }
+                    if augmented {
+                        break;
+                    }
+                    if !advanced {
+                        dist[ru] = u32::MAX;
+                        stack.pop();
+                        path.pop();
+                    }
+                }
+                if augmented {
+                    aug_total += 1;
+                }
+            }
+            if aug_total == 0 {
+                break;
+            }
+        }
+        let matched = mrow.iter().filter(|&&x| x != NIL).count();
+
+        // Tarjan SCC on matched rows (digraph r -> mcol[c]); pop order is
+        // REVERSE topological on the condensation (all successors of a block
+        // pop before it), so scc_of ranks blocks sinks-first.
+        let mut idx = vec![u32::MAX; nd];
+        let mut low = vec![0u32; nd];
+        let mut on = vec![false; nd];
+        let mut sccstack: Vec<u32> = Vec::new();
+        let mut scc_of = vec![u32::MAX; nd];
+        let mut n_scc = 0u32;
+        let mut counter = 0u32;
+        let mut call: Vec<(u32, u32)> = Vec::new();
+        for s in 0..nd {
+            if mrow[s] == NIL || idx[s] != u32::MAX {
+                continue;
+            }
+            call.push((s as u32, 0));
+            idx[s] = counter;
+            low[s] = counter;
+            counter += 1;
+            on[s] = true;
+            sccstack.push(s as u32);
+            while let Some(top) = call.last_mut() {
+                let r = top.0 as usize;
+                if (top.1 as usize) < radj[r].len() {
+                    let c = radj[r][top.1 as usize];
+                    top.1 += 1;
+                    let r2 = mcol[c as usize];
+                    if r2 == NIL {
+                        continue;
+                    }
+                    let r2u = r2 as usize;
+                    if idx[r2u] == u32::MAX {
+                        idx[r2u] = counter;
+                        low[r2u] = counter;
+                        counter += 1;
+                        on[r2u] = true;
+                        sccstack.push(r2);
+                        call.push((r2, 0));
+                    } else if on[r2u] && idx[r2u] < low[r] {
+                        low[r] = idx[r2u];
+                    }
+                } else {
+                    call.pop();
+                    if let Some(&(pr, _)) = call.last() {
+                        let pu = pr as usize;
+                        if low[r] < low[pu] {
+                            low[pu] = low[r];
+                        }
+                    }
+                    if low[r] == idx[r] {
+                        while let Some(&x) = sccstack.last() {
+                            sccstack.pop();
+                            on[x as usize] = false;
+                            scc_of[x as usize] = n_scc;
+                            if x as usize == r {
+                                break;
+                            }
+                        }
+                        n_scc += 1;
+                    }
+                }
+            }
+        }
+        let t_dm = t0.elapsed().as_secs_f64();
+        println!(
+            "  matched={matched}/{nd} scc_blocks={n_scc} dm_time={t_dm:.3}s"
+        );
+
+        // Group matched rows by SCC id (pop order = reverse topo). Within a
+        // block, rows sorted ascending for determinism.
+        let mut blocks: Vec<Vec<u32>> = vec![Vec::new(); n_scc as usize];
+        for r in 0..nd {
+            if scc_of[r] != u32::MAX {
+                blocks[scc_of[r] as usize].push(r as u32);
+            }
+        }
+        for b in blocks.iter_mut() {
+            b.sort_unstable();
+        }
+
+        let unmatched_primals: Vec<u32> = (0..np as u32).filter(|&c| mcol[c as usize] == NIL).collect();
+        let unmatched_duals: Vec<u32> = (0..nd as u32).filter(|&r| mrow[r as usize] == NIL).collect();
+        let slacks: Vec<usize> = (np..d0).collect();
+
+        // Emission builder. block_dir: false = pop order (sinks first),
+        // true = reversed pop order (sources first). pair_pd: primal before
+        // dual inside a pair. up_first: unmatched primals before the blocks
+        // (else after). Unmatched duals always last (they have no matched
+        // primal; their neighbourhoods collapse onto whatever remains).
+        let build = |block_dir: bool, pair_pd: bool, up_first: bool| -> Vec<usize> {
+            let mut perm: Vec<usize> = Vec::with_capacity(n);
+            perm.extend(slacks.iter().copied());
+            if up_first {
+                perm.extend(unmatched_primals.iter().map(|&c| c as usize));
+            }
+            let iter_blocks: Box<dyn Iterator<Item = &Vec<u32>>> = if block_dir {
+                Box::new(blocks.iter().rev())
+            } else {
+                Box::new(blocks.iter())
+            };
+            for blk in iter_blocks {
+                for &r in blk {
+                    let c = mrow[r as usize] as usize;
+                    if pair_pd {
+                        perm.push(c);
+                        perm.push(d0 + r as usize);
+                    } else {
+                        perm.push(d0 + r as usize);
+                        perm.push(c);
+                    }
+                }
+            }
+            if !up_first {
+                perm.extend(unmatched_primals.iter().map(|&c| c as usize));
+            }
+            perm.extend(unmatched_duals.iter().map(|&r| d0 + r as usize));
+            // Defensive completion (bijection safety).
+            if perm.len() < n {
+                let mut seen = vec![false; n];
+                for &v in &perm {
+                    seen[v] = true;
+                }
+                for v in 0..n {
+                    if !seen[v] {
+                        perm.push(v);
+                    }
+                }
+            }
+            perm
+        };
+
+        let mut best_raw: Option<(String, u64, Vec<usize>)> = None;
+        for (label, dirs) in [
+            ("btf_topo_pd", (true, true, false)),
+            ("btf_topo_dp", (true, false, false)),
+            ("btf_rtopo_pd", (false, true, false)),
+            ("btf_rtopo_dp", (false, false, false)),
+            ("btf_topo_pd_upf", (true, true, true)),
+            ("btf_rtopo_pd_upf", (false, true, true)),
+        ] {
+            let t0 = Instant::now();
+            let perm = build(dirs.0, dirs.1, dirs.2);
+            let f = flops_of(&sp, &perm);
+            let secs = t0.elapsed().as_secs_f64();
+            println!(
+                "  {label}\t{secs:.3}s\t{f}\t({:.4} vs incumbent)",
+                f as f64 / incumbent as f64
+            );
+            if best_raw.as_ref().map(|(_, bf, _)| f < *bf).unwrap_or(true) {
+                best_raw = Some((label.to_string(), f, perm));
+            }
+        }
+
+        // BTF-relabelled AMD on the two structurally distinct raw emissions:
+        // q maps new label -> original vertex; AMD runs on the relabelled
+        // pattern and the result composes back through q.
+        for (label, dirs) in [
+            ("btf_topo_pd", (true, true, false)),
+            ("btf_rtopo_pd", (false, true, false)),
+        ] {
+            let t0 = Instant::now();
+            let q = build(dirs.0, dirs.1, dirs.2);
+            let bpat = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+            let cand: Option<Vec<usize>> = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .and_then(|bc| {
+                    feral_amd::amd_order(&bc)
+                        .ok()
+                        .map(|pb| pb.iter().map(|&x| q[x as usize]).collect())
+                });
+            let secs = t0.elapsed().as_secs_f64();
+            match cand {
+                Some(p) => {
+                    let f = flops_of(&sp, &p);
+                    println!(
+                        "  relabelamd_{label}\t{secs:.3}s\t{f}\t({:.4} vs incumbent)",
+                        f as f64 / incumbent as f64
+                    );
+                }
+                None => println!("  relabelamd_{label}\t{secs:.3}s\tFAIL"),
+            }
+        }
+    }
+}
+
+/// FLEET-N probe #2b — the BTF-relabelled-AMD family neighborhood. probe #2
+/// measured raw BTF dead but btf-relabelled AMD within 0.1–2% of the FULL
+/// incumbent on the big unitcommit rows. Sweep the cheap grid: emission
+/// {topo/rtopo × pd/dp} × sub-ordering {AMD, AMD-nodense, AMF α0.75/1.5,
+/// DegSqrt α2} on the relabelled pattern, plus the plain AMD anchor flops
+/// for context. Any point < incumbent ⇒ wire as consider! arm and verify
+/// end-to-end; none ⇒ kill idea #6.
+#[test]
+#[ignore]
+fn probe_fleet_n_btf2() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    let only: Option<Vec<String>> = std::env::var("SSI_PROBE_ONLY").ok().map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let key = format!("{}:{}", n, pat.nnz());
+        if let Some(list) = &only {
+            if !list.iter().any(|x| x == name || *x == key) {
+                continue;
+            }
+        }
+        let mut deg = vec![0u32; n];
+        let mut nbr1 = vec![u32::MAX; n];
+        let mut max_min_endpoint: i64 = -1;
+        for j in 0..n {
+            for &i in pat.col(j) {
+                if i > j && i < n {
+                    deg[j] += 1;
+                    deg[i] += 1;
+                    nbr1[j] = i as u32;
+                    nbr1[i] = j as u32;
+                    max_min_endpoint = max_min_endpoint.max(j as i64);
+                }
+            }
+        }
+        let d0 = (max_min_endpoint + 1) as usize;
+        let mut a = d0;
+        while a > 0 && deg[a - 1] == 1 && (nbr1[a - 1] as usize) >= d0 {
+            a -= 1;
+        }
+        let (np, ns, nd) = (a, d0 - a, n - d0);
+        let _ = ns;
+        let sp = scoring_pattern(pat);
+        let t0 = Instant::now();
+        let incumbent = flops_of(&sp, &order(pat));
+        let t_ord = t0.elapsed().as_secs_f64();
+        // Plain AMD anchor for context.
+        let anchor_f = {
+            let cp: Vec<i32> = sp.col_ptr.iter().map(|&x| x as i32).collect();
+            let ri: Vec<i32> = sp.row_idx.iter().map(|&x| x as i32).collect();
+            feral_ordering_core::CscPattern::new(n, &cp, &ri)
+                .and_then(|c| feral_amd::amd_order(&c).ok())
+                .map(|p| {
+                    let pu: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                    flops_of(&sp, &pu)
+                })
+                .unwrap_or(0)
+        };
+        println!(
+            "\n=== {name} [{key}] n={n} primal={np} dual={nd} incumbent={incumbent} anchor_amd={anchor_f} ({:.4} of inc) order()={t_ord:.2}s",
+            anchor_f as f64 / incumbent as f64
+        );
+        if np == 0 || nd == 0 {
+            println!("  DETECT-FAIL");
+            continue;
+        }
+
+        let mut radj: Vec<Vec<u32>> = vec![Vec::new(); nd];
+        for j in 0..n {
+            for &i in pat.col(j) {
+                if i > j && i < n {
+                    let (u, v) = (j, i);
+                    if u < np && v >= d0 {
+                        radj[v - d0].push(u as u32);
+                    } else if v < np && u >= d0 {
+                        radj[u - d0].push(v as u32);
+                    }
+                }
+            }
+        }
+        for l in radj.iter_mut() {
+            l.sort_unstable();
+            l.dedup();
+        }
+        const NIL: u32 = u32::MAX;
+        let mut mrow = vec![NIL; nd];
+        let mut mcol = vec![NIL; np];
+        let mut dist = vec![u32::MAX; nd];
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        loop {
+            queue.clear();
+            for r in 0..nd {
+                if mrow[r] == NIL {
+                    dist[r] = 0;
+                    queue.push_back(r as u32);
+                } else {
+                    dist[r] = u32::MAX;
+                }
+            }
+            let mut found = false;
+            while let Some(r) = queue.pop_front() {
+                for &c in &radj[r as usize] {
+                    let r2 = mcol[c as usize];
+                    if r2 == NIL {
+                        found = true;
+                    } else if dist[r2 as usize] == u32::MAX {
+                        dist[r2 as usize] = dist[r as usize] + 1;
+                        queue.push_back(r2);
+                    }
+                }
+            }
+            if !found {
+                break;
+            }
+            let mut aug_total = 0usize;
+            let mut it = vec![0u32; nd];
+            for r0 in 0..nd {
+                if mrow[r0] != NIL {
+                    continue;
+                }
+                let mut stack: Vec<u32> = vec![r0 as u32];
+                let mut path: Vec<(u32, u32)> = Vec::new();
+                it[r0] = 0;
+                let mut augmented = false;
+                while let Some(&r) = stack.last() {
+                    let ru = r as usize;
+                    let mut advanced = false;
+                    while (it[ru] as usize) < radj[ru].len() {
+                        let c = radj[ru][it[ru] as usize];
+                        it[ru] += 1;
+                        let r2 = mcol[c as usize];
+                        if r2 == NIL {
+                            path.push((r, c));
+                            for &(pr, pc) in path.iter().rev() {
+                                mrow[pr as usize] = pc;
+                                mcol[pc as usize] = pr;
+                            }
+                            augmented = true;
+                            break;
+                        }
+                        if dist[r2 as usize] == dist[ru] + 1 && (it[r2 as usize] as usize) == 0 {
+                            path.push((r, c));
+                            stack.push(r2);
+                            advanced = true;
+                            break;
+                        }
+                    }
+                    if augmented {
+                        break;
+                    }
+                    if !advanced {
+                        dist[ru] = u32::MAX;
+                        stack.pop();
+                        path.pop();
+                    }
+                }
+                if augmented {
+                    aug_total += 1;
+                }
+            }
+            if aug_total == 0 {
+                break;
+            }
+        }
+
+        let mut idx = vec![u32::MAX; nd];
+        let mut low = vec![0u32; nd];
+        let mut on = vec![false; nd];
+        let mut sccstack: Vec<u32> = Vec::new();
+        let mut scc_of = vec![u32::MAX; nd];
+        let mut n_scc = 0u32;
+        let mut counter = 0u32;
+        let mut call: Vec<(u32, u32)> = Vec::new();
+        for s in 0..nd {
+            if mrow[s] == NIL || idx[s] != u32::MAX {
+                continue;
+            }
+            call.push((s as u32, 0));
+            idx[s] = counter;
+            low[s] = counter;
+            counter += 1;
+            on[s] = true;
+            sccstack.push(s as u32);
+            while let Some(top) = call.last_mut() {
+                let r = top.0 as usize;
+                if (top.1 as usize) < radj[r].len() {
+                    let c = radj[r][top.1 as usize];
+                    top.1 += 1;
+                    let r2 = mcol[c as usize];
+                    if r2 == NIL {
+                        continue;
+                    }
+                    let r2u = r2 as usize;
+                    if idx[r2u] == u32::MAX {
+                        idx[r2u] = counter;
+                        low[r2u] = counter;
+                        counter += 1;
+                        on[r2u] = true;
+                        sccstack.push(r2);
+                        call.push((r2, 0));
+                    } else if on[r2u] && idx[r2u] < low[r] {
+                        low[r] = idx[r2u];
+                    }
+                } else {
+                    call.pop();
+                    if let Some(&(pr, _)) = call.last() {
+                        let pu = pr as usize;
+                        if low[r] < low[pu] {
+                            low[pu] = low[r];
+                        }
+                    }
+                    if low[r] == idx[r] {
+                        while let Some(&x) = sccstack.last() {
+                            sccstack.pop();
+                            on[x as usize] = false;
+                            scc_of[x as usize] = n_scc;
+                            if x as usize == r {
+                                break;
+                            }
+                        }
+                        n_scc += 1;
+                    }
+                }
+            }
+        }
+        let mut blocks: Vec<Vec<u32>> = vec![Vec::new(); n_scc as usize];
+        for r in 0..nd {
+            if scc_of[r] != u32::MAX {
+                blocks[scc_of[r] as usize].push(r as u32);
+            }
+        }
+        for b in blocks.iter_mut() {
+            b.sort_unstable();
+        }
+        let unmatched_primals: Vec<u32> = (0..np as u32).filter(|&c| mcol[c as usize] == NIL).collect();
+        let unmatched_duals: Vec<u32> = (0..nd as u32).filter(|&r| mrow[r as usize] == NIL).collect();
+        let slacks: Vec<usize> = (np..d0).collect();
+
+        let build = |block_dir: bool, pair_pd: bool| -> Vec<usize> {
+            let mut perm: Vec<usize> = Vec::with_capacity(n);
+            perm.extend(slacks.iter().copied());
+            let iter_blocks: Box<dyn Iterator<Item = &Vec<u32>>> = if block_dir {
+                Box::new(blocks.iter().rev())
+            } else {
+                Box::new(blocks.iter())
+            };
+            for blk in iter_blocks {
+                for &r in blk {
+                    let c = mrow[r as usize] as usize;
+                    if pair_pd {
+                        perm.push(c);
+                        perm.push(d0 + r as usize);
+                    } else {
+                        perm.push(d0 + r as usize);
+                        perm.push(c);
+                    }
+                }
+            }
+            perm.extend(unmatched_primals.iter().map(|&c| c as usize));
+            perm.extend(unmatched_duals.iter().map(|&r| d0 + r as usize));
+            if perm.len() < n {
+                let mut seen = vec![false; n];
+                for &v in &perm {
+                    seen[v] = true;
+                }
+                for v in 0..n {
+                    if !seen[v] {
+                        perm.push(v);
+                    }
+                }
+            }
+            perm
+        };
+
+        for (elabel, bdir, ppd) in [
+            ("topo_pd", true, true),
+            ("topo_dp", true, false),
+            ("rtopo_pd", false, true),
+            ("rtopo_dp", false, false),
+        ] {
+            let q = build(bdir, ppd);
+            let bpat = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
+            let Some(bc) = feral_ordering_core::CscPattern::new(n, &bcp, &bri) else {
+                println!("  {elabel}: bad pattern");
+                continue;
+            };
+            let subs: Vec<(&str, Box<dyn Fn() -> Option<Vec<i32>> + '_>)> = vec![
+                ("amd", Box::new(|| feral_amd::amd_order(&bc).ok())),
+                (
+                    "amd_nod",
+                    Box::new(|| {
+                        feral_amd::amd_order_opts(
+                            &bc,
+                            &feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 },
+                        )
+                        .ok()
+                        .map(|(p, ..)| p)
+                    }),
+                ),
+                (
+                    "amf075",
+                    Box::new(|| {
+                        feral_amf::amf_order_opts(
+                            &bc,
+                            &feral_amf::AmfOptions { dense_alpha: 0.75, ..Default::default() },
+                        )
+                        .ok()
+                        .map(|(p, ..)| p)
+                    }),
+                ),
+                (
+                    "amf15",
+                    Box::new(|| {
+                        feral_amf::amf_order_opts(
+                            &bc,
+                            &feral_amf::AmfOptions { dense_alpha: 1.5, ..Default::default() },
+                        )
+                        .ok()
+                        .map(|(p, ..)| p)
+                    }),
+                ),
+                (
+                    "degsqrt2",
+                    Box::new(|| {
+                        custom_metrics::order_variant(
+                            &bc,
+                            2.0,
+                            true,
+                            custom_metrics::ScoreVariant::DegSqrt,
+                        )
+                        .ok()
+                    }),
+                ),
+            ];
+            for (slabel, f) in subs {
+                let t0 = Instant::now();
+                let res = f();
+                let secs = t0.elapsed().as_secs_f64();
+                match res {
+                    Some(pb) => {
+                        let cand: Vec<usize> = pb.iter().map(|&x| q[x as usize]).collect();
+                        let fl = flops_of(&sp, &cand);
+                        let mark = if fl < incumbent { "  ***WIN***" } else { "" };
+                        println!(
+                            "  {elabel}/{slabel}\t{secs:.3}s\t{fl}\t({:.4} vs inc, {:.4} vs anchor){mark}",
+                            fl as f64 / incumbent as f64,
+                            fl as f64 / anchor_f as f64
+                        );
+                    }
+                    None => println!("  {elabel}/{slabel}\t{secs:.3}s\tFAIL"),
+                }
+            }
+        }
+    }
+}
+
+fn fo_slide_greedy(
+    n: usize,
+    adj: &mut [Vec<u32>],
+    asort: &[Vec<u32>],
+    ops: &mut i64,
+    max_rounds: usize,
+    xcand: usize,
+    max_edges_per_round: usize,
+) -> Option<(Vec<usize>, u64, usize, usize)> {
+    let (mut elim, mut score) = fo_mcs_check_score(n, adj, ops)?;
+    let mut accepted = 0usize;
+    let mut checks = 0usize;
+    for _round in 0..max_rounds {
+        if *ops < 0 {
+            break;
+        }
+        // Current madj sizes for ranking.
+        let mut pos = vec![0u32; n];
+        for (k, &v) in elim.iter().enumerate() {
+            pos[v] = k as u32;
+        }
+        let mut hd = vec![0u32; n];
+        for v in 0..n {
+            let pv = pos[v];
+            hd[v] = adj[v].iter().filter(|&&w| pos[w as usize] > pv).count() as u32;
+        }
+        // Fill edges (in H, not in the pattern), ranked heaviest first.
+        let mut fill: Vec<(u32, u32)> = Vec::new();
+        for u in 0..n {
+            for &w in &adj[u] {
+                if (w as usize) > u && asort[u].binary_search(&w).is_err() {
+                    fill.push((u as u32, w));
+                }
+            }
+        }
+        if fill.is_empty() {
+            break;
+        }
+        fill.sort_unstable_by(|a, b| {
+            let ka = hd[a.0 as usize] + hd[a.1 as usize];
+            let kb = hd[b.0 as usize] + hd[b.1 as usize];
+            kb.cmp(&ka).then(a.cmp(b))
+        });
+        fill.truncate(max_edges_per_round);
+        let mut improved_this_round = 0usize;
+        'edges: for &(u, v) in &fill {
+            if *ops < 0 {
+                break;
+            }
+            // Both slide directions: (u,v) -> (x,v) with x ∈ N(u), and
+            // (u,v) -> (u,x) with x ∈ N(v).
+            for dir in 0..2u8 {
+                let (keep, mv) = if dir == 0 { (v, u) } else { (u, v) };
+                // Candidate pivots: neighbours of the moved endpoint, not
+                // already adjacent to the kept endpoint, smallest current
+                // fill mass first.
+                let mut cands: Vec<u32> = adj[mv as usize]
+                    .iter()
+                    .copied()
+                    .filter(|&x| {
+                        x != keep && adj[keep as usize].binary_search(&x).is_err()
+                    })
+                    .collect();
+                cands.sort_unstable_by(|&a, &b| {
+                    hd[a as usize]
+                        .cmp(&hd[b as usize])
+                        .then(adj[a as usize].len().cmp(&adj[b as usize].len()))
+                        .then(a.cmp(&b))
+                });
+                cands.truncate(xcand);
+                for &x in &cands {
+                    if *ops < 0 {
+                        break 'edges;
+                    }
+                    // Tentatively apply: remove (u,v), insert (x,keep).
+                    let (uu, vv) = (u as usize, v as usize);
+                    let (Ok(pu), Ok(pv)) =
+                        (adj[uu].binary_search(&v), adj[vv].binary_search(&u))
+                    else {
+                        continue 'edges; // already gone (shouldn't happen)
+                    };
+                    adj[uu].remove(pu);
+                    adj[vv].remove(pv);
+                    let (xx, kk) = (x as usize, keep as usize);
+                    let ix = adj[kk].binary_search(&x).unwrap_err();
+                    adj[kk].insert(ix, x);
+                    let ik = adj[xx].binary_search(&keep).unwrap_err();
+                    adj[xx].insert(ik, keep);
+                    checks += 1;
+                    match fo_mcs_check_score(n, adj, ops) {
+                        Some((e2, s2)) if s2 < score => {
+                            // Accept.
+                            elim = e2;
+                            score = s2;
+                            accepted += 1;
+                            improved_this_round += 1;
+                            continue 'edges;
+                        }
+                        _ => {
+                            // Revert.
+                            let px = adj[kk].binary_search(&x).unwrap();
+                            adj[kk].remove(px);
+                            let pk = adj[xx].binary_search(&keep).unwrap();
+                            adj[xx].remove(pk);
+                            let iu = adj[uu].binary_search(&v).unwrap_err();
+                            adj[uu].insert(iu, v);
+                            let iv = adj[vv].binary_search(&u).unwrap_err();
+                            adj[vv].insert(iv, u);
+                        }
+                    }
+                }
+            }
+        }
+        if improved_this_round == 0 {
+            break;
+        }
+    }
+    Some((elim, score, accepted, checks))
+}
+
+fn fo_mcs_check_score(
+    n: usize,
+    adj: &[Vec<u32>],
+    ops: &mut i64,
+) -> Option<(Vec<usize>, u64)> {
+    let m2: usize = adj.iter().map(|a| a.len()).sum();
+    *ops -= (n + m2) as i64; // MCS cost
+    if *ops < 0 {
+        return None;
+    }
+    let elim = minl_mcs_peo(n, adj);
+    if elim.len() != n {
+        return None;
+    }
+    let mut pos = vec![0u32; n];
+    for (k, &v) in elim.iter().enumerate() {
+        pos[v] = k as u32;
+    }
+    let mut score: u64 = 0;
+    let mut madj: Vec<u32> = Vec::new();
+    for &v in &elim {
+        madj.clear();
+        let pv = pos[v];
+        *ops -= adj[v].len() as i64;
+        for &w in &adj[v] {
+            if pos[w as usize] > pv {
+                madj.push(w);
+            }
+        }
+        let c = (madj.len() + 1) as u64;
+        score += c * c;
+        if madj.len() >= 2 {
+            let mut pw = u32::MAX;
+            let mut w0 = 0u32;
+            for &w in &madj {
+                if pos[w as usize] < pw {
+                    pw = pos[w as usize];
+                    w0 = w;
+                }
+            }
+            let aw = &adj[w0 as usize];
+            *ops -= (madj.len() as i64) * 16;
+            for &x in &madj {
+                if x != w0 && aw.binary_search(&x).is_err() {
+                    return None; // not chordal
+                }
+            }
+        }
+        if *ops < 0 {
+            return None;
+        }
+    }
+    Some((elim, score))
+}
