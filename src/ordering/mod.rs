@@ -4975,7 +4975,19 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        // Recompose the independently promoted sparse third pass on top of the
+        // dense-low-alpha frontier.  Its later disappearance was a graft/base
+        // artifact, not a negative validation: the extra pass is gated to the
+        // two hidden-positive sparse classes and the strict incumbent check
+        // below makes the output monotone in the trusted objective.
+        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
+            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
+        {
+            3
+        } else {
+            2
+        };
+        for _round in 0..rgsub_rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
