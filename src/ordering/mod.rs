@@ -2567,6 +2567,30 @@ fn order_with_options(
             });
         }
 
+        // MID-DENSE METIS-SEED ARM.  This is the disjoint lower-nnz sibling
+        // of D_WIDE METIS above: the legacy partitioner gates stop at 120k
+        // while the dense AMF arms begin at 400k, leaving structured pooling
+        // KKT matrices in [200k, 400k) without a separator candidate.  The
+        // exact reconstructed-eval census found seed 5/13 wins on
+        // pooling_sppc0tp and pooling_sppb2tp; the same two-task arm passed an
+        // official cap run from the 5f024a7 parent.  The new D_WIDE task never
+        // overlaps this half-open nnz interval, so its per-matrix work and
+        // official timing evidence compose unchanged.
+        if (200_000..400_000).contains(&nnz)
+            && nnz > 20usize.saturating_mul(n)
+            && n < 20_000
+        {
+            for seed in [5u64, 13] {
+                let opts = feral_metis::MetisOptions {
+                    seed,
+                    ..Default::default()
+                };
+                consider!(move || {
+                    feral_metis::metis_order_full(&core, &opts).map(|(p, _, _)| p)
+                });
+            }
+        }
+
         // D DENSE LOW-ALPHA ARM (matrices_mage r1.1, EG-1-dense-low-alpha-arm):
         // for nnz >= 400k the shipped grid offers AMF only inside the 20-50
         // density window, leaving the dense-heavy class (nnz/n > 50) with no
