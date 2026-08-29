@@ -1268,13 +1268,20 @@ pub(crate) fn subtree_refine(
                             } else {
                                 stream_rng(k)
                             };
-                            // If round one improved some other block, an
-                            // unchanged block would otherwise repeat the same
-                            // deterministic D1 search byte-for-byte. Preserve
-                            // stream 0 and diversify only the second stream in
-                            // round two, with no added trajectories or work.
+                            // Round two otherwise repeats byte-for-byte on an
+                            // unchanged block. D1 is diversified everywhere;
+                            // diversify stream 0 on alternating top-32 ranks,
+                            // retaining the promoted trajectory on the other
+                            // half. No trajectories or work are added.
                             if n >= 10_000 && k == 1 && cfg.round == 1 {
                                 rng_seed ^= 0xA076_1D64_78BD_642F;
+                            }
+                            if n >= 10_000
+                                && k == 0
+                                && cfg.round == 1
+                                && block_rank & 1 == 1
+                            {
+                                rng_seed ^= 0xE703_7ED1_A0B4_28DB;
                             }
                             let r = search_with_nelim(
                                 m,

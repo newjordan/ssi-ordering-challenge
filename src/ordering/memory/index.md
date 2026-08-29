@@ -108,6 +108,8 @@ _(algorithm families & primitives — see [techniques/_TEMPLATE.md](techniques/_
   portfolio via METIS/Scotch/KaHIP plus two hand-rolled variants.
 
 ## Experiments
+
+- [[experiments/0027-rgsub-round2-striped-s0]] — direct-remote, equal-work round-two stream-zero diversification on alternating top-ranked large RGSUB blocks.
 - [0022-topk-telos-seeding.md](experiments/0022-topk-telos-seeding.md) — **WIN, dev
   0.842223→0.840107 shipped** (light extras; the full-grid variant hit 0.839362 dev but
   FAILED the grader's cap on a hidden matrix — read the postscript). 0020's fix built:
