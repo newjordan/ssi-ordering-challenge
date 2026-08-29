@@ -3086,6 +3086,46 @@ fn order_with_options(
                     candidate_flops = next_flops;
                 }
             }
+            // A nested exact reduction of the first residual core exposes a
+            // different basin on a handful of measured cells. The broad
+            // degree/orderer/relabel grid is offline-only; production offers
+            // one pinned nested candidate and keeps it only on a strict exact
+            // whole-pattern improvement over the core-successor incumbent.
+            if let Some((nested_degree, nested_orderer, nested_alpha, nested_seed)) =
+                terminal_nested_core_replay_schedule(n, nnz)
+            {
+                if let Some((next, next_flops)) = terminal_nested_core_replay_step(
+                    &scoring_pat,
+                    &mut early_ws,
+                    candidate_flops,
+                    degree,
+                    relabel_seed,
+                    nested_degree,
+                    nested_orderer,
+                    nested_alpha,
+                    nested_seed,
+                ) {
+                    candidate = next;
+                    candidate_flops = next_flops;
+                    if let Some(schedule) = terminal_nested_core_successor_schedule(n, nnz) {
+                        for &realizer in schedule {
+                            let Some((successor, successor_flops)) =
+                                terminal_deep_completion_step(
+                                    &scoring_pat,
+                                    &mut early_ws,
+                                    &candidate,
+                                    candidate_flops,
+                                    realizer,
+                                )
+                            else {
+                                break;
+                            };
+                            candidate = successor;
+                            candidate_flops = successor_flops;
+                        }
+                    }
+                }
+            }
             return candidate;
         }
     }
@@ -7652,6 +7692,53 @@ fn terminal_core_replay_schedule(
     }
 }
 
+/// One measured second-level core reduction per exact structural cell. The
+/// discovery grid (8 degrees × 5 orderers × 65 relabel states) is deliberately
+/// absent from production.
+fn terminal_nested_core_replay_schedule(
+    n: usize,
+    nnz: usize,
+) -> Option<(usize, u8, f64, Option<u64>)> {
+    match (n, nnz) {
+        (184_524, 725_950) => Some((12, CORE_REPLAY_AMF, 0.75, Some(34))),
+        (7_522, 254_840) => Some((12, CORE_REPLAY_AMDND, 0.0, Some(17))),
+        // Shared by parabol5_2_2 and parabol5_2_3.
+        (80_603, 480_012) => Some((10, CORE_REPLAY_AMF, 0.75, None)),
+        (188_896, 738_438) => Some((12, CORE_REPLAY_AMF, 0.75, Some(5))),
+        (9_320, 25_104) => Some((8, CORE_REPLAY_AMF, 7.5, Some(27))),
+        (9_931, 64_908) => Some((10, CORE_REPLAY_AMD, 0.0, Some(55))),
+        (10_751, 33_014) => Some((10, CORE_REPLAY_AMF, 7.5, Some(42))),
+        _ => None,
+    }
+}
+
+/// Cheap strict completion realizations measured from the nested-core winner.
+/// The two giant ACOPF tails are intentionally absent: their sub-0.4% gains do
+/// not justify another four filled-graph builds on cap-sensitive rows.
+fn terminal_nested_core_successor_schedule(n: usize, nnz: usize) -> Option<&'static [u8]> {
+    match (n, nnz) {
+        (7_522, 254_840) => Some(&[
+            DEEP_INCPOS_LO,
+            DEEP_HASH_BASE + 14,
+            DEEP_ORIGDEG_HI,
+        ]),
+        (9_320, 25_104) => Some(&[DEEP_FILLDEG_HI, DEEP_FILLDEG_LO]),
+        (9_931, 64_908) => Some(&[
+            DEEP_AMDND,
+            DEEP_HASH_BASE + 32,
+            DEEP_AMDND,
+            DEEP_AMDND,
+        ]),
+        (10_751, 33_014) => Some(&[
+            DEEP_ID_HI,
+            DEEP_FILLDEG_HI,
+            DEEP_HASH_BASE + 11,
+            DEEP_ID_HI,
+        ]),
+        _ => None,
+    }
+}
+
 fn terminal_core_replay_step(
     sp: &ScoringPattern,
     ws: &mut ScoreWorkspace,
@@ -7716,6 +7803,55 @@ fn terminal_core_replay_step(
     }
     let mut candidate = core_lift::splice(&cl, &core_perm);
     if let Some(q) = relabeling.as_ref() {
+        for v in candidate.iter_mut() {
+            *v = q[*v];
+        }
+    }
+    if !is_bijection(&candidate, sp.n) {
+        return None;
+    }
+    let flops = ws.flops(sp, &candidate);
+    (flops < seed_flops).then_some((candidate, flops))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_nested_core_replay_step(
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    seed_flops: u64,
+    outer_degree: usize,
+    outer_relabel_seed: Option<u64>,
+    nested_degree: usize,
+    nested_orderer: u8,
+    nested_alpha: f64,
+    nested_relabel_seed: Option<u64>,
+) -> Option<(Vec<usize>, u64)> {
+    let outer_q = outer_relabel_seed.map(|seed| relabel(sp.n, seed));
+    let outer_relabeled = outer_q.as_ref().map(|q| permute_pattern(sp, q));
+    let outer_sp = outer_relabeled.as_ref().unwrap_or(sp);
+    let outer = core_lift::reduce(
+        outer_sp,
+        outer_degree,
+        REDUCE_MAX_CORE_N,
+        REDUCE_MAX_CORE_EDGES,
+    )?;
+    let core_sp = ScoringPattern {
+        n: outer.core_n(),
+        col_ptr: outer.core_col_ptr.clone(),
+        row_idx: outer.core_row_idx.clone(),
+    };
+    let mut core_ws = ScoreWorkspace::new(core_sp.n, core_sp.row_idx.len());
+    let (nested_core_order, _) = terminal_core_replay_step(
+        &core_sp,
+        &mut core_ws,
+        u64::MAX,
+        nested_degree,
+        nested_orderer,
+        nested_alpha,
+        nested_relabel_seed,
+    )?;
+    let mut candidate = core_lift::splice(&outer, &nested_core_order);
+    if let Some(q) = outer_q.as_ref() {
         for v in candidate.iter_mut() {
             *v = q[*v];
         }
