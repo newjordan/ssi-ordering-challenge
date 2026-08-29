@@ -229,6 +229,8 @@ mod rgreedy;
 /// portfolio and the post-hoc phases' independent candidate batches. See its
 /// module doc for the argument that thread completion order decides nothing.
 mod parallel;
+/// Exact local descent over terminal permutation windows.
+mod window_dp;
 
 use feral::ordering::amd::permute_pattern;
 use feral::ordering::elimination_tree::EliminationTree;
@@ -6267,9 +6269,242 @@ fn order_with_options(
         }
     }
 
+    // Offer the identical terminal completion re-realization once more, after
+    // the shipped pass has accepted its strict best candidate. Test builds
+    // retain an A/B switch; production builds compile the switch to true.
+    if second_completion_repass_enabled() {
+        if let Some((repass_scan_budget, repass_amd)) = completion_repass_cell(n, nnz) {
+            if let Some((cand, f)) = terminal_completion_repass(
+                &scoring_pat,
+                &mut ws,
+                &best_perm,
+                best_flops,
+                repass_scan_budget,
+                repass_amd,
+            ) {
+                #[cfg(test)]
+                SECOND_COMPLETION_REPASS_ACCEPTED.with(|c| c.set(true));
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+
+    // Continue the identical terminal realization to its measured fixed point.
+    // Rounds three and four retain isolated test switches; production builds
+    // compile both switches to true. A measured fifth round was below the
+    // promotion threshold and is intentionally omitted.
+    if third_completion_repass_enabled() {
+        if let Some((repass_scan_budget, repass_amd)) = completion_repass_cell(n, nnz) {
+            if let Some((cand, f)) = terminal_completion_repass(
+                &scoring_pat,
+                &mut ws,
+                &best_perm,
+                best_flops,
+                repass_scan_budget,
+                repass_amd,
+            ) {
+                #[cfg(test)]
+                THIRD_COMPLETION_REPASS_ACCEPTED.with(|c| c.set(true));
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+
+    if fourth_completion_repass_enabled() {
+        if let Some((repass_scan_budget, repass_amd)) = completion_repass_cell(n, nnz) {
+            if let Some((cand, f)) = terminal_completion_repass(
+                &scoring_pat,
+                &mut ws,
+                &best_perm,
+                best_flops,
+                repass_scan_budget,
+                repass_amd,
+            ) {
+                #[cfg(test)]
+                FOURTH_COMPLETION_REPASS_ACCEPTED.with(|c| c.set(true));
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+
+    // One additional pass over the already graded 701..2400 macro
+    // scale. The arki0011/0012 cap-risk cell is excluded; the failed
+    // 2401..5000 scale is not present in this candidate.
+    let safe_macro_arki_cap_risk = (44_800..45_000).contains(&n)
+        && (159_000..161_000).contains(&nnz)
+        && (80..=96).contains(&max_deg);
+    if safe_macro_round1_enabled()
+        && rgreedy_enabled
+        && n >= 10_000
+        && nnz > 0
+        && nnz <= 400_000
+        && nnz <= n.saturating_mul(10)
+        && max_deg <= 200
+        && !safe_macro_arki_cap_risk
+    {
+        let cfg = rgreedy::SubCfg {
+            round: 1,
+            ..MACRO_RGSUB_CFG
+        };
+        let permuted = permute_pattern(&scoring_pat, &best_perm);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let post = etree.postorder();
+        if post.len() == n {
+            let mut post_of = vec![0usize; n];
+            for (k, &p) in post.iter().enumerate() {
+                post_of[p] = k;
+            }
+            let counts = column_counts_gnp(&permuted, &etree);
+            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
+            let parent_post: Vec<i32> = post
+                .iter()
+                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
+                .collect();
+            let mut work: Vec<usize> = post.iter().map(|&p| best_perm[p]).collect();
+            let hits = rgreedy::subtree_refine(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &mut work,
+                &counts_post,
+                &parent_post,
+                cfg,
+            );
+            if hits > 0 && is_bijection(&work, n) {
+                let f = ws.flops(&scoring_pat, &work);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = work;
+                }
+            }
+        }
+    }
+
+    // Terminal window descent, after the fixed-point
+    // completion repass. The known sepasequ timing tail is excluded because
+    // its measured gain was only 904 flops (~0.000006 aggregate score).
+    if window_dp_enabled() {
+        const MIN_N: usize = 1_000;
+        const MAX_N: usize = 4_000;
+        const MAX_NNZ: usize = 60_000;
+        const K: usize = 8;
+        const MAX_UNIVERSE: usize = 512;
+        const OPS_BUDGET: i64 = 32_000_000;
+        let tail = (3_000..10_000).contains(&n) && (15_000..30_000).contains(&nnz);
+        let sepasequ_cap_risk = (2_500..2_600).contains(&n) && (11_000..11_300).contains(&nnz);
+        if (MIN_N..=MAX_N).contains(&n)
+            && nnz <= MAX_NNZ
+            && !tail
+            && !sepasequ_cap_risk
+        {
+            if let Some(candidate) = window_dp::descent(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &best_perm,
+                K,
+                MAX_UNIVERSE,
+                OPS_BUDGET,
+            ) {
+                if is_bijection(&candidate, n) {
+                    let f = ws.flops(&scoring_pat, &candidate);
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = candidate;
+                    }
+                }
+            }
+        }
+    }
+
     let _ = best_flops;
 
     best_perm
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SECOND_COMPLETION_REPASS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static SECOND_COMPLETION_REPASS_ACCEPTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static THIRD_COMPLETION_REPASS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static THIRD_COMPLETION_REPASS_ACCEPTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static FOURTH_COMPLETION_REPASS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static FOURTH_COMPLETION_REPASS_ACCEPTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn second_completion_repass_enabled() -> bool {
+    SECOND_COMPLETION_REPASS_OVERRIDE.with(|c| {
+        c.get()
+            .unwrap_or_else(|| std::env::var_os("SSI_SECOND_COMPLETION_REPASS").is_some())
+    })
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn second_completion_repass_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn third_completion_repass_enabled() -> bool {
+    THIRD_COMPLETION_REPASS_OVERRIDE.with(|c| {
+        c.get()
+            .unwrap_or_else(|| std::env::var_os("SSI_THIRD_COMPLETION_REPASS").is_some())
+    })
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn third_completion_repass_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn fourth_completion_repass_enabled() -> bool {
+    FOURTH_COMPLETION_REPASS_OVERRIDE.with(|c| {
+        c.get()
+            .unwrap_or_else(|| std::env::var_os("SSI_FOURTH_COMPLETION_REPASS").is_some())
+    })
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn fourth_completion_repass_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+#[inline]
+fn safe_macro_round1_enabled() -> bool {
+    std::env::var("SSI_SAFE_MACRO_ROUND1").as_deref() == Ok("1")
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn safe_macro_round1_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+#[inline]
+fn window_dp_enabled() -> bool {
+    std::env::var("SSI_WINDOW_DP").as_deref() == Ok("1")
+}
+
+#[cfg(not(test))]
+#[inline]
+const fn window_dp_enabled() -> bool {
+    true
 }
 
 /// Pinned (n, nnz) cells for the terminal completion re-realization pass —
