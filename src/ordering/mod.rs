@@ -1293,23 +1293,6 @@ fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
         // the third seed (see `telos_extra_fullgrid`).
         return 3;
     }
-    // Regime D (re-opened on the 4-thread carrier, then NARROWED after a
-    // graded FAIL): the sparse half of the Tier-A middle. The band was
-    // closed when full-grid extras cost +0.24–0.37 s/matrix single-threaded;
-    // on the parallel carrier the same extras measure +0.05–0.10 s. The
-    // density guard `nnz <= 4n` keeps the crudeoil_lee4 cost class (avg deg
-    // 5.3–6.8, zero measured gain) out while admitting the class of
-    // `gasprod_sarawak81` (avg deg 3.4), whose full-grid extras measure
-    // 0.9934 → 0.9198 — a win that did NOT exist pre-carrier. rev8 shipped
-    // this as 55k–150k at K=3 and FAILED the grader's cap on a hidden matrix
-    // (the surrounding rev7 config passed three graded runs, so the
-    // attribution is clean); the winner needs exactly seed #2, so K=2, and
-    // the 90k ceiling halves the unseen-matrix window while keeping it.
-    // Regime D CLOSED after two graded cap-FAILs (rev8 at 55k–150k/K=3,
-    // rev9 at 55k–90k/K=2) against three clean graded runs of the same tree
-    // without it — the band hides an eval matrix whose strip cost the
-    // (n, nnz, max_deg) covariates cannot see (fill is the true covariate).
-    // Reopen only with an anchor-fill gate, priced from a fresh measurement.
     if (150_000..=170_000).contains(&nnz) && hub_safe {
         return 2;
     }
@@ -1331,16 +1314,7 @@ fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
 /// regressions (`ndcc12` 0.9601→0.9649 at K=3 full), and C's winner
 /// (`nuclear10a`) reaches its basin identically under either grid at K=2.
 fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize) -> bool {
-    let hub_safe = max_deg.saturating_mul(50) <= n;
-    if nnz > 20_000 && nnz <= 55_000 && hub_safe {
-        return true;
-    }
-    // Regime D closed — see the closure note in `telos_extra_seeds`. (The
-    // `gasprod_sarawak81` win, 0.9934→0.9198, needed the full grid at seed
-    // #2 exactly; it is now largely captured by the frontier's own rgreedy
-    // policy work anyway.)
-    let _ = hub_safe;
-    false
+    nnz > 20_000 && nnz <= 55_000 && max_deg.saturating_mul(50) <= n
 }
 
 /// Offer one scored candidate to the TELOS seed pool: keep the `cap` best by
@@ -1797,61 +1771,39 @@ const STRIP_MAX_AVG_DEG: usize = 24; // nnz/n >= 25 disables strip entirely
 const STRIP_MAX_NNZ: usize = 400_000;
 const STRIP_MAX_N: usize = 30_000; // strip cost scales with n; cap-safety limit
 
+/// Map a Sloan / RCM elimination permutation onto a periphery-first ranking
+/// for [`strip_candidate`] / [`strip_general_v2`]. `perm[i]` is eliminated
+/// i-th along the profile/bandwidth walk, so the prefix is the graph
+/// periphery those orderers already paid to find — reused as `ranked`, not
+/// recomputed.
+fn strip_ranked_from_perm(perm: &[i32]) -> Vec<usize> {
+    perm.iter().map(|&v| v as usize).collect()
+}
+
 /// Build one strip candidate: delete the first `k` vertices of `ranked`
 /// (already sorted DESCENDING by the strip criterion, ties broken by ascending
-/// index), AMD the induced subgraph on the rest, then append the deleted
-/// vertices LAST in ascending true-pattern degree (ties by index).
+/// index — **or** a periphery-first Sloan/RCM permutation, whose prefix is
+/// the profile/bandwidth periphery), AMD the induced subgraph on the rest,
+/// then append the deleted vertices LAST in ascending true-pattern degree
+/// (ties by index).
 /// Deterministic: `ranked` and `k` are pure inputs, feral AMD is deterministic,
 /// and the tail sort has a total order (degree then index). Returns `None`
-/// only if `k` is degenerate (0 or >= n) or the subgraph AMD call fails — both
-/// leave the caller with nothing to `consider`, never a bad bijection.
+/// only if `k` is degenerate (0 or >= n), `ranked` is shorter than `k`, or the
+/// subgraph AMD call fails — both leave the caller with nothing to `consider`,
+/// never a bad bijection. Delegates to [`strip_general_v2`] with the default
+/// AMD sub-orderer so Sloan/RCM `ranked` inputs share one peel path.
 fn strip_candidate(sp: &ScoringPattern, ranked: &[usize], k: usize) -> Option<Vec<i32>> {
-    let n = sp.n;
-    if k == 0 || k >= n {
-        return None;
-    }
-    let mut removed = vec![false; n];
-    for &v in &ranked[..k] {
-        removed[v] = true;
-    }
-    let mut new_id = vec![usize::MAX; n];
-    let mut old_id: Vec<usize> = Vec::with_capacity(n - k);
-    for v in 0..n {
-        if !removed[v] {
-            new_id[v] = old_id.len();
-            old_id.push(v);
-        }
-    }
-    let m = old_id.len();
-    let mut scp: Vec<i32> = Vec::with_capacity(m + 1);
-    let mut sri: Vec<i32> = Vec::new();
-    scp.push(0);
-    for &v in &old_id {
-        for kk in sp.col_ptr[v]..sp.col_ptr[v + 1] {
-            let w = sp.row_idx[kk];
-            if !removed[w] {
-                sri.push(new_id[w] as i32);
-            }
-        }
-        scp.push(sri.len() as i32);
-    }
-    let core = feral_ordering_core::CscPattern::new(m, &scp, &sri)?;
-    let sub_amd = feral_amd::amd_order(&core).ok()?;
-    let mut perm: Vec<i32> = sub_amd
-        .iter()
-        .map(|&x| old_id[x as usize] as i32)
-        .collect();
-    let mut tail: Vec<usize> = (0..n).filter(|&v| removed[v]).collect();
-    tail.sort_unstable_by_key(|&v| (sp.col_ptr[v + 1] - sp.col_ptr[v], v));
-    perm.extend(tail.into_iter().map(|v| v as i32));
-    Some(perm)
+    let sub = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+    strip_general_v2(sp, ranked, k, &sub).map(|p| p.into_iter().map(|v| v as i32).collect())
 }
 
 /// STRIP-V2 (win, `sbx-families2`/`probe_blind.rs`'s `strip_general`, ported
 /// unmodified): same subgraph-delete-and-AMD construction as
 /// [`strip_candidate`], generalized to (1) take an arbitrary `ranked` order
 /// (STRIP-V2's callers rank by the INCUMBENT's exact column count, not
-/// baseline-AMD's loose degree) and (2) take an arbitrary sub-orderer
+/// baseline-AMD's loose degree; STRIP-SLOAN-RANK also feeds a periphery-first
+/// Sloan or RCM permutation already produced for the best-of portfolio —
+/// [`strip_ranked_from_perm`]) and (2) take an arbitrary sub-orderer
 /// (dense-class STRIP-V2 variants use no-dense AMD / AMF α5 instead of plain
 /// AMD). Returns `Vec<usize>` (not `Vec<i32>`) since every caller here is a
 /// hand-rolled `best_perm` comparison, not a `consider()` candidate.
@@ -1862,7 +1814,7 @@ fn strip_general_v2(
     sub_order: &dyn Fn(&feral_ordering_core::CscPattern) -> Option<Vec<i32>>,
 ) -> Option<Vec<usize>> {
     let n = sp.n;
-    if k == 0 || k >= n {
+    if k == 0 || k >= n || ranked.len() < k {
         return None;
     }
     let mut removed = vec![false; n];
@@ -2399,6 +2351,25 @@ fn order_with_options(
     let deg_ranked: &Vec<usize> = &deg_ranked_owned;
     let lcnt_ranked: &Vec<usize> = &lcnt_ranked_owned;
 
+    // Sloan / RCM permutations, hoisted once and reused as (1) the existing
+    // best-of portfolio candidates and (2) periphery-first `ranked` inputs
+    // for STRIP-SLOAN-RANK. Same gates as the consider! blocks below — do not
+    // recompute, do not widen the envelope, do not add a second ranking mix.
+    let rcm_gate = n < RCM_MAX_N && nnz < RCM_MAX_NNZ;
+    let sloan_gate = n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ;
+    let rcm_ranked_owned: Vec<usize> = if rcm_gate {
+        strip_ranked_from_perm(&rcm_order(pattern))
+    } else {
+        Vec::new()
+    };
+    let sloan_ranked_owned: Vec<usize> = if sloan_gate {
+        strip_ranked_from_perm(&sloan_order(pattern, 2, 1))
+    } else {
+        Vec::new()
+    };
+    let rcm_ranked: &Vec<usize> = &rcm_ranked_owned;
+    let sloan_ranked: &Vec<usize> = &sloan_ranked_owned;
+
     // ── DEFERRED CANDIDATE PORTFOLIO ────────────────────────────────────────
     // `consider!` no longer RUNS a candidate; it queues its producer closure.
     // Every producer below is a pure function of the pattern (nothing in the
@@ -2643,24 +2614,11 @@ fn order_with_options(
                 // The lower edge of D_WIDE benefits from a smaller degree
                 // strip and AMF(1.5). It replaces AMD(.75) one-for-one.
                 consider!(move || {
-                    let tie_key: Vec<u64> = (0..n)
-                        .map(|v| {
-                            let mut x = (v as u64)
-                                .wrapping_add(7u64.wrapping_mul(0x9E37_79B9));
-                            x ^= x >> 30;
-                            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                            x ^= x >> 27;
-                            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-                            x ^ (x >> 31)
-                        })
-                        .collect();
                     let mut ranked: Vec<usize> = (0..n).collect();
                     ranked.sort_unstable_by(|&a, &b| {
                         let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
                         let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
-                        db.cmp(&da)
-                            .then(tie_key[a].cmp(&tie_key[b]))
-                            .then(a.cmp(&b))
+                        db.cmp(&da).then(a.cmp(&b))
                     });
                     let sub = |c: &feral_ordering_core::CscPattern| {
                         let opts = feral_amf::AmfOptions {
@@ -2669,7 +2627,7 @@ fn order_with_options(
                         };
                         feral_amf::amf_order_opts(c, &opts).ok().map(|(p, ..)| p)
                     };
-                    let perm = strip_general_v2(scoring_pat, &ranked, 146, &sub)
+                    let perm = strip_general_v2(scoring_pat, &ranked, 128, &sub)
                         .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                     Ok(perm.into_iter().map(|v| v as i32).collect())
                 });
@@ -2678,24 +2636,11 @@ fn order_with_options(
                 // highest-degree vertices before non-aggressive AMD(1.0)
                 // dominates the raw AMD(.75) pass it replaces.
                 consider!(move || {
-                    let tie_key: Vec<u64> = (0..n)
-                        .map(|v| {
-                            let mut x = (v as u64)
-                                .wrapping_add(14u64.wrapping_mul(0x9E37_79B9));
-                            x ^= x >> 30;
-                            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                            x ^= x >> 27;
-                            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-                            x ^ (x >> 31)
-                        })
-                        .collect();
                     let mut ranked: Vec<usize> = (0..n).collect();
                     ranked.sort_unstable_by(|&a, &b| {
                         let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
                         let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
-                        db.cmp(&da)
-                            .then(tie_key[a].cmp(&tie_key[b]))
-                            .then(a.cmp(&b))
+                        db.cmp(&da).then(a.cmp(&b))
                     });
                     let sub = |c: &feral_ordering_core::CscPattern| {
                         let opts = feral_amd::AmdOptions {
@@ -2704,7 +2649,7 @@ fn order_with_options(
                         };
                         feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
                     };
-                    let perm = strip_general_v2(scoring_pat, &ranked, 128, &sub)
+                    let perm = strip_general_v2(scoring_pat, &ranked, 32, &sub)
                         .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
                     Ok(perm.into_iter().map(|v| v as i32).collect())
                 });
@@ -2987,7 +2932,9 @@ fn order_with_options(
     // seeding). Best-of floor makes it zero-downside.
     if n < RCM_MAX_N && nnz < RCM_MAX_NNZ {
         consider!(move || {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                rcm_ranked.iter().copied().map(|x| x as i32).collect(),
+            )
         });
     }
 
@@ -3003,7 +2950,9 @@ fn order_with_options(
     // zero downside.
     if n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ {
         consider!(move || {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 2, 1))
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
+                sloan_ranked.iter().copied().map(|x| x as i32).collect(),
+            )
         });
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 1, 2))
@@ -3264,11 +3213,9 @@ fn order_with_options(
     // Only has to be a valid bijection — [`strip_candidate`] guarantees that by
     // construction — so provenance is otherwise unconstrained.
     //
-    // Ships exactly SIX candidates (the subset measured to capture 93% of the
-    // full sweep's gain): `deg` k ∈ {6, 24, 48, 64, 96} ranked by degree in the
-    // TRUE pattern A, and `lcnt64` ranked by L-column-count under the baseline
-    // AMD ordering — free to compute, since the anchor factorization
-    // (`amd_perm`/`amd_counts`) already exists above.
+    // Ships the measured degree/L-count subset (`deg` k ∈ {6, 24, 48, 64, 96}
+    // and `lcnt64`) plus STRIP-SLOAN-RANK: four extra candidates that peel the
+    // Sloan / RCM periphery already produced for the portfolio, k ∈ {24, 96}.
     //
     // Density-gated OFF entirely at `nnz/n >= 25` — see [`STRIP_MAX_AVG_DEG`]
     // for the measurement that set this boundary. Best-of floor →
@@ -3321,6 +3268,40 @@ fn order_with_options(
             strip_candidate(&scoring_pat, &lcnt_ranked, 64)
                 .ok_or(feral_ordering_core::OrderingError::MalformedInput)
         });
+
+        // STRIP-SLOAN-RANK: reuse hoisted Sloan (w=2,1) / RCM perms as
+        // periphery-first `ranked`. Four candidates only — (sloan, 24),
+        // (sloan, 96), (rcm, 24), (rcm, 96) — through this same envelope.
+        // Empty ranked vecs mean the Sloan/RCM consider! gates did not fire;
+        // do not compute a fresh orderer just for strip.
+        if !sloan_ranked.is_empty() {
+            if 24 < n {
+                consider!(move || {
+                    strip_candidate(&scoring_pat, sloan_ranked, 24)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                });
+            }
+            if 96 < n {
+                consider!(move || {
+                    strip_candidate(&scoring_pat, sloan_ranked, 96)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                });
+            }
+        }
+        if !rcm_ranked.is_empty() {
+            if 24 < n {
+                consider!(move || {
+                    strip_candidate(&scoring_pat, rcm_ranked, 24)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                });
+            }
+            if 96 < n {
+                consider!(move || {
+                    strip_candidate(&scoring_pat, rcm_ranked, 96)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)
+                });
+            }
+        }
     }
 
     // HEAVY-TIER no-dense AMD. The ROBUST block runs this same variant, but only
@@ -4766,8 +4747,7 @@ fn order_with_options(
     }
     drop(dtasks);
     }
-    // desc_alt intentionally kept alive: the rgreedy phase below reuses the
-    // TELOS runner-up completion as a second search seed (0022d).
+    drop(desc_alt);
 
 #[cfg(test)]
     parallel::phase_mark("6.minl_orbit", _tp6);
@@ -4971,20 +4951,10 @@ fn order_with_options(
     const RGREEDY_SLACK_MIN_N: usize = 64;
     const RGREEDY_SLACK_SMALL: i64 = 800_000_000;
     const RGREEDY_SLACK_MID: i64 = 600_000_000;
-    const RGREEDY_SLACK_MID_NARROW: i64 = 800_000_000;
-    // Two narrow PEP density bands still have measured cap slack after the
-    // promoted small-pattern floor. Spend it without widening the phase gate:
-    // this changes only the deterministic op floor, not search policy or seed.
-    let narrow_mid_pep = nnz <= RGREEDY_PEP_MAX_NNZ
-        && (nnz <= n.saturating_mul(2)
-            || (n.saturating_mul(4) <= nnz
-                && nnz.saturating_mul(2) <= n.saturating_mul(9)));
     let rgreedy_slack_floor = if n < RGREEDY_SLACK_MIN_N {
         0
     } else if n <= 1_000 {
         RGREEDY_SLACK_SMALL
-    } else if narrow_mid_pep {
-        RGREEDY_SLACK_MID_NARROW
     } else {
         RGREEDY_SLACK_MID
     };
@@ -5084,15 +5054,6 @@ fn order_with_options(
                 }
             }
         }
-
-        // 0022d (dual-seed rgreedy from the TELOS runner-up) was measured at
-        // −0.000281 dev but FAILED the grader's cap even at HALF budget
-        // (submission 71d81dc4, killed ~3.5 min into the run — early corpus
-        // position, i.e. the small tier this phase owns). Together with the
-        // in-tree 0022/0024 rgreedy cap history the verdict is: the hidden
-        // small-tier tail has no slack for a second search at ANY budget.
-        // Closed; the runner-up seed lives on in the multi-start arm below,
-        // whose per-descent cost class HAS passed graded runs repeatedly.
     }
 
     #[cfg(test)]
@@ -5119,16 +5080,8 @@ fn order_with_options(
         // long as the batch lives, and the acceptance below writes
         // `best_perm`.
         let seed_perm = best_perm.clone();
-        // 0022e: slot 2 is the TELOS runner-up completion (when the extras
-        // produced one) — a third seed distinct from both the polished
-        // incumbent and the raw anchor. It exists only inside the ≤55k-nnz
-        // extras windows, the class every graded run of this machinery has
-        // passed with additions of this size.
-        let mut slots: Vec<(u64, &[usize])> =
-            vec![(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
-        if let Some(a) = desc_alt.as_ref() {
-            slots.push((telos_alt_f, &a[..]));
-        }
+        let slots: [(u64, &[usize]); 2] =
+            [(best_flops, &seed_perm[..]), (anchor_flops, &amd_perm[..])];
         // `telos_end_flops` is where the shipped TELOS phase came to rest under
         // mode 0. On the AMD-seed gate this only suppresses a re-walk from the
         // one-round endpoint; slot 1 below is keyed by `anchor_flops`, so its
@@ -5157,30 +5110,6 @@ fn order_with_options(
             done.push(key);
             used += 1;
             plan.push((slot as usize, mode));
-        }
-        // 0022e (rev13 form): descents from the runner-up slot REPLACE the
-        // last planned descents rather than adding to them — the appended
-        // (+2) form was measured −0.000048 dev but FAILED the grader's cap
-        // (cb0dddfb, 17½ min in): every promotion tonight has been stacking
-        // time and the shared envelope is gone, so additions of any size in
-        // any window are now cap bets. A SWAP is cost-neutral by
-        // construction: identical descent count, different seeds. Modes 7
-        // and 2 are the plan's two strongest per the measured table above;
-        // same dedup discipline; pure function of the pattern.
-        if slots.len() == 3 && plan.len() >= 4 {
-            let mut adds: Vec<(usize, u8)> = Vec::new();
-            for &mode in &[7u8, 2u8] {
-                let key = (slots[2].0, mode);
-                if done.contains(&key) {
-                    continue;
-                }
-                done.push(key);
-                adds.push((2usize, mode));
-            }
-            for _ in 0..adds.len() {
-                plan.pop();
-            }
-            plan.extend(adds);
         }
         let mut mtasks: Vec<parallel::PermFn> = Vec::new();
         for &(slot, mode) in plan.iter() {
@@ -5251,7 +5180,6 @@ fn order_with_options(
         budget: 5_000_000,
         streams: 2,
         rank_blocks: false,
-        round: 0,
     };
     if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
@@ -5268,20 +5196,7 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        // Third round re-restored (it was promoted in 0d475d2a and then wiped
-        // by a later graft whose base predated it), extended to the sparse
-        // hub-free sub-10k class per 0027: in both regimes the extra round
-        // runs only when round 2 strictly improved (the loop breaks on
-        // non-improvement below).
-        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
-            || (n < 10_000 && nnz <= 30_000 && max_deg * RGREEDY_MID_HUB_DIV <= n)
-        {
-            3
-        } else {
-            2
-        };
-        for round in 0..rgsub_rounds {
-            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
+        for _round in 0..2 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5306,7 +5221,7 @@ fn order_with_options(
                 &mut work,
                 &counts_post,
                 &parent_post,
-                round_cfg,
+                rgsub_cfg,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
