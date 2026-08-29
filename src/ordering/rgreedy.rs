@@ -116,6 +116,9 @@ pub(crate) struct Game<'a> {
     w: usize,
     adj0: &'a [u64],
     adj: Vec<u64>,
+    /// Degrees of the pristine graph, cached once per game. `reset` keeps the
+    /// old logical ops charge so deterministic budgets and outputs are exact.
+    deg0: Vec<u32>,
     deg: Vec<u32>,
     /// Live set as a dense array with position index (the linear-scan path).
     livelist: Vec<u32>,
@@ -212,11 +215,19 @@ impl<'a> Game<'a> {
         if adj0.len() < n * w {
             return None;
         }
+        let mut deg0 = vec![0u32; n];
+        for (v, d) in deg0.iter_mut().enumerate() {
+            *d = adj0[v * w..v * w + w]
+                .iter()
+                .map(|word| word.count_ones())
+                .sum();
+        }
         Some(Game {
             n,
             w,
             adj: adj0[..n * w].to_vec(),
             adj0,
+            deg0,
             deg: vec![0; n],
             livelist: Vec::with_capacity(n),
             pos: vec![0; n],
@@ -238,12 +249,9 @@ impl<'a> Game<'a> {
         self.adj.copy_from_slice(&self.adj0[..self.n * self.w]);
         self.bhead.fill(-1);
         self.livelist.clear();
+        self.deg.copy_from_slice(&self.deg0);
         for v in 0..self.n {
-            let mut d = 0u32;
-            for k in 0..self.w {
-                d += self.adj[v * self.w + k].count_ones();
-            }
-            self.deg[v] = d;
+            let d = self.deg[v];
             if v >= self.nelim {
                 continue; // permanently live: never a pivot, never bucketed
             }
