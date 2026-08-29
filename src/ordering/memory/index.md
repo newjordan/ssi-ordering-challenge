@@ -231,27 +231,6 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   blindly.
 
 - [0028-compose-narrow-slack-rgsub3-runnerup-swap.md](experiments/0028-compose-narrow-slack-rgsub3-runnerup-swap.md) — **WIN (dev −0.000241, 22/2)**: same-round compose of 19b52f11 (narrow PEP slack 800M + RGSUB round 3 + round-2 seed diversification) and bbebe613 (runner-up seed swap in the multi-start plan) on f48a17f.
-- [0030-winnable-band-hunt.md](experiments/0030-winnable-band-hunt.md) — **WIN (proxy −0.000040,
-  2/0; dev byte-identical)** + the winnable-band census instrument. Full 0.93–0.99-band census on
-  the reconstructed eval corpus (118 rows: 16 gt/46 mid/56 lt) with NEW per-phase attribution
-  (`attrib_mark`, test-only): the band is won by late DESCENT phases, and every crown-style
-  selector variant (AMF/AMD alpha grids, strips, DegSqrt cascades) lands at EXACTLY the AMD
-  anchor on the sparse band mass — selector diversity is exhausted there, only search moves it.
-  Shipped: ultra-dense no-dense-AMD arm, `nnz ∈ [400k,1.2M) ∧ nnz ≥ 100n` (a cell both
-  `HEAVY_AMDND_MAX_NNZ` 700k and `D_WIDE_MAX_NNZ` 1M excluded): idx219 0.9719→0.9556, idx19
-  0.06898→0.06808 on the proxy, zero dev rows in gate. MCS-caching checked: N/A (no slide walk
-  in this tree, MCS realized once per candidate).
-- [0031-fleet-h.md](experiments/0031-fleet-h.md) — **WIN (eval proxy −0.000128, 5/0) + two
-  kill-proofs.** Terminal-MINL widened into `100k<nnz≤300k ∧ 20<d<50` (gams03 −0.037, sppb2pq
-  −0.018; density floor keeps the gate-wall class out; 300k→700k extension measured zero and cut).
-  KILLED with proof: (1) 0026's deferred D_WIDE relabelled-AMF multistart — full 7α×8-seed grid is
-  0.5%–112% worse than today's incumbents in both corpora, value absorbed by the 0026 arm + crown
-  bands + heavy relabelled-AMF; (2) the crown band-k "note values" (128/32) — both LOSE on eval,
-  the divergent in-code k (146/128) are the real tuned values, the note is stale.
-
-## Open questions
-- [open-questions.md](open-questions.md) — the research queue.
-
 - [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
   pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
