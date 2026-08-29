@@ -5022,7 +5022,7 @@ fn order_with_options(
     // the denser hidden members that plausibly run hot are excluded) and a
     // halved 150M budget (~0.2 s grader-side for the 4-stream fan-out).
     const RGREEDY_MID_MAX_NNZ: usize = 30_000;
-    const RGREEDY_MID_BUDGET: i64 = 150_000_000;
+    const RGREEDY_MID_BUDGET: i64 = 230_000_000;
     #[cfg(test)]
     let _tp = std::time::Instant::now();
     let rgreedy_pep_gate = nnz > 0 && nnz <= RGREEDY_PEP_MAX_NNZ;
