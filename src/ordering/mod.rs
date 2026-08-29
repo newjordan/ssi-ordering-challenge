@@ -2333,8 +2333,6 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
-    let max_deg_sq = (max_deg as u128) * (max_deg as u128);
-    let medium_metric_hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -2379,15 +2377,33 @@ fn order_with_options(
     // now only queues candidates); they must be declared BEFORE `tasks`
     // because the queued strip closures borrow them and locals drop in
     // reverse declaration order.
+    //
+    // Sloan(2,1) is computed ONCE here when it is already on the consider
+    // queue (`SLOAN_MAX_*`). The NestedSubgraphBuilder strip ranks by the
+    // reverse of that same permutation — last-Sloan-numbered vertices
+    // stripped first — so ranking does not add a third Sloan call. The
+    // consider-queue Sloan(2,1) task returns this vec; Sloan(1,2) stays a
+    // separate consider-only pass.
+    let sloan_gate = n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ;
+    let sloan_21_owned: Option<Vec<i32>> = if sloan_gate {
+        Some(sloan_order(pattern, 2, 1))
+    } else {
+        None
+    };
     let strip_gate =
         n > 0 && n < STRIP_MAX_N && nnz < STRIP_MAX_NNZ && nnz < (STRIP_MAX_AVG_DEG + 1) * n;
     let (deg_ranked_owned, lcnt_ranked_owned): (Vec<usize>, Vec<usize>) = if strip_gate {
-        let mut deg_ranked: Vec<usize> = (0..n).collect();
-        deg_ranked.sort_unstable_by(|&a, &b| {
-            let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
-            let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
-            db.cmp(&da).then(a.cmp(&b))
-        });
+        let deg_ranked: Vec<usize> = if let Some(ref s21) = sloan_21_owned {
+            s21.iter().rev().map(|&x| x as usize).collect()
+        } else {
+            let mut deg_ranked: Vec<usize> = (0..n).collect();
+            deg_ranked.sort_unstable_by(|&a, &b| {
+                let da = pattern.col_ptr[a + 1] - pattern.col_ptr[a];
+                let db = pattern.col_ptr[b + 1] - pattern.col_ptr[b];
+                db.cmp(&da).then(a.cmp(&b))
+            });
+            deg_ranked
+        };
         let mut lcnt = vec![0usize; n];
         for (pos, &v) in amd_perm.iter().enumerate() {
             lcnt[v] = amd_counts[pos];
@@ -2563,7 +2579,32 @@ fn order_with_options(
                 dense_alpha: 1.25,
                 ..Default::default()
             };
-            consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
+            if n < 10_000 && nnz >= 800_000 && nnz > 100usize.saturating_mul(n) {
+                // Ultra-dense sub-10k pedigree slice: reuse the AMF-1.25 task
+                // for the independently measured k=512 degree strip, whose
+                // non-aggressive no-dense AMD core improves the exact parent
+                // completion without increasing portfolio width.
+                consider!(move || {
+                    let mut ranked: Vec<usize> = (0..n).collect();
+                    ranked.sort_unstable_by(|&a, &b| {
+                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                        db.cmp(&da).then(a.cmp(&b))
+                    });
+                    let sub = |c: &feral_ordering_core::CscPattern| {
+                        let opts = feral_amd::AmdOptions {
+                            aggressive: false,
+                            dense_alpha: -1.0,
+                        };
+                        feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
+                    };
+                    let perm = strip_general_v2(scoring_pat, &ranked, 512, &sub)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    Ok(perm.into_iter().map(|v| v as i32).collect())
+                });
+            } else {
+                consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
+            }
             if nnz >= D_WIDE_MAX_DENSITY * n {
                 // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
                 // place of AMD(.75). The 50..100 band refines its raw ordering
@@ -2790,20 +2831,11 @@ fn order_with_options(
 
         // Tighter-dense AMF (α2) — a distinct AMF ordering for dense-ish mediums
         // that the α5/α10 AMF variants miss. Time-trivial at this size.
-        if nnz >= 200_000 && medium_metric_hub_safe {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                0.75,
-                true,
-                custom_metrics::ScoreVariant::DegSqrt,
-            ));
-        } else {
-            let amf_opts2 = feral_amf::AmfOptions {
-                dense_alpha: 2.0,
-                ..Default::default()
-            };
-            consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
-        }
+        let amf_opts2 = feral_amf::AmfOptions {
+            dense_alpha: 2.0,
+            ..Default::default()
+        };
+        consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
         // add unique wins beyond the existing α{-1,2,5,10} set. Gated to genuinely
@@ -3012,9 +3044,9 @@ fn order_with_options(
     // move the worst case. Deterministic (fixed pseudo-peripheral seeding + a
     // priorities-only monotone max-heap with a fixed tie-break). Best-of floor →
     // zero downside.
-    if n < SLOAN_MAX_N && nnz < SLOAN_MAX_NNZ {
+    if let Some(ref s21) = sloan_21_owned {
         consider!(move || {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 2, 1))
+            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(s21.clone())
         });
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(sloan_order(pattern, 1, 2))
@@ -3265,21 +3297,23 @@ fn order_with_options(
         consider!(move || feral_kahip::kahip_order_full(&core, &kahip_eco).map(|(p, _, _)| p));
     }
 
-    // STRIP TRANSFORM — delete the k densest (or highest-L-column-count under
-    // baseline AMD) vertices, AMD the induced subgraph on what remains, then
-    // append the deleted vertices LAST in ascending true-pattern degree. This
-    // is a genuinely different family from everything above: every other
-    // candidate orders the WHOLE graph; this one deliberately throws away the
-    // vertices AMD struggles with most, lets minimum degree run clean on the
-    // rest, and appends the troublemakers where they do the least damage.
+    // STRIP TRANSFORM — delete the k highest-ranked vertices, AMD the induced
+    // subgraph on what remains, then append the deleted vertices LAST in
+    // ascending true-pattern degree. This is a genuinely different family from
+    // everything above: every other candidate orders the WHOLE graph; this one
+    // deliberately throws away the vertices AMD struggles with most, lets
+    // minimum degree run clean on the rest, and appends the troublemakers
+    // where they do the least damage.
     // Only has to be a valid bijection — [`strip_candidate`] guarantees that by
     // construction — so provenance is otherwise unconstrained.
     //
-    // Ships exactly SIX candidates (the subset measured to capture 93% of the
-    // full sweep's gain): `deg` k ∈ {6, 24, 48, 64, 96} ranked by degree in the
-    // TRUE pattern A, and `lcnt64` ranked by L-column-count under the baseline
-    // AMD ordering — free to compute, since the anchor factorization
-    // (`amd_perm`/`amd_counts`) already exists above.
+    // NestedSubgraphBuilder: a SINGLE strip at k=24, ranked by the reverse of
+    // the consider-queue Sloan(2,1) perm when that pass is already gated on
+    // (degree fallback otherwise). Plus `lcnt64` ranked by L-column-count
+    // under the baseline AMD ordering — free to compute, since the anchor
+    // factorization (`amd_perm`/`amd_counts`) already exists above. Dropping
+    // the k=96 NestedSubgraphBuilder AMD pass shrinks work on ringpack-scale
+    // n (e.g. n=17999) vs the {24,96} pair.
     //
     // Density-gated OFF entirely at `nnz/n >= 25` — see [`STRIP_MAX_AVG_DEG`]
     // for the measurement that set this boundary. Best-of floor →
@@ -3306,7 +3340,7 @@ fn order_with_options(
         // is byte-identical to the old `strip_candidate(&scoring_pat,
         // &deg_ranked, k)` call it replaces for each surviving k — see its
         // doc comment.
-        let ks: Vec<usize> = [96usize, 64, 48, 24, 6].into_iter().filter(|&k| k < n).collect();
+        let ks: Vec<usize> = [24usize].into_iter().filter(|&k| k < n).collect();
         if let Some((&k0, rest)) = ks.split_first() {
             let (mut deg_builder, deg_sub0) =
                 nested_subgraph::NestedSubgraphBuilder::new(pattern, &deg_ranked, k0);
@@ -5178,13 +5212,7 @@ fn order_with_options(
         // construction: identical descent count, different seeds. Modes 7
         // and 2 are the plan's two strongest per the measured table above;
         // same dedup discipline; pure function of the pattern.
-        // Near the hub threshold, the mid-density runner-up can displace a
-        // stronger incumbent-seed basin. Retain it for low/high densities and
-        // strong hubs, where the full exact A/B was positive or unchanged.
-        let runner_up_swap = max_deg.saturating_mul(50) <= n
-            || nnz < n.saturating_mul(4)
-            || nnz > n.saturating_mul(5);
-        if slots.len() == 3 && plan.len() >= 4 && runner_up_swap {
+        if slots.len() == 3 && plan.len() >= 4 {
             let mut adds: Vec<(usize, u8)> = Vec::new();
             for &mode in &[7u8, 2u8] {
                 let key = (slots[2].0, mode);

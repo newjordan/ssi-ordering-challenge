@@ -231,6 +231,7 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   blindly.
 
 - [0028-compose-narrow-slack-rgsub3-runnerup-swap.md](experiments/0028-compose-narrow-slack-rgsub3-runnerup-swap.md) — **WIN (dev −0.000241, 22/2)**: same-round compose of 19b52f11 (narrow PEP slack 800M + RGSUB round 3 + round-2 seed diversification) and bbebe613 (runner-up seed swap in the multi-start plan) on f48a17f.
+- [0029-pr346-terminal-p50-pedigree.md](experiments/0029-pr346-terminal-p50-pedigree.md) — **QUALIFIED ON PROMOTED PR346, READY FOR ATOMIC PREFLIGHT**: terminal P50 plus a task-neutral pedigree strip on official `0.812114` PR346. Same-machine public `0.817692 -> 0.816337`, worst `0.927 -> 0.966 s`; exact pedigree root-harness `0.953819`; release, scorer, equivalence, and security checks pass. PR342 supplies official isolated `-0.000956` hidden evidence; residual risk is serial P50 work stacking with PR346's sparse third round.
 - [0025-pair-descent-extension.md](experiments/0025-pair-descent-extension.md) — **WIN (small,
   pure).** Terminal pair-descent extended to (4000,12000] hub-gated: 15 improve, ZERO regress
   (terminal phase ⇒ no reseed risk, by construction). Hardened to nnz≤30k / 48M after the
