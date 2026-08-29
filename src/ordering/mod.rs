@@ -209,6 +209,7 @@ mod exact_dp;
 /// highly decomposable (median ~30% articulation points, 65-399 blocks per
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
+mod compress;
 /// RANDOMIZED GREEDY ELIMINATION-GAME SEARCH — a new candidate family for the
 /// small tier. Maintains the EXACT fill graph as bitsets and runs thousands of
 /// randomized exact-minimum-degree eliminations, accumulating `Σ c_j²` for free
@@ -2460,6 +2461,62 @@ fn order_with_options(
         };
     }
 
+    // Twin compression + simplicial peel — exact preprocessing; AMD/AMF on the
+    // compressed graph is strictly cheaper and often finds a different basin.
+    if let Some(comp) = compress::preprocess(&scoring_pat_owned) {
+        if comp.compressed.n > 0 {
+            let comp_cp: Vec<i32> = comp
+                .compressed
+                .col_ptr
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            let comp_ri: Vec<i32> = comp
+                .compressed
+                .row_idx
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            let comp_nc = comp.compressed.n;
+            let comp_meta = comp.clone();
+            let comp_cp1 = comp_cp.clone();
+            let comp_ri1 = comp_ri.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp1, &comp_ri1)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let p = feral_amd::amd_order(&comp_core)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta.expand_perm_i32(&pu)
+            });
+            let comp_meta2 = comp.clone();
+            let comp_cp2 = comp_cp.clone();
+            let comp_ri2 = comp_ri.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp2, &comp_ri2)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let opts = feral_amf::AmfOptions {
+                    dense_alpha: 5.0,
+                    ..Default::default()
+                };
+                let (p, ..) = feral_amf::amf_order_opts(&comp_core, &opts)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta2.expand_perm_i32(&pu)
+            });
+            let comp_meta3 = comp.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp, &comp_ri)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let opts = feral_amd::AmdOptions {
+                    aggressive: false,
+                    dense_alpha: -1.0,
+                };
+                let (p, ..) = feral_amd::amd_order_opts(&comp_core, &opts)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta3.expand_perm_i32(&pu)
+            });
+        }
+    }
+
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
     // heavy orderings as the prior safe run.)
@@ -3166,6 +3223,59 @@ fn order_with_options(
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
         });
+        // Structured relabel: RCM numbering biases AMD tie-breaks toward locality.
+        let amd_rcm = feral_amd::AmdOptions::default();
+        consider!(move || {
+            let q: Vec<usize> = rcm_order(pattern).into_iter().map(|x| x as usize).collect();
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_rcm)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
+    }
+
+    // Gap-based hub deferral: cut at visible degree-tail gaps instead of α sweeps.
+    if max_deg * max_deg > 4 * n
+        && nnz >= 200_000
+        && nnz < MEDIUM_MAX_NNZ
+        && n >= 1_000
+    {
+        let hub_ks = gap_hub_prefix_lengths(n, pattern.col_ptr.as_slice(), max_deg);
+        for k in hub_ks {
+            consider!(move || {
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| {
+                    let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                    let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                let sub = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+                let perm = strip_general_v2(scoring_pat, &ranked, k, &sub)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                Ok(perm.into_iter().map(|v| v as i32).collect())
+            });
+            consider!(move || {
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| {
+                    let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                    let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                let sub = |c: &feral_ordering_core::CscPattern| {
+                    let opts = feral_amf::AmfOptions {
+                        dense_alpha: 0.75,
+                        ..Default::default()
+                    };
+                    feral_amf::amf_order_opts(c, &opts).ok().map(|(p, ..)| p)
+                };
+                let perm = strip_general_v2(scoring_pat, &ranked, k, &sub)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                Ok(perm.into_iter().map(|v| v as i32).collect())
+            });
+        }
     }
 
     // Sloan wavefront/profile reduction — a pure-Rust O(nnz log n) ordering from
@@ -4622,6 +4732,35 @@ fn order_with_options(
                     best_flops = f;
                     best_perm = cand;
                 }
+            }
+        }
+    }
+
+    // Hub-first: eliminate a hub early when most neighbours sit in top columns.
+    if n >= 5_000 && nnz >= 100_000 && max_deg * max_deg > 4 * n {
+        if let Some((cand, f)) = hub_first_candidate(
+            pattern,
+            scoring_pat,
+            &mut ws,
+            &best_perm,
+            max_deg,
+            n,
+        ) {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+
+    // Root-strip: defer top fill columns when objective mass concentrates at root.
+    if n >= 10_000 && nnz > 0 && nnz <= 600_000 {
+        if let Some((cand, f)) =
+            root_strip_refine(scoring_pat, &mut ws, &best_perm, n, nnz)
+        {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
             }
         }
     }
@@ -7542,6 +7681,137 @@ fn final_simplicial_promotion(
         seed_flops,
         SIMPLICIAL_PROMOTION_OPS_BUDGET,
     )
+}
+
+/// Degree-tail gap sizes for hub-set deferral (mat_fact Q5).
+fn gap_hub_prefix_lengths(n: usize, col_ptr: &[usize], max_deg: usize) -> Vec<usize> {
+    let sqrt_n = (n as f64).sqrt() as usize;
+    if max_deg <= 2 * sqrt_n.max(1) {
+        return Vec::new();
+    }
+    let mut degs: Vec<usize> = (0..n).map(|v| col_ptr[v + 1] - col_ptr[v]).collect();
+    degs.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = Vec::new();
+    for k in 1..degs.len().min(6) {
+        if degs[k - 1] <= 2 * sqrt_n {
+            break;
+        }
+        let gap = degs[k - 1].saturating_sub(degs[k]);
+        if gap >= degs[k].max(1) / 3 {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// Try hub-first ordering when hub neighbours dominate top column mass.
+fn hub_first_candidate(
+    pattern: &Pattern,
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    perm: &[usize],
+    max_deg: usize,
+    n: usize,
+) -> Option<(Vec<usize>, u64)> {
+    let sqrt_n = (n as f64).sqrt() as usize;
+    if max_deg <= 2 * sqrt_n.max(1) || n < 5_000 {
+        return None;
+    }
+    let mut hub = 0usize;
+    let mut hub_deg = 0usize;
+    for v in 0..n {
+        let d = pattern.col_ptr[v + 1] - pattern.col_ptr[v];
+        if d > hub_deg {
+            hub_deg = d;
+            hub = v;
+        }
+    }
+    if hub_deg <= 2 * sqrt_n {
+        return None;
+    }
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let mut lcnt = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        lcnt[v] = counts[pos];
+    }
+    let mut flops_by_v: Vec<u64> = lcnt.iter().map(|&c| (c as u64) * (c as u64)).collect();
+    flops_by_v.sort_unstable();
+    let thresh = flops_by_v[flops_by_v.len() * 99 / 100];
+    let mut top_nbrs = 0usize;
+    let mut total_nbrs = 0usize;
+    for k in pattern.col_ptr[hub]..pattern.col_ptr[hub + 1] {
+        let u = pattern.row_idx[k];
+        if u != hub {
+            total_nbrs += 1;
+            if (lcnt[u] as u64) * (lcnt[u] as u64) >= thresh {
+                top_nbrs += 1;
+            }
+        }
+    }
+    if total_nbrs == 0 || top_nbrs * 10 < total_nbrs * 8 {
+        return None;
+    }
+    let mut cand: Vec<usize> = Vec::with_capacity(n);
+    cand.push(hub);
+    cand.extend(perm.iter().copied().filter(|&v| v != hub));
+    if !is_bijection(&cand, n) {
+        return None;
+    }
+    let f = ws.flops(sp, &cand);
+    let f0 = ws.flops(sp, perm);
+    if f < f0 {
+        Some((cand, f))
+    } else {
+        None
+    }
+}
+
+/// Root-strip refinement when top-1% columns carry enough objective mass.
+fn root_strip_refine(
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    perm: &[usize],
+    n: usize,
+    nnz: usize,
+) -> Option<(Vec<usize>, u64)> {
+    if n < 10_000 || nnz == 0 || nnz > 600_000 {
+        return None;
+    }
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let total: u64 = counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+    let top_k = (n / 100).max(1).min(32);
+    let top_mass: u64 = counts
+        .iter()
+        .rev()
+        .take(top_k)
+        .map(|&c| (c as u64) * (c as u64))
+        .sum();
+    if top_mass * 100 < total * 40 {
+        return None;
+    }
+    let mut lcnt = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        lcnt[v] = counts[pos];
+    }
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
+    let k = top_k.min(n - 1);
+    let sub = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+    let cand = strip_general_v2(sp, &ranked, k, &sub)?;
+    if !is_bijection(&cand, n) {
+        return None;
+    }
+    let f = ws.flops(sp, &cand);
+    let f0 = ws.flops(sp, perm);
+    if f < f0 {
+        Some((cand, f))
+    } else {
+        None
+    }
 }
 
 /// Whether `perm` is a bijection of `0..n` (guards a candidate before scoring).
