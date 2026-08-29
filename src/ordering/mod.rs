@@ -1016,6 +1016,17 @@ const WATCH_MINL_MAX_FILL: usize = 145_000;
 const WATCH_MINL_OPS_BUDGET: i64 = MINL_OPS_BUDGET;
 const WATCH_MINL_MAX_COMMON: usize = MINL_MAX_COMMON;
 
+/// Tight envelope for the independent `PHARMAKOS(watcher(base))` sibling.
+/// The raw watcher above remains unchanged; this fourth completion task pays
+/// for one smaller watcher pass, one exact-completion rebuild, and exactly one
+/// terminal-expulsion candidate before the existing global strict scorer.
+const WATCH_PHARMAKOS_MAX_N: usize = 12_000;
+const WATCH_PHARMAKOS_MAX_NNZ: usize = 30_000;
+const WATCH_PHARMAKOS_MAX_LNNZ: usize = 120_000;
+const WATCH_PHARMAKOS_MAX_FILL: usize = 60_000;
+const WATCH_PHARMAKOS_OPS_BUDGET: i64 = 12_000_000;
+const WATCH_PHARMAKOS_MAX_COMMON: usize = 512;
+
 /// COMPONENT B — ORBIT-BATCHED COMPLETION-LATTICE DESCENT (Noether priming
 /// round 4, `noether.md` §2.2 "Component B"; source doc:
 /// `~/ssi-ordering-LEARNINGS/data/priming-round4/noether.md`). Same move as
@@ -4708,6 +4719,22 @@ fn order_with_options(
         }));
     }
 
+    // Fourth completion sibling, deliberately appended after all existing
+    // tasks so their strict-argmin tie order is unchanged. The serial
+    // PHARMAKOS phase below only sees this batch's winner; generating P(W)
+    // here preserves the otherwise-missed basin where raw watcher is not the
+    // batch argmin but one terminal expulsion from it is.
+    if pharmakos_enabled
+        && nnz > 0
+        && n <= WATCH_PHARMAKOS_MAX_N
+        && nnz <= WATCH_PHARMAKOS_MAX_NNZ
+        && !minl_off()
+    {
+        dtasks.push(Box::new(move || {
+            watcher_pharmakos_once(scoring_pat, base_desc)
+        }));
+    }
+
     {
         let mut dres = parallel::run_perms(&dtasks, scoring_pat, n, nnz, best_flops);
         parallel::accept(&mut dres, &mut best_flops, &mut best_perm, |_| {});
@@ -5364,6 +5391,119 @@ fn pharmakos_terminal_reorder(sp: &ScoringPattern, in_s: &[bool]) -> Option<Vec<
     let tail: Vec<usize> = (0..n).filter(|&v| in_s[v]).collect(); // already ascending
     perm.extend(tail);
     Some(perm)
+}
+
+/// Compose a tightly bounded raw watcher pass with exactly one deterministic
+/// PHARMAKOS-like terminal-expulsion attempt. This producer intentionally does
+/// no scoring or local acceptance: its caller's existing `run_perms` invocation
+/// validates and scores the returned permutation beside the raw watcher.
+fn watcher_pharmakos_once(sp: &ScoringPattern, start_perm: &[usize]) -> Option<Vec<usize>> {
+    watcher_pharmakos_raw_and_once(sp, start_perm).map(|(_, expelled)| expelled)
+}
+
+/// Return the tight raw watcher seed together with its one-shot expulsion.
+/// Kept separate so focused tests can prove the composition itself, rather
+/// than attributing the watcher's own improvement to the terminal move.
+fn watcher_pharmakos_raw_and_once(
+    sp: &ScoringPattern,
+    start_perm: &[usize],
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let n = sp.n;
+    if n == 0 {
+        return None;
+    }
+
+    // Re-run the same witness-driven completion descent under this sibling's
+    // smaller, independently certified envelope.
+    let (fcp, fri) = filled_graph(sp, start_perm, WATCH_PHARMAKOS_MAX_LNNZ)?;
+    let mut adj: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            fri[fcp[v] as usize..fcp[v + 1] as usize]
+                .iter()
+                .map(|&x| x as u32)
+                .collect()
+        })
+        .collect();
+    let asort: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            let mut c: Vec<u32> = sp.row_idx[sp.col_ptr[v]..sp.col_ptr[v + 1]]
+                .iter()
+                .map(|&x| x as u32)
+                .filter(|&x| x as usize != v)
+                .collect();
+            c.sort_unstable();
+            c
+        })
+        .collect();
+    let mut fill: Vec<(u32, u32)> = Vec::new();
+    for u in 0..n {
+        for &wv in &adj[u] {
+            if (wv as usize) > u && asort[u].binary_search(&wv).is_err() {
+                fill.push((u as u32, wv));
+            }
+        }
+    }
+    if fill.is_empty()
+        || fill.len() > WATCH_PHARMAKOS_MAX_FILL
+        || fill.len().saturating_mul(5) < fri.len()
+    {
+        return None;
+    }
+    let mut ids: Vec<u32> = (0..fill.len() as u32).collect();
+    ids.sort_unstable_by_key(|&i| {
+        let (u, v) = fill[i as usize];
+        (adj[u as usize].len() + adj[v as usize].len(), i)
+    });
+    let result = watcher_minimalize(
+        &mut adj,
+        &fill,
+        &ids,
+        WATCH_PHARMAKOS_OPS_BUDGET,
+        WATCH_PHARMAKOS_MAX_COMMON,
+    );
+    if result.removed == 0 {
+        return None;
+    }
+    let watcher_perm = minl_mcs_peo(n, &adj);
+    if !is_bijection(&watcher_perm, n) {
+        return None;
+    }
+
+    // Rebuild because MCS can realize a strict subcompletion of `adj` when the
+    // bounded watcher stops early. Blame, etree, and counts must describe the
+    // exact completion induced by `watcher_perm`.
+    let (wfcp, wfri) = filled_graph(sp, &watcher_perm, WATCH_PHARMAKOS_MAX_LNNZ)?;
+    let watcher_adj: Vec<Vec<u32>> = (0..n)
+        .map(|v| {
+            wfri[wfcp[v] as usize..wfcp[v + 1] as usize]
+                .iter()
+                .map(|&x| x as u32)
+                .collect()
+        })
+        .collect();
+    let permuted = permute_pattern(sp, &watcher_perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let blame = pharmakos_blame(n, &watcher_perm, &etree, &counts, &watcher_adj);
+
+    // One round, one try: the established first-attempt batch size and exact
+    // descending-blame/ascending-id tie order, with no retry and no local score.
+    let mut eligible: Vec<usize> = (0..n).collect();
+    eligible.sort_unstable_by(|&a, &b| blame[b].cmp(&blame[a]).then(a.cmp(&b)));
+    if eligible.is_empty() || blame[eligible[0]] == 0 {
+        return None;
+    }
+    let batch_k = if n >= PHARMAKOS_BATCH_N_THRESHOLD {
+        PHARMAKOS_BATCH_K
+    } else {
+        1
+    };
+    let mut in_s = vec![false; n];
+    for &v in eligible.iter().take(batch_k) {
+        in_s[v] = true;
+    }
+    let expelled = pharmakos_terminal_reorder(sp, &in_s)?;
+    Some((watcher_perm, expelled))
 }
 
 /// Exact clique check on sorted adjacency for the completion-lattice
@@ -6806,6 +6946,99 @@ mod tests {
         }
         let pat = Pattern::from_edges(n, &edges);
         assert_eq!(order(&pat), order(&pat));
+    }
+
+    #[test]
+    fn watcher_pharmakos_once_is_reachable_valid_and_deterministic() {
+        // Center-first elimination of a star creates a dense, highly
+        // nonminimal leaf clique. This deterministically exercises watcher
+        // deletion, exact-completion rebuild, blame ranking, and the one-shot
+        // terminal reorder without relying on the external corpus.
+        let n = 48;
+        let edges: Vec<(usize, usize)> = (1..n).map(|v| (0, v)).collect();
+        let pat = Pattern::from_edges(n, &edges);
+        let sp = ScoringPattern {
+            n,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        };
+        let center_first: Vec<usize> = (0..n).collect();
+
+        let first = watcher_pharmakos_once(&sp, &center_first)
+            .expect("star's center-first completion must reach the composed sibling");
+        let second = watcher_pharmakos_once(&sp, &center_first)
+            .expect("the deterministic second call must take the same path");
+        assert_bijection(&first, n);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn watcher_pharmakos_once_fails_closed_without_fill() {
+        let n = 32;
+        let pat = Pattern::from_edges(n, &[]);
+        let sp = ScoringPattern {
+            n,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        };
+        let identity: Vec<usize> = (0..n).collect();
+        assert!(watcher_pharmakos_once(&sp, &identity).is_none());
+    }
+
+    #[test]
+    fn watcher_pharmakos_once_has_strict_synthetic_witness() {
+        let n = 22;
+        let edges = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 8),
+            (8, 9),
+            (9, 10),
+            (10, 11),
+            (11, 12),
+            (12, 13),
+            (13, 14),
+            (14, 15),
+            (15, 16),
+            (16, 17),
+            (17, 18),
+            (18, 19),
+            (19, 20),
+            (20, 21),
+            (3, 5),
+            (4, 17),
+            (5, 11),
+            (6, 8),
+            (6, 9),
+            (7, 14),
+            (10, 12),
+            (13, 17),
+            (14, 21),
+        ];
+        let start = [
+            21, 15, 5, 19, 2, 20, 1, 4, 10, 14, 9, 12, 0, 3, 6, 11, 17, 13, 8, 16, 18, 7,
+        ];
+        let pat = Pattern::from_edges(n, &edges);
+        let sp = ScoringPattern {
+            n,
+            col_ptr: pat.col_ptr.clone(),
+            row_idx: pat.row_idx.clone(),
+        };
+
+        let (raw, expelled) = watcher_pharmakos_raw_and_once(&sp, &start)
+            .expect("fixed witness must reach raw watcher and one expulsion");
+        assert_bijection(&raw, n);
+        assert_bijection(&expelled, n);
+        let raw_f = flops_of(&sp, &raw);
+        let expelled_f = flops_of(&sp, &expelled);
+        assert_eq!(raw_f, 301);
+        assert_eq!(expelled_f, 262);
+        assert!(expelled_f < raw_f);
     }
 
     /// RCM must always return a valid bijection, including on a disconnected
