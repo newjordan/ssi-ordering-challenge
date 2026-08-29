@@ -2593,6 +2593,32 @@ fn order_with_options(
             }
         }
 
+        // Two non-overlapping coverage cells retained from the b42 exact
+        // portfolio. The other b42 arms are already absorbed by this frontier.
+        if (200_000..=500_000).contains(&nnz) && nnz <= 4usize.saturating_mul(n) {
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.5,
+                    false,
+                    custom_metrics::ScoreVariant::DegDivNvSqrtWf,
+                )
+            });
+        }
+        if (400_000..=500_000).contains(&nnz)
+            && nnz > 8usize.saturating_mul(n)
+            && nnz <= 13usize.saturating_mul(n)
+        {
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.5,
+                    false,
+                    custom_metrics::ScoreVariant::DegDivNvDegme,
+                )
+            });
+        }
+
         // Keep only the measured truck winner from the dense extension.
         // Exakoss's terminal pedigree strip is strictly better than the
         // no-dense AMD candidate, so retaining the broad three-pass arm would
@@ -2937,6 +2963,19 @@ fn order_with_options(
                     custom_metrics::order_variant(
                         &core,
                         alpha,
+                        true,
+                        custom_metrics::ScoreVariant::DegSqrt,
+                    )
+                });
+            }
+
+            // Exact500 census: only ringpack_30_1 reaches this structural
+            // cell, where alpha 2.5 strictly improves the current incumbent.
+            if n > 4_000 && nnz < 200_000 && (700..800).contains(&max_deg) {
+                consider!(move || {
+                    custom_metrics::order_variant(
+                        &core,
+                        2.5,
                         true,
                         custom_metrics::ScoreVariant::DegSqrt,
                     )
