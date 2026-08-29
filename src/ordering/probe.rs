@@ -7021,3 +7021,521 @@ fn probe_fleet_j_full() {
         println!("WORST order() = {:.3} s ({})", r0.0, r0.1);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUPERSET INSTRUMENT (session 2026-08-29). Measures per-row ratio AND isolated
+// `order()` wall time on an ARBITRARY corpus given by `SSI_CORPUS_FILE`, so the
+// full 1309-row MINLPLib reconstruction (a strict superset of the hidden eval
+// corpus) can be used both as a score proxy and — the point — as a CAP-RISK MAP.
+// Loads via `ssi_scoring::load_corpus_jsonl` directly, so it needs no change to
+// any non-editable file. Test-only; never shipped, never read by the grader.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-row ratio + isolated time over `$SSI_CORPUS_FILE`.
+///
+/// Env:
+///   `SSI_CORPUS_FILE`  corpus to grade (required).
+///   `SSI_PROBE_TSV`    if set, write a machine-readable TSV here.
+///   `SSI_PROBE_MIN_N` / `SSI_PROBE_MAX_N`  restrict to a dimension window.
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_superset`
+#[test]
+#[ignore]
+fn probe_superset() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            println!("SKIP probe_superset: set SSI_CORPUS_FILE");
+            return;
+        }
+    };
+    let min_n: usize = std::env::var("SSI_PROBE_MIN_N").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let max_n: usize = std::env::var("SSI_PROBE_MAX_N").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_superset: failed to load {path_string}: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+    println!(
+        "{:<34} {:>8} {:>10} {:>9} {:>9}",
+        "matrix", "n", "nnz", "ratio", "sec"
+    );
+
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut rows: Vec<(String, usize, usize, f64, f64)> = Vec::new();
+    let mut worst_s = 0.0f64;
+    let mut worst_name = String::new();
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n < min_n || n > max_n {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd) as f64;
+
+        let t0 = Instant::now();
+        let perm = order(pat);
+        let secs = t0.elapsed().as_secs_f64();
+        assert!(is_bijection(&perm, n), "{name}: order() returned a non-bijection");
+        let f = flops_of(&sp, &perm) as f64;
+        let ratio = if base > 0.0 { f / base } else { 1.0 };
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        if secs > worst_s {
+            worst_s = secs;
+            worst_name = name.clone();
+        }
+        println!("{name:<34} {n:>8} {nnz:>10} {ratio:>9.4} {secs:>9.3}");
+        rows.push((name.clone(), n, nnz, ratio, secs));
+    }
+
+    println!("\n{:<10} {:>6} {:>12}", "bucket", "count", "geomean");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<10} {:>6} {:>12.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("\nscore (weighted): {:.6}", aggregate(&log_sums, &counts));
+    println!("worst order(): {worst_s:.3} s on {worst_name}");
+
+    if let Ok(tsv) = std::env::var("SSI_PROBE_TSV") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(&tsv) {
+            let _ = writeln!(f, "name\tn\tnnz\tratio\tsec");
+            for (nm, n, nnz, r, s) in &rows {
+                let _ = writeln!(f, "{nm}\t{n}\t{nnz}\t{r:.6}\t{s:.4}");
+            }
+            println!("wrote {} rows to {tsv}", rows.len());
+        }
+    }
+}
+
+/// COST DECOMPOSITION: for every matrix, time the AMD anchor, the anchor's
+/// SCORING pass (permute + elimination tree + Gilbert-Ng-Peyton column counts)
+/// and the full `order()`. The scoring pass is pure overhead on any matrix
+/// where every candidate gate is closed, because `order()` then returns the
+/// anchor permutation it already had.
+///
+/// `SSI_CORPUS_FILE=<corpus> cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_anchor_cost`
+#[test]
+#[ignore]
+fn probe_anchor_cost() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => { println!("SKIP: set SSI_CORPUS_FILE"); return; }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => { println!("SKIP: {e}"); return; }
+    };
+    println!("{:<34} {:>8} {:>10} {:>8} {:>8} {:>8} {:>8}",
+             "matrix", "n", "nnz", "amd_s", "score_s", "total_s", "rest_s");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 { continue; }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+
+        let t0 = Instant::now();
+        let amd: Vec<usize> = feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect();
+        let amd_s = t0.elapsed().as_secs_f64();
+
+        let t1 = Instant::now();
+        let permuted = permute_pattern(&sp, &amd);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let _f: u64 = counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+        let score_s = t1.elapsed().as_secs_f64();
+
+        let t2 = Instant::now();
+        let _p = order(pat);
+        let total_s = t2.elapsed().as_secs_f64();
+
+        println!("{name:<34} {n:>8} {nnz:>10} {amd_s:>8.3} {score_s:>8.3} {total_s:>8.3} {:>8.3}",
+                 (total_s - amd_s - score_s).max(0.0));
+    }
+}
+
+/// CANDIDATE BATTERY on an arbitrary corpus: for every matrix, run a fixed list
+/// of candidate generators OUTSIDE the shipped gates and report each one's
+/// ratio-vs-AMD and isolated cost. Answers "if this gate were opened here, what
+/// would it buy and what would it cost?" without editing any gate.
+///
+/// Env: SSI_CORPUS_FILE (required), SSI_PROBE_TSV (optional).
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_battery`
+#[test]
+#[ignore]
+fn probe_battery() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => { println!("SKIP: set SSI_CORPUS_FILE"); return; }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => { println!("SKIP: {e}"); return; }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+
+    let mut tsv = String::from("matrix\tn\tnnz\tcand\tratio\tsec\n");
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 { continue; }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core).unwrap().into_iter().map(|x| x as usize).collect();
+        let base = flops_of(&sp, &amd) as f64;
+
+        // What the SHIPPED portfolio achieves today (the bar to beat).
+        let t0 = Instant::now();
+        let cur = order(pat);
+        let cur_s = t0.elapsed().as_secs_f64();
+        let cur_r = flops_of(&sp, &cur) as f64 / base;
+        println!("\n=== {name}  n={n} nnz={nnz} density={:.1}  SHIPPED ratio={cur_r:.4} ({cur_s:.3}s)",
+                 nnz as f64 / n as f64);
+        tsv.push_str(&format!("{name}\t{n}\t{nnz}\tSHIPPED\t{cur_r:.6}\t{cur_s:.4}\n"));
+
+        let mut run = |label: String, f: &dyn Fn() -> Option<Vec<usize>>| {
+            let t = Instant::now();
+            let p = f();
+            let s = t.elapsed().as_secs_f64();
+            if let Some(p) = p {
+                if is_bijection(&p, n) {
+                    let r = flops_of(&sp, &p) as f64 / base;
+                    let mark = if r < cur_r - 1e-12 { " <== BEATS SHIPPED" } else { "" };
+                    println!("    {label:<28} ratio={r:.4}  {s:.3}s{mark}");
+                    tsv.push_str(&format!("{name}\t{n}\t{nnz}\t{label}\t{r:.6}\t{s:.4}\n"));
+                    return;
+                }
+            }
+            println!("    {label:<28} FAILED       {s:.3}s");
+        };
+
+        // ── AMF at several dense_alpha ─────────────────────────────────────
+        for a in [0.5f64, 1.0, 2.0, 10.0] {
+            let o = feral_amf::AmfOptions { dense_alpha: a, ..Default::default() };
+            run(format!("amf_a{a}"), &|| feral_amf::amf_order_opts(&core, &o).ok().map(|(p, ..)| p.into_iter().map(|x| x as usize).collect()));
+        }
+        // ── AMD variants ───────────────────────────────────────────────────
+        for (agg, a) in [(false, 10.0f64), (true, 0.5), (true, 1.0), (true, 2.0), (true, 20.0), (true, -1.0)] {
+            let o = feral_amd::AmdOptions { aggressive: agg, dense_alpha: a };
+            run(format!("amd_agg{}_a{a}", agg as u8), &|| feral_amd::amd_order_opts(&core, &o).ok().map(|(p, ..)| p.into_iter().map(|x| x as usize).collect()));
+        }
+        // ── METIS nested dissection, several seeds ─────────────────────────
+        // Guarded: on the big sparse families (faclay, acopf) a partitioner is
+        // both catastrophically WORSE than AMD (ratio 2-13000x, measured) and
+        // 11 s per seed, so running it there only slows the battery down.
+        let partitioners_ok = nnz <= 400_000;
+        for s in [0u64, 1, 2, 5] {
+            if !partitioners_ok { break; }
+            let o = feral_metis::MetisOptions { seed: s, ..Default::default() };
+            run(format!("metis_s{s}"), &|| feral_metis::metis_order_full(&core, &o).ok().map(|(p, ..)| p.into_iter().map(|x| x as usize).collect()));
+        }
+        // ── Scotch / KaHIP defaults ────────────────────────────────────────
+        if partitioners_ok {
+            run("scotch".to_string(), &|| feral_scotch::scotch_order(&core).ok().map(|p| p.into_iter().map(|x| x as usize).collect()));
+            run("kahip".to_string(), &|| feral_kahip::kahip_order(&core).ok().map(|p| p.into_iter().map(|x| x as usize).collect()));
+        }
+
+        // ── relabelled AMD restarts (the frontier's strongest family) ──────
+        for seed in [1u64, 2, 3, 7] {
+            run(format!("relabel_amd_s{seed}"), &|| {
+                let q = relabel(n, seed);
+                let b = permute_pattern(&sp, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
+                let (pb, ..) = feral_amd::amd_order_opts(&bcore, &feral_amd::AmdOptions::default()).ok()?;
+                Some(pb.iter().map(|&x| q[x as usize]).collect())
+            });
+        }
+    }
+
+    if let Ok(p) = std::env::var("SSI_PROBE_TSV") {
+        let _ = std::fs::write(&p, &tsv);
+        println!("\nwrote {p}");
+    }
+}
+
+/// PHASE ATTRIBUTION on an arbitrary corpus: for every matrix, time the shipped
+/// `order()` and then re-run it with each optional phase switched off, so the
+/// cost AND the ratio each phase actually buys can be read per row. The point is
+/// to find rows that spend a large fraction of the 2 s cap and buy nothing —
+/// those are the cap-failure risk, and the cap is per matrix, so the only fix is
+/// to not spend it there.
+///
+/// Env: SSI_CORPUS_FILE (required), SSI_PROBE_TSV (optional).
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_phases`
+#[test]
+#[ignore]
+fn probe_phases() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => { println!("SKIP: set SSI_CORPUS_FILE"); return; }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => { println!("SKIP: {e}"); return; }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+    let mut tsv = String::from("matrix\tn\tnnz\tvariant\tratio\tsec\n");
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 { continue; }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(&sp, &feral_amd::amd_order(&core).unwrap()
+            .into_iter().map(|x| x as usize).collect::<Vec<_>>()) as f64;
+
+        let mut row = |label: &str, f: &dyn Fn() -> Vec<usize>| -> (f64, f64) {
+            let t = Instant::now();
+            let p = f();
+            let s = t.elapsed().as_secs_f64();
+            let r = flops_of(&sp, &p) as f64 / base;
+            tsv.push_str(&format!("{name}\t{n}\t{nnz}\t{label}\t{r:.6}\t{s:.4}\n"));
+            (r, s)
+        };
+
+        let (full_r, full_s) = row("FULL", &|| order(pat));
+        println!("\n=== {name}  n={n} nnz={nnz}  FULL ratio={full_r:.4} ({full_s:.3}s)");
+
+        let variants: [(&str, (usize, bool, bool, bool, bool, usize)); 6] = [
+            ("no_relabel",  (0,          true,  true,  true,  true,  usize::MAX)),
+            ("no_orbit",    (usize::MAX, false, true,  true,  true,  usize::MAX)),
+            ("no_pharmakos",(usize::MAX, true,  false, true,  true,  usize::MAX)),
+            ("no_midx",     (usize::MAX, true,  true,  false, true,  usize::MAX)),
+            ("no_rgreedy",  (usize::MAX, true,  true,  true,  false, usize::MAX)),
+            ("no_telos_ms", (usize::MAX, true,  true,  true,  true,  0)),
+        ];
+        for (label, (rc, ob, ph, mx, rg, tm)) in variants {
+            let (r, s) = row(label, &|| order_with_options(pat, rc, ob, ph, mx, rg, tm));
+            println!("    {label:<14} ratio={r:.4} ({s:.3}s)   Δsec={:+.3}  Δratio={:+.4}",
+                     s - full_s, r - full_r);
+        }
+        // MINL (completion-lattice descent) via its test hook.
+        MINL_OFF.with(|c| c.set(true));
+        let (r, s) = row("no_minl", &|| order(pat));
+        MINL_OFF.with(|c| c.set(false));
+        println!("    {:<14} ratio={r:.4} ({s:.3}s)   Δsec={:+.3}  Δratio={:+.4}",
+                 "no_minl", s - full_s, r - full_r);
+    }
+
+    if let Ok(p) = std::env::var("SSI_PROBE_TSV") {
+        let _ = std::fs::write(&p, &tsv);
+        println!("\nwrote {p}");
+    }
+}
+
+/// SEED-DEPTH CURVE for the relabelled-AMD heavy tier: for each matrix, the
+/// running best over the SHIPPED seed sequence (`seed = r + 1`, see the restart
+/// loop in `order_with_options`) against the AMD anchor, reported at several
+/// depths with cumulative cost. This is what sizes `heavy_multi`'s budget/cap:
+/// the shipped policy collapses to ONE draw above nnz~900k, and on the
+/// tie-saturated power-flow KKT family the per-seed spread is large.
+///
+/// `SSI_CORPUS_FILE=<corpus> cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_seed_depth`
+#[test]
+#[ignore]
+fn probe_seed_depth() {
+    const DEPTHS: [usize; 7] = [1, 2, 4, 8, 16, 24, 48];
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => { println!("SKIP: set SSI_CORPUS_FILE"); return; }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => { println!("SKIP: {e}"); return; }
+    };
+    println!("corpus: {} matrices\n", corpus.len());
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 { continue; }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core).unwrap()
+            .into_iter().map(|x| x as usize).collect();
+        let base = flops_of(&sp, &amd) as f64;
+
+        let mut best = f64::INFINITY;
+        let mut cum = 0.0f64;
+        let mut out = String::new();
+        let mut di = 0usize;
+        for r in 0..*DEPTHS.last().unwrap() {
+            let seed = r as u64 + 1;
+            let t = Instant::now();
+            let q = relabel(n, seed);
+            let b = permute_pattern(&sp, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let cand = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .and_then(|bc| feral_amd::amd_order_opts(&bc, &feral_amd::AmdOptions::default()).ok()
+                    .map(|(pb, ..)| pb.iter().map(|&x| q[x as usize]).collect::<Vec<usize>>()));
+            cum += t.elapsed().as_secs_f64();
+            if let Some(p) = cand {
+                let ratio = flops_of(&sp, &p) as f64 / base;
+                if ratio < best { best = ratio; }
+            }
+            if di < DEPTHS.len() && r + 1 == DEPTHS[di] {
+                out.push_str(&format!("  K={:<3} best={:.4} cum={:.3}s", DEPTHS[di], best, cum));
+                di += 1;
+            }
+        }
+        println!("{name}  n={n} nnz={nnz}\n{out}\n");
+    }
+}
+
+/// STRUCTURED TIE-BREAKS for AMD (session 2026-08-29, acopf follow-up).
+///
+/// The relabel multi-start works because AMD resolves ties in its degree metric
+/// by VERTEX NUMBERING, and on tie-saturated graphs (power-flow KKT: median
+/// degree 3-4) that choice is essentially arbitrary. The shipped code resamples
+/// it RANDOMLY. If ties are the mechanism, a DELIBERATE numbering should beat a
+/// random draw — in particular the nested-dissection order, which is a poor
+/// ORDERING here (2.5-3.2x worse than AMD) but may be a good TIE-BREAK: it makes
+/// AMD prefer separator-consistent vertices exactly when the degree metric is
+/// indifferent. That composition is constrained minimum degree in spirit, and
+/// both halves already ship; nothing composes them.
+///
+/// `SSI_CORPUS_FILE=<corpus> cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_tiebreak`
+#[test]
+#[ignore]
+fn probe_tiebreak() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => { println!("SKIP: set SSI_CORPUS_FILE"); return; }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => { println!("SKIP: {e}"); return; }
+    };
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 { continue; }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core).unwrap()
+            .into_iter().map(|x| x as usize).collect();
+        let base = flops_of(&sp, &amd) as f64;
+
+        // adjacency + degrees straight off the pattern
+        let deg: Vec<usize> = (0..n).map(|j| pat.col_ptr[j+1] - pat.col_ptr[j]).collect();
+        let neigh = |v: usize| &pat.row_idx[pat.col_ptr[v]..pat.col_ptr[v+1]];
+
+        // ---- candidate numberings Q (q[k] = original vertex numbered k) ----
+        let mut qs: Vec<(String, Vec<usize>)> = Vec::new();
+
+        let mut asc: Vec<usize> = (0..n).collect();
+        asc.sort_by_key(|&v| (deg[v], v));
+        let mut desc = asc.clone(); desc.reverse();
+        qs.push(("deg_asc".into(), asc.clone()));
+        qs.push(("deg_desc".into(), desc));
+
+        // RCM-style BFS from a minimum-degree seed, and its reverse
+        let start = (0..n).min_by_key(|&v| (deg[v], v)).unwrap();
+        let mut seen = vec![false; n];
+        let mut bfs: Vec<usize> = Vec::with_capacity(n);
+        let mut head = 0usize;
+        for s in std::iter::once(start).chain(asc.iter().copied()) {
+            if seen[s] { continue; }
+            seen[s] = true; bfs.push(s);
+            while head < bfs.len() {
+                let v = bfs[head]; head += 1;
+                let mut nb: Vec<usize> = neigh(v).iter().copied().filter(|&u| !seen[u]).collect();
+                nb.sort_by_key(|&u| (deg[u], u));
+                for u in nb { if !seen[u] { seen[u] = true; bfs.push(u); } }
+            }
+        }
+        let mut rcm = bfs.clone(); rcm.reverse();
+        qs.push(("bfs".into(), bfs));
+        qs.push(("rcm".into(), rcm));
+
+        // nested dissection as a NUMBERING, and reversed
+        if let Ok((p, ..)) = feral_metis::metis_order_full(&core, &feral_metis::MetisOptions::default()) {
+            let nd: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+            let mut ndr = nd.clone(); ndr.reverse();
+            qs.push(("nd".into(), nd));
+            qs.push(("nd_rev".into(), ndr));
+        }
+        // AMF as a numbering
+        if let Ok((p, ..)) = feral_amf::amf_order_opts(&core, &feral_amf::AmfOptions::default()) {
+            qs.push(("amf".into(), p.into_iter().map(|x| x as usize).collect()));
+        }
+        // AMD's own output as a numbering (self-composition / fixpoint step)
+        qs.push(("amd_self".into(), amd.clone()));
+        let mut amd_rev = amd.clone(); amd_rev.reverse();
+        qs.push(("amd_self_rev".into(), amd_rev));
+
+        println!("\n=== {name}  n={n} nnz={nnz}   AMD anchor = 1.0000");
+        // reference: the best of the shipped RANDOM seeds 1..8
+        let mut rand_best = f64::INFINITY;
+        let t_rand = Instant::now();
+        for seed in 1u64..=8 {
+            let q = relabel(n, seed);
+            if let Some(p) = compose_amd(&sp, &q, n) {
+                let r = flops_of(&sp, &p) as f64 / base;
+                if r < rand_best { rand_best = r; }
+            }
+        }
+        println!("    {:<16} {:.4}   ({:.3}s, 8 draws)", "random x8", rand_best, t_rand.elapsed().as_secs_f64());
+
+        for (label, q) in qs {
+            let t = Instant::now();
+            match compose_amd(&sp, &q, n) {
+                Some(p) => {
+                    let r = flops_of(&sp, &p) as f64 / base;
+                    let mark = if r < rand_best - 1e-9 { "  <== BEATS random x8" }
+                               else if r < 0.99999 { "  (beats AMD)" } else { "" };
+                    println!("    {label:<16} {r:.4}   ({:.3}s){mark}", t.elapsed().as_secs_f64());
+                }
+                None => println!("    {label:<16} FAILED"),
+            }
+        }
+    }
+}
+
+/// `AMD(Q A Qᵀ)` composed back through `Q` — the shipped relabel trick with an
+/// arbitrary numbering rather than a random one.
+#[cfg(test)]
+fn compose_amd(sp: &ScoringPattern, q: &[usize], n: usize) -> Option<Vec<usize>> {
+    let b = permute_pattern(sp, q);
+    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)?;
+    let (pb, ..) = feral_amd::amd_order_opts(&bcore, &feral_amd::AmdOptions::default()).ok()?;
+    Some(pb.iter().map(|&x| q[x as usize]).collect())
+}

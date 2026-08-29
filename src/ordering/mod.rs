@@ -278,7 +278,7 @@ const SWEEP_EXTRA_MAX_NNZ: usize = 150_000;
 /// only ever runs on ultra-sparse patterns where several AMD passes are
 /// milliseconds; the worst case is therefore held byte-for-byte.
 const ROBUST_MAX_N: usize = 150_000;
-const ROBUST_MAX_NNZ: usize = 130_000;
+const ROBUST_MAX_NNZ: usize = 400_000;
 
 /// Reverse Cuthill–McKee envelope. RCM is O(nnz) pure Rust — a few-millisecond
 /// BFS even at large n — so it is bounded PRIMARILY by nnz. The `nnz < 130000`
@@ -517,7 +517,7 @@ const RELABEL_MAX_RESTARTS_LARGE: usize = 150;
 ///
 /// Pays for itself on `acopf_case9241pegase_qcqp` (n=313068, nnz=1292408), which
 /// otherwise receives *only* the baseline AMD pass: 1.0000 -> 0.9737.
-const RELABEL_HEAVY_MAX_NNZ: usize = 1_500_000;
+const RELABEL_HEAVY_MAX_NNZ: usize = 2_000_000;
 
 /// ── MID-BAND RELABEL DIVERSITY EXTENSION (see the block in
 /// `order_with_options` for the measurement that motivates it).
@@ -1639,7 +1639,7 @@ fn relabel_restarts(budget: usize, cap: usize, n: usize, nnz: usize, max_deg: us
         && nnz <= RELABEL_HEAVY_MAX_NNZ
         && nnz <= HEAVY_SPARSE_MAX_AVG_DEG * n
     {
-        (900_000 / nnz).clamp(1, 4)
+        (6_000_000 / nnz).clamp(1, 8)
     } else {
         0
     };
@@ -2591,6 +2591,24 @@ fn order_with_options(
                 };
                 consider!(move || feral_amf::amf_order_opts(&core, &opts_a).map(|(p, ..)| p));
             }
+        }
+
+        // DENSE-BAND LOW-ALPHA **AMD** ARM (2026-08-29, 1309-row superset census).
+        // The whole D family above offers only **AMF** (approximate minimum
+        // FILL) at low alpha in the dense band; approximate minimum DEGREE at
+        // low alpha is never tried there at any width. Measured winners:
+        // pooling_sppc1stp 0.8366 -> 0.7926, pooling_sppc3stp 0.5156 -> 0.4881,
+        // pooling_sppb2stp 0.5083 -> 0.4943, at 0.002-0.006 s (one AMD pass,
+        // and AMD is the anchor this file already pays for on every matrix).
+        // Gated on density plus D_WIDE's absolute ceiling, deliberately
+        // spanning both sides of D_MAX_NNZ (pooling_sppb2stp, nnz=293,608,
+        // sits below that cut): the density selects the class, not the window.
+        if nnz < D_WIDE_MAX_NNZ && nnz > D_WIDE_MIN_DENSITY * n {
+            let amd_dense_05 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 0.5,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_dense_05).map(|(p, ..)| p));
         }
 
         // Keep only the measured truck winner from the dense extension.
