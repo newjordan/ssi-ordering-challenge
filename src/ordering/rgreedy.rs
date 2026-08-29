@@ -869,6 +869,39 @@ pub(crate) fn stream_rng(k: usize) -> u64 {
     0x9E37_79B9_7F4A_7C15u64.wrapping_mul(2 * k as u64 + 1) ^ (k as u64) << 32
 }
 
+/// TEST-ONLY A/B switch for the equal-work round-two RGSUB seed policy.
+/// Production always uses the variant; probes can reconstruct exact f48.
+#[cfg(test)]
+pub(crate) static RGSUB_ROUND2_SEED_VARIANT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[inline]
+fn rgsub_round2_seed_variant() -> bool {
+    #[cfg(test)]
+    {
+        RGSUB_ROUND2_SEED_VARIANT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+#[inline]
+fn round2_d1_seed(base: u64, block_rank: usize) -> u64 {
+    let salt = if block_rank >= 32 {
+        0xE703_7ED1_A0B4_28DB
+    } else {
+        0xA076_1D64_78BD_642F
+    };
+    base ^ salt
+}
+
+#[inline]
+fn round2_k0_seed(base: u64) -> u64 {
+    base ^ 0xA076_1D64_78BD_642F
+}
+
 pub(crate) fn stream_params(k: usize) -> Params {
     let mut p = Params::DEFAULT;
     match k % 4 {
@@ -1271,11 +1304,18 @@ pub(crate) fn subtree_refine(
                             // Keep the same two searches and uniform-prefix
                             // stream-1 policy, but use PEP's promoted second
                             // seed to sample an independent subtree basin.
-                            let rng_seed = if n >= 10_000 && k == 1 {
+                            let mut rng_seed = if n >= 10_000 && k == 1 {
                                 0xD1B5_4A32_D192_ED03
                             } else {
                                 stream_rng(k)
                             };
+                            if rgsub_round2_seed_variant() && n >= 10_000 && cfg.round == 1 {
+                                if k == 1 {
+                                    rng_seed = round2_d1_seed(rng_seed, block_rank);
+                                } else if k == 0 {
+                                    rng_seed = round2_k0_seed(rng_seed);
+                                }
+                            }
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1338,4 +1378,6 @@ pub(crate) struct SubCfg {
     /// Select blocks by exact incumbent objective contribution divided by
     /// subtree size to the three-quarter power.
     pub(crate) rank_blocks: bool,
+    /// Zero-based outer RGSUB round, used only for equal-work seed routing.
+    pub(crate) round: usize,
 }
