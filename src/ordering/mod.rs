@@ -3408,15 +3408,10 @@ fn order_with_options(
     // overflow nor move the worst case. Deterministic. Best-of floor →
     // zero-downside.
     if n < ND_MAX_N && nnz < ND_MAX_NNZ {
-        consider!(move || {
-            Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order(pattern))
-        });
-        // Same BFS-separator structure, but each base-case leaf and unsplittable
-        // separator is ordered by AMD on its induced subgraph (textbook ND +
-        // minimum-degree hybrid) rather than a plain global-degree sort. Added
-        // as a DISTINCT candidate, so the best-of floor keeps it zero-downside
-        // on score; identical gate; deterministic; extra cost is ≈ one more ND
-        // pass plus O(nnz) induced-graph work, all below the slow tier.
+        // Single ND candidate: same BFS-separator tree, AMD on every leaf and
+        // unsplittable separator. The degree-leaf twin (`nd_order`) is the
+        // identical dissection with a weaker leaf order — dropping it halves
+        // ND work in this window (2.0s per-matrix cap). Scored via scoring_ws.
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(nd_order_impl(pattern, true))
         });
@@ -7137,9 +7132,12 @@ fn ndfm_order(pattern: &Pattern) -> Vec<i32> {
 /// by running feral AMD on the *induced* subgraph, then mapping the result back
 /// to global ids. `g2l` is a length-`n` scratch buffer that is `-1` everywhere
 /// on entry and is restored to `-1` on exit (only `nodes`' slots are touched).
-/// On any failure (degenerate pattern, AMD error, unexpected length) it falls
-/// back to the same ascending-degree fill `deg_fill` uses, so the result is
-/// always a valid, deterministic ordering of exactly `nodes`.
+/// If the induced subgraph is already a clique (every vertex has induced degree
+/// `m-1`; same predicate as `minl_is_clique` on a simple undirected graph),
+/// AMD cannot change LDL flops vs a degree fill — skip the CSC build + AMD
+/// pass and write `deg_fill`. On any failure (degenerate pattern, AMD error,
+/// unexpected length) it also falls back to that fill, so the result is always
+/// a valid, deterministic ordering of exactly `nodes`.
 fn amd_fill_induced(
     order: &mut [usize],
     lo: usize,
@@ -7149,12 +7147,20 @@ fn amd_fill_induced(
     g2l: &mut [i32],
 ) {
     let m = nodes.len();
+    if m <= 1 {
+        if m == 1 {
+            order[lo] = nodes[0];
+        }
+        return;
+    }
     // global -> local (1:1 over `nodes`); `nodes` is ascending so this is
     // deterministic and induced row lists come out sorted after sort_unstable.
     for (li, &v) in nodes.iter().enumerate() {
         g2l[v] = li as i32;
     }
     let mut col_ptr = vec![0i32; m + 1];
+    let mut clique = true;
+    let need = (m - 1) as i32;
     for (li, &v) in nodes.iter().enumerate() {
         let mut d = 0i32;
         for &w in &adj[v] {
@@ -7162,7 +7168,21 @@ fn amd_fill_induced(
                 d += 1;
             }
         }
+        if d != need {
+            clique = false;
+        }
         col_ptr[li + 1] = col_ptr[li] + d;
+    }
+    if clique {
+        for &v in nodes {
+            g2l[v] = -1;
+        }
+        let mut v = nodes.to_vec();
+        v.sort_by(|&a, &b| degree[a].cmp(&degree[b]).then_with(|| a.cmp(&b)));
+        for (t, u) in v.into_iter().enumerate() {
+            order[lo + t] = u;
+        }
+        return;
     }
     let mut row_idx = vec![0i32; col_ptr[m] as usize];
     for (li, &v) in nodes.iter().enumerate() {
@@ -7201,17 +7221,16 @@ fn amd_fill_induced(
     }
 }
 
+#[cfg(test)]
 fn nd_order(pattern: &Pattern) -> Vec<i32> {
     nd_order_impl(pattern, false)
 }
 
 /// Nested dissection with a choice of leaf/unsplittable-separator ordering.
-/// `amd_leaves = false` is the shipped behavior (ascending global-degree fill).
+/// `amd_leaves = false` is the degree-leaf fill (kept for tests / `nd_order`).
 /// `amd_leaves = true` orders each base-case leaf and each unsplittable
 /// separator with AMD on the induced subgraph (the textbook ND + minimum-degree
-/// hybrid). The two are DISTINCT candidates routed through the best-of floor,
-/// so the AMD-leaf variant can only lower a matrix's ratio, never raise it —
-/// only its (bounded) time is at stake.
+/// hybrid). The portfolio considers only the AMD-leaf variant — one tree.
 fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     let n = pattern.n;
 
