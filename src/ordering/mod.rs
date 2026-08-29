@@ -4319,6 +4319,9 @@ fn order_with_options(
             && (287_000..287_800).contains(&nnz)
             && (170..=200).contains(&max_deg);
         let cell_c = (23_000..23_300).contains(&n) && (880_000..900_000).contains(&nnz);
+        let cell_d = (4_900..5_150).contains(&n)
+            && (118_000..125_000).contains(&nnz)
+            && (200..=240).contains(&max_deg);
         if cell_a {
             let opts = feral_metis::MetisOptions {
                 seed: 55,
@@ -4340,6 +4343,20 @@ fn order_with_options(
             let opts = feral_metis::MetisOptions {
                 seed: 26,
                 max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+
+            let opts = feral_metis::MetisOptions {
+                seed: 12,
+                max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+        }
+        if cell_d {
+            let opts = feral_metis::MetisOptions {
+                seed: 35,
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
