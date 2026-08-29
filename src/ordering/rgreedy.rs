@@ -1073,6 +1073,138 @@ pub(crate) fn adjacent_pair_descent(
 // at a time.
 // ════════════════════════════════════════════════════════════════════════════
 
+// `search_with_nelim` is pure in the induced block, seed score, RNG seed,
+// stream policy, and op budget. Remembering an exact input that returned None
+// therefore lets a later round replace that otherwise byte-identical search
+// with a new deterministic RNG basin at equal work. The fingerprint is only a
+// lookup prefilter: `same_null_block` still compares the ordered S+boundary,
+// its partition, and the exact incumbent contribution, so collisions cannot
+// trigger a replacement. The effective RNG seed and stream class are part of
+// the null trajectory too; this preserves the frontier's existing round/rank
+// seed diversification whenever it has already selected a new trajectory.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NullTrajectory {
+    // `search_with_nelim` initializes its RNG from `rng_seed | 1`.
+    rng_seed: u64,
+    stream_class: u8,
+}
+
+#[derive(Clone)]
+struct NullBlock {
+    fingerprint: [u64; 2],
+    verts: Vec<usize>,
+    ssz: usize,
+    seed_flops: u64,
+    trajectories: Vec<NullTrajectory>,
+}
+
+#[derive(Default)]
+pub(crate) struct SubtreeHistory {
+    null_blocks: Vec<NullBlock>,
+}
+
+fn null_block_fingerprint(ssz: usize, seed_flops: u64, verts: &[usize]) -> [u64; 2] {
+    let mut a = 0x243F_6A88_85A3_08D3u64 ^ seed_flops ^ (ssz as u64).rotate_left(17);
+    let mut b = 0x1319_8A2E_0370_7344u64 ^ (verts.len() as u64).rotate_left(31);
+    for (i, &v) in verts.iter().enumerate() {
+        let x = (v as u64)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1));
+        a = (a ^ x).rotate_left(27).wrapping_mul(0x94D0_49BB_1331_11EB);
+        b = b
+            .wrapping_add(x ^ a.rotate_left(13))
+            .rotate_left(31)
+            .wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    }
+    [a, b]
+}
+
+fn same_null_block(
+    prior: &NullBlock,
+    fingerprint: [u64; 2],
+    verts: &[usize],
+    ssz: usize,
+    seed_flops: u64,
+) -> bool {
+    prior.fingerprint == fingerprint
+        && prior.ssz == ssz
+        && prior.seed_flops == seed_flops
+        && prior.verts == verts
+}
+
+impl SubtreeHistory {
+    fn trajectories(
+        &self,
+        fingerprint: [u64; 2],
+        verts: &[usize],
+        ssz: usize,
+        seed_flops: u64,
+    ) -> &[NullTrajectory] {
+        self.null_blocks
+            .iter()
+            .find(|prior| same_null_block(prior, fingerprint, verts, ssz, seed_flops))
+            .map_or(&[], |prior| prior.trajectories.as_slice())
+    }
+
+    fn remember(&mut self, mut block: NullBlock) {
+        if let Some(prior) = self.null_blocks.iter_mut().find(|prior| {
+            same_null_block(
+                prior,
+                block.fingerprint,
+                &block.verts,
+                block.ssz,
+                block.seed_flops,
+            )
+        }) {
+            for trajectory in block.trajectories.drain(..) {
+                if !prior.trajectories.contains(&trajectory) {
+                    prior.trajectories.push(trajectory);
+                }
+            }
+        } else {
+            self.null_blocks.push(block);
+        }
+    }
+}
+
+fn effective_rng_seed(rng_seed: u64) -> u64 {
+    rng_seed | 1
+}
+
+fn select_subtree_seed(k: usize, base_seed: u64, prior: &[NullTrajectory]) -> u64 {
+    // The first replacement preserves the earlier equal-work basin family.
+    // If a third round encounters that null too, the odd STEP walks a
+    // collision-free sequence modulo 2^64 until it finds an unseen seed.
+    const STEP: u64 = 0xD134_2543_DE82_E285;
+    let stream_class = (k % 4) as u8;
+    let base = NullTrajectory {
+        rng_seed: effective_rng_seed(base_seed),
+        stream_class,
+    };
+    if !prior.contains(&base) {
+        return base_seed;
+    }
+
+    let mut seed = stream_rng(k + 4);
+    while effective_rng_seed(seed) == base.rng_seed
+        || prior
+            .iter()
+            .any(|old| {
+                old.stream_class == stream_class
+                    && old.rng_seed == effective_rng_seed(seed)
+            })
+    {
+        seed = seed.wrapping_add(STEP);
+    }
+    seed
+}
+
+#[derive(Default)]
+struct SubtreePart {
+    improved: Vec<(usize, Vec<usize>)>,
+    null_blocks: Vec<NullBlock>,
+}
+
 /// Re-order the inside of elimination-tree SUBTREES of a postordered incumbent.
 ///
 /// ## Why a subtree is an exactly-separable subproblem
@@ -1113,6 +1245,9 @@ pub(crate) fn subtree_refine(
     counts: &[u32],
     parent: &[i32],
     cfg: SubCfg,
+    history: &mut SubtreeHistory,
+    track_nulls: bool,
+    remember_nulls: bool,
 ) -> usize {
     // Spend the ranked large-matrix budget on more D1 basins without adding
     // trajectories: 32 blocks get both streams and the next 64 get D1 only.
@@ -1195,14 +1330,15 @@ pub(crate) fn subtree_refine(
     let nthreads = super::parallel::PAR_MAX_THREADS.max(1).min(blocks.len());
     let perm_ro: &[usize] = perm;
     let blocks_ro: &[(usize, usize)] = &blocks;
-    let parts: Vec<Vec<(usize, Vec<usize>)>> = std::thread::scope(|sc| {
+    let history_ro: &SubtreeHistory = history;
+    let parts: Vec<SubtreePart> = std::thread::scope(|sc| {
         let handles: Vec<_> = (0..nthreads)
             .map(|t| {
                 sc.spawn(move || {
                     let mut local: Vec<u32> = vec![u32::MAX; n];
                     let mut touched: Vec<usize> = Vec::new();
                     let mut verts: Vec<usize> = Vec::new();
-                    let mut got: Vec<(usize, Vec<usize>)> = Vec::new();
+                    let mut part = SubtreePart::default();
                     let mut bi = t;
                     while bi < blocks_ro.len() {
                         let block_rank = bi;
@@ -1263,8 +1399,22 @@ pub(crate) fn subtree_refine(
                                 c * c
                             })
                             .sum();
+                        // History is enabled only for the measured >=10k path.
+                        // It changes neither block selection, stream count,
+                        // policy nor the per-stream deterministic op budget.
+                        let fingerprint = if track_nulls {
+                            null_block_fingerprint(ssz, seed_flops, &verts)
+                        } else {
+                            [0; 2]
+                        };
+                        let prior = if track_nulls {
+                            history_ro.trajectories(fingerprint, &verts, ssz, seed_flops)
+                        } else {
+                            &[]
+                        };
                         let seed: Vec<usize> = (0..ssz).collect();
                         let mut best: Option<(Vec<usize>, u64)> = None;
+                        let mut null_trajectories = Vec::new();
                         let first_stream =
                             usize::from(split_ranked_streams && block_rank >= 32);
                         for k in first_stream..cfg.streams.max(1) {
@@ -1291,6 +1441,13 @@ pub(crate) fn subtree_refine(
                             {
                                 rng_seed ^= 0xE703_7ED1_A0B4_28DB;
                             }
+                            if track_nulls {
+                                rng_seed = select_subtree_seed(k, rng_seed, prior);
+                            }
+                            let actual = NullTrajectory {
+                                rng_seed: effective_rng_seed(rng_seed),
+                                stream_class: (k % 4) as u8,
+                            };
                             let r = search_with_nelim(
                                 m,
                                 &adj0,
@@ -1305,15 +1462,27 @@ pub(crate) fn subtree_refine(
                                 if best.as_ref().is_none_or(|(_, bf)| f < *bf) {
                                     best = Some((o, f));
                                 }
+                            } else if remember_nulls {
+                                null_trajectories.push(actual);
                             }
+                        }
+                        if !null_trajectories.is_empty() {
+                            part.null_blocks.push(NullBlock {
+                                fingerprint,
+                                verts: verts.clone(),
+                                ssz,
+                                seed_flops,
+                                trajectories: null_trajectories,
+                            });
                         }
                         if let Some((ord, _)) = best {
                             if ord.len() == ssz {
-                                got.push((a, ord.iter().map(|&li| verts[li]).collect()));
+                                part.improved
+                                    .push((a, ord.iter().map(|&li| verts[li]).collect()));
                             }
                         }
                     }
-                    got
+                    part
                 })
             })
             .collect();
@@ -1325,7 +1494,10 @@ pub(crate) fn subtree_refine(
 
     let mut improved = 0usize;
     for part in parts {
-        for (a, ord) in part {
+        for block in part.null_blocks {
+            history.remember(block);
+        }
+        for (a, ord) in part.improved {
             perm[a..a + ord.len()].copy_from_slice(&ord);
             improved += 1;
         }
@@ -1355,4 +1527,96 @@ pub(crate) struct SubCfg {
     pub(crate) rank_blocks: bool,
     /// Zero-based outer RGSUB round, used only to diversify an equal-work seed.
     pub(crate) round: usize,
+}
+
+#[cfg(test)]
+mod null_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn exact_key_rejects_fingerprint_collisions() {
+        let verts = vec![4, 1, 8, 3];
+        let fingerprint = null_block_fingerprint(2, 73, &verts);
+        let prior = NullBlock {
+            fingerprint,
+            verts: verts.clone(),
+            ssz: 2,
+            seed_flops: 73,
+            trajectories: Vec::new(),
+        };
+        assert!(same_null_block(&prior, fingerprint, &verts, 2, 73));
+
+        let mut collision = verts.clone();
+        collision.swap(0, 1);
+        assert!(!same_null_block(&prior, fingerprint, &collision, 2, 73));
+        assert!(!same_null_block(&prior, fingerprint, &verts, 3, 73));
+        assert!(!same_null_block(&prior, fingerprint, &verts, 2, 74));
+    }
+
+    #[test]
+    fn only_an_exact_repeated_null_gets_a_new_seed() {
+        let base = stream_rng(0);
+        let other_policy = [NullTrajectory {
+            rng_seed: base,
+            stream_class: 1,
+        }];
+        assert_eq!(select_subtree_seed(0, base, &[]), base);
+        assert_eq!(select_subtree_seed(0, base, &other_policy), base);
+
+        let first_null = NullTrajectory {
+            rng_seed: base,
+            stream_class: 0,
+        };
+        let alternate = select_subtree_seed(0, base, &[first_null]);
+        assert_ne!(alternate, base);
+        assert_eq!(alternate, select_subtree_seed(0, base, &[first_null]));
+
+        let prior = [
+            first_null,
+            NullTrajectory {
+                rng_seed: alternate,
+                stream_class: 0,
+            },
+        ];
+        let next = select_subtree_seed(0, base, &prior);
+        assert_ne!(next, base);
+        assert_ne!(next, alternate);
+
+        let raw_even = 0x1234_5678_9ABC_DEF0;
+        let normalized_null = [NullTrajectory {
+            rng_seed: effective_rng_seed(raw_even),
+            stream_class: 0,
+        }];
+        let from_even = select_subtree_seed(0, raw_even, &normalized_null);
+        let from_odd = select_subtree_seed(0, raw_even | 1, &normalized_null);
+        assert_eq!(from_even, from_odd);
+        assert_ne!(effective_rng_seed(from_even), effective_rng_seed(raw_even));
+    }
+
+    #[test]
+    fn history_merges_only_exact_block_states() {
+        let verts = vec![9, 2, 7];
+        let fingerprint = null_block_fingerprint(2, 41, &verts);
+        let make_block = |rng_seed| NullBlock {
+            fingerprint,
+            verts: verts.clone(),
+            ssz: 2,
+            seed_flops: 41,
+            trajectories: vec![NullTrajectory {
+                rng_seed,
+                stream_class: 0,
+            }],
+        };
+        let mut history = SubtreeHistory::default();
+        history.remember(make_block(11));
+        history.remember(make_block(13));
+        history.remember(make_block(13));
+        assert_eq!(history.null_blocks.len(), 1);
+        assert_eq!(history.null_blocks[0].trajectories.len(), 2);
+
+        let mut collision = make_block(17);
+        collision.verts.swap(0, 1);
+        history.remember(collision);
+        assert_eq!(history.null_blocks.len(), 2);
+    }
 }

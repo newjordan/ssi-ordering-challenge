@@ -5297,6 +5297,12 @@ fn order_with_options(
         } else {
             2
         };
+        // Equal-work null routing: across accepted rounds, remember only exact
+        // >=10k block/trajectory inputs that returned no strict improvement.
+        // A replay of that pure search gets a deterministic unseen RNG seed;
+        // round/block/stream counts and each 5M-op allowance stay unchanged.
+        let mut rgsub_history = rgreedy::SubtreeHistory::default();
+        let use_null_history = n >= 10_000;
         for round in 0..rgsub_rounds {
             let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
@@ -5324,6 +5330,9 @@ fn order_with_options(
                 &counts_post,
                 &parent_post,
                 round_cfg,
+                &mut rgsub_history,
+                use_null_history,
+                use_null_history && round + 1 < rgsub_rounds,
             );
             if hits > 0 && is_bijection(&work, n) {
                 let f = ws.flops(&scoring_pat, &work);
