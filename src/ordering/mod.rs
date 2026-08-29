@@ -4335,6 +4335,22 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+            // FLEET-K2 (0038): a second METIS variant inside cell_a, the
+            // 0033 floor240+imb0.05+s55 winner. Mirrors the cell_a seed-2→0
+            // refresh pattern from vibecodooor's 3f497f6 commit and the
+            // fleet-l's "85/86 are dead, relabel is the lever" finding
+            // (0035): a fixed (variant, seed) may stale as the surrounding
+            // portfolio grows, so adding one more candidate with a
+            // different coarsen_floor costs one extra metis_order_full call
+            // on a single matrix (~0.2 s local on a 0.6 s incumbent) and
+            // cannot regress under the strict best-of floor.
+            let opts_alt = feral_metis::MetisOptions {
+                seed: 0,
+                coarsen_floor: 480,
+                max_imbalance: 0.05,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts_alt).map(|(p, ..)| p));
         }
         if cell_b {
             let opts = feral_metis::MetisOptions {
