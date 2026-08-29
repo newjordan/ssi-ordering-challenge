@@ -6833,6 +6833,43 @@ fn terminal_minl_candidates(
         #[cfg(test)]
         let gabriel_terminal_cell =
             gabriel_terminal_cell || std::env::var_os("SSI_TERMINAL_ALL").is_some();
+        // SPARSE-CELL REALIZATION FAMILY (this session). Generalises the
+        // one-row Gabriel cell above: the completion-lattice descent
+        // chooses a chordal completion, and the realization step then
+        // picks a PEO/tie-break basin for THAT graph — a separate
+        // problem, which MCS and default AMD do not exhaust. Three extra
+        // AMD option points on the descended graph, in the cheap sparse
+        // cell only.
+        //
+        // Gate (`n <= 30k ∧ nnz <= 100k ∧ nnz < 10n`) is evidence-derived
+        // from a corpus-wide A/B census of the realization menu: all
+        // measured winners are sparse (density 4.1-5.4), while the rows
+        // that pay time for nothing are exactly the ones this excludes —
+        // `pooling_sppc3pq` (density 38.6, +0.42 s) and `arki0013`
+        // (n=44.9k, +0.23 s). Measured: 2 better / 0 worse on dev
+        // (`crudeoil_pooling_dt2` -0.0081 ln in gt_10k,
+        // `crudeoil_pooling_ct3` -0.0029 ln), no row's `order()` time
+        // rises materially, and the AMF/relabel/wide variants of the same
+        // menu were measured and CUT (the 11-alpha x 16-seed sweep buys
+        // one extra -0.0018 row while taking `crudeoil_pooling_dt3` from
+        // 0.60 s to 4.13 s).
+        //
+        // Score-safe by construction: every candidate returns to the
+        // caller's strict `ws.flops` admission against the AMD-anchored
+        // incumbent, so a bad realization is discarded and only time is
+        // ever at risk.
+        let realize_sparse_cell =
+            n <= 30_000 && original_nnz <= 100_000 && original_nnz < 10 * n;
+        if realize_sparse_cell {
+            for (aggressive, dense_alpha) in
+                [(false, -1.0f64), (true, 2.5), (true, 20.0)]
+            {
+                let o = feral_amd::AmdOptions { aggressive, dense_alpha };
+                if let Ok((perm, ..)) = feral_amd::amd_order_opts(&core, &o) {
+                    candidates.push(perm.into_iter().map(|v| v as usize).collect());
+                }
+            }
+        }
         if gabriel_terminal_cell {
             let options = feral_amf::AmfOptions { dense_alpha: -1.0 };
             if let Ok((perm, ..)) = feral_amf::amf_order_opts(&core, &options) {
