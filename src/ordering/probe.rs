@@ -9820,3 +9820,656 @@ fn fo_mcs_check_score(
     }
     Some((elim, score))
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREDICTOR–CORRECTOR evaluation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run the predictor–corrector on an arbitrary corpus and compare it, on both
+/// cost and time, against plain AMD — the baseline the challenge scores against.
+///
+/// Reports for every matrix: AMD flops and seconds, predcorr flops and seconds,
+/// the ratio, and the phase breakdown (how many pivots were chosen by the exact
+/// rule, how many fell back to minimum degree, how many were dumped) plus which
+/// bound ended each phase. That last column is the point of the probe: it says
+/// whether `dense_pivot_deg` or `work_soft` is what actually binds.
+///
+/// Env:
+///   `SSI_CORPUS_FILE`  corpus to run (required).
+///   `SSI_PROBE_TSV`    machine-readable TSV output.
+///   `SSI_PC_WORK_SOFT` / `SSI_PC_WORK_HARD` / `SSI_PC_DENSE_DEG`
+///   `SSI_PC_TIE_CAP` / `SSI_PC_CLIQUE_FRAC`   parameter overrides.
+///   `SSI_PROBE_MIN_N` / `SSI_PROBE_MAX_N`     dimension window.
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_pc_vs_amd`
+#[test]
+#[ignore]
+fn probe_pc_vs_amd() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            println!("SKIP probe_pc_vs_amd: set SSI_CORPUS_FILE");
+            return;
+        }
+    };
+    let envu = |k: &str, d: u64| -> u64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let dflt = predcorr::PredcorrParams::default();
+    let params = predcorr::PredcorrParams {
+        work_soft: envu("SSI_PC_WORK_SOFT", dflt.work_soft),
+        dense_pivot_deg: envu("SSI_PC_DENSE_DEG", dflt.dense_pivot_deg as u64) as usize,
+        tie_cap: envu("SSI_PC_TIE_CAP", dflt.tie_cap as u64) as usize,
+    };
+    let min_n: usize = envu("SSI_PROBE_MIN_N", 0) as usize;
+    let max_n: usize = envu("SSI_PROBE_MAX_N", u64::MAX) as usize;
+
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_pc_vs_amd: failed to load {path_string}: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+    println!("params: {params:?}");
+
+    // ratio vs AMD, aggregated the way the harness aggregates
+    let mut log_sums = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut rows: Vec<(String, usize, usize, f64, f64, f64, predcorr::PredcorrStats)> = Vec::new();
+    let mut worst_pc = 0.0f64;
+    let mut worst_pc_name = String::new();
+    let mut wins = 0usize;
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n < min_n || n > max_n {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+
+        let t0 = Instant::now();
+        let amd: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let amd_s = t0.elapsed().as_secs_f64();
+        let base = flops_of(&sp, &amd) as f64;
+
+        let t1 = Instant::now();
+        let got = predcorr::predcorr_order_stats(pat, &params);
+        let pc_s = t1.elapsed().as_secs_f64();
+
+        let Some((perm, st)) = got else {
+            println!("{name:<34} {n:>8} PREDCORR RETURNED NONE");
+            continue;
+        };
+        assert!(is_bijection(&perm, n), "{name}: predcorr returned a non-bijection");
+        let f = flops_of(&sp, &perm) as f64;
+        let ratio = if base > 0.0 { f / base } else { 1.0 };
+
+        let b = bucket(n);
+        log_sums[b] += ratio.ln();
+        counts[b] += 1;
+        if pc_s > worst_pc {
+            worst_pc = pc_s;
+            worst_pc_name = name.clone();
+        }
+        if ratio < 1.0 {
+            wins += 1;
+        }
+        rows.push((name.clone(), n, nnz, ratio, amd_s, pc_s, st));
+    }
+
+    println!(
+        "\n{:<32} {:>7} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>3} {:>7}",
+        "matrix", "n", "nnz", "ratio", "amd_s", "pc_s", "exact", "amdtail", "dumped", "eA",
+        "maxdeg"
+    );
+    for (nm, n, nnz, r, a_s, p_s, st) in &rows {
+        println!(
+            "{nm:<32} {n:>7} {nnz:>9} {r:>8.4} {a_s:>8.3} {p_s:>8.3} {:>8} {:>8} {:>7} {:>3} {:>7}",
+            st.exact_pivots, st.amd_tail, st.dumped, st.exit_a, st.max_pivot_deg
+        );
+    }
+
+    println!("\n{:<10} {:>6} {:>12}", "bucket", "count", "geomean");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<10} {:>6} {:>12.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (log_sums[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("\nPREDCORR score vs AMD (weighted): {:.6}", aggregate(&log_sums, &counts));
+    println!("beat AMD on {wins}/{} matrices", rows.len());
+    println!("worst predcorr time: {worst_pc:.3} s on {worst_pc_name}");
+    let tot_amd: f64 = rows.iter().map(|r| r.4).sum();
+    let tot_pc: f64 = rows.iter().map(|r| r.5).sum();
+    println!("total time: amd {tot_amd:.2} s, predcorr {tot_pc:.2} s  ({:.1}x)", tot_pc / tot_amd);
+
+    // Which bound ended phase A, across the corpus.
+    for (code, label) in [(0u8, "never left A"), (1, "work_soft"), (2, "dense pivot"), (3, "skipped A")] {
+        let k = rows.iter().filter(|r| r.6.exit_a == code).count();
+        println!("exit_a {code} ({label}): {k}");
+    }
+    let fully_exact = rows.iter().filter(|r| r.6.amd_tail == 0 && r.6.dumped == 0).count();
+    println!("fully exact orderings: {fully_exact}/{}", rows.len());
+
+    if let Ok(tsv) = std::env::var("SSI_PROBE_TSV") {
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::File::create(&tsv) {
+            let _ = writeln!(
+                fh,
+                "name\tn\tnnz\tratio\tamd_s\tpc_s\texact\tamdtail\tdumped\texit_a\tmaxdeg\twork\ttailnnz"
+            );
+            for (nm, n, nnz, r, a_s, p_s, st) in &rows {
+                let _ = writeln!(
+                    fh,
+                    "{nm}\t{n}\t{nnz}\t{r:.6}\t{a_s:.4}\t{p_s:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    st.exact_pivots, st.amd_tail, st.dumped, st.exit_a,
+                    st.max_pivot_deg, st.work, st.tail_nnz
+                );
+            }
+            println!("wrote {} rows to {tsv}", rows.len());
+        }
+    }
+}
+
+/// The number that decides a submission: what the score becomes if the
+/// predictor–corrector is added as one more candidate to the shipped portfolio.
+///
+/// `order()` already picks the best of its candidates, so adding predcorr can
+/// only ever take `min(portfolio, predcorr)` per matrix. This reports the
+/// portfolio's own score, the score of that minimum, and the matrices where
+/// predcorr is what wins — the only rows a wiring would actually change.
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_pc_vs_portfolio`
+#[test]
+#[ignore]
+fn probe_pc_vs_portfolio() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            println!("SKIP probe_pc_vs_portfolio: set SSI_CORPUS_FILE");
+            return;
+        }
+    };
+    let envu = |k: &str, d: u64| -> u64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let dflt = predcorr::PredcorrParams::default();
+    let params = predcorr::PredcorrParams {
+        work_soft: envu("SSI_PC_WORK_SOFT", dflt.work_soft),
+        dense_pivot_deg: envu("SSI_PC_DENSE_DEG", dflt.dense_pivot_deg as u64) as usize,
+        tie_cap: envu("SSI_PC_TIE_CAP", dflt.tie_cap as u64) as usize,
+    };
+
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_pc_vs_portfolio: failed to load {path_string}: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+    println!("params: {params:?}");
+
+    let mut port_logs = [0.0f64; 3];
+    let mut comb_logs = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    let mut movers: Vec<(String, usize, f64, f64, f64, f64)> = Vec::new();
+    let mut n_rows = 0usize;
+    let mut worst_pc = 0.0f64;
+    let mut worst_pc_name = String::new();
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd) as f64;
+        if base <= 0.0 {
+            continue;
+        }
+
+        let t0 = Instant::now();
+        let port = order(pat);
+        let port_s = t0.elapsed().as_secs_f64();
+        let port_f = flops_of(&sp, &port) as f64;
+
+        // Emulate the SHIPPED gate: outside it, predcorr never runs, so it
+        // costs nothing and can change nothing.
+        let gate_n: usize = envu("SSI_PC_GATE_N", u64::MAX) as usize;
+        let gate_nnz: usize = envu("SSI_PC_GATE_NNZ", u64::MAX) as usize;
+        if n > gate_n || pat.nnz() > gate_nnz {
+            let b = bucket(n);
+            port_logs[b] += (port_f / base).ln();
+            comb_logs[b] += (port_f / base).ln();
+            counts[b] += 1;
+            n_rows += 1;
+            continue;
+        }
+
+        let t1 = Instant::now();
+        let pc = predcorr::predcorr_order_stats(pat, &params);
+        let pc_s = t1.elapsed().as_secs_f64();
+        if pc_s > worst_pc {
+            worst_pc = pc_s;
+            worst_pc_name = name.clone();
+        }
+        let pc_f = match pc {
+            Some((perm, _)) => {
+                assert!(is_bijection(&perm, n), "{name}: predcorr non-bijection");
+                flops_of(&sp, &perm) as f64
+            }
+            None => f64::INFINITY,
+        };
+
+        let comb_f = port_f.min(pc_f);
+        let b = bucket(n);
+        port_logs[b] += (port_f / base).ln();
+        comb_logs[b] += (comb_f / base).ln();
+        counts[b] += 1;
+        n_rows += 1;
+
+        if pc_f < port_f {
+            movers.push((
+                name.clone(),
+                n,
+                port_f / base,
+                pc_f / base,
+                pc_f / port_f,
+                port_s + pc_s,
+            ));
+        }
+    }
+
+    movers.sort_by(|a, b| a.4.partial_cmp(&b.4).unwrap());
+    println!(
+        "\n{:<34} {:>8} {:>10} {:>10} {:>9} {:>8}",
+        "matrix where predcorr WINS", "n", "port_r", "pc_r", "pc/port", "secs"
+    );
+    for (nm, n, pr, cr, rel, s) in &movers {
+        println!("{nm:<34} {n:>8} {pr:>10.4} {cr:>10.4} {rel:>9.4} {s:>8.3}");
+    }
+
+    let port_score = aggregate(&port_logs, &counts);
+    let comb_score = aggregate(&comb_logs, &counts);
+    println!("\n{:<12} {:>8} {:>12} {:>12}", "bucket", "count", "portfolio", "+predcorr");
+    for b in 0..3 {
+        if counts[b] > 0 {
+            println!(
+                "{:<12} {:>8} {:>12.6} {:>12.6}",
+                BUCKET_NAMES[b],
+                counts[b],
+                (port_logs[b] / counts[b] as f64).exp(),
+                (comb_logs[b] / counts[b] as f64).exp()
+            );
+        }
+    }
+    println!("\nportfolio score      : {port_score:.6}");
+    println!("portfolio + predcorr : {comb_score:.6}");
+    println!(
+        "delta                : {:+.6}  ({:+.3}% relative)",
+        comb_score - port_score,
+        100.0 * (comb_score - port_score) / port_score
+    );
+    println!("predcorr wins on {}/{} matrices", movers.len(), n_rows);
+    println!("worst predcorr time: {worst_pc:.3} s on {worst_pc_name}");
+}
+
+/// BLACK-BOX QUERY COST: how expensive is one evaluation of the objective?
+///
+/// The scored objective is a pure function `f(pattern, permutation) → Σ c_j²`,
+/// so any search method (annealing, beam, learned policy, TSP-style local
+/// search) is budgeted by how many times it can call `f`. This measures that
+/// directly: microseconds per evaluation and evaluations per second, as a
+/// function of `n` and `nnz`.
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_eval_cost`
+#[test]
+#[ignore]
+fn probe_eval_cost() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            println!("SKIP probe_eval_cost: set SSI_CORPUS_FILE");
+            return;
+        }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_eval_cost: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+
+    // decade buckets on n
+    let mut dec_us = vec![0.0f64; 8];
+    let mut dec_cnt = vec![0usize; 8];
+    let mut rows: Vec<(usize, usize, f64)> = Vec::new();
+
+    for (_name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let perm: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+
+        // enough repeats that small matrices are timed above clock noise
+        let reps: usize = if n < 1_000 {
+            200
+        } else if n < 10_000 {
+            20
+        } else {
+            3
+        };
+        let t0 = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..reps {
+            sink = sink.wrapping_add(flops_of(&sp, &perm));
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        assert!(sink != u64::MAX);
+
+        let d = (n as f64).log10().floor().max(0.0).min(7.0) as usize;
+        dec_us[d] += us;
+        dec_cnt[d] += 1;
+        rows.push((n, pat.nnz(), us));
+    }
+
+    println!("\n{:<14} {:>7} {:>14} {:>16}", "n range", "count", "us/eval (mean)", "evals/sec");
+    for d in 0..8 {
+        if dec_cnt[d] == 0 {
+            continue;
+        }
+        let mean = dec_us[d] / dec_cnt[d] as f64;
+        println!(
+            "10^{d}..10^{:<9} {:>7} {:>14.1} {:>16.0}",
+            d + 1,
+            dec_cnt[d],
+            mean,
+            1e6 / mean
+        );
+    }
+
+    rows.sort_by_key(|r| r.0);
+    println!("\n{:<12} {:>12} {:>14} {:>14}", "n", "nnz", "us/eval", "evals/sec");
+    let step = (rows.len() / 20).max(1);
+    for r in rows.iter().step_by(step) {
+        println!("{:<12} {:>12} {:>14.1} {:>14.0}", r.0, r.1, r.2, 1e6 / r.2);
+    }
+    if let Some(r) = rows.last() {
+        println!("{:<12} {:>12} {:>14.1} {:>14.0}", r.0, r.1, r.2, 1e6 / r.2);
+    }
+}
+
+/// HEADROOM MAP: for every matrix, how much has the portfolio actually gained
+/// over AMD? Rows near 1.0 are where every shipped mechanism has failed to find
+/// anything better than the baseline — the target list for a search or learning
+/// method, and the only rows where new value is available.
+///
+/// Also reports what a search would COST there (`f` evaluations per second), so
+/// target selection and affordability are read off the same table.
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_headroom`
+#[test]
+#[ignore]
+fn probe_headroom() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            println!("SKIP probe_headroom: set SSI_CORPUS_FILE");
+            return;
+        }
+    };
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_headroom: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+
+    let mut rows: Vec<(String, usize, usize, f64, f64, f64)> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd) as f64;
+        if base <= 0.0 {
+            continue;
+        }
+        let t0 = Instant::now();
+        let port = order(pat);
+        let port_s = t0.elapsed().as_secs_f64();
+        let ratio = flops_of(&sp, &port) as f64 / base;
+
+        // cost of one objective evaluation here
+        let reps: usize = if n < 1_000 { 100 } else if n < 10_000 { 10 } else { 2 };
+        let t1 = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..reps {
+            sink = sink.wrapping_add(flops_of(&sp, &port));
+        }
+        assert!(sink != u64::MAX);
+        let eval_us = t1.elapsed().as_secs_f64() * 1e6 / reps as f64;
+
+        rows.push((name.clone(), n, pat.nnz(), ratio, port_s, eval_us));
+    }
+
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+    println!(
+        "\n{:<36} {:>8} {:>10} {:>8} {:>8} {:>10} {:>12}",
+        "matrix (worst headroom first)", "n", "nnz", "ratio", "port_s", "us/eval", "evals/2s"
+    );
+    for (nm, n, nnz, r, s, us) in rows.iter().take(60) {
+        println!("{nm:<36} {n:>8} {nnz:>10} {r:>8.4} {s:>8.3} {us:>10.1} {:>12.0}", 2e6 / us);
+    }
+
+    for thr in [0.999f64, 0.99, 0.98, 0.95, 0.90] {
+        let k = rows.iter().filter(|r| r.3 >= thr).count();
+        let small = rows.iter().filter(|r| r.3 >= thr && r.1 < 10_000).count();
+        println!(
+            "ratio >= {thr:.3}: {k:>4}/{}  (of which n<10k: {small})",
+            rows.len()
+        );
+    }
+
+    if let Ok(tsv) = std::env::var("SSI_PROBE_TSV") {
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::File::create(&tsv) {
+            let _ = writeln!(fh, "name\tn\tnnz\tratio\tport_s\teval_us");
+            for (nm, n, nnz, r, s, us) in &rows {
+                let _ = writeln!(fh, "{nm}\t{n}\t{nnz}\t{r:.6}\t{s:.4}\t{us:.2}");
+            }
+            println!("wrote {} rows to {tsv}", rows.len());
+        }
+    }
+}
+
+/// Drive the offline ROLLOUT oracle and compare it against AMD, the shipped
+/// portfolio, and predcorr on the same matrices.
+///
+/// `deviations` is the number the whole learning plan rests on: how often the
+/// measured `Q` disagrees with the hand-designed greedy key. Zero deviations
+/// would mean the greedy rule is already making the right call and there is
+/// nothing for a learned `V` to learn.
+///
+/// Env: `SSI_CORPUS_FILE`, `SSI_RO_K`, `SSI_RO_BUDGET`, `SSI_PROBE_MAX_N`,
+///      `SSI_PROBE_TSV`.
+///
+/// `cargo test --release -p ssi-candidate-worker -- --ignored --nocapture --test-threads=1 probe_rollout`
+#[test]
+#[ignore]
+fn probe_rollout() {
+    let path_string = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            println!("SKIP probe_rollout: set SSI_CORPUS_FILE");
+            return;
+        }
+    };
+    let envu = |k: &str, d: u64| -> u64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let params = rollout::RolloutParams {
+        base: if std::env::var("SSI_RO_BASE").map(|v| v == "amd").unwrap_or(false) {
+            rollout::Base::Amd
+        } else {
+            rollout::Base::Predcorr
+        },
+        tie_cap: envu("SSI_RO_K", 8) as usize,
+        eval_budget: envu("SSI_RO_BUDGET", 2_000_000),
+        min_candidates: envu("SSI_RO_MINC", 1) as usize,
+        stride: envu("SSI_RO_STRIDE", 1) as usize,
+        max_rollout_steps: envu("SSI_RO_MAXSTEPS", u64::MAX) as usize,
+        min_deficiency: envu("SSI_RO_MINDEF", 1),
+    };
+    let max_n = envu("SSI_PROBE_MAX_N", 20_000) as usize;
+
+    let corpus = match ssi_scoring::load_corpus_jsonl(std::path::Path::new(&path_string)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIP probe_rollout: {e}");
+            return;
+        }
+    };
+    println!("corpus: {} matrices from {}", corpus.len(), path_string);
+    println!("params: {params:?}  max_n={max_n}");
+    println!(
+        "\n{:<28} {:>7} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>9}",
+        "matrix", "n", "amd_r", "port_r", "pc_r", "ROLL_r", "roll/pt", "dev", "roll_s"
+    );
+
+    let mut rows: Vec<(String, usize, f64, f64, f64, f64, usize, usize, f64)> = Vec::new();
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 || n > max_n {
+            continue;
+        }
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd: Vec<usize> = feral_amd::amd_order(&core)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as usize)
+            .collect();
+        let base = flops_of(&sp, &amd) as f64;
+        if base <= 0.0 {
+            continue;
+        }
+        let port_r = flops_of(&sp, &order(pat)) as f64 / base;
+        let pc_r = match predcorr::predcorr_order(pat) {
+            Some(q) => flops_of(&sp, &q) as f64 / base,
+            None => f64::NAN,
+        };
+
+        let mut ws = scoring_ws::ScoreWorkspace::new(n, pat.nnz());
+        let t0 = Instant::now();
+        let mut trace: Vec<rollout::CandRow> = Vec::new();
+        let got = rollout::rollout_order(pat, &sp, &mut ws, &params, &mut trace);
+        let roll_s = t0.elapsed().as_secs_f64();
+        let Some((perm, st)) = got else {
+            println!("{name:<28} {n:>7}  ROLLOUT FAILED");
+            continue;
+        };
+        assert!(is_bijection(&perm, n), "{name}: rollout non-bijection");
+        let roll_r = flops_of(&sp, &perm) as f64 / base;
+
+        // dump the measured (features -> Q) pairs: the training signal
+        if let Ok(dir) = std::env::var("SSI_RO_TRACE_DIR") {
+            use std::io::Write;
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut fh) = std::fs::File::create(format!("{dir}/{name}.tsv")) {
+                let _ = writeln!(fh, "step\tv\tdeficiency\tdegree\trank\tq\tchosen");
+                for r in &trace {
+                    let _ = writeln!(
+                        fh, "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        r.step, r.v, r.deficiency, r.degree, r.rank, r.q, r.chosen as u8
+                    );
+                }
+            }
+        }
+
+        println!(
+            "{name:<28} {n:>7} {:>9.4} {port_r:>9.4} {pc_r:>9.4} {roll_r:>9.4} {:>8.4} {:>8} {roll_s:>9.2}",
+            1.0, roll_r / port_r, st.deviations
+        );
+        rows.push((
+            name.clone(), n, 1.0, port_r, pc_r, roll_r, st.deviations, st.decision_steps, roll_s,
+        ));
+    }
+
+    if rows.is_empty() {
+        println!("no rows");
+        return;
+    }
+    let g = |f: &dyn Fn(&(String, usize, f64, f64, f64, f64, usize, usize, f64)) -> f64| -> f64 {
+        (rows.iter().map(|r| f(r).ln()).sum::<f64>() / rows.len() as f64).exp()
+    };
+    println!("\n--- geomean ratio vs AMD over {} matrices ---", rows.len());
+    println!("portfolio : {:.4}", g(&|r| r.3));
+    println!("predcorr  : {:.4}", g(&|r| r.4));
+    println!("ROLLOUT   : {:.4}", g(&|r| r.5));
+    println!("\nrollout beats portfolio on {}/{}", rows.iter().filter(|r| r.5 < r.3).count(), rows.len());
+    println!("rollout beats AMD       on {}/{}", rows.iter().filter(|r| r.5 < 1.0).count(), rows.len());
+    let dev: usize = rows.iter().map(|r| r.6).sum();
+    let dec: usize = rows.iter().map(|r| r.7).sum();
+    println!(
+        "deviations from greedy key: {dev}/{dec} decision steps ({:.1}%)",
+        100.0 * dev as f64 / dec.max(1) as f64
+    );
+    println!("total rollout time: {:.1} s", rows.iter().map(|r| r.8).sum::<f64>());
+
+    if let Ok(tsv) = std::env::var("SSI_PROBE_TSV") {
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::File::create(&tsv) {
+            let _ = writeln!(fh, "name\tn\tport_r\tpc_r\troll_r\tdeviations\tdecisions\troll_s");
+            for r in &rows {
+                let _ = writeln!(
+                    fh, "{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{:.3}",
+                    r.0, r.1, r.3, r.4, r.5, r.6, r.7, r.8
+                );
+            }
+            println!("wrote {} rows to {tsv}", rows.len());
+        }
+    }
+}
