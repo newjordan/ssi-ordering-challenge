@@ -484,7 +484,7 @@ pub fn biconn_heavy_order(
     // this is what keeps the huge dominant-block matrices (faclay75, largest
     // block ~700k nnz) cheap: without it the biggest block alone would draw
     // EXTRA_CAP expensive restarts for no measured win.
-    const EXTRA_CAP: usize = 7;
+    const EXTRA_CAP: usize = 0;
     let mut budget = total_restarts;
     let mut extra_of: Vec<usize> = vec![0; nc];
     {

@@ -2891,24 +2891,6 @@ fn order_with_options(
             consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
         }
 
-        // Hub-heavy medium graphs need the low-alpha DegSqrt basins too.
-        // The alpha-10 metric leaves the hub inside the quotient graph too
-        // long on ringpack-shaped matrices.  Alpha 1/2 completed an official
-        // validation on the preceding carrier; strict exact best-of scoring
-        // keeps every incumbent when neither candidate helps.
-        if !medium_metric_hub_safe {
-            for alpha in [1.0f64, 2.0] {
-                consider!(move || {
-                    custom_metrics::order_variant(
-                        &core,
-                        alpha,
-                        true,
-                        custom_metrics::ScoreVariant::DegSqrt,
-                    )
-                });
-            }
-        }
-
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
         // session, `probe_variant_drop_score_cost`): measured 0 unique wins
         // and an exact 0.00000000 dev-score cost across the full 300-matrix
@@ -3174,9 +3156,9 @@ fn order_with_options(
         });
 
         // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
-        // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
+        // matter (>=1200 owned vertices, <=30k block-nnz so a restart stays
         // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
-        // local flops, largest-block-first under a 24-restart global budget.
+        // local flops, largest-block-first under a 1-restart global budget.
         // Decomposition shrinks the problem, so this reaches blocks the
         // whole-graph relabel multi-start is gated out of on the big gt_10k
         // matrices. Adds crudeoil_lee1_07 (0.9032->0.8781) and syn30m03m
@@ -3190,7 +3172,7 @@ fn order_with_options(
         if nnz <= 60_000 {
             consider!(move || {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    biconn::biconn_heavy_order(pattern, 1, 1200, 30_000),
                 )
             });
         }
@@ -6913,7 +6895,7 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     }
     let degree: Vec<usize> = adj.iter().map(|a| a.len()).collect();
 
-    const ND_LEAF: usize = 200;
+    const ND_LEAF: usize = 400;
 
     let mut order: Vec<usize> = vec![0usize; n];
     let mut mark: Vec<bool> = vec![false; n]; // membership in the current subset
@@ -6922,7 +6904,7 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
 
     // Hard work budget: caps total per-subset scanning at O(n), so no adversarial
     // (e.g. highly disconnected) input can drive quadratic blow-up.
-    let mut budget: i64 = 64 * n as i64 + 4096;
+    let mut budget: i64 = 32 * n as i64 + 4096;
 
     // Scratch global->local map for AMD-on-induced-leaf ordering; -1 everywhere
     // between leaves. Allocated only when the AMD-leaf variant is requested.
