@@ -5952,3 +5952,37 @@ fn probe_merged_ablation() {
         );
     }
 }
+
+/// ANCHOR-FILL CENSUS (0022g groundwork): for every dev matrix, the anchor's
+/// exact fill `anchor_lnnz = Σ amd_counts` and max column count — the cost
+/// covariates the review identified as the ones every recent cap death was
+/// invisible to. Output is the data from which fill-keyed gate constants get
+/// derived at equal admitted cost. Cheap: one AMD + one GNP pass per matrix.
+#[test]
+#[ignore]
+fn probe_anchor_fill() {
+    let corpus = crate::corpus::corpus();
+    println!("FILL\tmatrix\tn\tnnz\tmax_deg\tanchor_lnnz\tanchor_maxcol\tfill_ratio");
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let amd = feral_amd::amd_order(&core).unwrap();
+        let perm: Vec<usize> = amd.into_iter().map(|x| x as usize).collect();
+        let permuted = permute_pattern(&sp, &perm);
+        let etree = EliminationTree::from_pattern(&permuted);
+        let counts = column_counts_gnp(&permuted, &etree);
+        let lnnz: u64 = counts.iter().map(|&c| c as u64).sum();
+        let maxcol: usize = counts.iter().copied().max().unwrap_or(0);
+        let md = probe_max_deg(pat);
+        println!(
+            "FILL\t{name}\t{n}\t{nnz}\t{md}\t{lnnz}\t{maxcol}\t{:.2}",
+            lnnz as f64 / nnz.max(1) as f64
+        );
+    }
+}
