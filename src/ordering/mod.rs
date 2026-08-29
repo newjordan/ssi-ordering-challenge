@@ -935,10 +935,10 @@ const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 /// keep the exact bitset replay in the measured medium tier; a deterministic
 /// precharged budget makes exhaustion fail closed.
 const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
-const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
-const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
+const SIMPLICIAL_PROMOTION_MAX_N: usize = 6_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 100_000;
 const SIMPLICIAL_PROMOTION_MAX_DENSITY: usize = 24;
-const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
+const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 64_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -2968,8 +2968,10 @@ fn order_with_options(
                 // Reuse this exact duplicate task slot for either the narrow
                 // seed-2 mover or the measured dense metric winner.
                 if metis_seed2_cell {
+                    // Pinned seed 2 rotted to 1.010× on 14100:477382; seed 0
+                    // scores 0.788× end-to-end (−24.6%). One literal, same cost.
                     let opts = feral_metis::MetisOptions {
-                        seed: 2,
+                        seed: 0,
                         ..Default::default()
                     };
                     consider!(move || {
@@ -3095,6 +3097,16 @@ fn order_with_options(
                     )
                 });
             }
+            // Hub-heavy medium: SqDiv α=1 wins two eval rows (4995:24790,
+            // 9995:49190); DegSqrt α grid wins none in this class.
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.0,
+                    true,
+                    custom_metrics::ScoreVariant::SqDiv,
+                )
+            });
         }
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
