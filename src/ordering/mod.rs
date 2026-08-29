@@ -2333,6 +2333,8 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
+    let max_deg_sq = (max_deg as u128) * (max_deg as u128);
+    let medium_metric_hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
 
     // Reusable scoring/permutation workspace for THIS order() call (ported
     // from the `sbx-perf` cost-reduction session, unmodified): n and nnz are
@@ -2561,32 +2563,7 @@ fn order_with_options(
                 dense_alpha: 1.25,
                 ..Default::default()
             };
-            if n < 10_000 && nnz >= 800_000 && nnz > 100usize.saturating_mul(n) {
-                // Ultra-dense sub-10k pedigree slice: reuse the AMF-1.25 task
-                // for the independently measured k=512 degree strip, whose
-                // non-aggressive no-dense AMD core improves the exact parent
-                // completion without increasing portfolio width.
-                consider!(move || {
-                    let mut ranked: Vec<usize> = (0..n).collect();
-                    ranked.sort_unstable_by(|&a, &b| {
-                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
-                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
-                        db.cmp(&da).then(a.cmp(&b))
-                    });
-                    let sub = |c: &feral_ordering_core::CscPattern| {
-                        let opts = feral_amd::AmdOptions {
-                            aggressive: false,
-                            dense_alpha: -1.0,
-                        };
-                        feral_amd::amd_order_opts(c, &opts).ok().map(|(p, ..)| p)
-                    };
-                    let perm = strip_general_v2(scoring_pat, &ranked, 512, &sub)
-                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
-                    Ok(perm.into_iter().map(|v| v as i32).collect())
-                });
-            } else {
-                consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
-            }
+            consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
             if nnz >= D_WIDE_MAX_DENSITY * n {
                 // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
                 // place of AMD(.75). The 50..100 band refines its raw ordering
@@ -2813,11 +2790,20 @@ fn order_with_options(
 
         // Tighter-dense AMF (α2) — a distinct AMF ordering for dense-ish mediums
         // that the α5/α10 AMF variants miss. Time-trivial at this size.
-        let amf_opts2 = feral_amf::AmfOptions {
-            dense_alpha: 2.0,
-            ..Default::default()
-        };
-        consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        if nnz >= 200_000 && medium_metric_hub_safe {
+            consider!(move || custom_metrics::order_variant(
+                &core,
+                0.75,
+                true,
+                custom_metrics::ScoreVariant::DegSqrt,
+            ));
+        } else {
+            let amf_opts2 = feral_amf::AmfOptions {
+                dense_alpha: 2.0,
+                ..Default::default()
+            };
+            consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        }
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
         // add unique wins beyond the existing α{-1,2,5,10} set. Gated to genuinely
@@ -5192,7 +5178,13 @@ fn order_with_options(
         // construction: identical descent count, different seeds. Modes 7
         // and 2 are the plan's two strongest per the measured table above;
         // same dedup discipline; pure function of the pattern.
-        if slots.len() == 3 && plan.len() >= 4 {
+        // Near the hub threshold, the mid-density runner-up can displace a
+        // stronger incumbent-seed basin. Retain it for low/high densities and
+        // strong hubs, where the full exact A/B was positive or unchanged.
+        let runner_up_swap = max_deg.saturating_mul(50) <= n
+            || nnz < n.saturating_mul(4)
+            || nnz > n.saturating_mul(5);
+        if slots.len() == 3 && plan.len() >= 4 && runner_up_swap {
             let mut adds: Vec<(usize, u8)> = Vec::new();
             for &mode in &[7u8, 2u8] {
                 let key = (slots[2].0, mode);
