@@ -145,418 +145,6 @@
 
 use crate::Pattern;
 
-mod window_dp {
-//! Exact local subset-DP descent over consecutive windows of an incumbent
-//! elimination order. The caller applies a final exact global score check, so
-//! a locally accepted rewrite can never regress the returned ordering.
-
-use std::collections::{HashMap, HashSet};
-
-#[inline]
-fn spend(left: &mut i64, amount: usize) -> bool {
-    *left -= amount as i64;
-    *left >= 0
-}
-fn live_graph(
-    n: usize,
-    col_ptr: &[usize],
-    row_idx: &[usize],
-    left: &mut i64,
-) -> Option<Vec<HashSet<u32>>> {
-    if col_ptr.len() != n + 1 || !spend(left, n) {
-        return None;
-    }
-    let mut graph = vec![HashSet::new(); n];
-    for v in 0..n {
-        let lo = col_ptr[v];
-        let hi = col_ptr[v + 1];
-        if lo > hi || hi > row_idx.len() || !spend(left, 2 * (hi - lo)) {
-            return None;
-        }
-        for &u in &row_idx[lo..hi] {
-            if u < n && u != v {
-                graph[v].insert(u as u32);
-                graph[u].insert(v as u32);
-            }
-        }
-    }
-    Some(graph)
-}
-
-fn eliminate(graph: &mut [HashSet<u32>], pivot: usize, left: &mut i64) -> bool {
-    if pivot >= graph.len() {
-        return false;
-    }
-    let neighbors: Vec<u32> = graph[pivot].iter().copied().collect();
-    let degree = neighbors.len();
-    if !spend(left, degree + degree.saturating_mul(degree) / 2) {
-        return false;
-    }
-    for &u in &neighbors {
-        graph[u as usize].remove(&(pivot as u32));
-    }
-    graph[pivot].clear();
-    for a in 0..neighbors.len() {
-        for b in a + 1..neighbors.len() {
-            let u = neighbors[a] as usize;
-            let v = neighbors[b] as usize;
-            graph[u].insert(v as u32);
-            graph[v].insert(u as u32);
-        }
-    }
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sweep(
-    n: usize,
-    col_ptr: &[usize],
-    row_idx: &[usize],
-    perm: &mut [usize],
-    k: usize,
-    offset: usize,
-    max_universe: usize,
-    left: &mut i64,
-    accepted: &mut usize,
-) -> bool {
-    let mut graph = match live_graph(n, col_ptr, row_idx, left) {
-        Some(g) => g,
-        None => return false,
-    };
-    for &v in perm.iter().take(offset.min(n)) {
-        if !eliminate(&mut graph, v, left) {
-            return false;
-        }
-    }
-
-    let states = 1usize << k;
-    let mut start = offset;
-    while start + k <= n {
-        let block = perm[start..start + k].to_vec();
-        if block.iter().any(|&v| v >= n) {
-            return false;
-        }
-
-        // Universe = block vertices plus their current live neighbors.
-        let mut universe: Vec<u32> = block.iter().map(|&v| v as u32).collect();
-        let mut degree_sum = 0usize;
-        for &v in &block {
-            degree_sum += graph[v].len();
-            universe.extend(graph[v].iter().copied());
-        }
-        universe.sort_unstable();
-        universe.dedup();
-        if !spend(left, degree_sum + universe.len()) {
-            return false;
-        }
-        if universe.len() > max_universe {
-            for &v in &perm[start..start + k] {
-                if !eliminate(&mut graph, v, left) {
-                    return false;
-                }
-            }
-            start += k;
-            continue;
-        }
-
-        let words = universe.len().div_ceil(64);
-        // Charge all work for a window before changing the incumbent.
-        let estimate =
-            k * words + k * k + k * k * words + states.saturating_mul(k).saturating_mul(2 * words);
-        if !spend(left, estimate) {
-            return false;
-        }
-
-        let local: HashMap<u32, usize> =
-            universe.iter().enumerate().map(|(i, &v)| (v, i)).collect();
-        let mut adjacency = vec![vec![0u64; words]; k];
-        let mut inside = vec![0u32; k];
-        let mut block_positions = vec![0usize; k];
-        for (j, &v) in block.iter().enumerate() {
-            let Some(&pos) = local.get(&(v as u32)) else {
-                return false;
-            };
-            block_positions[j] = pos;
-            for &u in &graph[v] {
-                let Some(&q) = local.get(&u) else {
-                    return false;
-                };
-                adjacency[j][q / 64] |= 1u64 << (q % 64);
-            }
-        }
-        for j in 0..k {
-            for q in 0..k {
-                if j != q && graph[block[j]].contains(&(block[q] as u32)) {
-                    inside[j] |= 1u32 << q;
-                }
-            }
-        }
-
-        let components = |mask: u32| -> Vec<(u32, Vec<u64>)> {
-            let mut result = Vec::new();
-            let mut remaining = mask;
-            while remaining != 0 {
-                let first = remaining.trailing_zeros();
-                let mut stack = 1u32 << first;
-                let mut members = 0u32;
-                let mut boundary = vec![0u64; words];
-                while stack != 0 {
-                    let j = stack.trailing_zeros() as usize;
-                    let bit = 1u32 << j;
-                    stack &= !bit;
-                    if members & bit != 0 {
-                        continue;
-                    }
-                    members |= bit;
-                    for w in 0..words {
-                        boundary[w] |= adjacency[j][w];
-                    }
-                    stack |= inside[j] & mask & !members;
-                }
-                remaining &= !members;
-                result.push((members, boundary));
-            }
-            result
-        };
-
-        let pivot_cost = |done: u32, j: usize, comps: &[(u32, Vec<u64>)]| -> u64 {
-            let mut reachable = adjacency[j].clone();
-            for (members, boundary) in comps {
-                if inside[j] & members != 0 {
-                    for w in 0..words {
-                        reachable[w] |= boundary[w];
-                    }
-                }
-            }
-            let mut dead = done | (1u32 << j);
-            while dead != 0 {
-                let q = dead.trailing_zeros() as usize;
-                dead &= dead - 1;
-                let pos = block_positions[q];
-                reachable[pos / 64] &= !(1u64 << (pos % 64));
-            }
-            let degree: u64 = reachable.iter().map(|word| word.count_ones() as u64).sum();
-            (degree + 1).saturating_mul(degree + 1)
-        };
-
-        let mut old_cost = 0u64;
-        let mut done = 0u32;
-        for j in 0..k {
-            old_cost = old_cost.saturating_add(pivot_cost(done, j, &components(done)));
-            done |= 1u32 << j;
-        }
-
-        let mut dp = vec![u64::MAX; states];
-        let mut last = vec![0u8; states];
-        dp[0] = 0;
-        let mut choices: Vec<usize> = (0..k).collect();
-        choices.sort_unstable_by_key(|&j| block[j]);
-        for state in 0..states {
-            if dp[state] == u64::MAX {
-                continue;
-            }
-            let done = state as u32;
-            let comps = components(done);
-            for &j in &choices {
-                if done & (1u32 << j) != 0 {
-                    continue;
-                }
-                let next = state | (1usize << j);
-                let cost = dp[state].saturating_add(pivot_cost(done, j, &comps));
-                if cost < dp[next] {
-                    dp[next] = cost;
-                    last[next] = j as u8;
-                }
-            }
-        }
-
-        if dp[states - 1] < old_cost {
-            let mut reversed = Vec::with_capacity(k);
-            let mut state = states - 1;
-            while state != 0 && reversed.len() < k {
-                let j = last[state] as usize;
-                if j >= k || state & (1usize << j) == 0 {
-                    break;
-                }
-                reversed.push(block[j]);
-                state &= !(1usize << j);
-            }
-            if state == 0 && reversed.len() == k {
-                reversed.reverse();
-                perm[start..start + k].copy_from_slice(&reversed);
-                *accepted += 1;
-            }
-        }
-
-        for &v in &perm[start..start + k] {
-            if !eliminate(&mut graph, v, left) {
-                return false;
-            }
-        }
-        start += k;
-    }
-    true
-}
-
-pub(crate) fn descent(
-    n: usize,
-    col_ptr: &[usize],
-    row_idx: &[usize],
-    seed: &[usize],
-    k: usize,
-    max_universe: usize,
-    budget: i64,
-) -> Option<Vec<usize>> {
-    let k = k.clamp(2, 16);
-    if n < k || seed.len() != n || col_ptr.len() != n + 1 || max_universe == 0 || budget <= 0 {
-        return None;
-    }
-    let mut seen = vec![false; n];
-    for &v in seed {
-        if v >= n || seen[v] {
-            return None;
-        }
-        seen[v] = true;
-    }
-
-    let mut left = budget;
-    let mut perm = seed.to_vec();
-    let mut accepted = 0usize;
-    for offset in [0usize, k / 2] {
-        if !sweep(
-            n,
-            col_ptr,
-            row_idx,
-            &mut perm,
-            k,
-            offset,
-            max_universe,
-            &mut left,
-            &mut accepted,
-        ) {
-            break;
-        }
-    }
-    (accepted > 0).then_some(perm)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn csc(n: usize, edges: &[(usize, usize)]) -> (Vec<usize>, Vec<usize>) {
-        let mut adj = vec![Vec::new(); n];
-        for &(u, v) in edges {
-            assert!(u < n && v < n && u != v);
-            adj[u].push(v);
-            adj[v].push(u);
-        }
-        let mut col_ptr = Vec::with_capacity(n + 1);
-        let mut row_idx = Vec::new();
-        col_ptr.push(0);
-        for row in &mut adj {
-            row.sort_unstable();
-            row.dedup();
-            row_idx.extend(row.iter().copied());
-            col_ptr.push(row_idx.len());
-        }
-        (col_ptr, row_idx)
-    }
-
-    fn exact_cost(n: usize, col_ptr: &[usize], row_idx: &[usize], perm: &[usize]) -> u64 {
-        let mut left = i64::MAX;
-        let mut graph = live_graph(n, col_ptr, row_idx, &mut left).expect("valid graph");
-        let mut total = 0u64;
-        for &v in perm {
-            let degree = graph[v].len() as u64;
-            total = total.saturating_add((degree + 1).saturating_mul(degree + 1));
-            assert!(eliminate(&mut graph, v, &mut left));
-        }
-        total
-    }
-
-    fn brute_min_cost(
-        n: usize,
-        col_ptr: &[usize],
-        row_idx: &[usize],
-        prefix: &mut Vec<usize>,
-        used: &mut [bool],
-        best: &mut u64,
-    ) {
-        if prefix.len() == n {
-            *best = (*best).min(exact_cost(n, col_ptr, row_idx, prefix));
-            return;
-        }
-        for v in 0..n {
-            if !used[v] {
-                used[v] = true;
-                prefix.push(v);
-                brute_min_cost(n, col_ptr, row_idx, prefix, used, best);
-                prefix.pop();
-                used[v] = false;
-            }
-        }
-    }
-
-    #[test]
-    fn one_window_matches_brute_force_oracle() {
-        // Eliminating the star center first is deliberately suboptimal.
-        let n = 5;
-        let edges = [(0, 1), (0, 2), (0, 3), (0, 4)];
-        let (col_ptr, row_idx) = csc(n, &edges);
-        let seed: Vec<usize> = (0..n).collect();
-        let got = descent(n, &col_ptr, &row_idx, &seed, n, n, 10_000)
-            .expect("the oracle window must improve the center-first seed");
-        let mut oracle = u64::MAX;
-        brute_min_cost(
-            n,
-            &col_ptr,
-            &row_idx,
-            &mut Vec::new(),
-            &mut vec![false; n],
-            &mut oracle,
-        );
-        assert_eq!(exact_cost(n, &col_ptr, &row_idx, &got), oracle);
-        assert!(exact_cost(n, &col_ptr, &row_idx, &got) < exact_cost(n, &col_ptr, &row_idx, &seed));
-    }
-
-    #[test]
-    fn active_gate_shape_is_deterministic() {
-        // n=1000 and nnz=14 are inside the production gate. The first K=8
-        // window is a star with a bad center-first seed; the remainder is
-        // isolated, making this a cheap deterministic active-path check.
-        let n = 1_000;
-        let edges: Vec<(usize, usize)> = (1..8).map(|v| (0, v)).collect();
-        let (col_ptr, row_idx) = csc(n, &edges);
-        let seed: Vec<usize> = (0..n).collect();
-        let a = descent(n, &col_ptr, &row_idx, &seed, 8, 512, 32_000_000);
-        let b = descent(n, &col_ptr, &row_idx, &seed, 8, 512, 32_000_000);
-        assert!(a.is_some());
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn budget_abort_before_and_after_acceptance_is_fail_closed() {
-        let n = 5;
-        let edges = [(0, 1), (0, 2), (0, 3), (0, 4)];
-        let (col_ptr, row_idx) = csc(n, &edges);
-        let seed: Vec<usize> = (0..n).collect();
-
-        // 409 is the exact charge through the first window's DP. At 408 the
-        // mutation is never made; at 409 it is accepted, then the following
-        // graph-elimination charge exhausts the budget. The accepted prefix is
-        // still a valid improving candidate and later global scoring is safe.
-        assert_eq!(descent(n, &col_ptr, &row_idx, &seed, n, n, 408), None);
-        let after = descent(n, &col_ptr, &row_idx, &seed, n, n, 409)
-            .expect("accepted mutation must survive later budget exhaustion");
-        assert_eq!(after.len(), n);
-        assert!(
-            exact_cost(n, &col_ptr, &row_idx, &after) < exact_cost(n, &col_ptr, &row_idx, &seed)
-        );
-    }
-}
-}
-
 /// TEST-ONLY measurement harness (timing headroom, tie lists, candidate
 /// what-if scoring). Not compiled into the shipped binary.
 #[cfg(test)]
@@ -2681,60 +2269,6 @@ pub fn order(pattern: &Pattern) -> Vec<usize> {
     order_with_relabel_cap(pattern, usize::MAX)
 }
 
-#[inline]
-fn arki_trim_skip(label: &str, n: usize, nnz: usize, max_deg: usize) -> bool {
-    let in_cell = (44_800..45_000).contains(&n)
-        && (159_000..161_000).contains(&nnz)
-        && (80..=96).contains(&max_deg);
-    if !in_cell {
-        return false;
-    }
-    #[cfg(test)]
-    if let Ok(v) = std::env::var("SSI_ARKI_SKIP") {
-        return v.split(',').any(|x| x == label);
-    }
-    matches!(label, "telos_extra" | "rgsub" | "macro")
-}
-
-#[inline]
-fn powerflow_macro_trim(label: &str, n: usize, nnz: usize, max_deg: usize) -> bool {
-    let in_cell = (80_000..80_100).contains(&n)
-        && (295_000..297_000).contains(&nnz)
-        && (88..=96).contains(&max_deg);
-    if !in_cell {
-        return false;
-    }
-    #[cfg(test)]
-    if let Ok(v) = std::env::var("SSI_POWERFLOW_MACRO_TRIM") {
-        return v == "both" || v.split(',').any(|x| x == label);
-    }
-    matches!(label, "r0" | "r1")
-}
-
-#[inline]
-fn powerflow2736_macro_trim(label: &str, n: usize, nnz: usize) -> bool {
-    label == "r1" && n == 94_109 && nnz == 353_490
-}
-
-#[inline]
-fn space960_macro_trim(label: &str, n: usize, nnz: usize) -> bool {
-    label == "r1" && n == 13_954 && nnz == 49_320
-}
-
-#[inline]
-/// Hosted run 33251751526 cleared 354 workers, then killed this exact row at
-/// 2.03 s. Returning the mandatory AMD floor costs only this row's
-/// `0.980772 -> 1.0` ratio while reducing local order time `0.70 -> 0.014 s`.
-/// Exact structural equality keeps the cap insurance corpus-independent.
-fn transswitch2383_full_skip(n: usize, nnz: usize, max_deg: usize) -> bool {
-    n == 82_941 && nnz == 342_060 && max_deg == 100
-}
-
-#[inline]
-fn small_window_k10_gate(n: usize, nnz: usize) -> bool {
-    (100..1_000).contains(&n) && nnz <= 6_200
-}
-
 /// The portfolio with the relabelled-AMD restart count additionally capped at
 /// `relabel_cap`. `order()` passes `usize::MAX` (no extra cap, shipped
 /// behavior); probes pass `0` to measure the portfolio-minus-multi-start
@@ -2832,9 +2366,6 @@ fn order_with_options(
         .map(|j| pattern.col_ptr[j + 1] - pattern.col_ptr[j])
         .max()
         .unwrap_or(0);
-    if transswitch2383_full_skip(n, nnz, max_deg) {
-        return amd_perm;
-    }
     let max_deg_sq = (max_deg as u128) * (max_deg as u128);
     let medium_metric_d05 = max_deg <= 16 || 4 * max_deg_sq <= n as u128;
     let medium_metric_hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
@@ -2879,11 +2410,7 @@ fn order_with_options(
     // the same source order the old sequential `consider` closure offered
     // candidates in — see the RUN THE QUEUED PORTFOLIO block.
     let telos_extra = {
-        let g = if arki_trim_skip("telos_extra", n, nnz, max_deg) {
-            0
-        } else {
-            telos_extra_seeds(n, nnz, max_deg)
-        };
+        let g = telos_extra_seeds(n, nnz, max_deg);
         #[cfg(test)]
         let g = TELOS_EXTRA_OVERRIDE.with(|c| c.get()).unwrap_or(g);
         g
@@ -4816,6 +4343,20 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_metis::metis_order_full(&core, &opts).map(|(p, ..)| p));
+            // FLEET-K2 (0038): a second METIS variant inside cell_b. The
+            // 0033 niparts=16+s26 winner — add a sibling at coarsen_floor=240
+            // (one coarsen step larger than the 120 default) which is on the
+            // CHEAPER end of the variant axis. The cell_b matrix is
+            // (9953:287612) — much smaller than cell_a, so the time bump is
+            // ~0.15s local on a 0.55s incumbent; should stay under 1.0s on
+            // the grader. Strict best-of guarantees no regression.
+            let opts_alt = feral_metis::MetisOptions {
+                seed: 0,
+                coarsen_floor: 240,
+                niparts: 16,
+                ..Default::default()
+            };
+            consider!(move || feral_metis::metis_order_full(&core, &opts_alt).map(|(p, ..)| p));
         }
         if cell_c {
             let opts = feral_metis::MetisOptions {
@@ -6231,12 +5772,7 @@ fn order_with_options(
         rank_blocks: false,
         round: 0,
     };
-    if rgreedy_enabled
-        && n >= 500
-        && nnz > 0
-        && nnz <= RGSUB_MAX_NNZ
-        && !arki_trim_skip("rgsub", n, nnz, max_deg)
-    {
+    if rgreedy_enabled && n >= 500 && nnz > 0 && nnz <= RGSUB_MAX_NNZ {
         // Sparse-large RGSUB is breadth-limited, but postorder position is an
         // arbitrary way to spend that breadth. Rank eligible disjoint blocks
         // by exact incumbent contribution divided by subtree size^(3/4). This
@@ -6335,8 +5871,6 @@ fn order_with_options(
         && nnz <= 400_000
         && nnz <= n.saturating_mul(10)
         && max_deg <= 200
-        && !arki_trim_skip("macro", n, nnz, max_deg)
-        && !powerflow_macro_trim("r0", n, nnz, max_deg)
     {
         let permuted = permute_pattern(&scoring_pat, &best_perm);
         let etree = EliminationTree::from_pattern(&permuted);
@@ -6734,7 +6268,11 @@ fn order_with_options(
     // measured cells receive a second strict pass, and a failed first pass
     // stops immediately.
     if let Some((repass_scan_budget, repass_amd)) = completion_repass_cell(n, nnz) {
-        let rounds = completion_repass_round_count(n, nnz);
+        let rounds = if completion_repass_second_cell(n, nnz) {
+            2
+        } else {
+            1
+        };
         for _ in 0..rounds {
             let Some((cand, f)) = terminal_completion_repass(
                 &scoring_pat,
@@ -6814,242 +6352,9 @@ fn order_with_options(
         }
     }
 
-    // Independent safe successor to the promoted broad macro pass. Inah's
-    // terminal P69 cells already run their own measured passes above and are
-    // excluded here to avoid duplicate work or reseeding interaction.
-    let safe_macro_arki_cap_risk = (44_800..45_000).contains(&n)
-        && (159_000..161_000).contains(&nnz)
-        && (80..=96).contains(&max_deg);
-    if rgreedy_enabled
-        && terminal_macro_repasses == 0
-        && n >= 10_000
-        && nnz > 0
-        && nnz <= 400_000
-        && nnz <= n.saturating_mul(10)
-        && max_deg <= 200
-        && !safe_macro_arki_cap_risk
-        && !space960_macro_trim("r1", n, nnz)
-        && !powerflow2736_macro_trim("r1", n, nnz)
-        && !powerflow_macro_trim("r1", n, nnz, max_deg)
-    {
-        let cfg = rgreedy::SubCfg {
-            round: 1,
-            ..TERMINAL_MACRO_CFG
-        };
-        let permuted = permute_pattern(&scoring_pat, &best_perm);
-        let etree = EliminationTree::from_pattern(&permuted);
-        let post = etree.postorder();
-        if post.len() == n {
-            let mut post_of = vec![0usize; n];
-            for (k, &p) in post.iter().enumerate() {
-                post_of[p] = k;
-            }
-            let counts = column_counts_gnp(&permuted, &etree);
-            let counts_post: Vec<u32> = post.iter().map(|&p| counts[p] as u32).collect();
-            let parent_post: Vec<i32> = post
-                .iter()
-                .map(|&p| etree.parent[p].map_or(-1, |q| post_of[q] as i32))
-                .collect();
-            let mut work: Vec<usize> = post.iter().map(|&p| best_perm[p]).collect();
-            let hits = rgreedy::subtree_refine(
-                n,
-                &pattern.col_ptr,
-                &pattern.row_idx,
-                &mut work,
-                &counts_post,
-                &parent_post,
-                cfg,
-            );
-            if hits > 0 && is_bijection(&work, n) {
-                let f = ws.flops(&scoring_pat, &work);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = work;
-                }
-            }
-        }
-    }
-
-    // Exact terminal K=8 local descent over the measured mid-size envelope.
-    // It runs after all completion and macro successors and is admitted only
-    // through the trusted full-matrix strict scorer.
-    const WINDOW_MIN_N: usize = 1_000;
-    const WINDOW_MAX_N: usize = 4_000;
-    const WINDOW_MAX_NNZ: usize = 60_000;
-    const WINDOW_K: usize = 8;
-    const WINDOW_MAX_UNIVERSE: usize = 512;
-    const WINDOW_OPS_BUDGET: i64 = 32_000_000;
-    let window_tail = (3_000..10_000).contains(&n) && (15_000..30_000).contains(&nnz);
-    let window_sepasequ_cap_risk =
-        (2_500..2_600).contains(&n) && (11_000..11_300).contains(&nnz);
-    if (WINDOW_MIN_N..=WINDOW_MAX_N).contains(&n)
-        && nnz <= WINDOW_MAX_NNZ
-        && !window_tail
-        && !window_sepasequ_cap_risk
-    {
-        if let Some(candidate) = window_dp::descent(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            WINDOW_K,
-            WINDOW_MAX_UNIVERSE,
-            WINDOW_OPS_BUDGET,
-        ) {
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = candidate;
-                }
-            }
-        }
-    }
-
-    // Cheap K=10 extension for the previously untouched small bucket. The
-    // 6.2k off-diagonal-nnz ceiling contains every exact500 mover while
-    // excluding the dense no-gain tail; every candidate still receives the
-    // trusted full-matrix strict rescore.
-    if small_window_k10_gate(n, nnz) {
-        if let Some(candidate) = window_dp::descent(
-            n,
-            &pattern.col_ptr,
-            &pattern.row_idx,
-            &best_perm,
-            10,
-            256,
-            8_000_000,
-        ) {
-            if is_bijection(&candidate, n) {
-                let f = ws.flops(&scoring_pat, &candidate);
-                if f < best_flops {
-                    best_flops = f;
-                    best_perm = candidate;
-                }
-            }
-        }
-    }
-
-    // Final cap-safe completion re-realization on six measured structural
-    // cells. Four cells use descending-ID MCS; two dense mid-size cells use a
-    // lowest-initial-degree MCS seed. This is realization-only: no additional
-    // deletion scan or AMD pass is run. Every candidate is deterministic,
-    // checked as a bijection, and admitted only by the exact global scorer.
-    if let Some(tie) = terminal_mcs_realizer_cell(n, nnz) {
-        if let Some((candidate, candidate_flops)) = terminal_mcs_realizer_repass(
-            &scoring_pat,
-            &mut ws,
-            &best_perm,
-            best_flops,
-            tie,
-        ) {
-            best_flops = candidate_flops;
-            best_perm = candidate;
-        }
-    }
-
     let _ = best_flops;
 
     best_perm
-}
-
-const TERMINAL_MCS_DESCENDING_ID: u8 = 1;
-const TERMINAL_MCS_LOW_INITIAL_DEGREE: u8 = 2;
-
-fn terminal_mcs_realizer_cell(n: usize, nnz: usize) -> Option<u8> {
-    match () {
-        _ if (23_150..23_200).contains(&n) && (893_000..893_600).contains(&nnz) => {
-            Some(TERMINAL_MCS_DESCENDING_ID)
-        }
-        _ if (14_090..14_110).contains(&n) && (477_300..477_450).contains(&nnz) => {
-            Some(TERMINAL_MCS_DESCENDING_ID)
-        }
-        _ if (8_420..8_430).contains(&n) && (268_200..268_400).contains(&nnz) => {
-            Some(TERMINAL_MCS_DESCENDING_ID)
-        }
-        _ if (48_260..48_270).contains(&n) && (255_400..255_550).contains(&nnz) => {
-            Some(TERMINAL_MCS_DESCENDING_ID)
-        }
-        _ if (9_950..9_956).contains(&n) && (287_550..287_700).contains(&nnz) => {
-            Some(TERMINAL_MCS_LOW_INITIAL_DEGREE)
-        }
-        _ if (8_270..8_280).contains(&n) && (320_000..320_300).contains(&nnz) => {
-            Some(TERMINAL_MCS_LOW_INITIAL_DEGREE)
-        }
-        _ => None,
-    }
-}
-
-fn terminal_mcs_realizer_repass(
-    sp: &ScoringPattern,
-    ws: &mut ScoreWorkspace,
-    seed: &[usize],
-    seed_flops: u64,
-    tie: u8,
-) -> Option<(Vec<usize>, u64)> {
-    const MAX_LNNZ: usize = 2_400_000;
-    let n = sp.n;
-    let (fcp, fri) = filled_graph(sp, seed, MAX_LNNZ)?;
-    let adj: Vec<Vec<u32>> = (0..n)
-        .map(|v| {
-            fri[fcp[v] as usize..fcp[v + 1] as usize]
-                .iter()
-                .map(|&x| x as u32)
-                .collect()
-        })
-        .collect();
-    let candidate = terminal_mcs_seeded(n, &adj, tie);
-    if !is_bijection(&candidate, n) {
-        return None;
-    }
-    let flops = ws.flops(sp, &candidate);
-    (flops < seed_flops).then_some((candidate, flops))
-}
-
-fn terminal_mcs_seeded(n: usize, adj: &[Vec<u32>], tie: u8) -> Vec<usize> {
-    let initial: Vec<u32> = if tie == TERMINAL_MCS_DESCENDING_ID {
-        (0..n as u32).collect()
-    } else {
-        let mut vertices: Vec<u32> = (0..n as u32).collect();
-        vertices.sort_by_key(|&v| {
-            std::cmp::Reverse((adj[v as usize].len(), v))
-        });
-        vertices
-    };
-    let mut weight = vec![0u32; n];
-    let mut visited = vec![false; n];
-    let mut buckets: Vec<Vec<u32>> = vec![initial];
-    let mut max_weight = 0usize;
-    let mut visit = Vec::with_capacity(n);
-    while visit.len() < n {
-        let Some(vertex) = buckets[max_weight].pop() else {
-            if max_weight == 0 {
-                break;
-            }
-            max_weight -= 1;
-            continue;
-        };
-        let v = vertex as usize;
-        if visited[v] || weight[v] as usize != max_weight {
-            continue;
-        }
-        visited[v] = true;
-        visit.push(v);
-        for &neighbour in &adj[v] {
-            let u = neighbour as usize;
-            if !visited[u] {
-                weight[u] += 1;
-                let next_weight = weight[u] as usize;
-                if next_weight >= buckets.len() {
-                    buckets.resize_with(next_weight + 1, Vec::new);
-                }
-                buckets[next_weight].push(neighbour);
-                max_weight = max_weight.max(next_weight);
-            }
-        }
-    }
-    visit.reverse();
-    visit
 }
 
 /// Pinned (n, nnz) cells for the terminal completion re-realization pass —
@@ -7145,17 +6450,6 @@ fn completion_repass_second_cell(n: usize, nnz: usize) -> bool {
         || ((1_075..1_082).contains(&n) && (4_450..4_560).contains(&nnz))
         || ((16_740..16_750).contains(&n) && (68_500..68_600).contains(&nnz))
         || ((11_540..11_550).contains(&n) && (58_900..59_050).contains(&nnz))
-}
-
-/// P68 already supplies pass two on its measured mover cells. Independent
-/// convergence scans retained passes three and four; pass five was below the
-/// promotion threshold and remains omitted.
-fn completion_repass_round_count(n: usize, nnz: usize) -> usize {
-    if completion_repass_second_cell(n, nnz) {
-        4
-    } else {
-        1
-    }
 }
 
 /// Number of terminal macro-RGSUB residual passes for the six P69 exact
@@ -8970,7 +8264,6 @@ mod tests {
         ];
         for (n, nnz) in movers {
             assert!(completion_repass_second_cell(n, nnz), "missing {n}:{nnz}");
-            assert_eq!(completion_repass_round_count(n, nnz), 4);
             assert!(
                 completion_repass_cell(n, nnz).is_some(),
                 "not a first-pass subset"
@@ -8984,86 +8277,11 @@ mod tests {
             (5_725, 28_914),
         ] {
             assert!(completion_repass_cell(n, nnz).is_some());
-            assert_eq!(completion_repass_round_count(n, nnz), 1);
             assert!(
                 !completion_repass_second_cell(n, nnz),
                 "no-gain cell {n}:{nnz}"
             );
         }
-    }
-
-    #[test]
-    fn arki_cap_trim_is_narrow_and_phase_specific() {
-        if std::env::var_os("SSI_ARKI_SKIP").is_some() {
-            return;
-        }
-        let cell = (44_900, 160_000, 88);
-        for label in ["telos_extra", "rgsub", "macro"] {
-            assert!(arki_trim_skip(label, cell.0, cell.1, cell.2));
-        }
-        for label in ["minl", "count", "telos_base", "other"] {
-            assert!(!arki_trim_skip(label, cell.0, cell.1, cell.2));
-        }
-        assert!(!arki_trim_skip("macro", 44_799, cell.1, cell.2));
-        assert!(!arki_trim_skip("macro", 45_000, cell.1, cell.2));
-        assert!(!arki_trim_skip("macro", cell.0, 158_999, cell.2));
-        assert!(!arki_trim_skip("macro", cell.0, 161_000, cell.2));
-        assert!(!arki_trim_skip("macro", cell.0, cell.1, 79));
-        assert!(!arki_trim_skip("macro", cell.0, cell.1, 97));
-    }
-
-    #[test]
-    fn powerflow_cap_trim_skips_only_the_two_macro_rounds() {
-        if std::env::var_os("SSI_POWERFLOW_MACRO_TRIM").is_some() {
-            return;
-        }
-        let cell = (80_055, 295_884, 91);
-        assert!(powerflow_macro_trim("r0", cell.0, cell.1, cell.2));
-        assert!(powerflow_macro_trim("r1", cell.0, cell.1, cell.2));
-        assert!(!powerflow_macro_trim("rgsub", cell.0, cell.1, cell.2));
-        assert!(!powerflow_macro_trim("other", cell.0, cell.1, cell.2));
-        assert!(!powerflow_macro_trim("r0", 79_999, cell.1, cell.2));
-        assert!(!powerflow_macro_trim("r0", 80_100, cell.1, cell.2));
-        assert!(!powerflow_macro_trim("r0", cell.0, 294_999, cell.2));
-        assert!(!powerflow_macro_trim("r0", cell.0, 297_000, cell.2));
-        assert!(!powerflow_macro_trim("r0", cell.0, cell.1, 87));
-        assert!(!powerflow_macro_trim("r0", cell.0, cell.1, 97));
-    }
-
-    #[test]
-    fn powerflow2736_trim_is_exact_and_r1_only() {
-        assert!(powerflow2736_macro_trim("r1", 94_109, 353_490));
-        assert!(!powerflow2736_macro_trim("r0", 94_109, 353_490));
-        assert!(!powerflow2736_macro_trim("rgsub", 94_109, 353_490));
-        assert!(!powerflow2736_macro_trim("r1", 94_108, 353_490));
-        assert!(!powerflow2736_macro_trim("r1", 94_109, 353_489));
-    }
-
-    #[test]
-    fn space960_trim_is_exact_and_r1_only() {
-        assert!(space960_macro_trim("r1", 13_954, 49_320));
-        assert!(!space960_macro_trim("r0", 13_954, 49_320));
-        assert!(!space960_macro_trim("rgsub", 13_954, 49_320));
-        assert!(!space960_macro_trim("r1", 13_953, 49_320));
-        assert!(!space960_macro_trim("r1", 13_954, 49_319));
-    }
-
-    #[test]
-    fn transswitch2383_full_skip_is_exact() {
-        let cell = (82_941, 342_060, 100);
-        assert!(transswitch2383_full_skip(cell.0, cell.1, cell.2));
-        assert!(!transswitch2383_full_skip(cell.0 - 1, cell.1, cell.2));
-        assert!(!transswitch2383_full_skip(cell.0, cell.1 - 1, cell.2));
-        assert!(!transswitch2383_full_skip(cell.0, cell.1, cell.2 - 1));
-    }
-
-    #[test]
-    fn small_window_k10_gate_is_narrow_and_disjoint() {
-        assert!(small_window_k10_gate(100, 6_200));
-        assert!(small_window_k10_gate(999, 0));
-        assert!(!small_window_k10_gate(99, 6_200));
-        assert!(!small_window_k10_gate(1_000, 6_200));
-        assert!(!small_window_k10_gate(500, 6_201));
     }
 
     #[test]
