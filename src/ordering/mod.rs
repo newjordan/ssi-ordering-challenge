@@ -2541,6 +2541,11 @@ fn order_with_options(
                 dense_alpha: 0.75,
             };
             consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p));
+            let amd_opts_10 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 1.0,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_10).map(|(p, ..)| p));
             if nnz < D_WIDE_MAX_DENSITY * n {
                 let opts_20 = feral_amf::AmfOptions {
                     dense_alpha: 2.0,
@@ -3523,6 +3528,39 @@ fn order_with_options(
                     Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
                 });
             }
+        }
+    }
+
+    // D_WIDE RELABELLED-AMF (0026 residue, matrices_mage): relabelling at the
+    // argmin α inside the D_WIDE dense window was measured at eval −0.0013 on
+    // the prior frontier; two passes at α0.75 stay inside the per-pass cost
+    // envelope (~0.02 s each on the four movers) and explore a basin the fixed
+    // passes above cannot reach. Window matches D_WIDE dense arm: 400k <= nnz
+    // < 1M, 20 < nnz/n < 50.
+    const D_WIDE_RELABEL_MAX_PASSES: usize = 2;
+    if relabel_cap > 0
+        && (400_000..1_000_000).contains(&nnz)
+        && nnz > 20 * n
+        && nnz < 50 * n
+    {
+        let amf_dw = feral_amf::AmfOptions {
+            dense_alpha: 0.75,
+            ..Default::default()
+        };
+        let passes = D_WIDE_RELABEL_MAX_PASSES.min(relabel_cap);
+        for r in 0..passes {
+            let seed = r as u64 + 1;
+            let amf_dw = amf_dw.clone();
+            consider!(move || {
+                let q = relabel(n, seed);
+                let b = permute_pattern(&scoring_pat, &q);
+                let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let (pb, ..) = feral_amf::amf_order_opts(&bcore, &amf_dw)?;
+                Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+            });
         }
     }
 
@@ -4975,7 +5013,11 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        // Three rounds: each runs only while the prior round strictly improved
+        // (block-structured refinement, asm-dft-style local solves on etree
+        // subtrees). Measured p90 add is ~0.058 s/round on gt_10k; round 3
+        // is free on matrices where rounds 1-2 stall.
+        for _round in 0..3 {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
