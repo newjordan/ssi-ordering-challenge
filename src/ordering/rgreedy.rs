@@ -6,8 +6,8 @@
 //! a *relabelled* pattern to `feral_amd`/`feral_amf` and re-scoring the result.
 //! AMD is an *approximate* minimum-degree code: supervariables, aggressive
 //! absorption, approximate external degrees, multiple elimination. Relabelling
-//! only perturbs its internal tie-breaks, so the reachable set of orderings is a
-//! narrow neighbourhood of "what AMD's approximations happen to produce".
+//! only perturbs its internal tie-breaks, so the reachable set of orderings is
+//! a narrow neighbourhood of "what AMD's approximations happen to produce".
 //! `memory/experiments/0018` measured 3000 relabel seeds × 2 objectives on the
 //! near-AMD mass and found essentially nothing — but explicitly flagged that it
 //! is a *depth* result inside those two objectives, not a proof of optimality.
@@ -1068,171 +1068,6 @@ pub(crate) fn adjacent_pair_descent(
     changed_any.then_some(cur)
 }
 
-/// Promote currently simplicial vertices across a short non-adjacent window.
-///
-/// Ost, Schulz, and Strash (arXiv:2004.11315) prove that a simplicial vertex is
-/// safe to eliminate immediately. At each exact elimination state, this pass
-/// looks 2..=16 positions ahead of the planned pivot `x`. A future simplicial
-/// neighbor with smaller current degree is moved in front of `x`; the minimum
-/// `(degree, position, vertex id)` wins and every other vertex keeps its relative
-/// order. The caller still re-scores the completed candidate with the canonical
-/// symbolic scorer and accepts strict improvements only.
-///
-/// Every potentially expensive operation is charged *before* it runs. If the
-/// deterministic budget cannot cover validation, graph construction, a
-/// deficiency check, a rotation, or an elimination, the whole candidate is
-/// discarded (`None`) rather than returning partially budgeted work.
-pub(crate) fn simplicial_promotion(
-    n: usize,
-    col_ptr: &[usize],
-    row_idx: &[usize],
-    seed: &[usize],
-    budget: i64,
-) -> Option<Vec<usize>> {
-    const MAX_DISTANCE: usize = 16;
-    const MAX_PROMOTIONS: usize = 256;
-
-    struct PrechargedBudget {
-        remaining: i64,
-    }
-    impl PrechargedBudget {
-        fn charge(&mut self, cost: usize) -> bool {
-            let Ok(cost) = i64::try_from(cost) else {
-                return false;
-            };
-            if cost > self.remaining {
-                return false;
-            }
-            self.remaining -= cost;
-            true
-        }
-    }
-
-    if n < 3 || n > MAX_N || budget <= 0 || seed.len() != n || col_ptr.len() != n + 1 {
-        return None;
-    }
-    let mut work = PrechargedBudget { remaining: budget };
-
-    // Reserve the complete validation scan before touching caller-provided
-    // offsets: offsets, rows, seed, and initialization of the seen set.
-    // Saturation turns impossible sizes into a clean budget failure.
-    let validation_cost = (n + 1)
-        .saturating_add(row_idx.len())
-        .saturating_add(seed.len())
-        .saturating_add(n);
-    if !work.charge(validation_cost)
-        || col_ptr.first().copied() != Some(0)
-        || col_ptr.last().copied() != Some(row_idx.len())
-        || col_ptr
-            .windows(2)
-            .any(|p| p[0] > p[1] || p[1] > row_idx.len())
-        || row_idx.iter().any(|&v| v >= n)
-    {
-        return None;
-    }
-    let mut seen = vec![false; n];
-    for &v in seed {
-        if v >= n || seen[v] {
-            return None;
-        }
-        seen[v] = true;
-    }
-
-    let w = n.div_ceil(64);
-    // Zeroing the pristine bit matrix, scanning all input entries/columns, then
-    // constructing `Game`'s mutable adjacency copy and O(n) work arrays.
-    let build_cost = n
-        .saturating_mul(w)
-        .saturating_add(row_idx.len())
-        .saturating_add(n);
-    let game_cost = n
-        .saturating_mul(w)
-        .saturating_add(9usize.saturating_mul(n))
-        .saturating_add(w);
-    if !work.charge(build_cost) {
-        return None;
-    }
-    let adj0 = Game::build_adj(n, col_ptr, row_idx)?;
-    if !work.charge(game_cost) {
-        return None;
-    }
-    let mut game = Game::new(n, &adj0)?;
-
-    // `reset`: adjacency copy + popcount pass + fixed per-vertex bookkeeping,
-    // matching the operation model used by `Game` itself.
-    let reset_cost = 2usize
-        .saturating_mul(n)
-        .saturating_mul(w)
-        .saturating_add(8usize.saturating_mul(n));
-    if !work.charge(reset_cost) {
-        return None;
-    }
-    game.reset();
-
-    if !work.charge(n) {
-        return None;
-    }
-    let mut cur = seed.to_vec();
-    let mut promotions = 0usize;
-    for k in 0..n - 2 {
-        let x = cur[k];
-        let x_degree = game.deg[x];
-        let last = (k + MAX_DISTANCE).min(n - 1);
-        let mut best: Option<(u32, usize, usize)> = None;
-
-        for (j, &v) in cur.iter().enumerate().take(last + 1).skip(k + 2) {
-            // Position/id reads, degree comparison, and adjacency membership.
-            if !work.charge(4) {
-                return None;
-            }
-            let degree = game.deg[v];
-            if degree >= x_degree
-                || game.adj[x * game.w + (v >> 6)] & (1u64 << (v & 63)) == 0
-            {
-                continue;
-            }
-
-            let deficiency_cost = (degree as usize + 1)
-                .saturating_mul(2usize.saturating_mul(w).saturating_add(4));
-            if !work.charge(deficiency_cost) {
-                return None;
-            }
-            if game.deficiency(v) == 0 {
-                let key = (degree, j, v);
-                if best.is_none_or(|old| key < old) {
-                    best = Some(key);
-                }
-            }
-        }
-
-        if let Some((_, j, _)) = best {
-            if !work.charge(j - k) {
-                return None;
-            }
-            cur[k..=j].rotate_right(1);
-            promotions += 1;
-            if promotions == MAX_PROMOTIONS {
-                return Some(cur);
-            }
-        }
-
-        // No later scan exists after k == n-3, so replaying that last pivot
-        // would consume budget without changing the candidate.
-        if k + 1 < n - 2 {
-            let v = cur[k];
-            let eliminate_cost = (game.deg[v] as usize + 1)
-                .saturating_mul(3usize.saturating_mul(w).saturating_add(6))
-                .saturating_add(24);
-            if !work.charge(eliminate_cost) {
-                return None;
-            }
-            game.eliminate(v);
-        }
-    }
-
-    (promotions > 0).then_some(cur)
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // SUBTREE REFINEMENT — the exact elimination game on gt_10k, one etree subtree
 // at a time.
@@ -1279,44 +1114,6 @@ pub(crate) fn subtree_refine(
     parent: &[i32],
     cfg: SubCfg,
 ) -> usize {
-    let nnz = col_ptr.last().copied().unwrap_or(0);
-    let max_deg = col_ptr.windows(2).map(|p| p[1] - p[0]).max().unwrap_or(0);
-    let ratio_ge = |num: usize, den: usize| {
-        nnz.saturating_mul(den) >= n.saturating_mul(num)
-    };
-    let ratio_lt = |num: usize, den: usize| {
-        nnz.saturating_mul(den) < n.saturating_mul(num)
-    };
-    let cap_risk_cell = (10_000..10_300).contains(&n)
-        && (42_000..45_000).contains(&nnz)
-        && max_deg < 40;
-    // Exact-corpus safe cells for replacing repeated later-round trajectories.
-    // These gates use only matrix structure and preserve stream/task counts.
-    let diversify_later_rounds = ((6_000..15_000).contains(&n)
-        && ratio_ge(13, 4)
-        && ratio_lt(11, 2)
-        && max_deg < 200)
-        || ((1_500..4_000).contains(&n) && ratio_ge(6, 1))
-        || ((2_200..15_000).contains(&n)
-            && ratio_ge(17, 4)
-            && ratio_lt(13, 2)
-            && (50..75).contains(&max_deg))
-        || ((5_000..10_000).contains(&n) && (100..1_000).contains(&max_deg))
-        || ((500..10_000).contains(&n)
-            && ratio_ge(29, 10)
-            && ratio_lt(13, 4)
-            && max_deg < 50)
-        || ((2_200..4_000).contains(&n)
-            && ratio_ge(27, 10)
-            && ratio_lt(9, 2)
-            && max_deg < 50)
-        || ((1_500..3_000).contains(&n)
-            && ratio_ge(4, 1)
-            && ratio_lt(11, 2)
-            && max_deg < 75)
-        || ((6_000..9_000).contains(&n) && max_deg < 40);
-    let diversify_later_rounds = diversify_later_rounds && !cap_risk_cell;
-
     // Spend the ranked large-matrix budget on more D1 basins without adding
     // trajectories: 32 blocks get both streams and the next 64 get D1 only.
     let split_ranked_streams =
@@ -1493,16 +1290,6 @@ pub(crate) fn subtree_refine(
                                 && block_rank & 1 == 1
                             {
                                 rng_seed ^= 0xE703_7ED1_A0B4_28DB;
-                            }
-                            // Diversify later outer rounds without adding a
-                            // trajectory, block, operation, or task.
-                            if diversify_later_rounds && n < 10_000 && cfg.round >= 1 {
-                                rng_seed ^= 0x2545_F491_4F6C_DD1Du64
-                                    .wrapping_mul(cfg.round as u64 * 2 + 1);
-                            }
-                            if diversify_later_rounds && n >= 10_000 && cfg.round >= 2 {
-                                rng_seed ^= 0x3C6E_F372_FE94_F82Bu64
-                                    .wrapping_mul(cfg.round as u64 * 2 + 1);
                             }
                             let r = search_with_nelim(
                                 m,
