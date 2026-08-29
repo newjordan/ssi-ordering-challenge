@@ -7,19 +7,6 @@ it, rather than deleting it — a resolved question is a useful signpost.
 
 ## Active
 
-- [x] **0026's deferred D_WIDE relabelled-AMF multistart (FRONTIER-MAP2 lead N2).** RESOLVED
-      NEGATIVE by [0031](experiments/0031-fleet-h.md): the full deferred grid (7 alphas x 8 seeds,
-      isolated) is 0.5%-112% worse than the current incumbents on every window matrix in both
-      corpora — the old −0.0013 was absorbed by the 0026 dense arm + crown selector bands + heavy
-      relabelled-AMF. Do not re-derive.
-- [x] **Crown band-k note/code drift as headroom (FRONTIER-MAP2 §3).** RESOLVED NEGATIVE by
-      [0031](experiments/0031-fleet-h.md): both note values (128 in <35, 32 in 42-50) LOSE on eval
-      (sppc1tp 0.359→0.486, njlata 0.561→0.570); the in-code 146/128 are the tuned values.
-- [ ] **Terminal-MINL leftover cells** ([0031](experiments/0031-fleet-h.md)): in-band riders
-      `pooling_sppb2tp`/`pedigree_ex1058` pay 0.04-0.10 s for zero — a finer covariate could trim
-      them; and the dense-cell n-widening (25k,30k] has no local members, so only an unmeasurable
-      cap bet covers hypothetical hidden ones. Low value either way.
-
 - [x] **Structured relabelings, not random ones.** RESOLVED by
       [0006](experiments/0006-hillclimb-phase.md): at EQUAL budget every
       hill-climb schedule loses to i.i.d. random (0.8775-0.8787 vs 0.876511).
