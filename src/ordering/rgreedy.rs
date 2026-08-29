@@ -1116,8 +1116,7 @@ pub(crate) fn subtree_refine(
 ) -> usize {
     // Spend the ranked large-matrix budget on more D1 basins without adding
     // trajectories: 32 blocks get both streams and the next 64 get D1 only.
-    let split_ranked_streams =
-        n >= 10_000 && cfg.rank_blocks && cfg.max_blocks == 64 && cfg.streams == 2;
+    let split_ranked_streams = false;
 
     // ── subtree sizes and their contiguous postorder blocks ─────────────────
     // Postorder ⇒ every child precedes its parent, so one ascending sweep
