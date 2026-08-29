@@ -2482,6 +2482,17 @@ fn order_with_options(
         )));
     }
 
+    // Sparse ultra-giants sit above every ordinary portfolio envelope. One
+    // AMF alpha-5 pass is near-linear in this density class and supplies a
+    // candidate where the incumbent otherwise falls back to its AMD anchor.
+    if nnz > 2_500_000 && nnz <= 4usize.saturating_mul(n) {
+        let opts = feral_amf::AmfOptions {
+            dense_alpha: 5.0,
+            ..Default::default()
+        };
+        consider!(move || feral_amf::amf_order_opts(&core, &opts).map(|(p, ..)| p));
+    }
+
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
     // preserve the big gt_10k wins. (With AMD default this is the same pair of
     // heavy orderings as the prior safe run.)
@@ -6479,21 +6490,11 @@ fn terminal_minl_candidates(
         // sparse, low-hub n≈12.7k Gabriel row. AMF with dense detection
         // disabled realizes the same descended chordal graph at 0.834 of the
         // incumbent's flops; one fixed relabel reaches a slightly better
-        // tie-break basin. The tight structural cell reaches one exact row,
-        // and both permutations are admitted only through the trusted global
-        // strict scorer in the caller.
-        let original_nnz = sp.row_idx.len();
-        let original_max_deg = (0..n)
-            .map(|v| sp.col_ptr[v + 1] - sp.col_ptr[v])
-            .max()
-            .unwrap_or(0);
-        let gabriel_terminal_cell = (12_000..13_000).contains(&n)
-            && (65_000..75_000).contains(&original_nnz)
-            && original_max_deg <= 40;
-        #[cfg(test)]
-        let gabriel_terminal_cell =
-            gabriel_terminal_cell || std::env::var_os("SSI_TERMINAL_ALL").is_some();
-        if gabriel_terminal_cell {
+        // tie-break basin. Both permutations are admitted only through the
+        // trusted global strict scorer in the caller. The same two realizations
+        // are cheap on every completion already admitted by the terminal-MINL
+        // gate, so keep them available across that pre-budgeted envelope.
+        {
             let options = feral_amf::AmfOptions { dense_alpha: -1.0 };
             if let Ok((perm, ..)) = feral_amf::amf_order_opts(&core, &options) {
                 candidates.push(perm.into_iter().map(|v| v as usize).collect());
@@ -6520,6 +6521,7 @@ fn terminal_minl_candidates(
                 }
             }
         }
+
     }
     Some(candidates)
 }
