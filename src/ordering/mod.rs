@@ -2611,6 +2611,11 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_075).map(|(p, ..)| p));
+            let opts_05_dense = feral_amf::AmfOptions {
+                dense_alpha: 0.5,
+                ..Default::default()
+            };
+            consider!(move || feral_amf::amf_order_opts(&core, &opts_05_dense).map(|(p, ..)| p));
             let opts_125 = feral_amf::AmfOptions {
                 dense_alpha: 1.25,
                 ..Default::default()
@@ -2639,6 +2644,11 @@ fn order_with_options(
             } else {
                 consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
             }
+            let amd_opts_10 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 1.0,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_10).map(|(p, ..)| p));
             if nnz >= D_WIDE_MAX_DENSITY * n {
                 // Above the D_WIDE density ceiling, use low-alpha DegSqrt in
                 // place of AMD(.75). The 50..100 band refines its raw ordering
@@ -5448,7 +5458,15 @@ fn order_with_options(
             2
         };
         for round in 0..rgsub_rounds {
-            let round_cfg = rgreedy::SubCfg { round, ..rgsub_cfg };
+            let round_cfg = if round == 2 && n >= 10_000 && nnz <= 100_000 {
+                rgreedy::SubCfg {
+                    round,
+                    min_s: 16,
+                    ..rgsub_cfg
+                }
+            } else {
+                rgreedy::SubCfg { round, ..rgsub_cfg }
+            };
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
@@ -5647,6 +5665,25 @@ fn order_with_options(
             }
         }
 
+        // Post-MINL adjacent-pair polish on the sparse terminal cell only.
+        if n <= 30_000 && nnz <= 100_000 && n >= PAIR_DESCENT_MIN_N {
+            if let Some(cand) = rgreedy::adjacent_pair_descent(
+                n,
+                &pattern.col_ptr,
+                &pattern.row_idx,
+                &best_perm,
+                2,
+                PAIR_DESCENT_EXT_OPS_BUDGET,
+            ) {
+                if is_bijection(&cand, n) {
+                    let f = ws.flops(&scoring_pat, &cand);
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = cand;
+                    }
+                }
+            }
+        }
     }
 
     // Re-rank by each accepted start's exact column counts before every peel,
