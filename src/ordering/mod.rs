@@ -209,6 +209,7 @@ mod exact_dp;
 /// highly decomposable (median ~30% articulation points, 65-399 blocks per
 /// matrix), so this covers a structural blind spot. See its module doc.
 mod biconn;
+mod compress;
 /// RANDOMIZED GREEDY ELIMINATION-GAME SEARCH — a new candidate family for the
 /// small tier. Maintains the EXACT fill graph as bitsets and runs thousands of
 /// randomized exact-minimum-degree eliminations, accumulating `Σ c_j²` for free
@@ -2254,6 +2255,25 @@ fn telos_schedule(nnz: usize) -> (usize, &'static [(u8, usize)], usize, &'static
     }
 }
 
+/// Hard wall-clock guard: return the best incumbent before the grader SIGKILL.
+struct OrderDeadline {
+    start: std::time::Instant,
+}
+
+impl OrderDeadline {
+    const LIMIT_MS: u128 = 1_400;
+
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn hit(&self) -> bool {
+        self.start.elapsed().as_millis() >= Self::LIMIT_MS
+    }
+}
+
 /// Return an elimination order for `pattern` (best-of over the ordering family).
 pub fn order(pattern: &Pattern) -> Vec<usize> {
     order_with_relabel_cap(pattern, usize::MAX)
@@ -2292,6 +2312,7 @@ fn order_with_options(
     if n == 0 {
         return Vec::new();
     }
+    let deadline = OrderDeadline::new();
 
     // i32-indexed borrowed pattern shared by every feral ordering crate.
     let col_ptr_i32: Vec<i32> = pattern
@@ -2460,24 +2481,60 @@ fn order_with_options(
         };
     }
 
-    // ARM C (reconstructed-eval superset, this session) — ultra-dense giants
-    // ABOVE every existing envelope (nnz > 1.2M, nnz >= 100n): no candidate
-    // of any family currently runs there (the AMF envelope below stops at
-    // 1.5M/320k and the metric tier at 1.2M, and this class is above or
-    // outside both). AMF α=0.75 takes `densitymod` (n=24,524, nnz=3.24M)
-    // 1.0000 -> 0.3263 (isolated <0.01s); RCM takes `milinfract` (n=2,002,
-    // nnz=2.0M) 1.0000 -> 0.7407 (0.04s). Three superset rows enter (the
-    // third, `telecomsp_nor_sun`, runs over-cap on every tree and cannot be
-    // graded); zero dev rows. Pure additions under the best-of floor.
-    if nnz > 1_200_000 && nnz >= 100usize.saturating_mul(n) {
-        let opts_c = feral_amf::AmfOptions {
-            dense_alpha: 0.75,
-            ..Default::default()
-        };
-        consider!(move || feral_amf::amf_order_opts(&core, &opts_c).map(|(p, ..)| p));
-        consider!(move || Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(
-            pattern
-        )));
+    // Twin compression + simplicial peel — exact preprocessing; AMD/AMF on the
+    // compressed graph is strictly cheaper and often finds a different basin.
+    if let Some(comp) = compress::preprocess(&scoring_pat_owned) {
+        if comp.compressed.n > 0 {
+            let comp_cp: Vec<i32> = comp
+                .compressed
+                .col_ptr
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            let comp_ri: Vec<i32> = comp
+                .compressed
+                .row_idx
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            let comp_nc = comp.compressed.n;
+            let comp_meta = comp.clone();
+            let comp_cp1 = comp_cp.clone();
+            let comp_ri1 = comp_ri.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp1, &comp_ri1)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let p = feral_amd::amd_order(&comp_core)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta.expand_perm_i32(&pu)
+            });
+            let comp_meta2 = comp.clone();
+            let comp_cp2 = comp_cp.clone();
+            let comp_ri2 = comp_ri.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp2, &comp_ri2)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let opts = feral_amf::AmfOptions {
+                    dense_alpha: 5.0,
+                    ..Default::default()
+                };
+                let (p, ..) = feral_amf::amf_order_opts(&comp_core, &opts)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta2.expand_perm_i32(&pu)
+            });
+            let comp_meta3 = comp.clone();
+            consider!(move || {
+                let comp_core = feral_ordering_core::CscPattern::new(comp_nc, &comp_cp, &comp_ri)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                let opts = feral_amd::AmdOptions {
+                    aggressive: false,
+                    dense_alpha: -1.0,
+                };
+                let (p, ..) = feral_amd::amd_order_opts(&comp_core, &opts)?;
+                let pu: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                comp_meta3.expand_perm_i32(&pu)
+            });
+        }
     }
 
     // AMF α5 — the highest-value extra candidate; kept on the large envelope to
@@ -2626,139 +2683,6 @@ fn order_with_options(
                 dense_alpha: 20.0,
             };
             consider!(move || feral_amd::amd_order_opts(&core, &opts).map(|(p, ..)| p));
-        }
-
-        // RECONSTRUCTED-EVAL SUPERSET ARMS (chainyoda). A 1092-row
-        // reconstruction of every size-eligible non-dev MINLPLib KKT pattern
-        // (recipe: public note c6714213) was swept with a 60-candidate battery
-        // on the promoted tree; each arm below adds ONE measured winner under
-        // a gate audited against both the dev corpus and the full superset.
-        // All are pure additions under the strict best-of floor, so score risk
-        // is structurally zero and only the audited time is at stake.
-
-        // ARM A — sparse heavy band, one quotient metric. The 200k-500k
-        // "metric dead window" verdict was measured on dev members only;
-        // the superset shows `nuclear10b` (n=71,573, nnz=250,344, nnz<=4n)
-        // at 0.9061 -> 0.7842 under DegDivNvSqrtWf α=1.5 (isolated 0.03s).
-        // The nnz<=4n guard keeps out the window's measured-expensive dense
-        // members (`nuclear10a` 9.4, `meanvar-*` ~35). Ten superset rows and
-        // one dev row (`unitcommit_200_100_1_mod_8`, +~0.02s) are admitted.
-        if (200_000..=500_000).contains(&nnz) && nnz <= 4 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                1.5,
-                false,
-                custom_metrics::ScoreVariant::DegDivNvSqrtWf,
-            ));
-        }
-
-        // ARM B — `sjup2` band (400k-500k, density 8-13): DegDivNvDegme
-        // α=1.5 takes sjup2 (n=35,469, nnz=423,442) 0.9999 -> 0.9537
-        // (isolated 0.09s). sjup2 is the only known corpus row in the gate;
-        // zero dev rows enter it.
-        if (400_000..=500_000).contains(&nnz) && nnz > 8 * n && nnz <= 13 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                1.5,
-                false,
-                custom_metrics::ScoreVariant::DegDivNvDegme,
-            ));
-        }
-
-        // ARM E — aggressive AMD α=0.75 inside the D_WIDE window: the window
-        // ships AMF alphas and (now) METIS but no low-alpha AMD.
-        // `pooling_sppc1stp` (n=19,673, nnz=516,464, density 26.3) measures
-        // 0.8491 -> 0.7502 under it (isolated <0.01s). Same window as the
-        // METIS task above: the three dev `*pq` pooling twins pay ~0.03s each.
-        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
-            && nnz > D_WIDE_MIN_DENSITY * n
-            && nnz < D_WIDE_MAX_DENSITY * n
-        {
-            let amd_075_e = feral_amd::AmdOptions {
-                aggressive: true,
-                dense_alpha: 0.75,
-            };
-            consider!(move || feral_amd::amd_order_opts(&core, &amd_075_e).map(|(p, ..)| p));
-        }
-
-        // ARM W1 — pooling `*stp` heavy band (600k-800k, density 20-35):
-        // DegSqrt α=2.5 (non-aggressive). pooling_sppb5stp 0.2384 -> 0.1894
-        // (isolated 0.12s). The ceiling stops at 800k because the same pass
-        // costs ~0.6s at 967k nnz (`pooling_sppc3stp`), where ARM W4 already
-        // achieves the same composed ratio for ~0.01s. No dev rows.
-        if (600_000..800_000).contains(&nnz) && nnz > 20 * n && nnz < 35 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                2.5,
-                false,
-                custom_metrics::ScoreVariant::DegSqrt,
-            ));
-        }
-
-        // ARM W2 — pooling medium band (200k-400k, density 20-35): SqDiv
-        // α=0.75 AGGRESSIVE. pooling_sppc0stp 0.4673 -> 0.3846 (isolated
-        // <0.01s); the band also holds the sppb2/arki000x class, all held by
-        // the floor where the incumbent is better. No dev rows.
-        if (200_000..400_000).contains(&nnz) && nnz > 20 * n && nnz < 35 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                0.75,
-                true,
-                custom_metrics::ScoreVariant::SqDiv,
-            ));
-        }
-
-        // ARM W3 — sparse mid band (20k-60k nnz, 3n-4n, n>=5k):
-        // DegDivNvSqrtWf α=1.0. mpbp_33 0.3202 -> 0.2004 (isolated <0.01s).
-        // Nine dev rows (the mpbp family, chp_shorttermplan2d,
-        // powerflow0300p, supplychainr1_053050) enter at ~0.005s each and can
-        // only gain under the floor.
-        if (20_000..=60_000).contains(&nnz) && nnz >= 3 * n && nnz <= 4 * n && n >= 5_000 {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                1.0,
-                false,
-                custom_metrics::ScoreVariant::DegDivNvSqrtWf,
-            ));
-        }
-
-        // ARM W4 — same pooling density window, wider nnz (250k-1M, 20-35):
-        // DegP075 α=0.5. pooling_sppc3stp 0.5156 -> 0.4825 and
-        // pooling_sppb2stp 0.5083 -> 0.4888 (isolated ~0.01s). One dev row
-        // (`pooling_sppc1pq`, ~0.02s).
-        if (250_000..1_000_000).contains(&nnz) && nnz > 20 * n && nnz < 35 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                0.5,
-                false,
-                custom_metrics::ScoreVariant::DegP075,
-            ));
-        }
-
-        // ARM W5 — parabolic band (400k-600k, 4n-8n): DegPlusDegme α=2.5.
-        // parabol5_2_2 and parabol5_2_3 both 0.7950 -> 0.7565 (isolated
-        // 0.01s each). One dev row (`cont6-qq`, ~0.05s) plus
-        // `transswitch2736spp`, all floor-protected.
-        if (400_000..600_000).contains(&nnz) && nnz >= 4 * n && nnz <= 8 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                2.5,
-                false,
-                custom_metrics::ScoreVariant::DegPlusDegme,
-            ));
-        }
-
-        // ARM F — parabolic-control band (150k-200k, density 5-10): DegP125
-        // α=0.75 takes `parabol_p` (n=24,005, nnz=188,574) 0.8819 -> 0.8179
-        // (isolated 0.01s). Two dev rows enter (`nuclear10a`, `methanol400`,
-        // ~0.02s each, both far from the cap).
-        if (150_000..200_000).contains(&nnz) && nnz > 5 * n && nnz < 10 * n {
-            consider!(move || custom_metrics::order_variant(
-                &core,
-                0.75,
-                false,
-                custom_metrics::ScoreVariant::DegP125,
-            ));
         }
 
         // D DENSE LOW-ALPHA ARM (matrices_mage r1.1, EG-1-dense-low-alpha-arm):
@@ -3319,6 +3243,63 @@ fn order_with_options(
         consider!(move || {
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(rcm_order(pattern))
         });
+        // Structured relabel: RCM numbering biases AMD tie-breaks toward locality.
+        let amd_rcm = feral_amd::AmdOptions::default();
+        consider!(move || {
+            let q: Vec<usize> = rcm_order(pattern).into_iter().map(|x| x as usize).collect();
+            let b = permute_pattern(&scoring_pat, &q);
+            let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+            let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+            let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+            let (pb, ..) = feral_amd::amd_order_opts(&bcore, &amd_rcm)?;
+            Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+        });
+    }
+
+    // Gap-based hub deferral: cut at visible degree-tail gaps instead of α sweeps.
+    // Cap-safe: bounded gap count, nnz ceiling below grader tail (mat_fact Q5/Q16).
+    const GAP_HUB_MAX_NNZ: usize = 350_000;
+    if max_deg * max_deg > 4 * n
+        && nnz >= 200_000
+        && nnz < GAP_HUB_MAX_NNZ
+        && n >= 1_000
+    {
+        let hub_ks = gap_hub_prefix_lengths(n, pattern.col_ptr.as_slice(), max_deg);
+        for k in hub_ks {
+            consider!(move || {
+                let mut ranked: Vec<usize> = (0..n).collect();
+                ranked.sort_unstable_by(|&a, &b| {
+                    let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                    let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                    db.cmp(&da).then(a.cmp(&b))
+                });
+                let sub = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+                let perm = strip_general_v2(scoring_pat, &ranked, k, &sub)
+                    .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                Ok(perm.into_iter().map(|v| v as i32).collect())
+            });
+            if nnz < 300_000 {
+                consider!(move || {
+                    let mut ranked: Vec<usize> = (0..n).collect();
+                    ranked.sort_unstable_by(|&a, &b| {
+                        let da = scoring_pat.col_ptr[a + 1] - scoring_pat.col_ptr[a];
+                        let db = scoring_pat.col_ptr[b + 1] - scoring_pat.col_ptr[b];
+                        db.cmp(&da).then(a.cmp(&b))
+                    });
+                    let sub = |c: &feral_ordering_core::CscPattern| {
+                        let opts = feral_amf::AmfOptions {
+                            dense_alpha: 0.75,
+                            ..Default::default()
+                        };
+                        feral_amf::amf_order_opts(c, &opts).ok().map(|(p, ..)| p)
+                    };
+                    let perm = strip_general_v2(scoring_pat, &ranked, k, &sub)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    Ok(perm.into_iter().map(|v| v as i32).collect())
+                });
+            }
+        }
     }
 
     // Sloan wavefront/profile reduction — a pure-Rust O(nnz log n) ordering from
@@ -4381,6 +4362,9 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("1.portfolio", _tp1);
+    if deadline.hit() {
+        return best_perm;
+    }
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
     // and the negative equal-budget result that shaped this design. Runs after
     // every other candidate so the incumbent it perturbs is the portfolio's
@@ -4463,6 +4447,9 @@ fn order_with_options(
 
 #[cfg(test)]
     parallel::phase_mark("2.hillclimb", _tp2);
+    if deadline.hit() {
+        return best_perm;
+    }
     // ── POST-HOC blind-spot families (`sbx-families2`): operate on the
     // PORTFOLIO'S OWN best incumbent (`best_perm`/`best_flops` as left by
     // every candidate + relabel-restart + hill-climb above), not on the raw
@@ -4779,6 +4766,41 @@ fn order_with_options(
         }
     }
 
+    if deadline.hit() {
+        return best_perm;
+    }
+    // Hub-first: eliminate a hub early when most neighbours sit in top columns.
+    if n >= 5_000 && nnz >= 100_000 && max_deg * max_deg > 4 * n {
+        if let Some((cand, f)) = hub_first_candidate(
+            pattern,
+            scoring_pat,
+            &mut ws,
+            &best_perm,
+            max_deg,
+            n,
+        ) {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+
+    // Root-strip: defer top fill columns when objective mass concentrates at root.
+    if n >= 10_000 && nnz > 0 && nnz <= 600_000 {
+        if let Some((cand, f)) =
+            root_strip_refine(scoring_pat, &mut ws, &best_perm, n, nnz)
+        {
+            if f < best_flops {
+                best_flops = f;
+                best_perm = cand;
+            }
+        }
+    }
+
+    if deadline.hit() {
+        return best_perm;
+    }
     // ── TELOS-GRADIENT DESCENT — see the `TELOS_*` constants' doc comment
     // for the rationale, the measured per-bucket marginal, and the cost
     // model. Runs LAST so the counts it descends on are the final
@@ -5626,6 +5648,9 @@ fn order_with_options(
     #[cfg(test)]
     parallel::phase_mark("9.telos_ms", _tp9);
 
+    if deadline.hit() {
+        return best_perm;
+    }
     // ── RGSUB — the exact elimination game on elimination-tree SUBTREES ─────
     // Everything `rgreedy` does, applied to a BLOCK of the incumbent instead
     // of the whole matrix, which is what lets it reach `gt_10k` at all.
@@ -5830,7 +5855,8 @@ fn order_with_options(
     const DENSE_LOW_RELABEL_MIN_NNZ: usize = 400_000;
     const DENSE_LOW_RELABEL_MAX_NNZ: usize = 1_000_000;
     const DENSE_LOW_RELABEL_MIN_DENSITY: usize = 20;
-    if (DENSE_LOW_RELABEL_MIN_NNZ..DENSE_LOW_RELABEL_MAX_NNZ).contains(&nnz)
+    if !deadline.hit()
+        && (DENSE_LOW_RELABEL_MIN_NNZ..DENSE_LOW_RELABEL_MAX_NNZ).contains(&nnz)
         && nnz > DENSE_LOW_RELABEL_MIN_DENSITY * n
     {
         // The >50-density class keeps the officially validated four seeds.
@@ -7695,6 +7721,137 @@ fn final_simplicial_promotion(
         seed_flops,
         SIMPLICIAL_PROMOTION_OPS_BUDGET,
     )
+}
+
+/// Degree-tail gap sizes for hub-set deferral (mat_fact Q5).
+fn gap_hub_prefix_lengths(n: usize, col_ptr: &[usize], max_deg: usize) -> Vec<usize> {
+    let sqrt_n = (n as f64).sqrt() as usize;
+    if max_deg <= 2 * sqrt_n.max(1) {
+        return Vec::new();
+    }
+    let mut degs: Vec<usize> = (0..n).map(|v| col_ptr[v + 1] - col_ptr[v]).collect();
+    degs.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = Vec::new();
+    for k in 1..degs.len().min(4) {
+        if degs[k - 1] <= 2 * sqrt_n {
+            break;
+        }
+        let gap = degs[k - 1].saturating_sub(degs[k]);
+        if gap >= degs[k].max(1) / 3 {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// Try hub-first ordering when hub neighbours dominate top column mass.
+fn hub_first_candidate(
+    pattern: &Pattern,
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    perm: &[usize],
+    max_deg: usize,
+    n: usize,
+) -> Option<(Vec<usize>, u64)> {
+    let sqrt_n = (n as f64).sqrt() as usize;
+    if max_deg <= 2 * sqrt_n.max(1) || n < 5_000 {
+        return None;
+    }
+    let mut hub = 0usize;
+    let mut hub_deg = 0usize;
+    for v in 0..n {
+        let d = pattern.col_ptr[v + 1] - pattern.col_ptr[v];
+        if d > hub_deg {
+            hub_deg = d;
+            hub = v;
+        }
+    }
+    if hub_deg <= 2 * sqrt_n {
+        return None;
+    }
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let mut lcnt = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        lcnt[v] = counts[pos];
+    }
+    let mut flops_by_v: Vec<u64> = lcnt.iter().map(|&c| (c as u64) * (c as u64)).collect();
+    flops_by_v.sort_unstable();
+    let thresh = flops_by_v[flops_by_v.len() * 99 / 100];
+    let mut top_nbrs = 0usize;
+    let mut total_nbrs = 0usize;
+    for k in pattern.col_ptr[hub]..pattern.col_ptr[hub + 1] {
+        let u = pattern.row_idx[k];
+        if u != hub {
+            total_nbrs += 1;
+            if (lcnt[u] as u64) * (lcnt[u] as u64) >= thresh {
+                top_nbrs += 1;
+            }
+        }
+    }
+    if total_nbrs == 0 || top_nbrs * 10 < total_nbrs * 8 {
+        return None;
+    }
+    let mut cand: Vec<usize> = Vec::with_capacity(n);
+    cand.push(hub);
+    cand.extend(perm.iter().copied().filter(|&v| v != hub));
+    if !is_bijection(&cand, n) {
+        return None;
+    }
+    let f = ws.flops(sp, &cand);
+    let f0 = ws.flops(sp, perm);
+    if f < f0 {
+        Some((cand, f))
+    } else {
+        None
+    }
+}
+
+/// Root-strip refinement when top-1% columns carry enough objective mass.
+fn root_strip_refine(
+    sp: &ScoringPattern,
+    ws: &mut ScoreWorkspace,
+    perm: &[usize],
+    n: usize,
+    nnz: usize,
+) -> Option<(Vec<usize>, u64)> {
+    if n < 10_000 || nnz == 0 || nnz > 600_000 {
+        return None;
+    }
+    let permuted = permute_pattern(sp, perm);
+    let etree = EliminationTree::from_pattern(&permuted);
+    let counts = column_counts_gnp(&permuted, &etree);
+    let total: u64 = counts.iter().map(|&c| (c as u64) * (c as u64)).sum();
+    let top_k = (n / 100).max(1).min(32);
+    let top_mass: u64 = counts
+        .iter()
+        .rev()
+        .take(top_k)
+        .map(|&c| (c as u64) * (c as u64))
+        .sum();
+    if top_mass * 100 < total * 40 {
+        return None;
+    }
+    let mut lcnt = vec![0usize; n];
+    for (pos, &v) in perm.iter().enumerate() {
+        lcnt[v] = counts[pos];
+    }
+    let mut ranked: Vec<usize> = (0..n).collect();
+    ranked.sort_unstable_by(|&a, &b| lcnt[b].cmp(&lcnt[a]).then(a.cmp(&b)));
+    let k = top_k.min(n - 1);
+    let sub = |c: &feral_ordering_core::CscPattern| feral_amd::amd_order(c).ok();
+    let cand = strip_general_v2(sp, &ranked, k, &sub)?;
+    if !is_bijection(&cand, n) {
+        return None;
+    }
+    let f = ws.flops(sp, &cand);
+    let f0 = ws.flops(sp, perm);
+    if f < f0 {
+        Some((cand, f))
+    } else {
+        None
+    }
 }
 
 /// Whether `perm` is a bijection of `0..n` (guards a candidate before scoring).
