@@ -2891,6 +2891,24 @@ fn order_with_options(
             consider!(move || feral_amd::amd_order_opts(&core, &amd_opts2).map(|(p, ..)| p));
         }
 
+        // Hub-heavy medium graphs need the low-alpha DegSqrt basins too.
+        // The alpha-10 metric leaves the hub inside the quotient graph too
+        // long on ringpack-shaped matrices.  Alpha 1/2 completed an official
+        // validation on the preceding carrier; strict exact best-of scoring
+        // keeps every incumbent when neither candidate helps.
+        if !medium_metric_hub_safe {
+            for alpha in [1.0f64, 2.0] {
+                consider!(move || {
+                    custom_metrics::order_variant(
+                        &core,
+                        alpha,
+                        true,
+                        custom_metrics::ScoreVariant::DegSqrt,
+                    )
+                });
+            }
+        }
+
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
         // session, `probe_variant_drop_score_cost`): measured 0 unique wins
         // and an exact 0.00000000 dev-score cost across the full 300-matrix
