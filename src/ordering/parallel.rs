@@ -49,6 +49,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 use super::scoring_ws::ScoreWorkspace;
 use super::{is_bijection, ScoringPattern};
@@ -208,6 +209,35 @@ fn run_generic(
     // Monotone shared upper bound on the final minimum. Only ever decreases.
     let gmin = AtomicU64::new(incumbent);
 
+    // Exact-duplicate flops memo. Experiment 0010 measured 27.4% of produced
+    // candidate permutations as exact duplicates of an earlier one (the same
+    // ordering reached through different arms), and the sequential portfolio's
+    // `flops_cache` skipped re-scoring them; the parallel port lost that.
+    // `flops` is a pure function of `(sp, perm)`, so caching it by a 128-bit
+    // hash of the permutation is OUTPUT-NEUTRAL: a lost race merely scores the
+    // same permutation twice and inserts the same value, and both required
+    // `order()` calls hash the same perms in the same code, so determinism is
+    // untouched. Keyed by hash (not the perm itself) to keep the map a few KB
+    // instead of retaining every unique permutation; a 128-bit collision over
+    // <=200 candidates is ~2^-113 and could at worst pick a non-minimal
+    // candidate deterministically, never break bijection/determinism gates.
+    let fmemo: Mutex<std::collections::HashMap<u128, u64>> =
+        Mutex::new(std::collections::HashMap::new());
+    let perm_hash = |perm: &[usize]| -> u128 {
+        let mut a: u64 = 0x243F6A8885A308D3;
+        let mut b: u64 = 0x13198A2E03707344;
+        for (i, &v) in perm.iter().enumerate() {
+            let x = (v as u64).wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
+            let mut z = x.wrapping_add(a).wrapping_mul(0xBF58476D1CE4E5B9);
+            z ^= z >> 31;
+            a = a.rotate_left(23) ^ z;
+            let mut y = x.wrapping_add(b).wrapping_mul(0x94D049BB133111EB);
+            y ^= y >> 29;
+            b = b.rotate_left(17) ^ y;
+        }
+        ((a as u128) << 64) | (b as u128)
+    };
+
     let eval = |i: usize, ws: &mut Option<ScoreWorkspace>| -> CandOut {
         let Some(perm) = produce(i) else {
             return CandOut::default();
@@ -215,8 +245,19 @@ fn run_generic(
         if !is_bijection(&perm, n) {
             return CandOut::default();
         }
-        let w = ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
-        let f = w.flops(sp, &perm);
+        let h = perm_hash(&perm);
+        let cached = fmemo.lock().ok().and_then(|m| m.get(&h).copied());
+        let f = match cached {
+            Some(f) => f,
+            None => {
+                let w = ws.get_or_insert_with(|| ScoreWorkspace::new(n, nnz));
+                let f = w.flops(sp, &perm);
+                if let Ok(mut m) = fmemo.lock() {
+                    m.insert(h, f);
+                }
+                f
+            }
+        };
         let prev = gmin.fetch_min(f, AtomicOrdering::Relaxed);
         CandOut {
             flops: Some(f),
