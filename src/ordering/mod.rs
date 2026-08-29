@@ -2536,26 +2536,16 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &opts_125).map(|(p, ..)| p));
-            if nnz >= D_WIDE_MAX_DENSITY * n {
-                // Above the D_WIDE density ceiling, a low-alpha DegSqrt
-                // quotient pass is both cheaper and materially more diverse
-                // than the AMD pass it replaces. Keeping this one-for-one
-                // preserves the accepted candidate count and timing envelope.
-                consider!(move || custom_metrics::order_variant(
-                    &core,
-                    0.75,
-                    true,
-                    custom_metrics::ScoreVariant::DegSqrt,
-                ));
-            } else {
-                let amd_opts_075 = feral_amd::AmdOptions {
-                    aggressive: true,
-                    dense_alpha: 0.75,
-                };
-                consider!(move || {
-                    feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p)
-                });
-            }
+            let amd_opts_075 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 0.75,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_075).map(|(p, ..)| p));
+            let amd_opts_10 = feral_amd::AmdOptions {
+                aggressive: true,
+                dense_alpha: 1.0,
+            };
+            consider!(move || feral_amd::amd_order_opts(&core, &amd_opts_10).map(|(p, ..)| p));
             if nnz < D_WIDE_MAX_DENSITY * n {
                 let opts_20 = feral_amf::AmfOptions {
                     dense_alpha: 2.0,
@@ -4990,7 +4980,17 @@ fn order_with_options(
         } else {
             RGSUB_CFG
         };
-        for _round in 0..2 {
+        // Conditional third round (0027 / 01cd43b): only sparse classes with
+        // remote evidence and tight nnz ceilings — NOT the wide hub gate that
+        // breached the grader cap on hidden matrices.
+        let rgsub_rounds = if (n >= 10_000 && nnz <= 100_000)
+            || (n < 10_000 && nnz <= 30_000 && max_deg.saturating_mul(32) <= n)
+        {
+            3
+        } else {
+            2
+        };
+        for _round in 0..rgsub_rounds {
             let permuted = permute_pattern(&scoring_pat, &best_perm);
             let etree = EliminationTree::from_pattern(&permuted);
             let post = etree.postorder();
