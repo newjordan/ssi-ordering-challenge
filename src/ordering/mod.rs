@@ -265,6 +265,14 @@ const AMF_SWEEP_MAX_N: usize = 320_000;
 /// least afford it, so WIN F's own envelope stops well below the gate wall
 /// rather than reusing the full 130_000 ceiling.
 const WINF_MAX_NNZ: usize = 130_000;
+/// Dense-row thresholds for the LOW-ALPHA DegSqrt arm in the MEDIUM block. See
+/// its call site for the measurement. Two values rather than one because the
+/// grid's two winners (1.0 and 2.0) were within 0.3% of each other on the
+/// matrix that motivated them, so which one is argmin on an unseen hub graph is
+/// not predictable from the dev corpus — and under the best-of floor carrying
+/// both costs one extra AMF-class pass and can never lose score.
+const DEGSQRT_LOW_ALPHAS: [f64; 2] = [1.0, 2.0];
+
 /// nnz ceiling for the extra sweep-found AMD α1/α16 passes in the MEDIUM block.
 /// Excludes high-nnz dense mediums (nuclear104 nnz=258k) that already load the
 /// candidate stack near the 2 s cap; below it each AMD pass is a few ms.
@@ -2803,6 +2811,65 @@ fn order_with_options(
                 ..Default::default()
             };
             consider!(move || feral_amf::amf_order_opts(&core, &amf_opts2).map(|(p, ..)| p));
+        }
+
+        // LOW-ALPHA DegSqrt — the SAME `custom_metrics` formula this file already
+        // ships, run at a dense-row threshold an order of magnitude tighter than
+        // the portfolio's standard 10.0.
+        //
+        // `dense_alpha` sets the dense-row cutoff at ~`alpha * sqrt(n)`. Every
+        // custom-metric / metric-sweep call site in this file passes 10.0, which
+        // on a HUB graph leaves the hubs inside the elimination where they
+        // dominate every degree-based score. The `nnz >= 200_000` branch above
+        // is the only place any low alpha (0.75) is used with a custom metric,
+        // and `ringpack_30_2` (nnz=121458) falls under it.
+        //
+        // MEASURED, not assumed (probe_diversity_grid, artifact
+        // `20260829T050107Z-probe.log`, marginal against the REAL shipped
+        // `order()` output on 279 dev matrices): DegSqrt at alpha 1.0 / 2.0
+        // returns 2 883 034 / 2 891 834 flops on `ringpack_30_2` against the
+        // whole incumbent portfolio's 3 739 119 — a 22.9% reduction on a
+        // `gt_10k` matrix with leverage 0.00646 per unit ln(ratio), i.e.
+        // **-0.00167 of dev score from that one matrix**. The same formula at
+        // the shipped alpha 10.0 does not win there at all, and no other point
+        // of an 84-point (alpha x aggressive x formula) grid won anything
+        // material anywhere in the corpus — the value is specifically in the
+        // LOW dense threshold on hub graphs.
+        //
+        // Cost: two AMF-class elimination passes, measured at 0.378 s TOTAL
+        // across all 279 in-gate dev matrices (~1.4 ms each) in the same probe.
+        // They are queued into the existing 4-thread portfolio, are pure
+        // functions of the pattern, and sit under the best-of floor, so they
+        // cannot raise any per-matrix ratio.
+        //
+        // GATE — `!medium_metric_hub_safe`, i.e. `max_deg > 16 && max_deg² > 4n`.
+        // This is not a cost gate bolted on afterwards; it is the mechanism's
+        // own precondition. A low `dense_alpha` can only change an ordering if
+        // some vertex is dense at the low threshold, so on a hub-free graph the
+        // two passes reproduce work the portfolio already does and are pure
+        // cost. It also happens to be exactly the right cost gate, which is why
+        // the measurement below is stated matrix by matrix rather than in the
+        // aggregate: at `5f024a7` the nine slowest dev `order()` calls are
+        // `crudeoil_lee1_07` (0.727 s, max_deg 32), `crudeoil_pooling_ct3`
+        // (max_deg 85), `crudeoil_lee4_10` (85), `crudeoil_lee4_06` (38),
+        // `crudeoil_lee2_06` (40), `chp_shorttermplan2d` (38), `mpbp_48` (35),
+        // `procurement1large` (43) and `crudeoil_lee4_09` (69) — every one of
+        // them hub-SAFE, so this arm adds exactly zero time to all of them,
+        // while `ringpack_30_2` (max_deg 817) is hub-heavy and gets both
+        // passes. That matters more here than anywhere else in this file: the
+        // promoted tree this arm sits on ran at grader MAX 2.001 s against the
+        // 2.0 s cap (submission 01f063f4, Actions run 33232909274, recovered
+        // with tools/grader-timing.py), so an arm that widened the tail at all
+        // would be trading a measured score win for a coin-flip on the gate.
+        if !medium_metric_hub_safe {
+            for alpha in DEGSQRT_LOW_ALPHAS {
+                consider!(move || custom_metrics::order_variant(
+                    &core,
+                    alpha,
+                    true,
+                    custom_metrics::ScoreVariant::DegSqrt,
+                ));
+            }
         }
 
         // Aggressive AMD α1 and α16 — the two sweep-found AMD variants that still
