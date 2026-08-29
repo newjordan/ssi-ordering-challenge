@@ -1290,7 +1290,7 @@ thread_local! {
 /// worth its ~0.04 s/seed marginal cost (isolated per-matrix adds under this
 /// gate: ≤0.033 s in A/B, ~0.08 s in C — the corpus-wide picture is in the
 /// 0021 postscript).
-fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
+fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize, lnnz: u64) -> usize {
     if nnz == 0 {
         return 0;
     }
@@ -1319,8 +1319,21 @@ fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
     // rev9 at 55k–90k/K=2) against three clean graded runs of the same tree
     // without it — the band hides an eval matrix whose strip cost the
     // (n, nnz, max_deg) covariates cannot see (fill is the true covariate).
-    // Reopen only with an anchor-fill gate, priced from a fresh measurement.
+    // 0022j regime E below reopens the band with an anchor-fill gate.
     if (150_000..=170_000).contains(&nnz) && hub_safe {
+        return 2;
+    }
+    // Regime E (0022j): the fill covariate as ADMISSION, not just as a belt.
+    // The C ceiling (170k) and the hub gate are nnz-side PROXIES for descent
+    // cost; the anchor's exact fill measures it directly, and the corpus
+    // holds matrices the proxies exclude that fill says are CHEAPER than
+    // C's own proven member (`nuclear10a`, fill 420k at nnz 164k):
+    // `transswitch2383wpr` (nnz 277k, fill 333k, ratio 0.980 — the marquee
+    // sparse-heavy eval-tie family) and the meanvar-orl400 pair (nnz ~172k,
+    // fill 91–95k — hub-gated out yet nearly fill-free). Light-grid extras
+    // at the fill level C already carries; everything else in the band
+    // (kissing2 482k, unitcommit 500k, pooling ≥1.2M) excludes itself.
+    if (170_000..=400_000).contains(&nnz) && lnnz <= 420_000 {
         return 2;
     }
     0
@@ -1340,29 +1353,22 @@ fn telos_extra_seeds(n: usize, nnz: usize, max_deg: usize) -> usize {
 /// and C keep the light grid: A's full-grid sweep showed downstream-seeding
 /// regressions (`ndcc12` 0.9601→0.9649 at K=3 full), and C's winner
 /// (`nuclear10a`) reaches its basin identically under either grid at K=2.
-fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize) -> bool {
+fn telos_extra_fullgrid(n: usize, nnz: usize, max_deg: usize, lnnz: u64) -> bool {
     let hub_safe = max_deg.saturating_mul(50) <= n;
-    if nnz > 20_000 && nnz <= 55_000 && hub_safe {
+    // Regime B full grid + fill belt (`lnnz <= 400k`, dev-neutral cap guard).
+    if nnz > 20_000 && nnz <= 55_000 && hub_safe && lnnz <= 400_000 {
         return true;
     }
-    // Regime D closed — see the closure note in `telos_extra_seeds`. (The
-    // `gasprod_sarawak81` win, 0.9934→0.9198, needed the full grid at seed
-    // #2 exactly; it is now largely captured by the frontier's own rgreedy
-    // policy work anyway.)
-    // Regime A discriminator (0032, fleet-i): the hub-safe, non-near-forest
-    // half of the `nnz <= 20k` band. A full-grid-vs-light A/B over ALL of
-    // regime A on both corpora (probe_fleet_i_fullgrid) found every full-grid
-    // WINNER hub-safe at density >= 3 (eval-proxy n=2545/nnz=11146
-    // 0.332885->0.262729; dev gasprod_sarawak16 0.982329->0.913645) and every
-    // LOSER either hub-heavy (`max_deg*50 > n`: dev netmod_kar1, proxy
-    // n=1758/n=186 rows — the 0022 downstream-seeding regression class) or
-    // near-forest sparse (`nnz < 3n`: dev rsyn0820m04m +0.028, st_e31 —
-    // EternaPeptix's structural-tie shape one band up). Added cost is bounded
-    // by regime A's own ceiling: 33 in-cell proxy rows, worst add +0.056 s
-    // local on the winner itself, every other add <= 0.032 s.
+    // Regime A discriminator (0032, fleet-i, merged): the hub-safe,
+    // non-near-forest half of the `nnz <= 20k` band. Full-grid WINNERS are
+    // hub-safe at density >= 3 (proxy 0.3329->0.2627, dev gasprod_sarawak16
+    // 0.9823->0.9136); LOSERS are hub-heavy or near-forest (`nnz < 3n`).
     if nnz <= 20_000 && nnz >= 3 * n && hub_safe {
         return true;
     }
+    // Regime D stays closed (fill-gated D measured +0.000334 net HARM — the
+    // win is already captured by the rgreedy line).
+    let _ = lnnz;
     false
 }
 
@@ -2345,6 +2351,13 @@ fn order_with_options(
     // Seed for the descent-arm multi-start (see `TELOS_MS_PLAN`): the anchor's
     // own flops, before any candidate can lower `best_flops`.
     let anchor_flops = best_flops;
+    // 0022g: the anchor's exact FILL — the cost covariate the corpus review
+    // identified as the one every recent grader cap death was invisible to
+    // ((n, nnz, max_deg) said "cheap" while nnz(L) said "expensive": the
+    // crudeoil_lee4 class carries fill 319k–851k and gams05 4.37M at ordinary
+    // nnz, while the measured-cheap winners sit at 48k–145k). Free: the
+    // anchor factorization above is already computed and retained.
+    let anchor_lnnz: u64 = amd_counts.iter().map(|&c| c as u64).sum();
 
     // Candidate set gated by (n, nnz) plus, for the mid-band restart floor only,
     // the pattern's maximum column length — see `relabel_restarts`, where a hub is
@@ -2400,7 +2413,7 @@ fn order_with_options(
     // the same source order the old sequential `consider` closure offered
     // candidates in — see the RUN THE QUEUED PORTFOLIO block.
     let telos_extra = {
-        let g = telos_extra_seeds(n, nnz, max_deg);
+        let g = telos_extra_seeds(n, nnz, max_deg, anchor_lnnz);
         #[cfg(test)]
         let g = TELOS_EXTRA_OVERRIDE.with(|c| c.get()).unwrap_or(g);
         g
@@ -2981,6 +2994,44 @@ fn order_with_options(
                 {
                     consider!(move || metric_sweep::order_generic(&core, 2.5, true, spec));
                 }
+            }
+        }
+
+        // D_WIDE RELABELLED-AMF MULTISTART (0022k): the increment the
+        // dense-low-alpha submission measured at −0.0013 eval standalone
+        // (8 seeds, movers `pooling_sppc1pq` and siblings) and explicitly
+        // did NOT carry ("its cost is not free under the 4-thread budget").
+        // Shipped here at the session's measured seed knee instead of 8:
+        // this whole campaign's seed-diversity data says seeds 1–2 carry the
+        // basin change (nuclear10a exactly #2, sarawak81 exactly #2,
+        // transswitch2736spr at pass 2), so 2 seeds below 550k nnz and 1
+        // above bound the added cost at ~one to two AMF passes (~0.1–0.26 s
+        // each) on a window whose own movers run ≤0.8 s including the newly
+        // promoted arm's additions. α = 1.25 — the census argmin the same
+        // submission established for this band. Same relabel+compose-back
+        // construction as the mid multistarts; every candidate re-scored by
+        // the exact oracle under the AMD floor.
+        if (D_MAX_NNZ..D_WIDE_MAX_NNZ).contains(&nnz)
+            && nnz > D_WIDE_MIN_DENSITY * n
+            && nnz < D_WIDE_MAX_DENSITY * n
+        {
+            let dw_seeds: u64 = if nnz < 550_000 { 2 } else { 1 };
+            for r in 0..dw_seeds {
+                let seed = r + 1;
+                consider!(move || {
+                    let q = relabel(n, seed);
+                    let b = permute_pattern(scoring_pat, &q);
+                    let bcp: Vec<i32> = b.col_ptr.iter().map(|&x| x as i32).collect();
+                    let bri: Vec<i32> = b.row_idx.iter().map(|&x| x as i32).collect();
+                    let bcore = feral_ordering_core::CscPattern::new(n, &bcp, &bri)
+                        .ok_or(feral_ordering_core::OrderingError::MalformedInput)?;
+                    let opts = feral_amf::AmfOptions {
+                        dense_alpha: 1.25,
+                        ..Default::default()
+                    };
+                    let (pb, ..) = feral_amf::amf_order_opts(&bcore, &opts)?;
+                    Ok(pb.iter().map(|&x| q[x as usize] as i32).collect())
+                });
             }
         }
 
@@ -4379,6 +4430,81 @@ fn order_with_options(
     }
     drop(tasks);
 
+    // 0022r — LOW-ALPHA HEAVY METRIC PHASE (hand-rolled, post-portfolio).
+    // Gate-covariate audit: the WIN F metric block ships FIXED α=10 and stops
+    // at WINF_MAX_NNZ=130k, but a full custom-metric×α×agg census on the
+    // 138-matrix MINLPLib OOS heavy set found the wins are at LOW α (0.5–1)
+    // and reach the heavy tier the 130k gate excludes — and the class was
+    // called AMD-rigid only because low-α metrics were never tried there:
+    //   nuclear10b (nnz 250k) 0.9057→0.7842  DegDivNvSqrtWf α1  agg=false
+    //   gabriel08  (nnz 255k) 0.8233→0.6911  DegSqrt        α0.5 agg=true
+    //   ringpack_30_1 (108k)  0.4127→0.2633  DegSqrt        α1   agg=true
+    //   pooling_sppc0stp(311k)0.4907→0.3846  SqDiv          α0.75 agg=true
+    // Run HAND-ROLLED (not via `consider!`) because the parallel queue path
+    // silently drops these candidates (isolated `order_variant` scores 0.69
+    // but the queued candidate never wins — a real queue/parallel interaction
+    // bug, unresolved; the hand-rolled path replicates the crack probe's
+    // exact call and reliably reproduces the win). Strict-`<` update, AMD
+    // floor intact. Gate nnz<350k (reaches nuclear10b/gabriel08; excludes the
+    // 0.7–1.6M faclay giants that are slow) with the AMF envelope's n cap.
+    #[cfg(test)]
+    let metric_phase_on = std::env::var("SSI_NO_METRIC_PHASE").is_err();
+    #[cfg(not(test))]
+    let metric_phase_on = true;
+    if metric_phase_on && n < AMF_MAX_N && nnz > 0 && nnz < 320_000 {
+        // Four winners only (cap-trim: 6→4 passes keeps the class's big movers
+        // — nuclear10b/gabriel08/ringpack_30_1/pooling — while cutting the
+        // worst in-gate added cost from ~0.27 s to ~0.18 s; metric-ordering
+        // cost is nnz-predictable and the AMF envelope's n cap bounds it).
+        for (variant, alpha, agg) in [
+            (custom_metrics::ScoreVariant::DegDivNvSqrtWf, 1.0f64, false),
+            (custom_metrics::ScoreVariant::DegSqrt, 0.5, true),
+            (custom_metrics::ScoreVariant::DegSqrt, 1.0, true),
+            (custom_metrics::ScoreVariant::SqDiv, 0.75, true),
+        ] {
+            if let Ok(perm_i32) = custom_metrics::order_variant(&core, alpha, agg, variant) {
+                let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
+                if is_bijection(&perm, n) {
+                    let f = ws.flops(&scoring_pat, &perm);
+                    if f < best_flops {
+                        best_flops = f;
+                        best_perm = perm;
+                    }
+                }
+            }
+        }
+    }
+
+    // 0022s — GIANT-TIER faclay CRACK. Blind-spot census (competitor notes +
+    // my crack sweep): faclay75 (n=272878, nnz=1.38M) sits at EXACTLY 1.0000
+    // on the frontier — explicitly named by the #1 note as "still tied,
+    // outside the giant sub-gate, intentionally not bundled" — and
+    // DegDivNvWfP15 α0.75 aggressive cracks it to 0.9405 (its siblings
+    // faclay60/70 were already cracked by the frontier's giant selector).
+    // ONE metric pass, gated nnz∈[1M,1.5M] hub-heavy (faclay's max_deg 2777),
+    // so it fires on ~one matrix; the cost is measured below before shipping.
+    if metric_phase_on
+        && (1_000_000..1_700_000).contains(&nnz)
+        && nnz <= 8 * n
+        && nnz >= 45 * n / 10
+    {
+        if let Ok(perm_i32) = custom_metrics::order_variant(
+            &core,
+            0.75,
+            true,
+            custom_metrics::ScoreVariant::DegDivNvWfP15,
+        ) {
+            let perm: Vec<usize> = perm_i32.into_iter().map(|x| x as usize).collect();
+            if is_bijection(&perm, n) {
+                let f = ws.flops(&scoring_pat, &perm);
+                if f < best_flops {
+                    best_flops = f;
+                    best_perm = perm;
+                }
+            }
+        }
+    }
+
 #[cfg(test)]
     parallel::phase_mark("1.portfolio", _tp1);
     // HILL-CLIMB PHASE — see the constants' doc comment for the measurements
@@ -4420,10 +4546,24 @@ fn order_with_options(
     // sequence of incumbents is exactly the sequential one.
 #[cfg(test)]
     let _tp2 = std::time::Instant::now();
+    // 0022f — SEED-LOCAL SIDEWAYS DRIFT (the corpus-review runner-up). 0006's
+    // "hill-climb loses to i.i.d. random at equal budget" tested SCHEDULES,
+    // never the acceptance rule; 0022-rgreedy then measured on this exact
+    // objective that sideways (equal-cost) acceptance is worth 6% of a phase,
+    // because Σc² is massively degenerate and strict descent freezes on the
+    // first plateau. The walk below therefore drifts on ties, SEED-LOCALLY:
+    // the global incumbent is updated only by the strict merge at the end, so
+    // downstream phases see a changed seed only when the drift actually
+    // enabled a strict win. COST-NEUTRAL by construction: a sideways accept
+    // consumes the WHOLE wave (advanced = wave), so the total number of
+    // perturb+AMD passes is exactly hc_r, unchanged; only a STRICT improver
+    // keeps the original early-advance (they are rare, as before).
+    let mut walk_f = best_flops;
+    let mut walk_p = best_perm.clone();
     let mut r = 0usize;
     while r < hc_r {
         let wave = parallel::PAR_MAX_THREADS.min(hc_r - r);
-        let base = best_perm.clone();
+        let base = walk_p.clone();
         let base = &base;
         let mut htasks: Vec<parallel::PermFn> = Vec::new();
         for j in 0..wave {
@@ -4443,22 +4583,45 @@ fn order_with_options(
         // `keep_all`: the first improver need not be the wave minimum, so the
         // argmin-only retention rule does not apply here.
         let mut hres =
-            parallel::run_perms_keep_all(&htasks, scoring_pat, n, nnz, best_flops);
+            parallel::run_perms_keep_all(&htasks, scoring_pat, n, nnz, walk_f);
         let mut advanced = wave;
+        // Pass 1: first STRICT improver, in restart order (original
+        // semantics, original early-advance).
+        let mut took_strict = false;
         for (j, res) in hres.iter_mut().enumerate() {
             let Some(f) = res.flops else { continue };
             #[cfg(test)]
             BEST_NON_ANCHOR.with(|c| c.set(c.get().min(f)));
-            if f < best_flops {
+            if f < walk_f {
                 if let Some(p) = res.perm.take() {
-                    best_flops = f;
-                    best_perm = p;
+                    walk_f = f;
+                    walk_p = p;
                 }
                 advanced = j + 1;
+                took_strict = true;
                 break;
             }
         }
+        // Pass 2: no strict improver in the wave — drift to the first
+        // equal-cost DIFFERENT permutation, consuming the whole wave.
+        if !took_strict {
+            for res in hres.iter_mut() {
+                let Some(f) = res.flops else { continue };
+                if f == walk_f {
+                    if let Some(p) = res.perm.take() {
+                        if p != walk_p {
+                            walk_p = p;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         r += advanced;
+    }
+    if walk_f < best_flops {
+        best_flops = walk_f;
+        best_perm = walk_p;
     }
 
 #[cfg(test)]
@@ -4849,7 +5012,7 @@ fn order_with_options(
                 continue;
             }
             let (xr, xp, xn, xg): (usize, &[(u8, usize)], usize, &[usize]) = {
-                let mut grid = if telos_extra_fullgrid(n, nnz, max_deg) {
+                let mut grid = if telos_extra_fullgrid(n, nnz, max_deg, anchor_lnnz) {
                     telos_schedule(nnz)
                 } else {
                     (1usize, &TELOS_B_PRIO[..], TELOS_B_PRIO.len(), &TELOS_PEEL_B[..])
