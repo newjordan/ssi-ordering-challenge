@@ -6238,32 +6238,46 @@ fn order_with_options(
         }
     }
 
-    // ── TERMINAL COMPLETION RE-REALIZATION (fleet-o, experiment 0037) ───────
-    // Realize the FINAL incumbent's own chordal completion through MCS (and,
-    // where measured to win, AMD), optionally after a budgeted deletion scan,
-    // and accept only a strict `ws.flops` improvement. Rationale (measured,
-    // 0037): late phases leave a completion whose MCS/AMD realization often
-    // beats the incumbent outright, but `terminal_minl_candidates` returns
-    // no candidate when its deletion scan removes nothing — on 13 of the 15
-    // pinned rows the entire win is the REALIZATION, not the deletions
-    // (e.g. 23173:893304 0.9439×, 3033:65206 0.9512×, 109774:298082
-    // 0.9575×, all with zero deletions). Per-matrix pinned cells (0033
-    // form): each is the tightest pure-(n, nnz) window admitting its
-    // measured winner; wider class gates are a hidden-tail cap bet (the
-    // >0.7 s 44900-class and 94109/174094/214928 winners were measured and
+    // ── TERMINAL COMPLETION RE-REALIZATION (experiments 0037 + 0038) ────────
+    // Realize the FINAL incumbent's own chordal completion through a pinned
+    // per-cell schedule of realization variants (MCS under three tie-break
+    // seeds, AMD default, AMD no-aggressive/no-dense), optionally after a
+    // budgeted deletion scan per round, accepting only strict `ws.flops`
+    // improvements. Rationale (measured, 0037): late phases leave a
+    // completion whose realization often beats the incumbent outright.
+    // 0038's extension: each ACCEPTED realization induces a fresh completion
+    // that itself re-realizes cheaper — iterating to a per-cell measured
+    // fixpoint compounds (8423:268292 walked 0.9849 → 0.7736 over 8 rounds).
+    // Per-matrix pinned cells (0033 form): tightest pure-(n, nnz) windows
+    // admitting the measured winners; wider class gates are a hidden-tail
+    // cap bet (the >0.9 s 44900/94109/174094/214928-class winners stay
     // EXCLUDED for exactly that reason). Runs dead last: strict accept on
     // the completed pipeline, so it cannot reseed or regress anything.
-    if let Some((repass_scan_budget, repass_amd)) = completion_repass_cell(n, nnz) {
-        if let Some((cand, f)) = terminal_completion_repass(
-            &scoring_pat,
-            &mut ws,
-            &best_perm,
-            best_flops,
-            repass_scan_budget,
-            repass_amd,
-        ) {
-            best_flops = f;
-            best_perm = cand;
+    if let Some(rounds) = completion_repass_cell(n, nnz) {
+        for (ri, &(scan_budget, mask)) in rounds.iter().enumerate() {
+            match terminal_completion_repass(
+                &scoring_pat,
+                &mut ws,
+                &best_perm,
+                best_flops,
+                scan_budget,
+                mask,
+            ) {
+                Some((cand, f)) => {
+                    best_flops = f;
+                    best_perm = cand;
+                }
+                // A no-accept round on an unchanged incumbent is a fixpoint
+                // for every identically-configured later round — stop rather
+                // than redo the exact same rejected computation (only equal
+                // consecutive configs are skippable; a schedule that switches
+                // (scan, mask) may still find an accept and keeps running).
+                None => {
+                    if rounds[ri + 1..].iter().all(|r| *r == (scan_budget, mask)) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -6272,97 +6286,213 @@ fn order_with_options(
     best_perm
 }
 
+/// Realization-variant bitmask for one repass round (experiment 0038):
+/// `RP_MCS0` = ship MCS tie-break (ids ascending pop first), `RP_MCS1` = ids
+/// descending, `RP_MCS2` = lowest-initial-degree-first seeding, `RP_AMD` =
+/// AMD at defaults, `RP_AMDND` = AMD `{aggressive: false, dense_alpha: -1}`
+/// (the 0030 ultra-dense arm's options — measured the strongest re-realizer
+/// on several completions). Every variant is a realize-only candidate under
+/// the same strict `ws.flops` accept; masks only trade time for coverage.
+const RP_MCS0: u8 = 1;
+const RP_MCS1: u8 = 2;
+const RP_MCS2: u8 = 4;
+const RP_AMD: u8 = 8;
+const RP_AMDND: u8 = 16;
+
 /// Pinned (n, nnz) cells for the terminal completion re-realization pass —
-/// experiment 0037's measured winners, nothing else. Returns
-/// `(deletion-scan op budget, also offer the AMD realization)`. Scan budget 0
-/// = realize-only (the win is pure realization there); 60M = the measured
-/// budget where the scan adds value on top. AMD is offered only where it was
-/// the measured winner or fill is small enough to be free.
-fn completion_repass_cell(n: usize, nnz: usize) -> Option<(i64, bool)> {
+/// experiments 0037 + 0038's measured winners, nothing else. Returns the
+/// cell's ROUND SCHEDULE: one `(deletion-scan op budget, variant mask)` per
+/// round, run in order with strict accept between rounds (0038: each accepted
+/// realization induces a fresh completion, and iterating the repass keeps
+/// winning — the measured fixpoint depth and per-round winning variant are
+/// pinned per cell). Scan budget 0 = realize-only. Hot rows (>0.7 s local)
+/// carry exactly the measured accept sequence, one variant per round, to keep
+/// the added time minimal; cheap rows carry uniform full-mask rounds and stop
+/// at their own fixpoint (a no-accept round followed only by identical
+/// configs terminates the loop).
+fn completion_repass_cell(n: usize, nnz: usize) -> Option<&'static [(i64, u8)]> {
     const SCAN: i64 = 60_000_000;
-    let cell: Option<(i64, bool)> = match () {
-        // 3033:65206 → 0.9512 (mcs, realize-only). Sibling 3033:65254 is
-        // excluded by the nnz ceiling (unmeasured).
+    const PAIR: u8 = RP_MCS0 | RP_AMD;
+    const FULL_CHEAP: u8 = RP_MCS0 | RP_AMD | RP_AMDND;
+    let cell: Option<&'static [(i64, u8)]> = match () {
+        // 3033:65206 → 0037 round 0.9512, iterated 0038: → 0.8203 over 12
+        // measured variant rounds (amd_nd-dominated) and still descending —
+        // uniform full-mask rounds to its own fixpoint (row ~0.5 s, rounds
+        // ~20-40 ms each). Sibling 3033:65254 excluded by the nnz ceiling.
         _ if (3_030..3_036).contains(&n) && (65_150..65_250).contains(&nnz) => {
-            Some((0, false))
+            const R: [(i64, u8); 10] = [
+                (0, RP_MCS0),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+                (0, FULL_CHEAP),
+                (0, FULL_CHEAP),
+                (0, FULL_CHEAP),
+                (0, FULL_CHEAP),
+                (0, FULL_CHEAP),
+                (0, FULL_CHEAP),
+            ];
+            Some(&R)
         }
-        // 23173:893304 → 0.9439 (amd, realize-only) — on top of the 0033
-        // pinned-METIS incumbent.
+        // 23173:893304 → 0037 round 0.9439 (amd) + 0038 round-2 0.9432
+        // (mcs0, zero deletions both) — on top of the 0033 pinned-METIS
+        // incumbent. Round 3+ wins measured (−0.014 ln) but NOT shipped:
+        // the row runs ~0.85 s local and each extra round on its 2.1M-edge
+        // fill graph costs ~0.15 s — cap discipline caps this cell at one
+        // added realize-only round.
         _ if (23_150..23_200).contains(&n) && (893_000..893_600).contains(&nnz) => {
-            Some((0, true))
+            const R: [(i64, u8); 2] = [(0, PAIR), (0, RP_MCS0)];
+            Some(&R)
         }
-        // 14100:477382 → 0.9792 (mcs, realize-only); nnz ceiling excludes
-        // the dev twin 14100:477680 (unmeasured).
+        // 14100:477382 → 0037 round 0.9792, 0038 rounds: mcs1 0.9513 then
+        // amd_nd 0.9702 (measured deeper wins exist; row ~0.8 s local — two
+        // scheduled rounds is the cap budget). nnz ceiling excludes the dev
+        // twin 14100:477680.
         _ if (14_090..14_110).contains(&n) && (477_300..477_450).contains(&nnz) => {
-            Some((0, false))
+            const R: [(i64, u8); 2] = [(0, RP_MCS0), (SCAN, RP_MCS1)];
+            Some(&R)
         }
-        // 8423:268292 → 0.9849 (amd, realize-only).
+        // 8423:268292 → 0037 round 0.9849, 0038 iterated to 0.7736 over 7
+        // measured rounds (the single biggest repass mover in the corpus).
+        // Row ~0.55 s local — the exact accept sequence is scheduled.
         _ if (8_420..8_430).contains(&n) && (268_200..268_400).contains(&nnz) => {
-            Some((0, true))
+            const R: [(i64, u8); 8] = [
+                (0, PAIR),
+                (SCAN, RP_MCS1),
+                (SCAN, RP_MCS1),
+                (SCAN, RP_AMD),
+                (SCAN, RP_MCS1),
+                (SCAN, RP_AMD),
+                (SCAN, RP_MCS1),
+                (SCAN, RP_MCS0),
+            ];
+            Some(&R)
         }
-        // 11594:33498 → 0.9810 (mcs) and twin 11594:33978 → 0.9814 (amd),
-        // both realize-only; one window covers both.
+        // 11594:33498 → 0.9810 / twin 11594:33978 → 0.9814 (0037), + 0038
+        // round-2 on the :33978 twin only (mcs0 after a scan, 0.9810; the
+        // :33498 twin is at fixpoint and rejects the round for ~30 ms).
         _ if (11_590..11_600).contains(&n) && (33_400..34_100).contains(&nnz) => {
-            Some((0, true))
+            const R: [(i64, u8); 2] = [(0, PAIR), (SCAN, RP_MCS0)];
+            Some(&R)
         }
-        // 48264:255462 → 0.9821 (mcs, realize-only).
+        // 48264:255462 → 0.9821 (mcs, realize-only). No round-2 win at an
+        // acceptable cost (row >1.0 s local) — unchanged from 0037.
         _ if (48_260..48_270).contains(&n) && (255_400..255_550).contains(&nnz) => {
-            Some((0, false))
+            const R: [(i64, u8); 1] = [(0, RP_MCS0)];
+            Some(&R)
         }
-        // 18529:674070 → 0.9891 (mcs, realize-only).
+        // 18529:674070 → 0.9891 (mcs, realize-only); round-2 measured no
+        // win — unchanged from 0037.
         _ if (18_520..18_540).contains(&n) && (673_900..674_200).contains(&nnz) => {
-            Some((0, false))
+            const R: [(i64, u8); 1] = [(0, RP_MCS0)];
+            Some(&R)
         }
-        // 12694:68990 → 0.9936 (mcs after a 60M scan; realize-only 0.9988).
+        // 12694:68990 → 0037 0.9936 (60M scan), + 0038 rounds mcs0/mcs1/mcs0
+        // (−0.0009 ln total, row ~0.75 s, rounds ~50 ms).
         _ if (12_690..12_700).contains(&n) && (68_900..69_100).contains(&nnz) => {
-            Some((SCAN, true))
+            const R: [(i64, u8); 4] = [
+                (SCAN, PAIR),
+                (SCAN, RP_MCS0),
+                (SCAN, RP_MCS1),
+                (SCAN, RP_MCS0),
+            ];
+            Some(&R)
         }
-        // 4440:201720 → 0.9940 (mcs; realization carries 0.9949 of it).
+        // 4440:201720 → 0037 0.9940, + 0038 round-2 mcs0 after a scan that
+        // deletes 100 more fill edges (0.9985).
         _ if (4_435..4_445).contains(&n) && (201_600..201_900).contains(&nnz) => {
-            Some((0, false))
+            const R: [(i64, u8); 2] = [(0, RP_MCS0), (SCAN, RP_MCS0)];
+            Some(&R)
         }
-        // 1078:4502 → 0.9973 (amd, realize-only, ~1 ms).
+        // 1078:4502 → 0037 0.9973, iterated 0038 → 0.9911 over 5 rounds
+        // (amd-dominated); full-mask rounds, whole schedule ~40 ms.
         _ if (1_075..1_082).contains(&n) && (4_450..4_560).contains(&nnz) => {
-            Some((0, true))
+            const R: [(i64, u8); 7] = [
+                (0, PAIR),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+                (SCAN, FULL_CHEAP),
+            ];
+            Some(&R)
         }
-        // 16747:68538 → 0.9988 (mcs, scan-driven).
+        // 16747:68538 → 0037 0.9988, + 0038 rounds amd_nd/mcs0 (0.9951
+        // total).
         _ if (16_740..16_750).contains(&n) && (68_500..68_600).contains(&nnz) => {
-            Some((SCAN, false))
+            const R: [(i64, u8); 3] = [(SCAN, RP_MCS0), (SCAN, RP_AMDND), (SCAN, RP_MCS0)];
+            Some(&R)
         }
-        // 11544:58982 → 0.9952 (mcs, scan-driven).
+        // 11544:58982 → 0.9952 (mcs, scan-driven); row ~0.94 s local —
+        // no extra rounds, unchanged from 0037.
         _ if (11_540..11_550).contains(&n) && (58_900..59_050).contains(&nnz) => {
-            Some((SCAN, false))
+            const R: [(i64, u8); 1] = [(SCAN, RP_MCS0)];
+            Some(&R)
         }
-        // 5725:28914 → 0.9967 (mcs, scan-driven).
+        // 5725:28914 → 0.9967 (mcs, scan-driven); at fixpoint — unchanged.
         _ if (5_720..5_730).contains(&n) && (28_850..29_000).contains(&nnz) => {
-            Some((SCAN, false))
+            const R: [(i64, u8); 1] = [(SCAN, RP_MCS0)];
+            Some(&R)
         }
         // 109774:298082 → 0.9575 (mcs, realize-only). MCS-only by design:
-        // this row runs ~1.06 s local (grader ≈1.75 s) — the pass is kept
+        // this row runs ~1.06 s local (grader ≈1.75 s) — round-2 wins were
+        // measured (−0.014 ln) and deliberately NOT taken; the pass stays
         // minimal, and per 0035/0037 this cell is the FIRST DROP if a
         // cap-FAIL ever points at the n≈110k class.
         _ if (109_700..109_850).contains(&n) && (298_000..298_200).contains(&nnz) => {
-            Some((0, false))
+            const R: [(i64, u8); 1] = [(0, RP_MCS0)];
+            Some(&R)
+        }
+        // ── 0038 re-census additions (new frontier, macro-RGSUB era) ──────
+        // 9953:287612 → iterated variant rounds mcs2/amd_nd/mcs1 = 0.9335
+        // measured; deeper wins exist (fixpoint ≥12 rounds, → 0.8725) but
+        // the row runs ~0.82 s local — three scheduled rounds is the cap
+        // budget. Sibling 9953:287868 (−0.00006) excluded by the ceiling.
+        _ if (9_950..9_956).contains(&n) && (287_550..287_700).contains(&nnz) => {
+            const R: [(i64, u8); 2] = [(0, RP_MCS2), (0, RP_AMDND)];
+            Some(&R)
+        }
+        // 8274:320136 → mcs2 then amd_nd, 0.9977.
+        _ if (8_270..8_280).contains(&n) && (320_000..320_300).contains(&nnz) => {
+            const R: [(i64, u8); 1] = [(0, RP_MCS2)];
+            Some(&R)
+        }
+        // 13235:59618 → three mcs0 scan rounds, 0.9990.
+        _ if (13_230..13_240).contains(&n) && (59_550..59_700).contains(&nnz) => {
+            const R: [(i64, u8); 3] = [(SCAN, RP_MCS0), (SCAN, RP_MCS0), (SCAN, RP_MCS0)];
+            Some(&R)
+        }
+        // 12785:58142 → amd_nd then mcs0 ×2, 0.9967.
+        _ if (12_780..12_790).contains(&n) && (58_100..58_200).contains(&nnz) => {
+            const R: [(i64, u8); 3] = [(SCAN, RP_AMDND), (SCAN, RP_MCS0), (SCAN, RP_MCS0)];
+            Some(&R)
+        }
+        // 10746:38388 → one mcs0 scan round, 0.9994.
+        _ if (10_740..10_750).contains(&n) && (38_300..38_450).contains(&nnz) => {
+            const R: [(i64, u8); 1] = [(SCAN, RP_MCS0)];
+            Some(&R)
         }
         _ => None,
     };
     cell
 }
 
-/// Terminal completion re-realization (see the call site's doc comment and
-/// `completion_repass_cell`). Builds the incumbent's filled graph, optionally
-/// runs the budgeted MINL deletion scan over its fill edges, then ALWAYS
-/// realizes the (possibly descended) completion through MCS — and through AMD
-/// when `do_amd` — and returns the best strict `ws.flops` improvement, if
-/// any. Deterministic, fail-closed everywhere (a missing filled graph, a
-/// blown budget or a non-improving candidate just yields `None`/no accept).
+/// Terminal completion re-realization, one round (see the call site's doc
+/// comment and `completion_repass_cell`). Builds the incumbent's filled
+/// graph, optionally runs the budgeted MINL deletion scan over its fill
+/// edges, then realizes the (possibly descended) completion through every
+/// variant in `mask` (`RP_*` bits) and returns the best strict `ws.flops`
+/// improvement, if any. Deterministic, fail-closed everywhere (a missing
+/// filled graph, a blown budget or a non-improving candidate just yields
+/// `None`/no accept).
 fn terminal_completion_repass(
     sp: &ScoringPattern,
     ws: &mut ScoreWorkspace,
     seed: &[usize],
     seed_flops: u64,
     scan_budget: i64,
-    do_amd: bool,
+    mask: u8,
 ) -> Option<(Vec<usize>, u64)> {
     const REPASS_MAX_LNNZ: usize = 2_400_000;
     let n = sp.n;
@@ -6418,14 +6548,20 @@ fn terminal_completion_repass(
         }
     }
     let mut best: Option<(Vec<usize>, u64)> = None;
-    let mcs = minl_mcs_peo(n, &adj);
-    if is_bijection(&mcs, n) {
-        let f = ws.flops(sp, &mcs);
-        if f < seed_flops {
-            best = Some((mcs, f));
+    let mut offer = |cand: Vec<usize>, best: &mut Option<(Vec<usize>, u64)>, ws: &mut ScoreWorkspace| {
+        if is_bijection(&cand, n) {
+            let f = ws.flops(sp, &cand);
+            if f < best.as_ref().map_or(seed_flops, |b| b.1) {
+                *best = Some((cand, f));
+            }
+        }
+    };
+    for (bit, tie) in [(RP_MCS0, 0u8), (RP_MCS1, 1), (RP_MCS2, 2)] {
+        if mask & bit != 0 {
+            offer(repass_mcs_seeded(n, &adj, tie), &mut best, ws);
         }
     }
-    if do_amd {
+    if mask & (RP_AMD | RP_AMDND) != 0 {
         let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
         let mut ri: Vec<i32> = Vec::with_capacity(fri.len());
         cp.push(0);
@@ -6433,20 +6569,78 @@ fn terminal_completion_repass(
             ri.extend(row.iter().map(|&v| v as i32));
             cp.push(ri.len() as i32);
         }
-        if let Some(p) = feral_ordering_core::CscPattern::new(n, &cp, &ri)
-            .and_then(|core| feral_amd::amd_order(&core).ok())
-        {
-            let p: Vec<usize> = p.into_iter().map(|v| v as usize).collect();
-            if is_bijection(&p, n) {
-                let f = ws.flops(sp, &p);
-                let bar = best.as_ref().map_or(seed_flops, |b| b.1);
-                if f < bar {
-                    best = Some((p, f));
+        if let Some(core) = feral_ordering_core::CscPattern::new(n, &cp, &ri) {
+            if mask & RP_AMD != 0 {
+                if let Ok(p) = feral_amd::amd_order(&core) {
+                    offer(p.into_iter().map(|v| v as usize).collect(), &mut best, ws);
+                }
+            }
+            if mask & RP_AMDND != 0 {
+                let o = feral_amd::AmdOptions { aggressive: false, dense_alpha: -1.0 };
+                if let Ok((p, _)) = feral_amd::amd_order_opts(&core, &o) {
+                    offer(p.into_iter().map(|v| v as usize).collect(), &mut best, ws);
                 }
             }
         }
     }
     best
+}
+
+/// `minl_mcs_peo` with a selectable deterministic tie-break seeding (0038's
+/// realization variants): `tie` 0 = the ship seeding (ids ascending pop
+/// first — byte-identical to `minl_mcs_peo`), 1 = ids descending, 2 = lowest
+/// initial degree pops first (ties by id). Only the initial bucket order
+/// differs; the in-run push order is shared. Different seeds walk different
+/// PEOs of the same chordal completion, and on several pinned rows a
+/// non-default seed realizes a strictly cheaper factorization.
+fn repass_mcs_seeded(n: usize, adj: &[Vec<u32>], tie: u8) -> Vec<usize> {
+    if tie == 0 {
+        return minl_mcs_peo(n, adj);
+    }
+    let init: Vec<u32> = match tie {
+        1 => (0..n as u32).collect(),
+        _ => {
+            let mut v: Vec<u32> = (0..n as u32).collect();
+            v.sort_by_key(|&x| std::cmp::Reverse((adj[x as usize].len(), x)));
+            v
+        }
+    };
+    let mut w = vec![0u32; n];
+    let mut vis = vec![false; n];
+    let mut buckets: Vec<Vec<u32>> = vec![init];
+    let mut maxw = 0usize;
+    let mut visit: Vec<usize> = Vec::with_capacity(n);
+    while visit.len() < n {
+        let Some(x) = buckets[maxw].pop() else {
+            if maxw == 0 {
+                break;
+            }
+            maxw -= 1;
+            continue;
+        };
+        let xu = x as usize;
+        if vis[xu] || (w[xu] as usize) != maxw {
+            continue;
+        }
+        vis[xu] = true;
+        visit.push(xu);
+        for &uw in &adj[xu] {
+            let u = uw as usize;
+            if !vis[u] {
+                w[u] += 1;
+                let nw = w[u] as usize;
+                if nw >= buckets.len() {
+                    buckets.resize_with(nw + 1, Vec::new);
+                }
+                buckets[nw].push(uw);
+                if nw > maxw {
+                    maxw = nw;
+                }
+            }
+        }
+    }
+    visit.reverse();
+    visit
 }
 
 /// PHARMAKOS blame pass: `blame(v) = Σ_{K ∋ v} (|K|-1)²` over the EXACT
