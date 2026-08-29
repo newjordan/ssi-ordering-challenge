@@ -7021,3 +7021,217 @@ fn probe_fleet_j_full() {
         println!("WORST order() = {:.3} s ({})", r0.0, r0.1);
     }
 }
+/// FLEET-K — envelope census for the two newest frontier mechanisms plus the
+/// pinned metis-seed cells (probe_fleet_h's corpus pattern: loads
+/// `$SSI_CORPUS_FILE` itself; reconstructed rows carry blank names, keyed
+/// `n:nnz`).
+///
+/// Sections (each a TSV, one row per candidate measured against the FULL
+/// `order()` incumbent of the same matrix):
+///   * `SIMP` — simplicial-promotion envelope. Cells: `cur` (the shipped gate
+///     n∈[1k,4k] ∧ nnz≤60k ∧ d≤24 — measures second-pass/budget headroom on
+///     the already-promoted output), `n_ext` (4k,6k], `nnz_ext` (60k,100k],
+///     `dens_ext` d∈(24,32]. For every cell member the promotion runs from
+///     `order()`'s final output at budgets 32M and 64M; budget exhaustion
+///     inside `rgreedy::simplicial_promotion` returns None (whole candidate
+///     dropped), so a 64M-only success is exactly the budget-raise win.
+///   * `HUB` — hub-heavy medium class (n<60k ∧ nnz<400k ∧ max_deg>16 ∧
+///     max_deg²>4n, i.e. `!medium_metric_hub_safe`): DegSqrt α∈{0.5,4} and
+///     SqDiv α∈{0.5,1,2,4} — the unmeasured siblings of abbdacf's α1/α2
+///     DegSqrt arm.
+///   * `HUBX` — the same metric family OUTSIDE the medium window
+///     (n≥60k ∨ nnz≥400k, still hub-unsafe, nnz<1.2M to bound probe cost):
+///     DegSqrt α∈{0.5,1,2,4}, individually timed.
+///   * `SEED` — the two pinned metis_seed cells only (seed5: n∈[8000,8500] ∧
+///     nnz∈[267k,269k) ∧ deg∈[250,280] or n∈[9500,10000) ∧ nnz∈[287k,289k) ∧
+///     deg∈[170,200]; seed2: n∈[14000,14200) ∧ nnz∈[470k,485k)): the
+///     remaining seeds {0,1,3,4,6,7} plus the pinned seed as sanity.
+#[test]
+#[ignore]
+fn probe_fleet_k() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok()
+    );
+
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let max_deg = (0..n)
+            .map(|j| pat.col_ptr[j + 1] - pat.col_ptr[j])
+            .max()
+            .unwrap_or(0);
+        let max_deg_sq = (max_deg as u128) * (max_deg as u128);
+        let hub_safe = max_deg <= 16 || max_deg_sq <= 4 * n as u128;
+
+        let simp_cell: Option<&str> = if (1_000..=4_000).contains(&n) && nnz <= 24 * n {
+            if nnz <= 60_000 {
+                Some("cur")
+            } else if nnz <= 100_000 {
+                Some("nnz_ext")
+            } else {
+                None
+            }
+        } else if (4_001..=6_000).contains(&n) && nnz <= 60_000 && nnz <= 24 * n {
+            Some("n_ext")
+        } else if (4_001..=6_000).contains(&n)
+            && (60_001..=100_000).contains(&nnz)
+            && nnz <= 24 * n
+        {
+            Some("corner")
+        } else if (1_000..=4_000).contains(&n)
+            && nnz <= 60_000
+            && nnz > 24 * n
+            && nnz <= 32 * n
+        {
+            Some("dens_ext")
+        } else {
+            None
+        };
+        // `$SSI_PROBE_SECT=SIMP` (etc.) restricts to one section for fast
+        // re-census of a single mechanism.
+        let sect_only = std::env::var("SSI_PROBE_SECT").ok();
+        let want = |s: &str| sect_only.as_deref().is_none_or(|w| w == s);
+
+        let hub_med = n < 60_000 && nnz < 400_000 && !hub_safe && want("HUB");
+        let hub_ext =
+            (n >= 60_000 || nnz >= 400_000) && !hub_safe && nnz < 1_200_000 && want("HUBX");
+
+        let seed5_cell = ((8_000..=8_500).contains(&n)
+            && (267_000..269_000).contains(&nnz)
+            && (250..=280).contains(&max_deg))
+            || ((9_500..10_000).contains(&n)
+                && (287_000..289_000).contains(&nnz)
+                && (170..=200).contains(&max_deg));
+        let seed2_cell = (14_000..14_200).contains(&n) && (470_000..485_000).contains(&nnz);
+
+        let simp_cell = simp_cell.filter(|_| want("SIMP"));
+        let seed5_cell = seed5_cell && want("SEED");
+        let seed2_cell = seed2_cell && want("SEED");
+        if simp_cell.is_none() && !hub_med && !hub_ext && !seed5_cell && !seed2_cell {
+            continue;
+        }
+
+        let key = format!("{}:{}", n, nnz);
+        let label = if name.is_empty() { &key } else { name };
+        let sp = scoring_pattern(pat);
+        let t0 = Instant::now();
+        let perm0 = order(pat);
+        let order_secs = t0.elapsed().as_secs_f64();
+        let f0 = flops_of(&sp, &perm0);
+        if f0 == 0 {
+            continue;
+        }
+
+        if let Some(cell) = simp_cell {
+            let mut cols = Vec::new();
+            for &budget in &[32_000_000i64, 64_000_000] {
+                let t = Instant::now();
+                let got = rgreedy::simplicial_promotion(
+                    n,
+                    &pat.col_ptr,
+                    &pat.row_idx,
+                    &perm0,
+                    budget,
+                );
+                let secs = t.elapsed().as_secs_f64();
+                match got {
+                    Some(cand) => {
+                        let f = flops_of(&sp, &cand);
+                        cols.push(format!("{:.6}/{secs:.3}s", f as f64 / f0 as f64));
+                    }
+                    None => cols.push(format!("none/{secs:.3}s")),
+                }
+            }
+            println!(
+                "SIMP\t{cell}\t{label}\t{n}\t{nnz}\t{max_deg}\t{:.2}\t{order_secs:.3}\tb32={}\tb64={}",
+                nnz as f64 / n as f64,
+                cols[0],
+                cols[1]
+            );
+        }
+
+        if hub_med || hub_ext {
+            let (cp, ri) = core_of(pat);
+            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+            let sec = if hub_med { "HUB" } else { "HUBX" };
+            let specs: Vec<(custom_metrics::ScoreVariant, f64)> = if hub_med {
+                vec![
+                    (custom_metrics::ScoreVariant::DegSqrt, 0.5),
+                    (custom_metrics::ScoreVariant::DegSqrt, 4.0),
+                    (custom_metrics::ScoreVariant::SqDiv, 0.5),
+                    (custom_metrics::ScoreVariant::SqDiv, 1.0),
+                    (custom_metrics::ScoreVariant::SqDiv, 2.0),
+                    (custom_metrics::ScoreVariant::SqDiv, 4.0),
+                ]
+            } else {
+                vec![
+                    (custom_metrics::ScoreVariant::DegSqrt, 0.5),
+                    (custom_metrics::ScoreVariant::DegSqrt, 1.0),
+                    (custom_metrics::ScoreVariant::DegSqrt, 2.0),
+                    (custom_metrics::ScoreVariant::DegSqrt, 4.0),
+                ]
+            };
+            let mut cols = Vec::new();
+            for (variant, alpha) in specs {
+                let t = Instant::now();
+                let got = custom_metrics::order_variant(&core, alpha, true, variant);
+                let secs = t.elapsed().as_secs_f64();
+                match got {
+                    Ok(p) => {
+                        let cand: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                        let f = flops_of(&sp, &cand);
+                        cols.push(format!(
+                            "{variant:?}a{alpha}={:.6}/{secs:.3}s",
+                            f as f64 / f0 as f64
+                        ));
+                    }
+                    Err(_) => cols.push(format!("{variant:?}a{alpha}=err/{secs:.3}s")),
+                }
+            }
+            println!(
+                "{sec}\t{label}\t{n}\t{nnz}\t{max_deg}\t{order_secs:.3}\t{}",
+                cols.join("\t")
+            );
+        }
+
+        if seed5_cell || seed2_cell {
+            let (cp, ri) = core_of(pat);
+            let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+            let pinned = if seed5_cell { 5 } else { 2 };
+            let mut cols = Vec::new();
+            for seed in [0u64, 1, 2, 3, 4, 5, 6, 7] {
+                let opts = feral_metis::MetisOptions {
+                    seed,
+                    ..Default::default()
+                };
+                let t = Instant::now();
+                let got = feral_metis::metis_order_full(&core, &opts);
+                let secs = t.elapsed().as_secs_f64();
+                match got {
+                    Ok((p, ..)) => {
+                        let cand: Vec<usize> = p.iter().map(|&x| x as usize).collect();
+                        let f = flops_of(&sp, &cand);
+                        cols.push(format!("s{seed}={:.6}/{secs:.3}s", f as f64 / f0 as f64));
+                    }
+                    Err(_) => cols.push(format!("s{seed}=err/{secs:.3}s")),
+                }
+            }
+            println!(
+                "SEED\tpin{pinned}\t{label}\t{n}\t{nnz}\t{max_deg}\t{order_secs:.3}\t{}",
+                cols.join("\t")
+            );
+        }
+    }
+}

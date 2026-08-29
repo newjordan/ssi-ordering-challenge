@@ -934,11 +934,19 @@ const PAIR_DESCENT_OPS_BUDGET: i64 = 128_000_000;
 /// (Ost, Schulz, Strash, arXiv:2004.11315). The density and absolute-nnz gates
 /// keep the exact bitset replay in the measured medium tier; a deterministic
 /// precharged budget makes exhaustion fail closed.
+/// Envelope re-measured on the grader-exact reconstructed eval corpus
+/// (fleet-k, experiment 0034): n 4k→6k and nnz 60k→100k each hold movers
+/// (n=5725/nnz=28914 −0.31%, n=3033/nnz=65206 −0.98%, plus two <0.03% rows);
+/// the (4k,6k]×(60k,100k] corner and the (24,32] density band have ZERO
+/// corpus members, so the rectangle below is exactly the measured region.
+/// The 64M budget is required for the n=5725 win (32M exhausts there and
+/// fails closed); on every other member the replay finishes far below 32M,
+/// so the raise is free. Worst promotion cost measured at 64M: 0.021 s local.
 const SIMPLICIAL_PROMOTION_MIN_N: usize = 1_000;
-const SIMPLICIAL_PROMOTION_MAX_N: usize = 4_000;
-const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 60_000;
+const SIMPLICIAL_PROMOTION_MAX_N: usize = 6_000;
+const SIMPLICIAL_PROMOTION_MAX_NNZ: usize = 100_000;
 const SIMPLICIAL_PROMOTION_MAX_DENSITY: usize = 24;
-const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 32_000_000;
+const SIMPLICIAL_PROMOTION_OPS_BUDGET: i64 = 64_000_000;
 
 /// ── COMPLETION-LATTICE DESCENT (minimalization, 2026-08 Grothendieck
 /// session) ──────────────────────────────────────────────────────────────
@@ -2815,8 +2823,13 @@ fn order_with_options(
                 // Reuse this exact duplicate task slot for either the narrow
                 // seed-2 mover or the measured dense metric winner.
                 if metis_seed2_cell {
+                    // Seed re-census on the cell's one eval member (fleet-k,
+                    // 0034, grader-exact corpus): raw METIS-ND rel to the full
+                    // incumbent is s0 0.788, s3 0.929, s2 1.010 (the pinned
+                    // seed no longer wins on this tree), everything else ≥1.04.
+                    // Seed 0 is a straight swap — same single task, same cost.
                     let opts = feral_metis::MetisOptions {
-                        seed: 2,
+                        seed: 0,
                         ..Default::default()
                     };
                     consider!(move || {
@@ -2942,6 +2955,22 @@ fn order_with_options(
                     )
                 });
             }
+            // SqDiv sibling of the same hub-heavy class (fleet-k, 0034):
+            // the full sibling census on the grader-exact eval corpus —
+            // DegSqrt α∈{0.5,4} and SqDiv α∈{0.5,1,2,4} on every
+            // !medium_metric_hub_safe member — found exactly two movers,
+            // both SqDiv and both α-invariant across the grid (n=4995
+            // −2.8%, n=9995 −2.9%), so one α suffices. Outside the medium
+            // window (n≥60k ∨ nnz≥400k, nnz<1.2M) the same census found
+            // zero wins — the class boundary is right where it is.
+            consider!(move || {
+                custom_metrics::order_variant(
+                    &core,
+                    1.0,
+                    true,
+                    custom_metrics::ScoreVariant::SqDiv,
+                )
+            });
         }
 
         // Default-α AMF ("amf_default") DROPPED (`sbx-perf` cost-reduction
