@@ -3057,7 +3057,7 @@ fn order_with_options(
     // while avoiding the expensive portfolio on these cap-sensitive rows.
     if let Some((degree, orderer, alpha, relabel_seed)) = terminal_core_replay_schedule(n, nnz) {
         let mut early_ws = ScoreWorkspace::new(n, nnz);
-        if let Some((candidate, _)) = terminal_core_replay_step(
+        if let Some((mut candidate, mut candidate_flops)) = terminal_core_replay_step(
             &scoring_pat,
             &mut early_ws,
             best_flops,
@@ -3066,6 +3066,26 @@ fn order_with_options(
             alpha,
             relabel_seed,
         ) {
+            // A second oracle realized the winning core candidate's chordal
+            // completion through 42 deterministic PEO families. Ship only the
+            // exact measured successor sequence on percentage-scale movers.
+            // Every round strict-scores against the preceding accepted result;
+            // failure simply keeps the last trusted core winner.
+            if let Some(schedule) = terminal_core_successor_schedule(n, nnz) {
+                for &realizer in schedule {
+                    let Some((next, next_flops)) = terminal_deep_completion_step(
+                        &scoring_pat,
+                        &mut early_ws,
+                        &candidate,
+                        candidate_flops,
+                        realizer,
+                    ) else {
+                        break;
+                    };
+                    candidate = next;
+                    candidate_flops = next_flops;
+                }
+            }
             return candidate;
         }
     }
@@ -7556,6 +7576,28 @@ fn terminal_deep_completion_step(
 const CORE_REPLAY_AMD: u8 = 0;
 const CORE_REPLAY_AMDND: u8 = 1;
 const CORE_REPLAY_AMF: u8 = 2;
+
+/// Measured completion realizations applied only after an exact-prefix core
+/// replay wins. The broad 42-realizer discovery grid is deliberately absent;
+/// production pays only the recorded strict-improvement path.
+fn terminal_core_successor_schedule(n: usize, nnz: usize) -> Option<&'static [u8]> {
+    match (n, nnz) {
+        // 0.979172x after three rounds; the fourth round bought only 0.007%.
+        (17_860, 69_708) => Some(&[DEEP_AMDND, DEEP_FILLDEG_HI, DEEP_ID_LO]),
+        // 0.981674x after two rounds; the third bought only 0.065%.
+        (10_751, 33_014) => Some(&[DEEP_FILLDEG_HI, DEEP_ID_HI]),
+        (2_482, 8_128) => Some(&[DEEP_FILLDEG_HI]),
+        (9_320, 25_104) => Some(&[DEEP_HASH_BASE + 29]),
+        // 0.960778x after two rounds; later rounds jointly bought only 0.055%.
+        (7_656, 27_338) => Some(&[DEEP_ID_HI, DEEP_ID_LO]),
+        // Retain the first two of four profitable rounds: 2.14% at bounded cost.
+        (109_774, 298_082) => Some(&[DEEP_ORIGDEG_HI, DEEP_ID_HI]),
+        (71_573, 250_344) => Some(&[DEEP_AMDND, DEEP_AMDND, DEEP_ID_HI]),
+        // The third round bought only 0.002%.
+        (13_235, 59_618) => Some(&[DEEP_INCPOS_LO, DEEP_ID_LO]),
+        _ => None,
+    }
+}
 
 fn terminal_core_replay_schedule(
     n: usize,

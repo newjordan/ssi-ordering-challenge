@@ -275,6 +275,13 @@ _(hypotheses run against the corpus — see [experiments/_TEMPLATE.md](experimen
   complete paths measure at or below ~0.65 s; active tests 66/66, hard-cap 5/5,
   full 300-matrix harness clean.
 
+- [0045-core-completion-successors.md](experiments/0045-core-completion-successors.md) —
+  **BANKED WIN, eight 1.00%–4.03% residual row cuts.** Realize each exact-core
+  winner's chordal completion through a measured deterministic PEO sequence;
+  selected incremental ln delta **−0.191298**, isolated factor `0.99961748` over
+  500 rows. Exact-only, no broad grid; slowest affected complete path 0.258 s,
+  active tests 66/66 and hard-cap 5/5.
+
 - [0032-fleet-i.md](experiments/0032-fleet-i.md) — **WIN (v2 proxy −0.000314 + −0.000168)**: TELOS Regime-A full-grid discriminator (hub_safe ∧ nnz≥3n) + terminal-MINL sparse-gt cell (30k<n≤50k ∧ nnz≤170k ∧ d<10); rgsub round-3 widening killed (kill-proof at site).
 
 - [0033-fleet-j.md](experiments/0033-fleet-j.md) — **WIN (v2 proxy −0.009964, 0.805444→0.795480)**: the
