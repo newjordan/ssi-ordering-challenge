@@ -7122,6 +7122,137 @@ fn probe_eval_sweep() {
             try_perm(&format!("strip{k}_amd"), &|| strip_candidate(&sp, &ranked, k));
         }
     }
+}/// FLEET-K — envelope census for the two newest frontier mechanisms plus the
+/// pinned metis-seed cells (probe_fleet_h's corpus pattern: loads
+/// `$SSI_CORPUS_FILE` itself; reconstructed rows carry blank names, keyed
+/// `n:nnz`).
+///
+/// Sections (each a TSV, one row per candidate measured against the FULL
+/// `order()` incumbent of the same matrix):
+///   * `SIMP` — simplicial-promotion envelope. Cells: `cur` (the shipped gate
+///     n∈[1k,4k] ∧ nnz≤60k ∧ d≤24 — measures second-pass/budget headroom on
+///     the already-promoted output), `n_ext` (4k,6k], `nnz_ext` (60k,100k],
+///     `dens_ext` d∈(24,32]. For every cell member the promotion runs from
+///     `order()`'s final output at budgets 32M and 64M; budget exhaustion
+///     inside `rgreedy::simplicial_promotion` returns None (whole candidate
+///     dropped), so a 64M-only success is exactly the budget-raise win.
+///   * `HUB` — hub-heavy medium class (n<60k ∧ nnz<400k ∧ max_deg>16 ∧
+///     max_deg²>4n, i.e. `!medium_metric_hub_safe`): DegSqrt α∈{0.5,4} and
+///     SqDiv α∈{0.5,1,2,4} — the unmeasured siblings of abbdacf's α1/α2
+///     DegSqrt arm.
+///   * `HUBX` — the same metric family OUTSIDE the medium window
+///     (n≥60k ∨ nnz≥400k, still hub-unsafe, nnz<1.2M to bound probe cost):
+///     DegSqrt α∈{0.5,1,2,4}, individually timed.
+///   * `SEED` — the two pinned metis_seed cells only (seed5: n∈[8000,8500] ∧
+///     nnz∈[267k,269k) ∧ deg∈[250,280] or n∈[9500,10000) ∧ nnz∈[287k,289k) ∧
+///     deg∈[170,200]; seed2: n∈[14000,14200) ∧ nnz∈[470k,485k)): the
+///     remaining seeds {0,1,3,4,6,7} plus the pinned seed as sanity.
+#[test]
+#[ignore]
+fn probe_fleet_k() {
+    let corpus: Vec<(String, Pattern)> = match std::env::var("SSI_CORPUS_FILE") {
+        Ok(p) if !p.trim().is_empty() => {
+            ssi_scoring::load_corpus_jsonl(std::path::Path::new(&p))
+                .expect("load SSI_CORPUS_FILE corpus")
+        }
+        _ => crate::corpus::corpus(),
+    };
+    println!(
+        "\ncorpus: {} matrices (SSI_CORPUS_FILE={:?})",
+        corpus.len(),
+        std::env::var("SSI_CORPUS_FILE").ok()
+    );
+    for (name, pat) in &corpus {
+        let n = pat.n;
+        if n == 0 {
+            continue;
+        }
+        let nnz = pat.nnz();
+        let sp = scoring_pattern(pat);
+        let (cp, ri) = core_of(pat);
+        let core = feral_ordering_core::CscPattern::new(n, &cp, &ri).unwrap();
+        let base = flops_of(
+            &sp,
+            &feral_amd::amd_order(&core)
+                .unwrap()
+                .into_iter()
+                .map(|x| x as usize)
+                .collect::<Vec<_>>(),
+        ) as f64;
+        let t0 = Instant::now();
+        let cur = flops_of(&sp, &order(pat)) as f64 / base;
+        let cur_s = t0.elapsed().as_secs_f64();
+        println!("\n=== {name} n={n} nnz={nnz} cur={cur:.4} cur_s={cur_s:.3}");
+
+        let mut try_perm = |label: &str, f: &dyn Fn() -> Option<Vec<i32>>| {
+            let t = Instant::now();
+            let p = f();
+            let secs = t.elapsed().as_secs_f64();
+            match p {
+                Some(p) => {
+                    let p: Vec<usize> = p.into_iter().map(|x| x as usize).collect();
+                    if is_bijection(&p, n) {
+                        let r = flops_of(&sp, &p) as f64 / base;
+                        println!("  {label}\t{secs:.3}s\t{r:.4}");
+                    } else {
+                        println!("  {label}\t{secs:.3}s\tNOT_BIJECTION");
+                    }
+                }
+                None => println!("  {label}\t{secs:.3}s\tFAIL"),
+            }
+        };
+
+        try_perm("rcm", &|| Some(rcm_order(pat)));
+        try_perm("sloan_2_1", &|| Some(sloan_order(pat, 2, 1)));
+        try_perm("sloan_1_2", &|| Some(sloan_order(pat, 1, 2)));
+        if n <= 300_000 {
+            try_perm("nd", &|| Some(nd_order(pat)));
+        }
+        for (li, l) in FAMILY_LABELS.iter().enumerate() {
+            // strong partitioners get slow on the giants; still worth one shot
+            if n > 260_000 && (li == 2 || li == 3) {
+                continue;
+            }
+            try_perm(l, &|| family_perm(li, &core));
+        }
+        for alpha in [0.5f64, 0.75, 1.25, 2.0, 5.0] {
+            let o = feral_amf::AmfOptions { dense_alpha: alpha, ..Default::default() };
+            try_perm(&format!("amf_{alpha}"), &|| {
+                feral_amf::amf_order_opts(&core, &o).ok().map(|(p, ..)| p)
+            });
+        }
+        for (agg, alpha) in [(true, 0.5f64), (true, 0.75), (false, 1.0), (false, -1.0)] {
+            let o = feral_amd::AmdOptions { aggressive: agg, dense_alpha: alpha };
+            try_perm(&format!("amd_{agg}_{alpha}"), &|| {
+                feral_amd::amd_order_opts(&core, &o).ok().map(|(p, ..)| p)
+            });
+        }
+        use custom_metrics::ScoreVariant as SV;
+        for (vi, v) in [
+            SV::SqDiv, SV::SqPure, SV::Ammf, SV::DegSqrt, SV::DegP075, SV::DegP125,
+            SV::DegDivNvSqrtWf, SV::DegDivNvWfP15, SV::DegPlusDegme, SV::DegDivNvDegme,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for alpha in [0.75f64, 1.5, 10.0] {
+                try_perm(&format!("metric{vi}_{alpha}"), &|| {
+                    custom_metrics::order_variant(&core, alpha, false, v).ok()
+                });
+            }
+        }
+        // degree strips: AMD core
+        let mut ranked: Vec<usize> = (0..n).collect();
+        ranked.sort_unstable_by_key(|&v| {
+            (usize::MAX - (sp.col_ptr[v + 1] - sp.col_ptr[v]), v)
+        });
+        for k in [16usize, 64, 128, 256, 512, 1024] {
+            if k * 4 > n {
+                continue;
+            }
+            try_perm(&format!("strip{k}_amd"), &|| strip_candidate(&sp, &ranked, k));
+        }
+    }
 }
 
 /// FINE SWEEP round 2: denser alpha grids, aggressive metric variants, extra
