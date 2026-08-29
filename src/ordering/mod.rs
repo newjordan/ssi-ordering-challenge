@@ -3066,24 +3066,17 @@ fn order_with_options(
             Ok::<Vec<i32>, feral_ordering_core::OrderingError>(biconn::biconn_order(pattern))
         });
 
-        // PER-BLOCK-HEAVY biconn: same decomposition, but blocks big enough to
-        // matter (>=32 owned vertices, <=150k block-nnz so a restart stays
-        // cheap) get a best-of-(1+K) relabelled-AMD multi-start scored by exact
-        // local flops, largest-block-first under a 24-restart global budget.
-        // Decomposition shrinks the problem, so this reaches blocks the
-        // whole-graph relabel multi-start is gated out of on the big gt_10k
-        // matrices. Adds crudeoil_lee1_07 (0.9032->0.8781) and syn30m03m
-        // (0.9977->0.9957) over plain biconn; worst isolated cost 0.368s
-        // (nuclear104). Restart 0 is plain AMD, so per-block quality >= plain
-        // biconn; best-of floor makes the composed candidate zero-downside.
-        // CAP-SAFETY (round-2 merge): heavy variant gated at nnz <= 60k —
-        // its measured wins (crudeoil_lee1_07, syn30m03m) are far below this,
-        // and per-block relabel restarts on the hot 100k+ gate-wall class
-        // (ringpack_30_2) added +0.14 s to the portfolio's worst case.
+        // PER-BLOCK-HEAVY biconn: same decomposition, but qualifying CORE
+        // blocks (owned >= min_block/32, block-nnz <= 60k) get nested
+        // dissection on the induced subgraph instead of stacked relabel-AMD.
+        // Fat blocks (nnz > 60k) stay on a single AMD pass. Largest-block-first
+        // under an 8-restart global budget, EXTRA_CAP=2, min_block=400.
+        // CAP-SAFETY: heavy variant still gated at nnz <= 60k so per-block ND
+        // cannot move the 100k+ gate-wall class.
         if nnz <= 60_000 {
             consider!(move || {
                 Ok::<Vec<i32>, feral_ordering_core::OrderingError>(
-                    biconn::biconn_heavy_order(pattern, 24, 32, 150_000),
+                    biconn::biconn_heavy_order(pattern, 8, 400, 60_000),
                 )
             });
         }
@@ -6499,7 +6492,7 @@ fn nd_order(pattern: &Pattern) -> Vec<i32> {
 /// hybrid). The two are DISTINCT candidates routed through the best-of floor,
 /// so the AMD-leaf variant can only lower a matrix's ratio, never raise it —
 /// only its (bounded) time is at stake.
-fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
+pub(super) fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     let n = pattern.n;
 
     // Symmetric adjacency (exclude self-loops; dedup for accurate degrees).
@@ -6520,7 +6513,7 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
     }
     let degree: Vec<usize> = adj.iter().map(|a| a.len()).collect();
 
-    const ND_LEAF: usize = 200;
+    const ND_LEAF: usize = 400;
 
     let mut order: Vec<usize> = vec![0usize; n];
     let mut mark: Vec<bool> = vec![false; n]; // membership in the current subset
@@ -6529,7 +6522,8 @@ fn nd_order_impl(pattern: &Pattern, amd_leaves: bool) -> Vec<i32> {
 
     // Hard work budget: caps total per-subset scanning at O(n), so no adversarial
     // (e.g. highly disconnected) input can drive quadratic blow-up.
-    let mut budget: i64 = 64 * n as i64 + 4096;
+    const ND_BUDGET_MULT: i64 = 32;
+    let mut budget: i64 = ND_BUDGET_MULT * n as i64 + 4096;
 
     // Scratch global->local map for AMD-on-induced-leaf ordering; -1 everywhere
     // between leaves. Allocated only when the AMD-leaf variant is requested.

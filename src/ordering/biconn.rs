@@ -359,24 +359,19 @@ pub fn biconn_order(pattern: &Pattern) -> Vec<i32> {
     perm.into_iter().map(|x| x as i32).collect()
 }
 
-/// PER-BLOCK-HEAVY variant: same decomposition and block-cut-tree emission as
-/// [`biconn_order`], but blocks large enough to matter get a best-of-K
-/// relabelled-AMD multi-start scored by EXACT local flops (`flops_of` on the
-/// block's own induced subgraph) instead of a single AMD pass.
+/// PER-BLOCK-HEAVY variant: same Tarjan BCC / largest-block root / deepest-first
+/// emit / articulations-deferred as [`biconn_order`], but qualifying CORE
+/// blocks (owned verts, block-nnz ≤ cap, owned ≥ min_block) are ordered by
+/// nested dissection (`nd_order_impl`) on the induced subgraph instead of a
+/// stacked relabel-AMD multi-start. Fat blocks (nnz > cap) take a single AMD
+/// pass — no extra restart stack.
 ///
-/// Why this is a different mechanism, not just more search: the whole-graph
-/// relabel multi-start in `mod.rs` is gated out of the big sparse gt_10k
-/// matrices by `n` (gabriel10 n=244056 gets ONE heavy restart). Decomposition
-/// shrinks the problem — gabriel10's largest block is only ~54% of n — so a
-/// per-block multi-start is affordable on blocks the whole-graph machinery
-/// cannot touch, and the decomposition theorem (fill never crosses an
-/// articulation) means improving a block's local flops improves the composed
-/// ordering. Deterministic: same `relabel(m, seed)` stream as the portfolio.
-///
-/// Restart budget is allocated LARGEST-BLOCK-FIRST (flops concentrate in the
-/// biggest blocks) under a global cap `total_restarts`, so worst-case added
-/// cost is bounded independent of the (possibly huge) block count: each
-/// restart is one block-local AMD pass plus one `flops_of`, both O(block).
+/// Why this is a different mechanism, not just more search: ND on a
+/// biconnected core pushes a BFS-level separator last inside that block,
+/// which stacked AMD cannot do. Decomposition still confines fill to the
+/// block. Budget is allocated LARGEST-BLOCK-FIRST under `total_restarts` so
+/// worst-case added cost stays bounded independent of block count: each
+/// flagged block is one ND pass (or one AMD pass if it is fat / too small).
 pub fn biconn_heavy_order(
     pattern: &Pattern,
     total_restarts: usize,
@@ -474,17 +469,15 @@ pub fn biconn_heavy_order(
 
     // Restart allocation, largest-block-first: block "size" for budget purposes
     // is its owned-vertex count (the part that gets ordered here). Each block
-    // with size >= min_block draws `1 + extra` passes (the base AMD plus
-    // `extra` relabelled restarts) until the global restart budget is spent.
-    // `extra` per block is capped so one huge block cannot eat the whole budget.
+    // with size >= min_block and nnz <= cap draws a ND slot (flagged via
+    // `extra_of > 0`) until the global restart budget is spent. `extra` per
+    // block is capped so one huge block cannot eat the whole budget.
     //
-    // COST SAFETY: a restart on a block costs ~O(block_nnz) (one block-local
-    // AMD pass + one flops_of). Blocks whose edge count exceeds
-    // `block_nnz_cap` are capped at the single base AMD pass (no restarts) —
-    // this is what keeps the huge dominant-block matrices (faclay75, largest
-    // block ~700k nnz) cheap: without it the biggest block alone would draw
-    // EXTRA_CAP expensive restarts for no measured win.
-    const EXTRA_CAP: usize = 7;
+    // COST SAFETY: ND on a block costs ~O(block_nnz log n). Blocks whose edge
+    // count exceeds `block_nnz_cap` stay on a single AMD pass (no ND, no
+    // restart stack) — this is what keeps huge dominant-block matrices
+    // (faclay75, largest block ~700k nnz) cheap.
+    const EXTRA_CAP: usize = 2;
     let mut budget = total_restarts;
     let mut extra_of: Vec<usize> = vec![0; nc];
     {
@@ -494,12 +487,15 @@ pub fn biconn_heavy_order(
             let sb = comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
             sb.cmp(&sa).then(a.cmp(&b))
         });
+        // Qualifying cores: owned >= min_block/32 (call site min_block=400 → 12;
+        // the previous compiled gate was owned>=32 with min_block passed as 32).
+        let owned_gate = (min_block / 32).max(1);
         for &b in &by_size {
             if budget == 0 {
                 break;
             }
             let owned_sz = comp_verts[b].len() - usize::from(parent_ap[b] != NONE);
-            if owned_sz < min_block || comps[b].len() > block_nnz_cap {
+            if owned_sz < owned_gate || comps[b].len() > block_nnz_cap {
                 continue;
             }
             let give = budget.min(EXTRA_CAP);
@@ -541,9 +537,8 @@ pub fn biconn_heavy_order(
             tok[v as usize] = gen;
             loc[v as usize] = li as u32;
         }
-        // Induced subgraph on `owned`, built in BOTH index widths: i32 for the
-        // feral core, usize for the exact `flops_of` scoring used to pick the
-        // best restart.
+        // Induced subgraph on `owned` (i32 CSC for feral AMD; usize Pattern
+        // for the ND core path).
         let mut col_ptr = vec![0i32; m + 1];
         for &(u, v) in &comps[b] {
             if tok[u as usize] == gen && tok[v as usize] == gen {
@@ -576,8 +571,9 @@ pub fn biconn_heavy_order(
         };
 
         let extra = extra_of[b];
-        if extra == 0 {
-            // Plain single AMD pass (identical to biconn_order's per-block path).
+        // Fat blocks (nnz > cap): single AMD, no extra restart stack.
+        // Small / unflagged blocks: same single-AMD fallback.
+        if extra == 0 || bnnz > block_nnz_cap {
             match feral_amd::amd_order(&core) {
                 Ok(sub) => perm.extend(sub.iter().map(|&x| owned[x as usize] as usize)),
                 Err(_) => perm.extend(owned.iter().map(|&v| v as usize)),
@@ -585,47 +581,19 @@ pub fn biconn_heavy_order(
             continue;
         }
 
-        // Heavy path: best-of-(1+extra) relabelled AMD, scored by exact local
-        // flops. Build the usize ScoringPattern once for flops_of.
-        let cp_us: Vec<usize> = col_ptr.iter().map(|&x| x as usize).collect();
-        let ri_us: Vec<usize> = row_idx.iter().map(|&x| x as usize).collect();
-        let spat = super::ScoringPattern {
+        // Core block: nested dissection on the induced owned subgraph.
+        // Replaces the stacked relabel-AMD multi-start (no extra seeds /
+        // ranking mix / second descent).
+        let sub_pat = Pattern {
             n: m,
-            col_ptr: cp_us,
-            row_idx: ri_us,
+            col_ptr: col_ptr.iter().map(|&x| x as usize).collect(),
+            row_idx: row_idx.iter().map(|&x| x as usize).collect(),
         };
-        let mut best_local: Option<Vec<u32>> = None;
-        let mut best_flops = u64::MAX;
-        // Restart 0 is plain AMD on the un-relabelled block; restarts 1..=extra
-        // are AMD on `relabel(m, seed)` relabellings, composed back. Same seed
-        // stream as the portfolio's multi-start.
-        for r in 0..=extra {
-            let cand: Option<Vec<u32>> = if r == 0 {
-                feral_amd::amd_order(&core)
-                    .ok()
-                    .map(|p| p.iter().map(|&x| x as u32).collect())
-            } else {
-                let q = super::relabel(m, r as u64);
-                let bpat = feral::ordering::amd::permute_pattern(&spat, &q);
-                let bcp: Vec<i32> = bpat.col_ptr.iter().map(|&x| x as i32).collect();
-                let bri: Vec<i32> = bpat.row_idx.iter().map(|&x| x as i32).collect();
-                feral_ordering_core::CscPattern::new(m, &bcp, &bri).and_then(|bc| {
-                    feral_amd::amd_order(&bc).ok().map(|pb| {
-                        pb.iter().map(|&x| q[x as usize] as u32).collect()
-                    })
-                })
-            };
-            let Some(local) = cand else { continue };
-            let local_us: Vec<usize> = local.iter().map(|&x| x as usize).collect();
-            let f = super::flops_of(&spat, &local_us);
-            if f < best_flops {
-                best_flops = f;
-                best_local = Some(local);
-            }
-        }
-        match best_local {
-            Some(local) => perm.extend(local.iter().map(|&x| owned[x as usize] as usize)),
-            None => perm.extend(owned.iter().map(|&v| v as usize)),
+        let sub = super::nd_order_impl(&sub_pat, true);
+        if sub.len() == m {
+            perm.extend(sub.iter().map(|&x| owned[x as usize] as usize));
+        } else {
+            perm.extend(owned.iter().map(|&v| v as usize));
         }
     }
 
