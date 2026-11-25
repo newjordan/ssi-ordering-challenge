@@ -153,6 +153,12 @@ mod tests {
         // The harness corpus loader must yield exactly what the shared
         // ssi_scoring reader parses, in the same order — one parser (Invariant 2).
         let path = std::path::Path::new(DEV_CORPUS_FILE);
+        if is_lfs_pointer(&read_prefix(path)) {
+            eprintln!(
+                "skipping corpus_matches_shared_jsonl_reader: {DEV_CORPUS_FILE} is a Git LFS pointer"
+            );
+            return;
+        }
         let shared = ssi_scoring::load_corpus_jsonl(path).expect("load dev corpus");
         let ours = corpus();
         assert_eq!(ours.len(), shared.len());

@@ -95,7 +95,19 @@ const TEST_TIME_CAP_FLAG: &str = "--test-time-cap";
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().collect();
-    let grader_mode = raw_args.iter().any(|arg| arg == "--grader");
+    let cli = match parse_cli(&raw_args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("error: {err}\n");
+            eprintln!("{}", usage());
+            return ExitCode::FAILURE;
+        }
+    };
+    if cli.help {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
+    let grader_mode = cli.grader;
     let worker_sandbox = match sandbox::WorkerSandbox::from_env(grader_mode) {
         Ok(sandbox) => sandbox,
         Err(e) => {
@@ -120,7 +132,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if raw_args.iter().any(|arg| arg == "--sandbox-self-check") {
+    if cli.sandbox_self_check {
         return match sandbox_self_check_parent(&worker_sandbox, &candidate_worker) {
             Ok(()) => {
                 println!("per-worker bubblewrap self-check passed");
@@ -132,10 +144,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    if raw_args
-        .iter()
-        .any(|arg| arg == "--sandbox-timeout-self-check")
-    {
+    if cli.sandbox_timeout_self_check {
         return match sandbox_timeout_self_check_parent(&worker_sandbox, &candidate_worker) {
             Ok(()) => {
                 println!("bubblewrap timeout teardown self-check passed");
@@ -147,9 +156,8 @@ fn main() -> ExitCode {
             }
         };
     }
-    let test_time_cap = raw_args.iter().any(|arg| arg == TEST_TIME_CAP_FLAG);
-
-    let note = parse_note();
+    let test_time_cap = cli.test_time_cap;
+    let note = cli.note;
     let repo_root = repo_root();
     // Preserve the trusted pre-run log before any contestant worker can write
     // through an absolute path. Artifact publication happens only after all
@@ -221,6 +229,10 @@ fn main() -> ExitCode {
 
     if show_matrix_census {
         println!(
+            "time is the slower of the two determinism runs (wall clock, cap {}s)",
+            TIME_CAP_PER_MATRIX.as_secs()
+        );
+        println!(
             "{:<28} {:>8} {:>10} {:>14} {:>14} {:>8} {:>9}",
             "matrix", "n", "nnz(A)", "flops(base)", "flops(yours)", "ratio", "time"
         );
@@ -277,7 +289,7 @@ fn main() -> ExitCode {
         }
 
         // --- contestant ordering: capped subprocess, run twice ---
-        let run_once = |tag: &str| -> Result<Vec<usize>, WorkerFailure> {
+        let run_once = |tag: &str| -> Result<(Vec<usize>, Duration), WorkerFailure> {
             let out_perm = scratch.path().join(format!("{seq}-{tag}.bin"));
             let _ = std::fs::remove_file(&out_perm);
             // Pre-create the output so grader mode can bind precisely one
@@ -311,14 +323,17 @@ fn main() -> ExitCode {
             let t0 = Instant::now();
             match watchdog::run_capped(&mut cmd, &cap) {
                 watchdog::WorkerOutcome::Ok => {
-                    ssi_worker_protocol::read_permutation(&out_perm, pat.n).map_err(|e| {
-                        WorkerFailure {
-                            // The parse error can echo bytes from the worker-written
-                            // output file, so keep it off the hidden path.
-                            detailed: format!("worker produced no readable permutation: {e}"),
-                            redacted: "worker produced no readable permutation".to_string(),
-                        }
-                    })
+                    let elapsed = t0.elapsed();
+                    ssi_worker_protocol::read_permutation(&out_perm, pat.n)
+                        .map(|perm| (perm, elapsed))
+                        .map_err(|e| {
+                            WorkerFailure {
+                                // The parse error can echo bytes from the worker-written
+                                // output file, so keep it off the hidden path.
+                                detailed: format!("worker produced no readable permutation: {e}"),
+                                redacted: "worker produced no readable permutation".to_string(),
+                            }
+                        })
                 }
                 other => Err(classify_worker_failure(
                     other,
@@ -329,8 +344,8 @@ fn main() -> ExitCode {
             }
         };
 
-        let perm1 = match run_once("a") {
-            Ok(p) => p,
+        let (perm1, elapsed1) = match run_once("a") {
+            Ok(pair) => pair,
             Err(e) => {
                 failed = Some(matrix_failure(
                     show_matrix_census,
@@ -341,8 +356,8 @@ fn main() -> ExitCode {
                 break;
             }
         };
-        let perm2 = match run_once("b") {
-            Ok(p) => p,
+        let (perm2, elapsed2) = match run_once("b") {
+            Ok(pair) => pair,
             Err(e) => {
                 failed = Some(matrix_failure(
                     show_matrix_census,
@@ -398,8 +413,9 @@ fn main() -> ExitCode {
                 break;
             }
         };
-        let ratio = yours.flops as f64 / base.flops as f64;
-        let fill_ratio = yours.nnz_l as f64 / base.nnz_l as f64;
+        let ratio = ssi_scoring::count_ratio(yours.flops, base.flops);
+        let fill_ratio = ssi_scoring::count_ratio(yours.nnz_l, base.nnz_l);
+        let elapsed = elapsed1.max(elapsed2);
         let b = size_bucket(pat.n);
         buckets[b].log_ratio_sum += ratio.ln();
         buckets[b].log_fill_sum += fill_ratio.ln();
@@ -414,7 +430,7 @@ fn main() -> ExitCode {
                 base.flops,
                 yours.flops,
                 ratio,
-                "(capped)"
+                format_elapsed(elapsed),
             );
             println!("{line}");
             let _ = writeln!(table, "{line}");
@@ -457,9 +473,11 @@ fn main() -> ExitCode {
             }
 
             println!(
-                "\nscore (weighted mean of per-bucket geomean flop ratios, lower is better): {score_val:.4}"
+                "\nscore    {score_val:.6}   weighted mean of per-bucket geomean flop ratios (lower is better; AMD = 1)"
             );
-            println!("tiebreak (weighted mean of per-bucket geomean fill ratios):                    {fill:.4}");
+            println!("tiebreak {fill:.6}   weighted mean of per-bucket geomean fill ratios");
+            println!("wrote    score.json");
+            println!("appended results.tsv");
 
             // score.json — top-level `score` is what the grader ranks on;
             // `metrics` is passthrough detail (Hilbert captures it whole and
@@ -1025,12 +1043,125 @@ fn result_row(ts: u64, status: &str, score: f64, fill: f64, note: &str) -> Strin
     format!("{ts}\t{status}\t{score:.6}\t{fill:.6}\t{note}")
 }
 
-fn parse_note() -> String {
-    let args: Vec<String> = std::env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--note" && i + 1 < args.len() {
-            return failsafe::sanitize(&args[i + 1]);
+#[derive(Debug)]
+struct Cli {
+    help: bool,
+    grader: bool,
+    sandbox_self_check: bool,
+    sandbox_timeout_self_check: bool,
+    test_time_cap: bool,
+    note: String,
+}
+
+fn usage() -> &'static str {
+    "\
+ssi-ordering-challenge — score a fill-reducing ordering against feral AMD
+
+Usage:
+  cargo run --release --offline --locked -- [options]
+
+Options:
+  --note <text>     Text stored in the results.tsv note column
+  --help, -h        Show this help and exit
+  --grader          Grader mode (requires SSI_GRADER_SANDBOX=bubblewrap)
+
+Environment (parent process only):
+  SSI_CORPUS_FILE                 JSONL corpus to grade instead of corpus/dev/patterns.jsonl
+  SSI_MAX_MATRIX_N                On the public dev corpus only, keep matrices with n at most this
+  SSI_CANDIDATE_WORKER            Path to the ssi-candidate-worker binary
+  SSI_ALLOW_UNSANDBOXED_WORKER=1  Run order() without a sandbox (local opt-out)
+
+The time column is the slower of the two determinism runs, in wall-clock
+seconds. Each run is killed at 2s. The printed score matches score.json.
+Lower is better; the AMD baseline is defined to be 1.\
+"
+}
+
+fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    let mut cli = Cli {
+        help: false,
+        grader: false,
+        sandbox_self_check: false,
+        sandbox_timeout_self_check: false,
+        test_time_cap: false,
+        note: String::new(),
+    };
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => cli.help = true,
+            "--grader" => cli.grader = true,
+            "--sandbox-self-check" => cli.sandbox_self_check = true,
+            "--sandbox-timeout-self-check" => cli.sandbox_timeout_self_check = true,
+            TEST_TIME_CAP_FLAG => cli.test_time_cap = true,
+            "--note" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err("--note requires a value".to_string());
+                };
+                if cli.note.is_empty() {
+                    cli.note = failsafe::sanitize(value);
+                }
+                i += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown argument {other}"));
+            }
+            other => return Err(format!("unexpected argument {other}")),
         }
+        i += 1;
     }
-    String::new()
+    Ok(cli)
+}
+
+/// Wall-clock label for one matrix. The cap is 2s, so successful runs fit in
+/// the 9-character table column (`0.842s`, `1.999s`).
+fn format_elapsed(elapsed: Duration) -> String {
+    format!("{:.3}s", elapsed.as_secs_f64())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{format_elapsed, parse_cli};
+    use std::time::Duration;
+
+    #[test]
+    fn help_and_note_parse() {
+        let args = vec![
+            "ssi-ordering-challenge".to_string(),
+            "--note".to_string(),
+            "hill climb".to_string(),
+            "--help".to_string(),
+        ];
+        let cli = parse_cli(&args).unwrap();
+        assert!(cli.help);
+        assert_eq!(cli.note, "hill climb");
+        assert!(!cli.grader);
+    }
+
+    #[test]
+    fn missing_note_value_and_unknown_flag_are_errors() {
+        let bin = "ssi-ordering-challenge".to_string();
+        let missing = parse_cli(&[bin.clone(), "--note".to_string()]);
+        assert!(missing.unwrap_err().contains("--note requires"));
+        let unknown = parse_cli(&[bin, "--nope".to_string()]);
+        assert!(unknown.unwrap_err().contains("unknown argument"));
+    }
+
+    #[test]
+    fn note_strips_tabs_and_newlines() {
+        let cli = parse_cli(&[
+            "bin".to_string(),
+            "--note".to_string(),
+            "a\tb\nc".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(cli.note, "a b c");
+        assert!(!cli.note.contains('\t'));
+    }
+
+    #[test]
+    fn format_elapsed_uses_seconds_with_three_decimals() {
+        assert_eq!(format_elapsed(Duration::from_millis(842)), "0.842s");
+        assert_eq!(format_elapsed(Duration::from_secs(2)), "2.000s");
+    }
 }

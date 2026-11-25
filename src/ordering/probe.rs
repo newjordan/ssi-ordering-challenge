@@ -3,9 +3,9 @@
 //! session can measure, rather than guess, two things the scored harness
 //! deliberately hides:
 //!
-//!   1. **Timing headroom.** The harness prints `(capped)` instead of a time,
-//!      so the only way to know how close `order()` runs to the enforced 2 s
-//!      SIGKILL is to time it here.
+//!   1. **Timing headroom.** The harness time column is only the slower of the
+//!      two full `order()` runs. Per-candidate cost, which is what a gate has
+//!      to budget against the 2 s SIGKILL, is visible here.
 //!   2. **Candidate value.** Before wiring a new candidate into `order()`, run
 //!      it here across the corpus and compute what the score *would* become.
 //!
@@ -2047,8 +2047,7 @@ fn probe_win_d_map() {
 
 /// TEMP CHECK (win F integration session): do the 7 new win-F custom-metric
 /// variants (`custom_metrics::ScoreVariant::Deg*`) win on the two co-ceiling
-/// "gate wall" matrices flagged in the cost model
-/// (`/Users/philrio/ssi-ordering-LEARNINGS/data/time-cost-model.md`) —
+/// "gate wall" matrices flagged in the external cost-model notes —
 /// `ringpack_30_2` (nnz≈121k) and `crudeoil_lee4_10` (nnz≈120k), both already
 /// running ~35 stacked candidates at ~0.67s? If a variant never wins there,
 /// firing it on those two matrices is pure added cost for zero value, and the
@@ -3367,16 +3366,21 @@ fn probe_orbit() {
 ///      constants' doc comments): no absolute timing claim needed, just that
 ///      the giants' code path provably does not touch either phase's logic.
 ///
-/// Env: SSI_CORPUS_FILE=<path> overrides the default reconstructed-eval-
-/// corpus path below.
+/// Env: SSI_CORPUS_FILE must name the reconstructed-eval JSONL. There is no
+/// default path.
 ///
 /// `cargo test --release -- --ignored --nocapture probe_stack`
 #[test]
 #[ignore]
 fn probe_stack() {
-    let default_path =
-        "/Users/philrio/ssi-ordering-LEARNINGS/data/corpus-reconstruction/eval-reconstructed.jsonl";
-    let path_string = std::env::var("SSI_CORPUS_FILE").unwrap_or_else(|_| default_path.to_string());
+    let Ok(path_string) = std::env::var("SSI_CORPUS_FILE") else {
+        println!("SKIP probe_stack: set SSI_CORPUS_FILE to a patterns.jsonl path");
+        return;
+    };
+    if path_string.trim().is_empty() {
+        println!("SKIP probe_stack: SSI_CORPUS_FILE is blank");
+        return;
+    }
     let path = std::path::Path::new(&path_string);
     let corpus = match ssi_scoring::load_corpus_jsonl(path) {
         Ok(c) => c,

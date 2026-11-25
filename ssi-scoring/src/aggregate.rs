@@ -32,6 +32,24 @@ pub struct BucketAcc {
     pub count: usize,
 }
 
+/// `numer / denom` for a flop or fill count.
+///
+/// Both sides are zero for an empty pattern (`n = 0`): that is a tie with the
+/// baseline, so the ratio is 1. A nonzero numerator against a zero denominator
+/// is infinite. Either case used to be `0/0` or `x/0` `NaN`, which poisoned
+/// the geomean.
+pub fn count_ratio(numer: u64, denom: u64) -> f64 {
+    if denom == 0 {
+        if numer == 0 {
+            1.0
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        numer as f64 / denom as f64
+    }
+}
+
 /// Geometric mean from a sum of natural logs and a count. `None` for an empty
 /// bucket (no matrices), so `combine` can renormalize it out.
 pub fn geomean(log_sum: f64, count: usize) -> Option<f64> {
@@ -63,7 +81,11 @@ pub fn combine(geomeans: &[Option<f64>; BUCKETS], weights: &[f64; BUCKETS]) -> f
 /// Stage C: the permutation must be a true bijection of 0..n.
 pub fn validate_permutation(perm: &[usize], n: usize) -> Result<(), String> {
     if perm.len() != n {
-        return Err(format!("permutation has length {}, expected {}", perm.len(), n));
+        return Err(format!(
+            "permutation has length {}, expected {}",
+            perm.len(),
+            n
+        ));
     }
     let mut seen = vec![false; n];
     for &v in perm {
@@ -90,6 +112,13 @@ mod tests {
         assert_eq!(size_bucket(9999), 1);
         assert_eq!(size_bucket(10000), 2);
         assert_eq!(size_bucket(340_000), 2);
+    }
+
+    #[test]
+    fn count_ratio_zero_denominator_is_a_tie_or_infinite() {
+        assert_eq!(count_ratio(0, 0), 1.0);
+        assert!(count_ratio(4, 0).is_infinite());
+        assert!((count_ratio(3, 6) - 0.5).abs() < 1e-12);
     }
 
     #[test]

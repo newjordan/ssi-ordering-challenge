@@ -214,7 +214,7 @@ Expected: `test result: ok` for all suites (closed-form scorer tests, oracle cro
 
 Run (invokes the committed hook exactly as the SessionStart hook does):
 ```bash
-slug="-Users-lulu-Documents-autoresearch-ordering-challenge-ssi-ordering-challenge"
+slug="<claude-project-slug>"
 printf '{"hook_event_name":"SessionStart","source":"startup","session_id":"%s","cwd":"%s","transcript_path":"%s"}' \
   "$CLAUDE_CODE_SESSION_ID" "$PWD" "$HOME/.claude/projects/$slug/$CLAUDE_CODE_SESSION_ID.jsonl" \
   | sh .hilbert/hooks/hilbert-trace.sh claude session

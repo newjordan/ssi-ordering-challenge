@@ -45,8 +45,9 @@
 //!
 //! ## The timing fact that bounds every change here
 //!
-//! MEASURED with the test-only `probe` module (the harness prints `(capped)`
-//! instead of a time, so this is otherwise invisible). Two runs of the SAME
+//! MEASURED with the test-only `probe` module (the harness time column is the
+//! slower of the two determinism runs; per-candidate cost is otherwise
+//! invisible). Two runs of the SAME
 //! probe on the SAME code, hours apart:
 //!
 //! | matrix            | run A   | run B   |

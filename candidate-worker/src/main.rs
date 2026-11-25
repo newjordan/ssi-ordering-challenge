@@ -282,3 +282,60 @@ fn test_timeout_worker() -> i32 {
     std::thread::sleep(Duration::from_secs(30));
     0
 }
+
+#[cfg(test)]
+mod order_contract {
+    use super::*;
+
+    fn assert_bijection(perm: &[usize], n: usize) {
+        assert_eq!(perm.len(), n, "length");
+        let mut seen = vec![false; n];
+        for &v in perm {
+            assert!(v < n && !seen[v], "not a bijection: {perm:?}");
+            seen[v] = true;
+        }
+    }
+
+    #[test]
+    fn empty_and_singleton_patterns_are_trivial_permutations() {
+        assert!(ordering::order(&Pattern::from_edges(0, &[])).is_empty());
+        assert_eq!(ordering::order(&Pattern::from_edges(1, &[])), vec![0]);
+    }
+
+    #[test]
+    fn small_graphs_are_deterministic_bijections_no_worse_than_amd() {
+        let star = Pattern::from_edges(7, &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6)]);
+        let path_edges: Vec<_> = (0..11).map(|i| (i, i + 1)).collect();
+        let path = Pattern::from_edges(12, &path_edges);
+        let width = 4;
+        let mut grid_edges = Vec::new();
+        for row in 0..width {
+            for col in 0..width {
+                let v = row * width + col;
+                if col + 1 < width {
+                    grid_edges.push((v, v + 1));
+                }
+                if row + 1 < width {
+                    grid_edges.push((v, v + width));
+                }
+            }
+        }
+        let grid = Pattern::from_edges(width * width, &grid_edges);
+
+        for pat in [&star, &path, &grid] {
+            let once = ordering::order(pat);
+            let twice = ordering::order(pat);
+            assert_eq!(once, twice, "nondeterministic on n={}", pat.n);
+            assert_bijection(&once, pat.n);
+            let amd = ssi_scoring::amd_baseline(pat);
+            assert_bijection(&amd, pat.n);
+            let got = ssi_scoring::score(pat, &once).flops;
+            let base = ssi_scoring::score(pat, &amd).flops;
+            assert!(
+                got <= base,
+                "n={} order flops {got} exceeded AMD {base}",
+                pat.n
+            );
+        }
+    }
+}

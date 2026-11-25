@@ -1,17 +1,8 @@
 # timestamp	status	score	fill_ratio	note
-# Append-only run log. The harness adds one row per `cargo run --release`:
-# Unix timestamp, status (OK/FAIL), score (weighted mean of per-bucket geomean
-# flop ratios vs feral-AMD, lower is better, AMD = 1.00), fill_ratio (same
-# weighted scheme over nnz(L), the tiebreak), and your --note.
-# The row below is the shipped feral-amd starter on the full
-# 300-pattern dev corpus — it ties the AMD baseline at 1.00 as a correct start.
+# Append-only run log. The harness adds one row per run: Unix timestamp,
+# status (OK/FAIL), score (weighted mean of per-bucket geomean flop ratios
+# versus feral AMD; lower is better; AMD is defined as 1), fill_ratio (the
+# same weights over nnz(L)), and the --note text.
+# The data row below is a historical run. It is not a measurement of the
+# current src/ordering/ tree. Test runs restore this file instead of appending.
 1782160339	OK	1.000000	1.000000	starter: feral-amd ordering on full dev corpus (ties AMD baseline)
-1784568653	FAIL	NaN	NaN	slay06m: order() exceeded the 2.0s per-matrix cap and was killed (took ≥ 2.0s). Your ordering must return within 2s on every matrix. This matrix is n=357, nnz=1080, nnz/n≈3 — if it is dense, the cost is in order() itself; gate expensive paths by BOTH n and nnz. | time_cap test: slow
-1784568669	OK	0.924552	0.979498	time_cap test: normal
-1784568677	FAIL	NaN	NaN	slay06m: order() exceeded the 2.0s per-matrix cap and was killed (took ≥ 2.0s). Your ordering must return within 2s on every matrix. This matrix is n=357, nnz=1080, nnz/n≈3 — if it is dense, the cost is in order() itself; gate expensive paths by BOTH n and nnz. | time_cap test: slow
-1784568694	OK	0.924552	0.979498	time_cap test: normal
-1784569496	FAIL	NaN	NaN	slay06m: order() exceeded the 2.0s per-matrix cap and was killed (took ≥ 2.0s). Your ordering must return within 2s on every matrix. This matrix is n=357, nnz=1080, nnz/n≈3 — if it is dense, the cost is in order() itself; gate expensive paths by BOTH n and nnz. | time_cap test: slow
-1784569512	OK	0.924552	0.979498	time_cap test: normal
-1784569526	FAIL	NaN	NaN	slay06m: order() exceeded the 2.0s per-matrix cap and was killed (took ≥ 2.0s). Your ordering must return within 2s on every matrix. This matrix is n=357, nnz=1080, nnz/n≈3 — if it is dense, the cost is in order() itself; gate expensive paths by BOTH n and nnz. | time_cap test: slow
-1784569543	OK	0.924552	0.979498	time_cap test: normal
-1784569570	OK	0.924552	0.979498	issue #20: worker pattern handoff

@@ -1,42 +1,37 @@
 # Development corpus
 
-`patterns.jsonl` here is the **full development corpus** (300 patterns, n up to
-~340,000), one CSC sparsity pattern per line. It spans the families NLP / QCP /
-QP / QCQP and populates all three scoring size buckets (lt_1k / 1k_10k / gt_10k).
+`patterns.jsonl` is the public development corpus: one symmetric CSC sparsity
+pattern per line. It is stored with Git LFS. The pointer checked in at this
+path records `size 103879806`.
 
-It is shipped in-repo via **Git LFS** because the file is ~99 MB. Install Git LFS
-before cloning, or fetch it afterward:
+Install Git LFS before cloning, or fetch the blob afterward:
 
 ```sh
 git lfs install
-git lfs pull   # if you cloned before installing git-lfs
+git lfs pull
 ```
 
-Without `git-lfs`, this path holds a small text *pointer* instead of JSONL, and
-the harness stops with a message telling you to run `git lfs pull`.
+Without Git LFS, this path is the pointer text rather than JSONL. The harness
+stops and tells you to run `git lfs pull`. Tests that need the resolved blob
+skip when they still see the pointer.
 
 ## Line format
 
-Each line is one symmetric sparsity pattern as compressed-sparse-column (CSC):
+Each line is one pattern:
 
 ```json
-{"n": 4, "nnz": 12, "indptr": [...], "indices": [...], "hash": "...", "source": "st_e09"}
+{"n": 4, "nnz": 12, "indptr": [0, 3, 6, 8, 12], "indices": [0, 1, 3, 0, 1, 3, 2, 3, 0, 1, 2, 3], "hash": "9cce0c0e", "source": "st_e09"}
 ```
 
-- `n` — matrix dimension. `indptr` (len n+1) / `indices` (len nnz) — CSC columns.
-- The stored pattern is the **full symmetrized** pattern and **includes the
-  diagonal**; the harness reader (`ssi_scoring::pattern_from_jsonl_line`) drops
-  the diagonal to produce the off-diagonal contract `Pattern`.
-- `hash` (SHA-256 of the canonical pattern) and `source` (origin problem) are
-  metadata; the harness uses `source` as the display name.
+- `n` is the dimension. `indptr` has length `n + 1`. `indices` has one entry per stored nonzero.
+- The stored pattern includes the diagonal. `ssi_scoring::pattern_from_jsonl_line` drops the diagonal and requires the off-diagonal pattern to be symmetric.
+- `source` is the display name. `hash` is metadata. Neither is an input to `order()`.
+- Keys are matched as JSON keys. A `source` value equal to `n` or `indices` does not hide the real field.
 
-## Grading a different corpus
-
-Point the harness at another corpus for one run with `SSI_CORPUS_FILE`:
+## Another corpus for one run
 
 ```sh
-SSI_CORPUS_FILE=/path/to/other.jsonl cargo run --release
+SSI_CORPUS_FILE=/path/to/other.jsonl cargo run --release --offline --locked -- --note "other corpus"
 ```
 
-Unset, the harness grades this in-repo corpus. The competition's hidden
-evaluation corpus is never published.
+Unset, the harness grades this file. A path that is not this file is treated as a hidden corpus: matrix names stay out of the log. The competition's evaluation corpus is not in this repository.
