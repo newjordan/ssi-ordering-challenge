@@ -19,7 +19,7 @@
 - **Weights:** `lt_1k = 0.30`, `1k_10k = 0.30`, `gt_10k = 0.40`.
 - **Empty buckets:** renormalize — weighted mean over populated buckets only, weights rescaled to sum to 1.
 - **Bucket metric keys:** `lt_1k` / `1k_10k` / `gt_10k`.
-- **Canonical full corpus source:** `../corpus-generation/corpus/dev/patterns.jsonl` (absolute: `/Users/lulu/Documents/autoresearch/ordering_challenge/corpus-generation/corpus/dev/patterns.jsonl`), ~99 MB, 300 patterns, bucket split `lt_1k=147, 1k_10k=108, gt_10k=45`.
+- **Canonical full corpus source:** `../corpus-generation/corpus/dev/patterns.jsonl` in a local checkout of the corpus-generation repo (do not commit that absolute path).
 - **Commit trailer:** end every commit message with `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 
 ---
@@ -560,7 +560,7 @@ Copy the real corpus over the sample path and commit it — with `.gitattributes
 
 - [ ] **Step 1: Copy the full corpus over the sample path**
 
-Run: `cp /Users/lulu/Documents/autoresearch/ordering_challenge/corpus-generation/corpus/dev/patterns.jsonl corpus/dev/patterns.jsonl`
+Run: `cp ../corpus-generation/corpus/dev/patterns.jsonl corpus/dev/patterns.jsonl`
 Then verify size and bucket split:
 Run: `wc -l corpus/dev/patterns.jsonl && du -h corpus/dev/patterns.jsonl && awk -F'"n":' '{split($2,a,","); n=a[1]; if(n<1000)s++; else if(n<10000)m++; else l++} END{print "lt_1k="s" 1k_10k="m" gt_10k="l}' corpus/dev/patterns.jsonl`
 Expected: `300` lines, `~99M`, `lt_1k=147 1k_10k=108 gt_10k=45`.

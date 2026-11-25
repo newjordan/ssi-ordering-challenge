@@ -573,7 +573,7 @@ Expected: no stale corpus references in docs/README (matches only in unrelated c
 - [ ] **Step 5: Update the best-score memory**
 
 After Task 4 printed the new score, update the memory file
-`/Users/lulu/.claude/projects/-Users-lulu-Documents-autoresearch-ordering-challenge-ssi-ordering-challenge/memory/ordering-best-score.md`
+the local agent memory file `ordering-best-score.md` (not committed)
 to note the corpus changed (old 0.9801 was on the `.mtx` corpus; re-baseline on the JSONL corpus). Do not invent a number — record the value the harness actually printed.
 
 - [ ] **Step 6: Commit**

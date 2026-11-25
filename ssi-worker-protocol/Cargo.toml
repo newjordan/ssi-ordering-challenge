@@ -2,6 +2,7 @@
 name = "ssi-worker-protocol"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100"
 license = "MIT"
 description = "Shared Pattern/permutation file protocol between the trusted parent and candidate worker"
 

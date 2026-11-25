@@ -15,13 +15,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 fn harness_bin() -> PathBuf {
-    // The integration test binary runs from target/<profile>/deps; the harness
-    // binary is two levels up at target/<profile>/ssi-ordering-challenge.
-    let mut p = std::env::current_exe().unwrap();
-    p.pop(); // deps
-    p.pop(); // profile dir
-    p.push("ssi-ordering-challenge");
-    p
+    // Cargo 1.100 places integration-test executables under
+    // target/<profile>/build/<pkg>/<hash>/out, not target/<profile>/deps.
+    // CARGO_BIN_EXE is the harness binary cargo actually produced.
+    PathBuf::from(env!("CARGO_BIN_EXE_ssi-ordering-challenge"))
 }
 
 fn candidate_bin() -> PathBuf {
@@ -30,6 +27,11 @@ fn candidate_bin() -> PathBuf {
         "ssi-candidate-worker{}",
         std::env::consts::EXE_SUFFIX
     ));
+    assert!(
+        path.is_file(),
+        "candidate worker not built at {}. Run `cargo build --offline --locked -p ssi-candidate-worker --bin ssi-candidate-worker` before these tests.",
+        path.display()
+    );
     path
 }
 
@@ -54,6 +56,49 @@ fn score_json_path() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("score.json")
 }
 
+fn results_tsv_path() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("results.tsv")
+}
+
+/// The harness appends to the repo's `results.tsv` even when its CWD is a temp
+/// dir. Integration tests used to leave those rows in the committed log.
+struct ArtifactRestore {
+    results: Option<Vec<u8>>,
+}
+
+impl ArtifactRestore {
+    fn capture() -> Self {
+        Self {
+            results: std::fs::read(results_tsv_path()).ok(),
+        }
+    }
+}
+
+impl Drop for ArtifactRestore {
+    fn drop(&mut self) {
+        match &self.results {
+            Some(bytes) => {
+                let _ = std::fs::write(results_tsv_path(), bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(results_tsv_path());
+            }
+        }
+        let _ = std::fs::remove_file(score_json_path());
+    }
+}
+
+fn dev_corpus_is_lfs_pointer() -> bool {
+    use std::io::Read as _;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/dev/patterns.jsonl");
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 80];
+    let n = file.read(&mut buf).unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n]).starts_with("version https://git-lfs.github.com/spec/")
+}
+
 fn top_level_score(json: &str) -> f64 {
     let (_, tail) = json
         .split_once("\"score\":")
@@ -67,6 +112,13 @@ fn top_level_score(json: &str) -> f64 {
 #[test]
 fn normal_run_succeeds_on_sample_corpus() {
     let _serialize = harness_lock();
+    let _restore = ArtifactRestore::capture();
+    if dev_corpus_is_lfs_pointer() {
+        eprintln!(
+            "skipping normal_run_succeeds_on_sample_corpus: corpus/dev/patterns.jsonl is a Git LFS pointer"
+        );
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("ssi-public-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -101,6 +153,14 @@ fn normal_run_succeeds_on_sample_corpus() {
         "public dev run should retain the per-matrix census:\n{stdout}"
     );
     assert!(
+        !stdout.contains("(capped)"),
+        "time column should be measured wall clock, not a placeholder:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("score.json"),
+        "a successful run should name the score file:\n{stdout}"
+    );
+    assert!(
         corpus.exists(),
         "absolute public dev corpus path must never be unlinked"
     );
@@ -120,6 +180,7 @@ fn normal_run_succeeds_on_sample_corpus() {
 #[test]
 fn hidden_corpus_omits_per_matrix_census() {
     let _serialize = harness_lock();
+    let _restore = ArtifactRestore::capture();
     let dir = std::env::temp_dir().join(format!("ssi-hidden-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -174,6 +235,7 @@ fn hidden_corpus_omits_per_matrix_census() {
 #[test]
 fn hidden_corpus_load_failure_omits_raw_name() {
     let _serialize = harness_lock();
+    let _restore = ArtifactRestore::capture();
     let dir = std::env::temp_dir().join(format!(
         "ssi-hidden-load-failure-test-{}",
         std::process::id()
@@ -210,15 +272,30 @@ fn slow_ordering_is_killed_and_fails_promptly() {
     // that sleeps 30s without ever calling order(). The 2s cap must kill that
     // real worker process and FAIL the run well under 30s, while contestant
     // code gets no environment or argv test seam.
+    //
+    // The corpus is a one-line synthetic pattern, not the Git LFS dev file.
+    // An unresolved LFS pointer used to fail this test in corpus load, and the
+    // assertion still passed because that path also prints "RUN FAILED".
     let _serialize = harness_lock();
+    let _restore = ArtifactRestore::capture();
     let dir = std::env::temp_dir().join(format!("ssi-slow-output-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let corpus = dir.join("tiny.jsonl");
+    std::fs::write(
+        &corpus,
+        concat!(
+            r#"{"n":3,"nnz":7,"indptr":[0,2,5,7],"indices":[0,1,0,1,2,1,2],"#,
+            r#""source":"tiny"}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
     let start = Instant::now();
     let out = Command::new(harness_bin())
         .env("SSI_CANDIDATE_WORKER", candidate_bin())
         .env("SSI_ALLOW_UNSANDBOXED_WORKER", "1")
-        .env("SSI_CORPUS_FILE", public_dev_corpus())
+        .env("SSI_CORPUS_FILE", &corpus)
         .current_dir(&dir)
         .args(["--test-time-cap", "--note", "time_cap test: slow"])
         .output()
@@ -228,16 +305,43 @@ fn slow_ordering_is_killed_and_fails_promptly() {
     assert!(!out.status.success(), "slow ordering should FAIL the run");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("time cap")
-            || stdout.contains("per-matrix cap")
-            || stdout.contains("RUN FAILED"),
-        "expected a time-cap failure message, got:\n{stdout}"
+        stdout.contains("per-matrix cap"),
+        "expected a time-cap failure message, got:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
         elapsed < Duration::from_secs(20),
         "cap was not enforced promptly: {elapsed:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn help_does_not_need_a_worker_or_corpus() {
+    let out = Command::new(harness_bin())
+        .arg("--help")
+        .output()
+        .expect("run harness --help");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--note"));
+    assert!(stdout.contains("SSI_CORPUS_FILE"));
+    assert!(stdout.contains("AMD"));
+}
+
+#[test]
+fn unknown_flag_is_rejected_before_scoring() {
+    let out = Command::new(harness_bin())
+        .arg("--not-a-flag")
+        .output()
+        .expect("run harness");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown argument"), "{stderr}");
 }
 
 #[test]

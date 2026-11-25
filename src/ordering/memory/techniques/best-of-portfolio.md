@@ -33,8 +33,8 @@ the pattern's shape.
 | second/third worst | 1.011 s `ringpack_30_2`, 0.869 s `nuclear104` |
 
 That is only a ~2× margin. Anything added to the slow tier risks the run. The
-[`probe`](../../probe.rs) module exists because the harness prints `(capped)`
-instead of a time, so this number is otherwise invisible.
+[`probe`](../../probe.rs) module isolates per-candidate cost. The harness time
+column reports only the slower of the two full `order()` runs.
 
 The cost driver is **nnz, not n** — `qapw` (n=705, nnz=87496) takes 0.539 s while
 much larger sparse matrices take less. Gate by nnz first, n as a backstop.

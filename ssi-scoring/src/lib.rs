@@ -46,16 +46,16 @@ use feral::ordering::elimination_tree::EliminationTree;
 use feral::sparse::csc::CscPattern;
 use feral::symbolic::{column_counts_gnp, total_factor_nnz};
 
+mod aggregate;
 mod loader;
 mod pattern;
-mod aggregate;
 
-pub use loader::{load_corpus_jsonl, pattern_from_jsonl_line, LoadError};
-pub use pattern::Pattern;
 pub use aggregate::{
-    combine, geomean, size_bucket, validate_permutation, BucketAcc, BUCKETS,
+    combine, count_ratio, geomean, size_bucket, validate_permutation, BucketAcc, BUCKETS,
     BUCKET_KEYS, BUCKET_WEIGHTS,
 };
+pub use loader::{load_corpus_jsonl, pattern_from_jsonl_line, LoadError};
+pub use pattern::Pattern;
 
 /// The symbolic factorization cost of an ordering, derived purely from the
 /// sparsity pattern and the permutation.
@@ -247,6 +247,11 @@ mod tests {
         let p = Pattern::from_edges(n, &edges);
         let amd = baseline_score(&p);
         let natural = score(&p, &identity(n));
-        assert!(amd.flops * 50 < natural.flops, "amd={:?} natural={:?}", amd, natural);
+        assert!(
+            amd.flops * 50 < natural.flops,
+            "amd={:?} natural={:?}",
+            amd,
+            natural
+        );
     }
 }

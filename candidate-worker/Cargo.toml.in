@@ -2,6 +2,7 @@
 name = "ssi-candidate-worker"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100"
 license = "MIT"
 description = "Untrusted candidate ordering worker"
 

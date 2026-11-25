@@ -2,6 +2,7 @@
 name = "ssi-scoring"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100"
 license = "MIT"
 description = "The ONE scoring code path for the SSI ordering challenge: a thin pattern-pure wrapper over feral's symbolic analysis and AMD baseline. Both the local harness and the private grader score by calling this crate."
 

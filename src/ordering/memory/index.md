@@ -75,8 +75,9 @@ these to the next scoring win, at zero extra measurement cost:
 
 ## Tooling
 - [`../probe.rs`](../probe.rs) — TEST-ONLY measurement module (`#[cfg(test)]`,
-  never shipped, never read by the grader). The harness prints `(capped)` instead
-  of a time, so this is the only way to see the cap. Run:
+  never shipped, never read by the grader). The harness time column is the
+  slower of the two full `order()` runs; this module is how a single candidate's
+  cost is isolated. Run:
   `cargo test --release -- --ignored --nocapture --test-threads=1 probe_<name>`
   - `probe_timing_and_score` — per-matrix `order()` time + the current score.
   - `probe_ties` — the matrices still tied at AMD (the target list).
